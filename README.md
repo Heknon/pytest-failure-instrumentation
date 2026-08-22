@@ -580,6 +580,12 @@ own pending publisher at test.pypi.org with the environment named `testpypi`.
 Leave that environment without reviewers — the point of a rehearsal is that it
 does not need one.
 
+## Licence
+
+MIT — see [LICENSE](LICENSE). Declared as an SPDX expression under
+[PEP 639](https://peps.python.org/pep-0639/) rather than a classifier, since
+PyPI rejects a distribution carrying both.
+
 ## Status
 
 All five kinds and every verdict in the tables above are covered, on all three
