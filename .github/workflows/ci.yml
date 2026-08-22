@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, "claude/**"]
+    # master is the default branch here; main is kept in case it is ever
+    # renamed. Without the default branch listed, the one push that most
+    # needs a green tick is the one that gets none.
+    branches: [master, main, "claude/**"]
   pull_request:
   workflow_dispatch:
 
