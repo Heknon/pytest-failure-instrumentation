@@ -3,7 +3,10 @@ depend on where the runner installed anything."""
 
 from __future__ import annotations
 
+import os
 import sysconfig
+
+import pytest
 
 from pytest_failure_instrumentation.analysis.attribution import Attributor
 
@@ -19,6 +22,15 @@ def frames_for(*paths):
 
 def test_the_stdlib_is_runtime_wherever_it_is_installed():
     assert Attributor(("yourcore",)).owner_of(f"{STDLIB}/ctypes/__init__.py") == "runtime"
+
+
+@pytest.mark.skipif(os.path.normcase("A") == "A", reason="case-sensitive paths")
+def test_the_stdlib_is_runtime_whatever_case_the_frame_reports():
+    """Windows reports the same directory as \\Lib\\ in sysconfig and \\lib\\ in
+    a traceback. Comparing them literally leaves threading.py owned by nobody,
+    and the nearest owner is the customer."""
+    attributor = Attributor(("yourcore",))
+    assert attributor.owner_of(STDLIB.swapcase() + "/threading.py") == "runtime"
 
 
 def test_a_frame_in_your_package_is_yours():

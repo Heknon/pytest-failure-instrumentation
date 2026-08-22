@@ -12,6 +12,7 @@ that the framework itself is what failed.
 
 from __future__ import annotations
 
+import os
 import re
 import sysconfig
 from pathlib import Path
@@ -25,14 +26,28 @@ FRAMEWORK_MARKERS = (
 FRAME_PATTERN = re.compile(r'File "([^"]+)", line (\d+),? in (\S+)')
 
 
+def comparable(path: str) -> str:
+    """A path in the form these comparisons can be made on.
+
+    ``normcase`` lowercases on Windows and does nothing on POSIX, which is
+    exactly the difference that matters: a Windows filesystem is
+    case-insensitive, and an interpreter there reports the same directory as
+    ``\\Lib\\`` in sysconfig and ``\\lib\\`` in a traceback. Comparing those
+    literally makes threading.py look like nobody's code, and a stdlib frame
+    that is not recognised as the runtime gets blamed on whoever is nearest -
+    which is the customer.
+    """
+    return os.path.normcase(path).replace("\\", "/")
+
+
 class Attributor:
     def __init__(self, packages: tuple[str, ...]) -> None:
-        self.packages = [name.replace("-", "_") for name in packages]
+        self.packages = [comparable(name.replace("-", "_")) for name in packages]
         stdlib = sysconfig.get_paths().get("stdlib", "")
-        self.stdlib = stdlib.replace("\\", "/") if stdlib else ""
+        self.stdlib = comparable(stdlib) if stdlib else ""
 
     def owner_of(self, path: str) -> str:
-        normalized = path.replace("\\", "/")
+        normalized = comparable(path)
         parts = normalized.split("/")
         if any(marker in normalized for marker in FRAMEWORK_MARKERS):
             return "runtime"
