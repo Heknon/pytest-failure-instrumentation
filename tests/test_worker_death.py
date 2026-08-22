@@ -113,10 +113,13 @@ def test_a_windows_ntstatus_is_decoded_as_the_fault_it_stands_for(distributed):
     assert death.exit_status == 0xC0000005
     assert death.verdict == "NATIVE_CRASH"
     assert "access violation" in death.exit_status_meaning
-    # TerminateProcess leaves no dump, so there is no frame to blame and the
-    # test in flight stays a lead rather than becoming a finding.
+    # TerminateProcess leaves no dump, so there is no frame to blame at all.
+    # What is left is the test that was in flight, offered as a lead: it names
+    # whoever owns the test module, which is not the same claim as knowing
+    # whose code failed.
     assert death.owner == "unknown"
-    assert death.suspect_owner == "product"
+    assert death.suspect_owner == "customer-code"
+    assert "test_crash.py" in (death.suspect_basis or "")
 
 
 def test_the_phase_is_recorded_because_pytest_cannot_tell_you(distributed):

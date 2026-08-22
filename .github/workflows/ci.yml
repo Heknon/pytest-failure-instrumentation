@@ -24,11 +24,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.11", "3.13"]
         exclude:
-          # setup-python has no 3.9 build for the arm64 macOS runners.
+          # setup-python has no 3.9 build for the arm64 macOS runners, and the
+          # x86_64 macos-13 runners that had one are retired - a job asking for
+          # them queues forever. 3.9 is covered on Linux and Windows.
           - os: macos-latest
-            python-version: "3.9"
-        include:
-          - os: macos-13
             python-version: "3.9"
 
     steps:
