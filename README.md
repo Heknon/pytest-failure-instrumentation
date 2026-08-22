@@ -407,13 +407,20 @@ you a hard ceiling per worker, which is why it is opt-in.
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
 
-One Windows difference is worth knowing about, because it changes what you
-will see rather than how it is reported: ctypes wraps every foreign function
-call in structured exception handling, so an access violation raised *through
-ctypes* becomes an `OSError` in the test rather than killing the worker. A
-fault inside a real C extension still ends the process, and arrives as an
-NTSTATUS exit code rather than a signal — but the same reproduction that
-segfaults a worker on Linux may simply fail a test on Windows.
+Two Windows differences are worth knowing about, because they change what you
+will see rather than how it is reported.
+
+ctypes wraps every foreign function call in structured exception handling, so
+an access violation raised *through ctypes* comes back as an `OSError` and the
+worker survives it. A fault inside a real C extension still ends the process —
+but the reproduction that segfaults a worker on Linux may simply fail a test on
+Windows.
+
+And a Windows process that dies from a fault reports an NTSTATUS as its exit
+code rather than a signal, while `abort()` reports plain `3` — the same code a
+deliberate `os._exit(3)` gives. What separates a crash from a clean exit there
+is whether a dump was written, not the exit status, which is why the crash
+stack is evidence in its own right rather than a decoration on the verdict.
 
 `psutil` is never required, only ever an upgrade: `pip install
 pytest-failure-instrumentation[psutil]`.

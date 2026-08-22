@@ -41,21 +41,31 @@ def native_call(pointer):
     """A fault in native code, the way a C extension produces one.
 
     On POSIX this is a SIGSEGV and the process is gone before anything can
-    react. Windows is different: ctypes wraps every foreign function call in
-    structured exception handling and turns an access violation into an
-    OSError, so the worker survives it and there is no death to report at all.
+    react. Windows cannot be made to do that through ctypes: every foreign
+    function call is wrapped in structured exception handling, so an access
+    violation comes back as an OSError and the worker survives it.
 
-    Dereferencing a pointer object is not wrapped that way, so it is tried
-    first. If the process is somehow still alive afterwards it exits with the
-    status the OS would have given it - which is what the exit-status probe and
-    the NTSTATUS decode table have to handle either way.
+    abort() is a real death there instead, and faulthandler still writes a
+    dump for it - which is what the attribution has to work from. It exits
+    with 3 rather than an NTSTATUS, so the crash is told from a plain
+    os._exit(3) by the presence of that dump and nothing else.
     """
     if sys.platform != "win32":
         return ctypes.string_at(pointer)
+    os.abort()
 
-    ctypes.cast(pointer, ctypes.POINTER(ctypes.c_char)).contents
+
+def exit_with_ntstatus(status=ACCESS_VIOLATION):
+    """Die with the exit code Windows reports for a real fault.
+
+    argtypes and restype are set because GetCurrentProcess returns a HANDLE:
+    ctypes defaults to a 32-bit int, which truncates the pseudo-handle and
+    makes TerminateProcess fail silently.
+    """
     kernel32 = ctypes.windll.kernel32
-    kernel32.TerminateProcess(kernel32.GetCurrentProcess(), ACCESS_VIOLATION)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    kernel32.TerminateProcess(kernel32.GetCurrentProcess(), status)
 
 
 def hard_exit(code):

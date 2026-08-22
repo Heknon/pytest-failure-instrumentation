@@ -47,24 +47,20 @@ def test_a_native_crash_is_reported_with_the_status_the_platform_gives(distribut
     assert death.phase == "call"
     assert death.run_ending is False
 
-    if sys.platform == "win32":
-        # Windows reports the fault as an NTSTATUS exit code rather than a
-        # signal, and does not always leave a dump behind.
-        assert death.exit_status == 0xC0000005
-    else:
+    if sys.platform != "win32":
         assert death.exit_status == -signal.SIGSEGV
-
-    if death.crash_stack:
-        # The deepest frame is ctypes; the useful one is whoever called it.
-        assert death.blamed_frame is not None
-        assert death.blamed_frame.module == "victim"
-        assert death.owner == "product"
-        assert death.severity == "critical"
     else:
-        # No stack means no finding. The test in flight is a lead, and is kept
-        # in the column for leads.
-        assert death.owner == "unknown"
-        assert death.suspect_owner == "product"
+        # abort() exits with 3, the same as a deliberate os._exit(3). What
+        # separates them is the dump asserted below, and nothing else.
+        assert death.exit_status == 3
+
+    # The deepest frame is ctypes or the CRT; the useful one is whoever
+    # called it.
+    assert death.crash_stack
+    assert death.blamed_frame is not None
+    assert death.blamed_frame.module == "victim"
+    assert death.owner == "product"
+    assert death.severity == "critical"
 
 
 def test_a_deliberate_exit_is_not_reported_as_a_crash(distributed):
@@ -102,6 +98,25 @@ def test_a_stop_signal_is_not_a_defect(distributed):
     assert death.verdict == f"SIGNAL_{int(signal.SIGTERM)}"
     # Nobody is paged for a run somebody asked to stop.
     assert death.severity == "informational"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTSTATUS is a Windows exit code")
+def test_a_windows_ntstatus_is_decoded_as_the_fault_it_stands_for(distributed):
+    """The decode table is unit-tested everywhere; this is the only place a
+    real process actually exits with one of those codes."""
+    distributed.pytester.makepyfile(
+        test_crash=crashing_test("victim.exit_with_ntstatus()")
+    )
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.exit_status == 0xC0000005
+    assert death.verdict == "NATIVE_CRASH"
+    assert "access violation" in death.exit_status_meaning
+    # TerminateProcess leaves no dump, so there is no frame to blame and the
+    # test in flight stays a lead rather than becoming a finding.
+    assert death.owner == "unknown"
+    assert death.suspect_owner == "product"
 
 
 def test_the_phase_is_recorded_because_pytest_cannot_tell_you(distributed):
