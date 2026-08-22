@@ -14,6 +14,7 @@ requires-python = ">=3.9"
 dependencies = ["pytest>=7.0", "pydantic>=2.0"]
 
 [project.optional-dependencies]
+test = ["pytest-xdist>=3.0"]
 # Only ever an upgrade: memory figures on macOS and Windows are better with it,
 # and every probe degrades to a declared "unavailable" without it.
 psutil = ["psutil>=5.9"]
@@ -23,3 +24,9 @@ failure_instrumentation = "pytest_failure_instrumentation.plugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The integration tests run a real pytest in a subprocess, and a wedged worker
+# is the point of some of them - so no test may hang the suite indefinitely.
+addopts = "-ra"

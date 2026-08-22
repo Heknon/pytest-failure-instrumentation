@@ -140,16 +140,16 @@ def _most_relevant(sections: list[list[str]]) -> list[str]:
         if any(marker in line for marker in RUNTEST_MARKERS for line in section):
             return section
     for section in sections:
-        if not _entirely_ours(section):
+        if not _mentions_us(section):
             return section
     return sections[0]
 
 
-def _entirely_ours(section: list[str]) -> bool:
-    frames = [line for line in section if line.lstrip().startswith('File "')]
-    return bool(frames) and all(
-        OWN_PACKAGE in line.replace("\\", "/") for line in frames
-    )
+def _mentions_us(section: list[str]) -> bool:
+    """Our own heartbeat thread sits mostly in threading.py, so a section is
+    deprioritised for containing any frame of ours, not only for being all
+    ours."""
+    return any(OWN_PACKAGE in line.replace("\\", "/") for line in section)
 
 
 def size(path: Path) -> int:

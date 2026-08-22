@@ -69,7 +69,17 @@ class CollectionTracker:
             }
             for digest, workers in grouped.items()
         ]
-        variants.sort(key=lambda variant: (-variant["worker_count"], variant["digest"]))
+        # Most workers first - the majority leads. On a tie the larger
+        # collection wins, so the same difference is reported as something
+        # missing rather than as something extra; the digest only ever breaks
+        # a tie between two equals, so the choice stays stable across runs.
+        variants.sort(
+            key=lambda variant: (
+                -variant["worker_count"],
+                -variant["test_count"],
+                variant["digest"],
+            )
+        )
         return variants
 
     def summarise(self, sample_size: int = SAMPLE_SIZE) -> dict[str, Any]:

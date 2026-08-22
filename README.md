@@ -1,5 +1,7 @@
 # pytest-failure-instrumentation
 
+[![CI](https://github.com/Heknon/pytest-failure-instrumentation/actions/workflows/ci.yml/badge.svg)](https://github.com/Heknon/pytest-failure-instrumentation/actions/workflows/ci.yml)
+
 Most test failures explain themselves. A `pytest_runtest_makereport` gives you
 an assertion, a traceback and a node id, and there is nothing left to
 investigate.
@@ -408,14 +410,38 @@ you a hard ceiling per worker, which is why it is opt-in.
 `psutil` is never required, only ever an upgrade: `pip install
 pytest-failure-instrumentation[psutil]`.
 
+## Tests
+
+```console
+pip install -e ".[test]"
+pytest
+```
+
+The integration tests run a real pytest in a subprocess through `pytester`,
+crash or wedge a worker for real, and read back what the plugin raised — so
+they exercise the mechanism rather than a mock of it. Every one of them also
+round-trips its incidents through `registry.parse` and asserts `model_dump()`
+equals the stored row, which makes the payload contract a property of every
+scenario rather than a test of its own.
+
+CI runs the suite on Linux, macOS and Windows across Python 3.9–3.13. The
+probes are platform code — procfs, psapi, `waitid`, `GetExitCodeProcess`,
+cgroup counters — and none of the Windows or macOS paths can be exercised on a
+Linux runner, which is the whole reason the matrix exists. Two axes matter as
+much as the operating system, so each gets its own job:
+
+- **without `psutil`**, which is what most people actually have. Every probe
+  has to degrade to a declared "unavailable" rather than to a wrong number.
+- **without `pytest-xdist`**, where `pytest_testnodedown` has no hookspec at
+  all and an unspecced hookimpl is a registration error — the failure mode that
+  once made a plain `pytest` run report nothing.
+
 ## Status
 
-All five kinds are wired and exercised end to end on Linux: every death verdict
-above, both stall states plus the busy-not-stuck case that must stay silent,
-both collection shapes, internal errors from a worker and from a plain
+All five kinds are wired and exercised end to end: every death verdict above,
+both stall states plus the busy-not-stuck case that must stay silent, both
+collection shapes, internal errors from a worker and from a plain
 single-process run, the gh-1362 reproduction quoted above, and the run summary.
-Every payload round-trips through `registry.parse` unchanged.
 
-The Windows and macOS probe paths are written from the platform APIs and have
-not been executed on those systems. `STALLED_SILENT` and the Windows NTSTATUS
-decodes have no test that produces them.
+`STALLED_SILENT` has no test that produces it. The Windows NTSTATUS decodes are
+unit-tested everywhere and produced for real only on the Windows runners.
