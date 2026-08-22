@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,14 @@ class IncidentEngine:
             and config.getoption("dist", "no") != "no"
         )
 
-        self.run_id = "unknown"
+        # xdist's own id for the run is the one a reader can line up against
+        # its logs, but it does not exist until xdist has started its workers -
+        # so it is resolved per incident, with a fallback fixed now. A
+        # timestamp is not enough: two runs starting in the same second are
+        # common on CI, and they would share an id.
+        self._run_id_fallback = os.environ.get("PYTEST_RUN_ID") or (
+            f"run-{uuid.uuid4().hex[:12]}"
+        )
         self.collections = CollectionTracker()
         self.reported_mismatch = False
         #: Last time each live worker said anything, and which are wedged
@@ -194,11 +202,19 @@ class IncidentEngine:
 
     # -- sources ---------------------------------------------------------
 
+    @property
+    def run_id(self) -> str:
+        """xdist's own id for this run, so an incident lines up with its logs.
+
+        Read from the session plugin rather than stored: the node manager that
+        holds it is built inside xdist's own ``pytest_sessionstart``, which may
+        run after this one.
+        """
+        session = self.config.pluginmanager.getplugin("dsession")
+        manager = getattr(session, "nodemanager", None)
+        return getattr(manager, "testrunuid", None) or self._run_id_fallback
+
     def pytest_sessionstart(self, session: pytest.Session) -> None:
-        manager = getattr(session.config, "_xdist_nodemanager", None)
-        self.run_id = getattr(manager, "testrunuid", None) or os.environ.get(
-            "PYTEST_RUN_ID", f"run-{int(time.time())}"
-        )
         # Only distributed runs can strand a worker. A single process that
         # wedges takes this detector down with it.
         if self.distributed and self.settings.stall_seconds > 0:

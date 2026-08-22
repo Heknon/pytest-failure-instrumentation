@@ -161,6 +161,63 @@ def test_the_phase_is_recorded_because_pytest_cannot_tell_you(distributed):
     assert death.test_in_flight == "test_crash.py::test_dies_in_teardown"
 
 
+def test_a_parametrized_node_id_still_names_the_test_that_died(distributed):
+    """A real node id is long: a path, a class, and a parameter set spelling
+    out the case - often with content hashes in it, which are the part that
+    says *which* case. It has to survive the fixed-size slot it is written to
+    whole, or the one fact this plugin exists to recover is the one it loses,
+    and the death is reported as one that happened before any test ran."""
+    distributed.pytester.makepyfile(
+        test_crash="""
+        import pytest
+
+        import victim
+
+        CASE = (
+            "input=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            "-expected=2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+        )
+
+
+        def test_filler():
+            assert True
+
+
+        @pytest.mark.parametrize("case", [CASE])
+        def test_invoice_reconciliation_matrix_for_the_quarterly_close(case):
+            victim.native_call(1)
+        """
+    )
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.verdict == "NATIVE_CRASH"
+    assert death.phase == "call"
+    assert death.tests_started == 1
+    # Whole, hashes and all: a truncated id names the test but not the case,
+    # which is the difference between a report you can re-run and one you
+    # cannot.
+    assert death.test_in_flight is not None
+    assert death.test_in_flight.startswith(
+        "test_crash.py::test_invoice_reconciliation_matrix_for_the_quarterly_close"
+    )
+    assert death.test_in_flight.endswith("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae]")
+    assert "before running any test" not in str(death)
+
+
+def test_the_run_id_is_the_one_xdist_writes_in_its_own_logs(distributed):
+    """Correlating an incident with the run it came from means using xdist's
+    id for that run, not one invented here - and every incident in the run has
+    to carry the same one."""
+    distributed.pytester.makepyfile(test_crash=crashing_test("victim.native_call(1)"))
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    # xdist's testrunuid is a uuid4 hex; the fallback is prefixed "run-".
+    assert len(death.run_id) == 32 and not death.run_id.startswith("run-")
+    assert {incident.run_id for incident in incidents} == {death.run_id}
+
+
 @pytest.mark.skipif(
     sys.platform != "linux",
     reason="RLIMIT_AS is not reliably enforced outside Linux",
