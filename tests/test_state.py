@@ -10,18 +10,24 @@ reported as one that died before running anything.
 from __future__ import annotations
 
 from pytest_failure_instrumentation.capture.state import (
+    ELIDED,
     SLOT_SIZE,
-    TRIMMED,
     WorkerState,
     read_state,
 )
 
-# The shape that overflows in practice: a real path, a class, and a parameter
-# set that spells out every dimension of the case.
-LONG_NODEID = (
-    "tests/integration/test_billing_reconciliation.py::TestQuarterlyClose"
-    "::test_invoice_matrix[currency=EUR-region=emea-tier=enterprise-2024-01-01]"
+# The long-but-ordinary shape: a real path, a class, and a parameter set
+# carrying content hashes. This is what the slot is sized to hold whole.
+HASHED_NODEID = (
+    "tests/e2e/test_replay.py::TestLedger::test_settles"
+    "[input=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    "-expected=2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae]"
 )
+
+# Past anything real, so the elision itself can be tested.
+OVERSIZED_NODEID = "tests/matrix/test_grid.py::test_case[" + "-".join(
+    f"dimension{index}=abcdef0123456789" for index in range(60)
+) + "]"
 
 
 def state_for(tmp_path, **fields):
@@ -32,7 +38,7 @@ def state_for(tmp_path, **fields):
 
 def test_the_slot_is_the_same_size_whatever_is_in_it(tmp_path):
     state = WorkerState(tmp_path / "gw0.state", 4242)
-    for nodeid in ("t.py::test_a", LONG_NODEID, "t.py::test_b[" + "x" * 4000 + "]"):
+    for nodeid in ("t.py::test_a", HASHED_NODEID, "t.py::test_b[" + "x" * 4000 + "]"):
         state.update(nodeid=nodeid, phase="call")
         assert (tmp_path / "gw0.state").stat().st_size == SLOT_SIZE
 
@@ -43,27 +49,38 @@ def test_a_short_node_id_is_recorded_as_it_is(tmp_path):
     assert record["phase"] == "setup"
 
 
-def test_an_oversized_node_id_costs_its_tail_and_nothing_else(tmp_path):
-    """The head is what everything reads - the module for attribution and for
-    the fingerprint, the test name for the alert - so the tail is what goes."""
+def test_a_long_id_with_hashes_in_it_is_kept_whole(tmp_path):
+    """The slot is sized for the ids people actually have. A suite keyed on
+    content hashes produces nothing else, and an id cut short there names the
+    test but not which case of it failed."""
     record = state_for(
-        tmp_path, nodeid=LONG_NODEID, phase="call", tests_started=7, tests_finished=6
+        tmp_path, nodeid=HASHED_NODEID, phase="call", tests_started=7, tests_finished=6
     )
-    assert record["nodeid"].endswith(TRIMMED)
-    assert LONG_NODEID.startswith(record["nodeid"][: -len(TRIMMED)])
-    # And the rest of the record survives intact, which is the whole point:
-    # trimming the encoded JSON instead would take these with it.
+    assert record["nodeid"] == HASHED_NODEID
     assert record["phase"] == "call"
     assert record["tests_started"] == 7
     assert record["tests_finished"] == 6
     assert record["pid"] == 4242
 
 
+def test_an_id_past_even_that_keeps_both_of_its_ends(tmp_path):
+    """Cutting the tail loses which case it was - a hash, a timestamp, an
+    account id all live at the end. Cutting the head loses the module the
+    incident is attributed to. So an id too long for the slot gives up its
+    middle, and says that it did."""
+    record = state_for(tmp_path, nodeid=OVERSIZED_NODEID, phase="call")
+    head, _, tail = record["nodeid"].partition(ELIDED)
+    assert head and tail
+    assert OVERSIZED_NODEID.startswith(head)
+    assert OVERSIZED_NODEID.endswith(tail)
+    assert record["phase"] == "call"
+
+
 def test_an_id_that_escapes_to_more_bytes_than_it_has_characters(tmp_path):
     """Quotes and non-ASCII parameters cost several bytes each once encoded.
     Subtracting an overflow in characters over-trims them - far enough, on a
     fully non-ASCII id, to throw away the module name as well."""
-    for parameter in ('"\\' * 80, "é中文" * 60, "\n\t" * 90):
+    for parameter in ('"\\' * 400, "é中文" * 300, "\n\t" * 450):
         record = state_for(tmp_path, nodeid=f"t.py::test_x[{parameter}]", phase="call")
         assert record, parameter
         assert record["nodeid"].startswith("t.py::test_x["), record["nodeid"]
@@ -75,10 +92,10 @@ def test_a_record_stays_readable_as_the_counters_grow_digits(tmp_path):
     state = WorkerState(tmp_path / "gw0.state", 4242)
     for count in (9, 99, 999, 9999, 99999, 999999):
         state.tests_started = state.tests_finished = count
-        state.update(nodeid=LONG_NODEID, phase="teardown")
+        state.update(nodeid=OVERSIZED_NODEID, phase="teardown")
         record = read_state(tmp_path / "gw0.state")
         assert record["tests_started"] == count
-        assert record["nodeid"].startswith("tests/integration/")
+        assert record["nodeid"].startswith("tests/matrix/test_grid.py::")
 
 
 def test_a_missing_file_reads_as_nothing_known(tmp_path):

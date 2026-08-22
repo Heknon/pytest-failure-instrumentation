@@ -7,7 +7,7 @@ it produces hundreds of thousands of lines nobody ever reads.
 
 Instead each worker keeps one small file that is *overwritten* in place. It
 never grows, costs a single ``pwrite`` per phase transition, and reading it is
-one 256-byte read rather than parsing a log.
+one fixed-size read rather than parsing a log.
 
 The file is written by exactly one process and read by exactly one other. A
 single ``pwrite`` of a small buffer is not formally atomic, so the reader
@@ -20,6 +20,11 @@ So the *node id* is trimmed to fit, never the encoded record: a truncated JSON
 object does not parse, and the reader then loses the phase and the counters
 too, and reports a worker that died mid-test as one that died before running
 anything.
+
+The slot is sized so that trimming is the exception rather than the rule. It
+is one write of one buffer at whatever size it is - 256 bytes and 1 KiB cost
+the same syscall and neither reaches a page - so the only thing a small slot
+bought was node ids losing their tails.
 """
 
 from __future__ import annotations
@@ -30,12 +35,22 @@ import time
 from pathlib import Path
 from typing import Any
 
-SLOT_SIZE = 256
+#: One write of one buffer, so the size is nearly free - see the module
+#: docstring. This leaves around 870 bytes for a node id, which is past any
+#: real one: a path, a class, a test name and a couple of hashes together
+#: reach a third of it.
+SLOT_SIZE = 1024
 
-#: Marks a node id that did not fit the slot, so a reader can tell a trimmed
-#: id from a short one. The tail goes because the head - the module and the
-#: test - is what attribution, fingerprinting and the alert text all read.
-TRIMMED = "..."
+#: Marks the part of a node id that did not fit, so a reader can tell an
+#: elided id from a short one.
+ELIDED = "..."
+
+#: How much of a too-long id to keep from the front. Both ends carry
+#: something the other does not: the head is the module and the test, which
+#: attribution and the fingerprint read, and the tail is where a parametrize
+#: puts the value that says *which* case this was - a hash, a timestamp, an
+#: account id. Cutting either end blind loses one of the two.
+HEAD_SHARE = 0.6
 
 
 class WorkerState:
@@ -78,7 +93,7 @@ class WorkerState:
             pass  # never let bookkeeping break a test run
 
     def _encode(self) -> bytes:
-        """The record as bytes, with the node id trimmed until it fits.
+        """The record as bytes, with the node id elided until it fits.
 
         Trimming the encoded JSON instead would save a byte count and lose the
         record: the reader gets an unparseable object and falls back to knowing
@@ -98,22 +113,36 @@ class WorkerState:
             if len(cached) <= SLOT_SIZE - 1:
                 return cached
 
-        # The longest prefix that still fits, found by search rather than by
+        # The most of the id that still fits, found by search rather than by
         # subtracting an overflow: json escaping means a character is not a
-        # byte, and a quote or a non-ASCII parameter costs several. Adding a
-        # character can only lengthen the record, so the fit is monotone and
-        # the search is exact. It runs once per oversized id, not per write.
+        # byte, and a quote or a non-ASCII parameter costs several. Keeping
+        # more can only lengthen the record, so the fit is monotone and the
+        # search is exact. It runs once per oversized id, not per write.
         low, high = 0, len(self.nodeid)
         while low < high:
             middle = (low + high + 1) // 2
-            candidate = self._record(self.nodeid[:middle] + TRIMMED, stamp)
-            if len(candidate) <= SLOT_SIZE - 1:
+            if len(self._record(self._elide(middle), stamp)) <= SLOT_SIZE - 1:
                 low = middle
             else:
                 high = middle - 1
-        trimmed = self.nodeid[:low] + TRIMMED if low else ""
+        trimmed = self._elide(low)
         self._trimmed = (self.nodeid, trimmed)
         return self._record(trimmed, stamp)
+
+    def _elide(self, keep: int) -> str:
+        """``keep`` characters of the node id, taken from both ends.
+
+        A hash lives at the end of a parametrized id and the module lives at
+        the start, so a cut that keeps only one end throws away either what
+        the incident is attributed to or which case it was.
+        """
+        if keep <= 0:
+            return ""
+        if keep >= len(self.nodeid):
+            return self.nodeid
+        head = round(keep * HEAD_SHARE)
+        tail = keep - head
+        return self.nodeid[:head] + ELIDED + (self.nodeid[-tail:] if tail else "")
 
     def _record(self, nodeid: str | None, stamp: float) -> bytes:
         payload = json.dumps(

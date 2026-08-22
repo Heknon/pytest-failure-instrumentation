@@ -369,14 +369,19 @@ and `run_ending` reflects which of the two happened.
 ## How it knows
 
 **A fixed-size state file.** Which test and phase is open right now is written
-to a 256-byte slot with `os.pwrite` — one syscall, no append, no growth, and a
+to a fixed-size slot with `os.pwrite` — one syscall, no append, no growth, and a
 file that is the same size after a million tests as after one. That is what
 separates "died in teardown" from "died mid-call": pytest's own `logfinish`
-fires only after the whole protocol, so it cannot tell them apart. A node id
-too long for the slot has its *tail* trimmed, never the record: a parametrized
-id runs past 256 bytes routinely, and truncating the encoded record leaves it
-unparseable — which costs the reader the phase and the counters as well, and
-reports a worker that died mid-call as one that died before running anything.
+fires only after the whole protocol, so it cannot tell them apart. The slot
+holds a node id of around 870 characters whole, which is past any real one —
+a path, a class, a test name and a couple of content hashes together reach a
+third of it. An id longer than that gives up its *middle*, never the record:
+truncating the encoded record leaves it unparseable, which costs the reader
+the phase and the counters as well and reports a worker that died mid-call as
+one that died before running anything. The middle goes rather than the tail
+because both ends carry something the other does not — the head is the module
+attribution reads, and the tail is where a parametrize puts the value saying
+which case this was.
 
 **The exit status, taken from the OS.** Where a `Popen` object survives, its
 return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
