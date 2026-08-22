@@ -317,7 +317,13 @@ return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
 `WNOWAIT` reads the status *without consuming it*, so execnet's own reaping
 still works afterwards and nothing is broken by looking. Only a parent may do
 this, which is why it happens on the controller, and why a remote gateway
-honestly reports `UNKNOWN` rather than guessing.
+honestly reports `UNKNOWN` rather than guessing. macOS does not expose
+`os.waitid` at all and falls back to the `Popen` object, which is why
+`capabilities` records the mechanism that answered rather than the one the
+platform was assumed to have. On Windows the code is normalised to its
+unsigned form first: an NTSTATUS is above 2³¹, so `0xC000013A` arrives signed
+or unsigned depending on who answered — and a negative status means "killed by
+signal N" to everything downstream.
 
 **faulthandler, pointed at a per-worker file.** pytest's own faulthandler
 plugin enables at configure time with `trylast`, aimed at shared stderr where

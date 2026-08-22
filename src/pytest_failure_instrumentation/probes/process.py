@@ -15,6 +15,20 @@ from typing import Any
 from .platform_flags import IS_WINDOWS, optional_psutil
 
 
+def unsigned_on_windows(status: int) -> int:
+    """Windows exit codes are unsigned; some sources hand them back signed.
+
+    An NTSTATUS is above 2^31, so ``0xC000013A`` arrives as either 3221225786
+    or -1073741510 depending on who answered - and a negative status means
+    "killed by signal N" to the classifier, which turns a Ctrl-C into
+    SIGNAL_1073741510. Normalised here, where the platform is known, so
+    everything downstream sees one form.
+    """
+    if IS_WINDOWS and status < 0:
+        return status + (1 << 32)
+    return status
+
+
 def exit_status(pid: int | None, popen: Any, timeout: float = 5.0) -> tuple[int | None, str | None, str]:
     """(status, kind, source) for a process that has ended.
 
@@ -24,7 +38,7 @@ def exit_status(pid: int | None, popen: Any, timeout: float = 5.0) -> tuple[int 
     answers, which makes it the easier platform here.
     """
     if popen is not None and getattr(popen, "returncode", None) is not None:
-        return int(popen.returncode), None, "popen.returncode"
+        return unsigned_on_windows(int(popen.returncode)), None, "popen.returncode"
 
     if pid and hasattr(os, "waitid"):
         result = _waitid_status(pid, timeout)
@@ -41,7 +55,7 @@ def exit_status(pid: int | None, popen: Any, timeout: float = 5.0) -> tuple[int 
             status = popen.poll()
             if status is None:
                 status = popen.wait(timeout=timeout)
-            return int(status), None, "popen.wait"
+            return unsigned_on_windows(int(status)), None, "popen.wait"
         except Exception:
             pass
 
@@ -77,7 +91,11 @@ def _windows_exit_status(pid: int) -> tuple[int, str | None, str] | None:
     psutil = optional_psutil()
     if psutil is not None:
         try:
-            return int(psutil.Process(pid).wait(timeout=5)), "exited", "psutil"
+            return (
+                unsigned_on_windows(int(psutil.Process(pid).wait(timeout=5))),
+                "exited",
+                "psutil",
+            )
         except Exception:
             pass
     try:

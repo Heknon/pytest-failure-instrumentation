@@ -8,6 +8,7 @@ precisely what a customer's machine will be running.
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -18,7 +19,12 @@ import pytest
 from pytest_failure_instrumentation import probes
 from pytest_failure_instrumentation.probes import memory, process
 
-posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX only")
+# macOS does not expose os.waitid at all, so the plugin falls back to the
+# Popen object there - which is why the capability record reports the
+# mechanism rather than assuming one.
+has_waitid = pytest.mark.skipif(
+    not hasattr(os, "waitid"), reason="no os.waitid on this platform"
+)
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 
 
@@ -65,7 +71,7 @@ def test_psapi_answers_without_psutil():
 # -- exit status ---------------------------------------------------------
 
 
-@posix_only
+@has_waitid
 def test_waitid_reads_a_status_without_consuming_it():
     """The whole reason for WNOWAIT: whoever owns the process still gets to
     reap it, so looking at a worker cannot break execnet's own cleanup."""
@@ -76,7 +82,7 @@ def test_waitid_reads_a_status_without_consuming_it():
     assert popen.wait(timeout=10) == 7
 
 
-@posix_only
+@has_waitid
 def test_waitid_reports_a_kill_as_a_negative_status():
     popen = child("import time", "time.sleep(30)")
     popen.send_signal(signal.SIGKILL)
@@ -98,3 +104,18 @@ def test_getexitcodeprocess_answers_from_a_handle(monkeypatch):
 
 def test_a_process_that_was_never_ours_yields_no_status_rather_than_a_guess():
     assert probes.exit_status(None, None) == (None, None, "unavailable")
+
+
+@windows_only
+def test_an_ntstatus_is_normalised_to_the_unsigned_form_it_is_documented_as():
+    """0xC000013A arrives signed or unsigned depending on who answered, and a
+    negative status means "killed by signal N" everywhere downstream."""
+    assert process.unsigned_on_windows(-1073741510) == 0xC000013A
+    assert process.unsigned_on_windows(-1073741819) == 0xC0000005
+    assert process.unsigned_on_windows(3) == 3
+
+
+def test_a_posix_signal_status_is_left_alone():
+    if sys.platform == "win32":
+        pytest.skip("negative statuses are signals only on POSIX")
+    assert process.unsigned_on_windows(-9) == -9
