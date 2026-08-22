@@ -439,7 +439,9 @@ round-trips its incidents through `registry.parse` and asserts `model_dump()`
 equals the stored row, which makes the payload contract a property of every
 scenario rather than a test of its own.
 
-CI runs the suite on Linux, macOS and Windows across Python 3.9–3.13. The
+CI runs the suite on Linux, macOS and Windows across Python 3.9–3.13 — every
+platform path in the table above is executed on the platform it was written
+for. The
 probes are platform code — procfs, psapi, `waitid`, `GetExitCodeProcess`,
 cgroup counters — and none of the Windows or macOS paths can be exercised on a
 Linux runner, which is the whole reason the matrix exists. Two axes matter as
@@ -453,10 +455,20 @@ much as the operating system, so each gets its own job:
 
 ## Status
 
-All five kinds are wired and exercised end to end: every death verdict above,
-both stall states plus the busy-not-stuck case that must stay silent, both
-collection shapes, internal errors from a worker and from a plain
-single-process run, the gh-1362 reproduction quoted above, and the run summary.
+All five kinds are wired and exercised end to end on all three platforms: every
+death verdict above, both stall states plus the busy-not-stuck case that must
+stay silent, both collection shapes, internal errors from a worker and from a
+plain single-process run, the gh-1362 reproduction quoted above, and the run
+summary. The Windows NTSTATUS decode runs against a process that really exits
+with one.
 
-`STALLED_SILENT` has no test that produces it. The Windows NTSTATUS decodes are
-unit-tested everywhere and produced for real only on the Windows runners.
+`STALLED_SILENT` — a stall assessed with the watchdog switched off, so there is
+no passive evidence either way — has no test that produces it.
+
+The first cross-platform run paid for itself twice. It found that a Windows
+`\Lib\` in `sysconfig` and a `\lib\` in a traceback made every stdlib frame
+look like nobody's code, so a blocked test was blamed on `threading.py` and
+then on the customer who called it — a runtime frame reported as customer code,
+which is the one direction this must never fail in. Only the 3.9 cell caught
+it. And it found that ctypes cannot raise an uncaught fault on Windows at all,
+which is a fact about what users will see rather than about the plugin.
