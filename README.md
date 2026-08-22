@@ -284,20 +284,41 @@ Sixty workers never produce sixty collections. They produce two or three
 ```
 [collection_mismatch] COLLECTION_MEMBERSHIP_DIFFERS  severity=needs-triage  owner=unknown  run-ending
     no stack; suspect customer-code (owner of a module the workers disagreed about (test_collect.py))
-    2 distinct collections across 2 workers
-    a1c0eb3811bc: 1 worker(s), 3 tests (gw0) - majority, used as the baseline
-    b85f154135e6: 1 worker(s), 2 tests (gw1) - 1 missing, 0 extra
-      across one module: test_collect.py
-      missing: test_collect.py::test_two
-    · 2 distinct collections across 2 workers
-    · xdist compares every worker against whichever registered first and emits a full diff per differing worker; this is one row per variant, measured against the majority
+    2 workers produced 2 different collections
+    baseline: 1 worker collected 3 tests, and everything below is measured against that list
+    1 worker is missing 1 test, in test_collect.py (gw1)
+        - test_collect.py::test_two
+    full id lists in .pytest-failures - one collection-<digest>.txt per collection
+    · xdist addresses tests by position rather than by id, so any difference between the lists is fatal - a reordering as much as a missing test
+    · the initial collections disagreed, so the run was aborted
 ```
+
+At sixty workers it stays the same shape, because the row count follows the
+number of *variants* rather than the number of workers:
+
+```
+    58 workers produced 3 different collections
+    baseline: 55 workers collected 300 tests, and everything below is measured against that list
+    2 workers are missing 1 test, in test_payments.py (gw41, gw58)
+        - test_payments.py::test_case_017
+    1 worker has 6 extra tests, in test_legacy.py (gw17)
+        + test_legacy.py::test_extra_0
+        + test_legacy.py::test_extra_1
+        + test_legacy.py::test_extra_2
+        and 3 more
+```
+
+Read it as: **how many distinct opinions existed, which workers held each, and
+how the minority differs from the majority.** Magnitude leads each line and
+identity follows, samples use diff notation, and a truncated sample always says
+how much it withheld — a sample that looks like the whole story is worse than
+no sample at all.
 
 Full id lists go to `collection-<digest>.txt` rather than into the payload —
 sixty workers times fifty thousand node ids is hundreds of megabytes, so only
 the digest is held per worker and the id list once per variant. An order
-difference reports where the two lists first disagree, which is the one fact a
-unified diff of a reordered list destroys.
+difference instead reports where the two lists first disagree, which is the one
+fact a unified diff of a reordered list destroys.
 
 A mismatch is run-ending *usually*, not always: xdist aborts when the initial
 collections disagree, but silently drops a worker that registers a differing

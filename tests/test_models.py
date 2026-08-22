@@ -142,3 +142,89 @@ def test_the_base_is_never_emitted_directly():
     # It has no kind of its own, so constructing one is a mistake.
     with pytest.raises(ValidationError):
         Incident(worker="gw1")
+
+
+# -- how a collection mismatch reads -------------------------------------
+
+MANY_WORKERS = CollectionMismatchIncident(
+    worker="controller",
+    verdict="COLLECTION_MEMBERSHIP_DIFFERS",
+    variant_count=2,
+    worker_count=20,
+    variants=[
+        {
+            "digest": "aaa",
+            "workers": [f"gw{n}" for n in range(17)],
+            "worker_count": 17,
+            "test_count": 300,
+            "role": "baseline",
+            "kind": "baseline",
+        },
+        {
+            "digest": "bbb",
+            "workers": ["gw3", "gw11", "gw19"],
+            "worker_count": 3,
+            "test_count": 259,
+            "missing_count": 50,
+            "extra_count": 9,
+            "missing_sample": ["test_legacy.py::a", "test_legacy.py::b"],
+            "extra_sample": ["test_shipping.py::c"],
+            "modules": ["test_legacy.py", "test_shipping.py"],
+            "module_count": 2,
+        },
+    ],
+)
+
+
+def test_the_headline_leads_with_scale_not_with_a_hash():
+    first = str(MANY_WORKERS).splitlines()[1].strip()
+    assert first == "20 workers produced 2 different collections"
+
+
+def test_the_baseline_says_it_is_the_reference_rather_than_a_finding():
+    baseline = str(MANY_WORKERS).splitlines()[2].strip()
+    assert baseline.startswith("baseline: 17 workers collected 300 tests")
+
+
+def test_a_variant_reads_as_a_sentence_about_what_it_did():
+    assert "3 workers differ: 50 missing, 9 extra (gw3, gw11, gw19)" in str(MANY_WORKERS)
+
+
+def test_samples_use_diff_notation():
+    rendered = str(MANY_WORKERS)
+    assert "- test_legacy.py::a" in rendered
+    assert "+ test_shipping.py::c" in rendered
+
+
+def test_a_truncated_sample_says_how_much_was_withheld():
+    """A sample that looks like the whole story is worse than no sample."""
+    # 50 missing and 9 extra, of which 2 and 1 are shown.
+    assert "and 56 more" in str(MANY_WORKERS)
+
+
+def test_several_modules_move_off_the_headline():
+    lines = [line.strip() for line in str(MANY_WORKERS).splitlines()]
+    assert "across 2 modules: test_legacy.py, test_shipping.py" in lines
+    # ...and stay out of the sentence naming the workers.
+    assert "test_legacy.py, test_shipping.py (gw3" not in str(MANY_WORKERS)
+
+
+def test_one_module_stays_in_the_sentence():
+    single = CollectionMismatchIncident(
+        worker="controller",
+        worker_count=2,
+        variant_count=2,
+        variants=[
+            {"digest": "aaa", "workers": ["gw0"], "worker_count": 1, "role": "baseline"},
+            {
+                "digest": "bbb",
+                "workers": ["gw1"],
+                "worker_count": 1,
+                "missing_count": 1,
+                "missing_sample": ["test_orders.py::a"],
+                "modules": ["test_orders.py"],
+                "module_count": 1,
+            },
+        ],
+    )
+    assert "1 worker is missing 1 test, in test_orders.py (gw1)" in str(single)

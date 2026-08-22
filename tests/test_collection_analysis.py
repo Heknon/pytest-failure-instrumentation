@@ -87,5 +87,14 @@ def test_samples_are_stable_across_runs():
     assert first["missing_sample"] == identifiers("b", "c")[:2] + ["test_module.py::d"][:1]
 
 
+def test_workers_are_ordered_the_way_they_are_numbered():
+    """gw11 sorting before gw3 reads as a mistake at exactly the scale this
+    report exists for."""
+    tracker = collection.CollectionTracker()
+    for name in ("gw19", "gw3", "gw11", "gw2"):
+        tracker.record(name, identifiers("a"))
+    assert tracker.variants()[0]["workers"] == ["gw2", "gw3", "gw11", "gw19"]
+
+
 def test_digest_depends_on_order():
     assert collection.digest_of(["a", "b"]) != collection.digest_of(["b", "a"])

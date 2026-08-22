@@ -15,10 +15,22 @@ digest is kept per worker and the full id list once per distinct variant.
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Iterable, Optional
 
 SAMPLE_SIZE = 3
 MODULES_SHOWN = 5
+
+
+def worker_key(worker: str) -> list:
+    """Sort gw3 before gw11.
+
+    Worker ids are numbered, and lexical order puts gw11 first - which reads
+    as a mistake at any scale worth reporting on.
+    """
+    return [
+        int(part) if part.isdigit() else part for part in re.split(r"(\d+)", worker)
+    ]
 
 
 def digest_of(identifiers: Iterable[str]) -> str:
@@ -62,10 +74,10 @@ class CollectionTracker:
         variants = [
             {
                 "digest": digest,
-                "workers": sorted(workers),
+                "workers": sorted(workers, key=worker_key),
                 "worker_count": len(workers),
                 "test_count": len(self.identifiers_by_digest.get(digest, [])),
-                "replacements": sorted(set(workers) & self.replacements),
+                "replacements": sorted(set(workers) & self.replacements, key=worker_key),
             }
             for digest, workers in grouped.items()
         ]

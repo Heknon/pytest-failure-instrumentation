@@ -53,48 +53,102 @@ class CollectionVariant(BaseModel):
     first_divergence: list[str] = Field(default_factory=list)
 
     def describe(self) -> list[str]:
+        """One variant, as a sentence about what it did differently.
+
+        Magnitude leads and identity follows: how many workers and what they
+        got wrong is what a reader is scanning for, while the digest is a
+        pointer to a file and belongs at the end of the line it labels.
+        """
+        if self.role == "baseline":
+            return [
+                f"baseline: {_workers(self.worker_count)} collected "
+                f"{self.test_count} tests, and everything below is measured "
+                "against that list"
+            ]
+        if self.kind == "order":
+            return [f"{_workers(self.worker_count)} collected the same "
+                    f"{self.test_count} tests in a different order {self._who()}"
+                    ] + self._order_detail() + self._replacement_note()
+        return (
+            [f"{_workers(self.worker_count)} {self._difference()}{self._inline_where()} {self._who()}"]
+            + self._spread()
+            + self._samples()
+            + self._replacement_note()
+        )
+
+    # -- the parts of that sentence --------------------------------------
+
+    def _who(self) -> str:
         shown = ", ".join(self.workers[:WORKERS_SHOWN])
         if self.worker_count > WORKERS_SHOWN:
             shown += f" and {self.worker_count - WORKERS_SHOWN} more"
-        head = (
-            f"{self.digest}: {self.worker_count} worker(s), "
-            f"{self.test_count} tests ({shown})"
+        return f"({shown})"
+
+    def _difference(self) -> str:
+        plural = self.worker_count != 1
+        if self.missing_count and self.extra_count:
+            return f"{'differ' if plural else 'differs'}: {self.missing_count} missing, {self.extra_count} extra"
+        if self.missing_count:
+            return (
+                f"{'are' if plural else 'is'} missing "
+                f"{_tests(self.missing_count)}"
+            )
+        noun = "test" if self.extra_count == 1 else "tests"
+        return f"{'have' if plural else 'has'} {self.extra_count} extra {noun}"
+
+    def _inline_where(self) -> str:
+        """One module fits in the sentence. A list of five does not - it pushes
+        the worker ids past where anyone is still reading."""
+        if self.module_count == 1 and self.modules:
+            return f", in {self.modules[0]}"
+        return ""
+
+    def _spread(self) -> list[str]:
+        if self.module_count <= 1 or not self.modules:
+            return []
+        listed = ", ".join(self.modules)
+        if self.module_count > len(self.modules):
+            listed += f" and {self.module_count - len(self.modules)} more"
+        return [f"    across {self.module_count} modules: {listed}"]
+
+    def _samples(self) -> list[str]:
+        """Diff notation, because everyone already reads it: - is what the
+        baseline had, + is what this worker had instead."""
+        lines = [f"    - {identifier}" for identifier in self.missing_sample]
+        lines += [f"    + {identifier}" for identifier in self.extra_sample]
+        withheld = (self.missing_count - len(self.missing_sample)) + (
+            self.extra_count - len(self.extra_sample)
         )
-        if self.role == "baseline":
-            return [head + " - majority, used as the baseline"]
+        if withheld > 0:
+            # Never silently truncate: a sample that looks like the whole
+            # story is worse than no sample.
+            lines.append(f"    and {withheld} more")
+        return lines
 
-        if self.kind == "order":
-            lines = [
-                head
-                + " - same tests, different order"
-                + (
-                    f", first differing at index {self.first_divergence_index}"
-                    if self.first_divergence_index is not None
-                    else ""
-                )
-            ]
-            if self.first_divergence:
-                lines.append(
-                    f"  baseline has {self.first_divergence[0]}, "
-                    f"this has {self.first_divergence[1]}"
-                )
-            return lines + self._replacement_note()
-
-        lines = [head + f" - {self.missing_count} missing, {self.extra_count} extra"]
-        if self.modules:
-            spread = f"{self.module_count} modules" if self.module_count > 1 else "one module"
-            lines.append(f"  across {spread}: {', '.join(self.modules)}")
-        lines += [f"  missing: {identifier}" for identifier in self.missing_sample]
-        lines += [f"  extra:   {identifier}" for identifier in self.extra_sample]
-        return lines + self._replacement_note()
+    def _order_detail(self) -> list[str]:
+        if self.first_divergence_index is None or not self.first_divergence:
+            return []
+        return [
+            f"    first difference at index {self.first_divergence_index}",
+            f"    - {self.first_divergence[0]}",
+            f"    + {self.first_divergence[1]}",
+        ]
 
     def _replacement_note(self) -> list[str]:
         if not self.replacements:
             return []
         return [
-            f"  {', '.join(self.replacements)} joined after the run started - "
+            f"    {', '.join(self.replacements)} joined after the run started - "
             "xdist drops a replacement whose collection differs, without saying so"
         ]
+
+
+def _workers(count: int) -> str:
+    return "1 worker" if count == 1 else f"{count} workers"
+
+
+def _tests(count: int) -> str:
+    return "1 test" if count == 1 else f"{count} tests"
 
 
 class CollectionMismatchIncident(Incident):
@@ -144,10 +198,19 @@ class CollectionMismatchIncident(Incident):
 
     def details(self) -> list[str]:
         lines = [
-            f"{self.variant_count} distinct collections across {self.worker_count} workers"
+            f"{_workers(self.worker_count)} produced "
+            f"{self.variant_count} different collections"
         ]
         for variant in self.variants:
             lines.extend(variant.describe())
+        if self.variant_files:
+            # The samples above are three ids out of possibly thousands; the
+            # reader who needs the rest should not have to ask where they went.
+            directory = Path(next(iter(self.variant_files.values()))).parent
+            lines.append(
+                f"full id lists in {directory} - one collection-<digest>.txt "
+                f"per collection"
+            )
         return lines
 
 
@@ -157,7 +220,7 @@ def build(tracker: CollectionTracker, directory: Path) -> CollectionMismatchInci
     order_only = all(
         variant.kind == "order" for variant in variants if variant.role != "baseline"
     )
-    return CollectionMismatchIncident(
+    incident = CollectionMismatchIncident(
         worker="controller",
         verdict="COLLECTION_ORDER_DIFFERS" if order_only else "COLLECTION_MEMBERSHIP_DIFFERS",
         confidence="high",
@@ -167,13 +230,20 @@ def build(tracker: CollectionTracker, directory: Path) -> CollectionMismatchInci
         variants=variants,
         variant_files=write_variant_files(tracker, directory),
         evidence=[
-            f"{summary['variant_count']} distinct collections across "
-            f"{summary['worker_count']} workers",
-            "xdist compares every worker against whichever registered first and "
-            "emits a full diff per differing worker; this is one row per variant, "
-            "measured against the majority",
+            "xdist addresses tests by position rather than by id, so any "
+            "difference between the lists is fatal - a reordering as much as a "
+            "missing test",
         ],
     )
+    # Which of xdist's two behaviours happened is the difference between a run
+    # that stopped and a run that quietly lost a worker.
+    incident.evidence.append(
+        "the initial collections disagreed, so the run was aborted"
+        if incident.ends_this_run()
+        else "a replacement worker's collection differed, so xdist dropped that "
+        "worker and the run continued one short"
+    )
+    return incident
 
 
 def write_variant_files(tracker: CollectionTracker, directory: Path) -> dict[str, str]:
