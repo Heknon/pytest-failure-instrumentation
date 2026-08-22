@@ -1,0 +1,218 @@
+name: Release
+
+# Tag the commit and the release runs itself:
+#
+#     git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag is the only input. Everything else - the version, the release notes,
+# whether it is a prerelease - is derived from it or from the repository, so
+# there is nothing to remember on the day.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Where to publish a dry run from the current branch"
+        type: choice
+        options: [testpypi, none]
+        default: testpypi
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read the version, and check the tag agrees with it
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c "
+          import pathlib, tomllib
+          print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])
+          ")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # A tag saying v0.2.0 that builds 0.1.0 uploads the wrong thing under
+          # the right name, and PyPI will not let you take it back.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $version"
+              exit 1
+            fi
+          fi
+
+          # PEP 440 spells prereleases 1.2.0rc1, with no separator to split on.
+          if printf '%s' "$version" | grep -Eq '(a|b|rc|dev)[0-9]*$'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the sdist and the wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check --strict dist/*
+
+      - name: List what was built
+        run: ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distribution
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    # The point is the artifact, not the source tree. A plugin that registers
+    # through an entry point fails silently when it is packaged wrong - the
+    # tests all pass, because nothing is instrumented at all - so the suite is
+    # run against the installed wheel with the source directory not on the path.
+    name: Verify the wheel on ${{ matrix.os }} / py${{ matrix.python-version }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.13"]
+        exclude:
+          - os: macos-latest
+            python-version: "3.9"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist
+
+      - name: Install the built wheel, not the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "$(ls dist/*.whl)" pytest-xdist
+
+      - name: Confirm the plugin registers from the installed package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'CHECK'
+          from importlib.metadata import distribution
+
+          import pytest_failure_instrumentation as package
+          from pytest_failure_instrumentation.incidents import registry
+
+          # The whole product is one entry point. If setuptools missed it the
+          # package still imports, the suite still passes, and nothing is
+          # instrumented at all - which is the one failure mode a green test
+          # run cannot rule out.
+          #
+          # Asked of the distribution rather than through entry_points(group=),
+          # which only grew that argument in 3.10 - and this has to answer on
+          # every Python the package claims to support.
+          installed = distribution("pytest-failure-instrumentation")
+          registered = [
+              entry
+              for entry in installed.entry_points
+              if entry.group == "pytest11" and entry.name == "failure_instrumentation"
+          ]
+          assert registered, "installed, and would do nothing whatsoever"
+          print("entry point:", registered[0].value)
+
+          located = package.__file__.replace("\\", "/")
+          assert "site-packages" in located, f"tested the checkout, not the wheel: {located}"
+          print("installed from:", located)
+          print("kinds:", sorted(registry.json_schema()["$defs"]))
+          CHECK
+
+      - name: Run the suite against it
+        run: pytest -q
+
+  publish:
+    name: Publish to ${{ (github.event_name == 'push' && 'PyPI') || inputs.repository }}
+    needs: [build, verify]
+    if: github.event_name == 'push' || inputs.repository == 'testpypi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Trusted publishing: PyPI verifies this workflow's OIDC identity, so there
+    # is no long-lived token in the repository to leak or rotate. Configure the
+    # publisher once at pypi.org/manage/account/publishing.
+    #
+    # The manual approval gate is not expressed here - it is a property of the
+    # environment named below, set under Settings -> Environments -> pypi ->
+    # Required reviewers. Naming an environment is what makes a gate possible;
+    # whether one exists is deliberately the repository's decision rather than
+    # this file's, so it cannot be removed by editing a branch. Waiting for a
+    # reviewer does not count against timeout-minutes.
+    environment:
+      name: ${{ (github.event_name == 'push' && 'pypi') || 'testpypi' }}
+      url: ${{ (github.event_name == 'push' && 'https://pypi.org/p/pytest-failure-instrumentation') || 'https://test.pypi.org/p/pytest-failure-instrumentation' }}
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ (github.event_name == 'push' && 'https://upload.pypi.org/legacy/') || 'https://test.pypi.org/legacy/' }}
+          print-hash: true
+
+  release:
+    # Last, and only for a tag: a GitHub release pointing at a version PyPI
+    # rejected would be worse than no release at all.
+    name: GitHub release
+    needs: [build, publish]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            ${{ needs.build.outputs.prerelease == 'true' && '--prerelease' || '' }}

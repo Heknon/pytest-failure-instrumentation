@@ -536,6 +536,71 @@ much as the operating system, so each gets its own job:
   job installs whatever is newest, so a hook signature or an ini type that
   arrived later would pass all of them and fail on a user's pinned pytest.
 
+## Releasing
+
+Tag the commit and the rest runs itself:
+
+```console
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The tag is the only input. `.github/workflows/release.yml` builds the sdist and
+wheel, refuses to continue if the tag disagrees with the version in
+`pyproject.toml`, installs the **built wheel** on Linux, macOS and Windows and
+runs the whole suite against it, publishes to PyPI, and then creates the GitHub
+release with the artifacts attached.
+
+The wheel is tested rather than the checkout because this plugin is one entry
+point. If packaging drops it the import still succeeds, the suite still passes,
+and nothing is instrumented at all — the one failure mode a green test run
+cannot rule out. So the release explicitly asserts the entry point exists and
+that the package under test came from `site-packages`.
+
+### Credentials
+
+There is no API token to create and no secret to add to the repository.
+Publishing uses [trusted publishing](https://docs.pypi.org/trusted-publishers/):
+PyPI verifies this workflow's OIDC identity at upload time, so nothing
+long-lived exists to leak or rotate. `GITHUB_TOKEN` is supplied by Actions
+automatically.
+
+What it does need is configuration, once, on each side.
+
+**On PyPI** — *Your account → Publishing*. The project does not exist there
+yet, so this is an **"Add a new pending publisher"**, not a setting on an
+existing project; a pending publisher is how a first upload is authorised for a
+name nobody has claimed. It becomes a normal publisher after that first
+release.
+
+| Field | Value |
+|---|---|
+| PyPI project name | `pytest-failure-instrumentation` |
+| Owner | `Heknon` |
+| Repository name | `pytest-failure-instrumentation` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
+
+**On GitHub** — *Settings → Environments → New environment*, named `pypi`.
+Under it, tick **Required reviewers** and add yourself. That is the manual gate:
+the run pauses before anything reaches PyPI, shows you the tag it is about to
+publish, and waits. Nothing is uploaded until someone approves, and waiting does
+not consume the job's timeout.
+
+Worth setting at the same time, under *Deployment branches and tags*: restrict
+the environment to the tag pattern `v*`, so the only thing that can ever reach
+PyPI is a tagged commit.
+
+**TestPyPI** is a separate site with a separate account, so rehearsing needs its
+own pending publisher at test.pypi.org with the environment named `testpypi`.
+Leave that environment without reviewers — the point of a rehearsal is that it
+does not need one.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). Declared as an SPDX expression under
+[PEP 639](https://peps.python.org/pep-0639/) rather than a classifier, since
+PyPI rejects a distribution carrying both.
+
 ## Status
 
 All five kinds and every verdict in the tables above are covered, on all three
