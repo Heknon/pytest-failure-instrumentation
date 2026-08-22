@@ -372,11 +372,14 @@ and `run_ending` reflects which of the two happened.
 to a fixed-size slot with `os.pwrite` — one syscall, no append, no growth, and a
 file that is the same size after a million tests as after one. That is what
 separates "died in teardown" from "died mid-call": pytest's own `logfinish`
-fires only after the whole protocol, so it cannot tell them apart. The slot
-holds a node id of around 870 characters whole, which is past any real one —
-a path, a class, a test name and a couple of content hashes together reach a
-third of it. An id longer than that gives up its *middle*, never the record:
-truncating the encoded record leaves it unparseable, which costs the reader
+fires only after the whole protocol, so it cannot tell them apart. The slot is
+5 KiB, holding a node id of around 4950 characters whole — past any real one by
+an order of magnitude, since a path, a class, a test name and a couple of
+content hashes together use a twentieth of it. The size is close to free: one
+write of one buffer costs the same syscall from 256 bytes to 8 KiB, and 5 KiB
+per worker is 320 KiB across a 64-way run. An id longer than that gives up its
+*middle*, never the record: truncating the encoded record leaves it
+unparseable, which costs the reader
 the phase and the counters as well and reports a worker that died mid-call as
 one that died before running anything. The middle goes rather than the tail
 because both ends carry something the other does not — the head is the module

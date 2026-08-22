@@ -21,10 +21,12 @@ object does not parse, and the reader then loses the phase and the counters
 too, and reports a worker that died mid-test as one that died before running
 anything.
 
-The slot is sized so that trimming is the exception rather than the rule. It
-is one write of one buffer at whatever size it is - 256 bytes and 1 KiB cost
-the same syscall and neither reaches a page - so the only thing a small slot
-bought was node ids losing their tails.
+The slot is sized so that eliding is the exception rather than the rule. It is
+one write of one buffer at whatever size it is, and the syscall costs the same
+from 256 bytes to 8 KiB, so the only thing a small slot bought was node ids
+losing their tails. What a larger one costs instead is a slightly wider window
+for a torn read, which the reader already retries through and which degrades
+to a stale-but-valid record rather than to nothing.
 """
 
 from __future__ import annotations
@@ -36,10 +38,10 @@ from pathlib import Path
 from typing import Any
 
 #: One write of one buffer, so the size is nearly free - see the module
-#: docstring. This leaves around 870 bytes for a node id, which is past any
-#: real one: a path, a class, a test name and a couple of hashes together
-#: reach a third of it.
-SLOT_SIZE = 1024
+#: docstring. This leaves around 4950 bytes for a node id, which is past any
+#: real one by an order of magnitude: a path, a class, a test name and a
+#: couple of content hashes together use a twentieth of it.
+SLOT_SIZE = 5 * 1024
 
 #: Marks the part of a node id that did not fit, so a reader can tell an
 #: elided id from a short one.

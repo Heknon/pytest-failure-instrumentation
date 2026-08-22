@@ -24,9 +24,9 @@ HASHED_NODEID = (
     "-expected=2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae]"
 )
 
-# Past anything real, so the elision itself can be tested.
+# Past anything real by a wide margin, so the elision itself can be tested.
 OVERSIZED_NODEID = "tests/matrix/test_grid.py::test_case[" + "-".join(
-    f"dimension{index}=abcdef0123456789" for index in range(60)
+    f"dimension{index}=abcdef0123456789" for index in range(250)
 ) + "]"
 
 
@@ -38,7 +38,7 @@ def state_for(tmp_path, **fields):
 
 def test_the_slot_is_the_same_size_whatever_is_in_it(tmp_path):
     state = WorkerState(tmp_path / "gw0.state", 4242)
-    for nodeid in ("t.py::test_a", HASHED_NODEID, "t.py::test_b[" + "x" * 4000 + "]"):
+    for nodeid in ("t.py::test_a", HASHED_NODEID, "t.py::test_b[" + "x" * 20000 + "]"):
         state.update(nodeid=nodeid, phase="call")
         assert (tmp_path / "gw0.state").stat().st_size == SLOT_SIZE
 
@@ -80,7 +80,7 @@ def test_an_id_that_escapes_to_more_bytes_than_it_has_characters(tmp_path):
     """Quotes and non-ASCII parameters cost several bytes each once encoded.
     Subtracting an overflow in characters over-trims them - far enough, on a
     fully non-ASCII id, to throw away the module name as well."""
-    for parameter in ('"\\' * 400, "é中文" * 300, "\n\t" * 450):
+    for parameter in ('"\\' * 2600, "é中文" * 2000, "\n\t" * 3000):
         record = state_for(tmp_path, nodeid=f"t.py::test_x[{parameter}]", phase="call")
         assert record, parameter
         assert record["nodeid"].startswith("t.py::test_x["), record["nodeid"]
