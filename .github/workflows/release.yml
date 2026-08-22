@@ -153,6 +153,13 @@ jobs:
     # Trusted publishing: PyPI verifies this workflow's OIDC identity, so there
     # is no long-lived token in the repository to leak or rotate. Configure the
     # publisher once at pypi.org/manage/account/publishing.
+    #
+    # The manual approval gate is not expressed here - it is a property of the
+    # environment named below, set under Settings -> Environments -> pypi ->
+    # Required reviewers. Naming an environment is what makes a gate possible;
+    # whether one exists is deliberately the repository's decision rather than
+    # this file's, so it cannot be removed by editing a branch. Waiting for a
+    # reviewer does not count against timeout-minutes.
     environment:
       name: ${{ (github.event_name == 'push' && 'pypi') || 'testpypi' }}
       url: ${{ (github.event_name == 'push' && 'https://pypi.org/p/pytest-failure-instrumentation') || 'https://test.pypi.org/p/pytest-failure-instrumentation' }}
