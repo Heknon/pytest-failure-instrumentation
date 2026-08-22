@@ -82,15 +82,32 @@ def _windows_exit_status(pid: int) -> tuple[int, str | None, str] | None:
             pass
     try:
         import ctypes
+        from ctypes import wintypes
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+        # Declared, not defaulted: OpenProcess returns a 64-bit HANDLE and
+        # ctypes would truncate it to a 32-bit int. Real handles are usually
+        # small enough to survive that, which is worse than failing - it works
+        # until it does not. Loaded into its own object so declaring these
+        # types cannot change how other code calls the same functions.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return None
         try:
-            code = ctypes.c_ulong()
+            code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
                 return None
             if code.value == STILL_ACTIVE:

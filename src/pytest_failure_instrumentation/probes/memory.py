@@ -51,6 +51,17 @@ def resident_megabytes() -> tuple[int | None, str]:
 
 
 def _windows_working_set() -> int | None:
+    """Current working set from psapi.
+
+    Every signature below is declared. ``GetCurrentProcess`` returns a HANDLE,
+    which is 64-bit, and ctypes defaults a return value to a 32-bit int: the
+    pseudo-handle is truncated, the call fails, and resident memory silently
+    reads as unavailable on every Windows machine without psutil.
+
+    The library is loaded into its own object rather than through
+    ``ctypes.windll``, which is process-global - declaring types on that would
+    change how somebody else's code calls the same functions.
+    """
     try:
         import ctypes
         from ctypes import wintypes
@@ -69,7 +80,16 @@ def _windows_working_set() -> int | None:
                 ("PeakPagefileUsage", ctypes.c_size_t),
             ]
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.GetCurrentProcess.argtypes = ()
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.K32GetProcessMemoryInfo.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(Counters),
+            wintypes.DWORD,
+        )
+        kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+
         counters = Counters()
         counters.cb = ctypes.sizeof(Counters)
         if not kernel32.K32GetProcessMemoryInfo(

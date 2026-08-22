@@ -470,6 +470,12 @@ The opt-in paths are covered too: the memory ceiling turning an uncatchable
 kill into a `MemoryError` that names the test, and the high-water snapshot
 naming the line holding the memory.
 
+The probes are also called directly, because in normal use they shadow each
+other — psutil answers before psapi, and execnet's `Popen` before `waitid` — so
+the fallbacks a customer's machine actually runs were never being executed.
+That includes the claim `WNOWAIT` rests on: the status is read, and the process
+is still reapable afterwards with the same answer.
+
 The first cross-platform run paid for itself twice. It found that a Windows
 `\Lib\` in `sysconfig` and a `\lib\` in a traceback made every stdlib frame
 look like nobody's code, so a blocked test was blamed on `threading.py` and
