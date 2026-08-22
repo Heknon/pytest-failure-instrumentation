@@ -521,6 +521,41 @@ much as the operating system, so each gets its own job:
   all and an unspecced hookimpl is a registration error — the failure mode that
   once made a plain `pytest` run report nothing.
 
+## Releasing
+
+Tag the commit and the rest runs itself:
+
+```console
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The tag is the only input. `.github/workflows/release.yml` builds the sdist and
+wheel, refuses to continue if the tag disagrees with the version in
+`pyproject.toml`, installs the **built wheel** on Linux, macOS and Windows and
+runs the whole suite against it, publishes to PyPI, and then creates the GitHub
+release with the artifacts attached.
+
+The wheel is tested rather than the checkout because this plugin is one entry
+point. If packaging drops it the import still succeeds, the suite still passes,
+and nothing is instrumented at all — the one failure mode a green test run
+cannot rule out. So the release explicitly asserts the entry point exists and
+that the package under test came from `site-packages`.
+
+Publishing uses [trusted publishing](https://docs.pypi.org/trusted-publishers/),
+so there is no API token in the repository. It needs configuring once, on PyPI
+under *Publishing*, with:
+
+| Field | Value |
+|---|---|
+| Owner / repository | `Heknon` / `pytest-failure-instrumentation` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
+
+Add a GitHub environment of the same name if you want a manual approval gate
+before anything reaches PyPI. Running the workflow manually publishes to
+TestPyPI instead, which needs the same setup there with the environment named
+`testpypi`.
+
 ## Status
 
 All five kinds and every verdict in the tables above are covered, on all three
