@@ -1,0 +1,167 @@
+"""What every incident carries, and how one renders itself as an alert.
+
+Every kind carries different evidence. A segfault's resident memory explains
+nothing; a collection mismatch has no exit status at all; a run summary has
+neither. So the payload is a model per kind rather than one wide dict with most
+of its keys empty, and ``kind`` is the discriminator that tells them apart -
+see :mod:`.registry` for parsing a stored row back into the right model.
+
+Field types are deliberately loose - ``str``, not ``Literal``. This code runs
+while something is already going wrong, and a validation error raised out of a
+crash-reporting path would end the very run it exists to explain. What is
+strict is the *shape*: ``extra="forbid"`` means a builder that invents a field
+is caught in development rather than writing a column nobody reads.
+
+Nothing here is imported by the worker-side capture path. Pydantic is loaded on
+the controller, and only once something has already died.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, ClassVar, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class Frame(BaseModel):
+    """One line of a stack, with the answer to "whose code is this"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    file: str
+    line: int
+    function: str
+    module: str
+    owner: str
+
+    def __str__(self) -> str:
+        return f"{Path(self.file).name}:{self.line} in {self.function}"
+
+
+class CgroupMemory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_mb: Optional[int] = None
+    peak_mb: Optional[int] = None
+    max_mb: Optional[int] = None
+
+
+class Capabilities(BaseModel):
+    """What the machine could measure, so a reader can tell "nothing went
+    wrong" from "unmeasurable here"."""
+
+    model_config = ConfigDict(extra="allow")
+
+    platform: str = ""
+    system: str = ""
+    python: str = ""
+    resident_memory: str = "unavailable"
+    system_memory: str = "unavailable"
+    cgroup_oom_counter: bool = False
+    exit_status: str = "unavailable"
+    live_stack: bool = False
+    psutil: bool = False
+
+
+class Incident(BaseModel):
+    """The fields every kind shares. Subclass per kind; never emitted itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: True for incidents that end the session rather than costing it one
+    #: worker. xdist replaces a dead worker and carries on; it cannot carry on
+    #: past an internal error, and cannot finish at all while a worker is
+    #: wedged. Read by severity, which raises a framework-owned defect that
+    #: ends the run above informational - no test is at fault, so nothing else
+    #: will ever surface it.
+    ends_run: ClassVar[bool] = False
+
+    kind: str
+    worker: str
+    verdict: str = "UNKNOWN"
+    confidence: str = "low"
+    evidence: list[str] = Field(default_factory=list)
+
+    # Filled by the engine, after the builder: identical for every kind, and
+    # none of it knowable while the kind-specific facts are being gathered.
+    severity: str = "needs-triage"
+    owner: str = "unknown"
+    run_ending: bool = False
+    fingerprint: str = ""
+    run_id: str = "unknown"
+    raised_at: float = 0.0
+    product_version: Optional[str] = None
+    capabilities: Optional[Capabilities] = None
+    top_frame: Optional[Frame] = None
+    blamed_frame: Optional[Frame] = None
+    #: A lead, not a conclusion - kept apart from ``owner`` so a guess never
+    #: sits in the column a reader takes for a finding.
+    suspect_owner: Optional[str] = None
+    suspect_basis: Optional[str] = None
+
+    # -- what the engine asks each kind ----------------------------------
+
+    def stack_lines(self) -> tuple[list[str], bool]:
+        """The text to read frames out of, and whether it reads outermost
+        first. faulthandler prints deepest first; tracebacks do not."""
+        return [], False
+
+    def suspect_nodeid(self) -> str | None:
+        """A test to fall back to when no stack named anybody."""
+        return None
+
+    def fingerprint_parts(self) -> list[str]:
+        """What makes this incident the same incident as another one.
+
+        Excludes worker id, pid, timings and memory figures: the same defect on
+        gw3 today and gw17 tomorrow is one incident with a count, not two rows.
+        """
+        return [self.kind, self.verdict]
+
+    # -- rendering -------------------------------------------------------
+
+    def details(self) -> list[str]:
+        """The kind's own facts, one line each. Overridden per kind."""
+        return []
+
+    def headline(self) -> str:
+        line = (
+            f"[{self.kind}] {self.verdict}  severity={self.severity}  "
+            f"owner={self.owner}"
+        )
+        return line + "  run-ending" if self.run_ending else line
+
+    def __str__(self) -> str:
+        """The alert body. One incident, readable without opening the record."""
+        lines = [self.headline()]
+        if self.blamed_frame is not None:
+            lines.append(f"blamed on {self.blamed_frame}")
+        elif self.suspect_owner:
+            lines.append(f"no stack; suspect {self.suspect_owner} ({self.suspect_basis})")
+        lines.extend(self.details())
+        lines.extend(f"· {item}" for item in self.evidence)
+        return "\n    ".join(lines)
+
+    # -- failure of the instrumentation itself ---------------------------
+
+    @classmethod
+    def degraded(cls, worker: str, failure: BaseException, context: str = "") -> Incident:
+        """An incident saying only that gathering the real one failed.
+
+        Every field below the two required ones has a default precisely so this
+        works for any kind. Losing the detail is acceptable; letting the
+        reporting path raise is not - it would surface as an INTERNALERROR and
+        end the customer's run.
+        """
+        evidence = [
+            f"the instrumentation failed while building this incident: {failure!r}",
+            "the facts below are all that survived; the underlying failure was real",
+        ]
+        if context:
+            evidence.append(context)
+        return cls(worker=worker, verdict="INSTRUMENTATION_FAILED", evidence=evidence)
+
+
+def frame_from(raw: dict[str, Any] | None) -> Frame | None:
+    return Frame(**raw) if raw else None

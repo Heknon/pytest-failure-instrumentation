@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytest-failure-instrumentation"
+version = "0.1.0"
+description = "Attribute pytest-xdist worker deaths, stalls and collection mismatches that otherwise leave no trace"
+readme = "README.md"
+requires-python = ">=3.9"
+# pydantic types the incident payload. It is imported on the controller
+# only, and only when xdist is active - a worker never loads it, so the
+# per-test path stays what it was.
+dependencies = ["pytest>=7.0", "pydantic>=2.0"]
+
+[project.optional-dependencies]
+# Only ever an upgrade: memory figures on macOS and Windows are better with it,
+# and every probe degrades to a declared "unavailable" without it.
+psutil = ["psutil>=5.9"]
+
+[project.entry-points.pytest11]
+failure_instrumentation = "pytest_failure_instrumentation.plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
