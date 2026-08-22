@@ -59,14 +59,22 @@ have nothing to say to each other, so they are not fields of the same object:
 | `kind` | Model | Raised on |
 |---|---|---|
 | `worker_death` | `WorkerDeathIncident` | needs xdist |
+| `worker_stall` | `WorkerStallIncident` | needs xdist |
+| `collection_mismatch` | `CollectionMismatchIncident` | needs xdist |
 | `internal_error` | `InternalErrorIncident` | any run |
 | `run_summary` | `RunSummaryIncident` | any run |
 
-Only worker deaths are a distributed problem. An internal error ends a
+The last two are not distributed problems. An internal error ends a
 single-process run just as finally, through a path that produces no terminal
 summary at all, and the run summary is what says a run reached its end — so
 the plugin registers whether or not you run under xdist, and a plain `pytest`
 gets both.
+
+Three of the five reach no hook at all. `pytest_testnodedown` needs a dead
+process and `pytest_internalerror` needs an exception; a wedged worker produces
+neither, and disagreeing collections produce neither. Those are found by
+polling and by comparing, which is why hooking only the two pytest offers shows
+a fraction of what goes wrong.
 
 They share `verdict`, `confidence`, `severity`, `owner`, `fingerprint`,
 `run_id`, `worker` and `evidence`. `str(incident)` is the alert text — the
@@ -101,6 +109,8 @@ on a customer's Windows box means "unmeasurable here", not "fine".
 
 ## Verdicts
 
+### A worker died
+
 | Verdict | Told apart by |
 |---|---|
 | `OOM_KILLED` | `-9` **and** the cgroup OOM counter moved |
@@ -114,6 +124,51 @@ on a customer's Windows box means "unmeasurable here", not "fine".
 An exit status of `-9` is identical for the OOM killer, a cancelled CI job and
 a stray `kill`, so only the cgroup counter licenses the OOM verdict. Without
 it, the honest answer is that it was killed.
+
+### A worker stalled
+
+Silence proves nothing on its own: the controller only hears from a worker when
+a phase *completes*, so a twenty-minute test and a deadlock look identical from
+outside. What separates them is the worker's own heartbeat, which carries CPU
+time.
+
+| Verdict | Heartbeat | CPU | Means |
+|---|---|---|---|
+| `STALLED_BLOCKED` | alive | none | the test thread is waiting on something that is not coming |
+| `STALLED_FROZEN` | stopped | — | native code is holding the GIL, or the process is stopped |
+| `STALLED_SILENT` | never ran | — | the watchdog is off, so there is no passive evidence either way |
+| *(not reported)* | alive | burning | slow, not stuck |
+
+The verdict is reached from beats already on disk. A stack is asked for
+*afterwards*, once the decision is made, because asking a wedged process a
+question can change its answer — a raw syscall in native code that ignores
+`EINTR` returns early when a signal lands, and the stall resumes.
+
+### Workers collected different tests
+
+| Verdict | Means |
+|---|---|
+| `COLLECTION_MEMBERSHIP_DIFFERS` | a test exists on one machine and not another |
+| `COLLECTION_ORDER_DIFFERS` | same tests, different sequence — fatal too, since xdist addresses tests by position |
+
+xdist compares every worker against whichever registered first and writes a
+full unified diff per differing worker. Sixty workers with one odd node is
+fifty-nine complete diffs, each naming the majority as the deviation. Sixty
+workers do not produce sixty collections — they produce two or three
+*variants*, so this reports one row per variant, measured against the largest:
+
+```
+[collection_mismatch] COLLECTION_MEMBERSHIP_DIFFERS  severity=needs-triage  run-ending
+    2 distinct collections across 2 workers
+    a1c0eb3811bc: 1 worker(s), 3 tests (gw0) - majority, used as the baseline
+    b85f154135e6: 1 worker(s), 2 tests (gw1) - 1 missing, 0 extra
+      across one module: test_collect.py
+      missing: test_collect.py::test_two
+```
+
+Full id lists are written to `collection-<digest>.txt` rather than carried in
+the payload. An order difference reports where the two lists first disagree,
+which is the one fact a unified diff of a reordered list destroys.
 
 ## Cost
 
@@ -171,12 +226,12 @@ pytest-failure-instrumentation[psutil]`.
 
 ## Status
 
-Working and tested on Linux: worker deaths (every verdict above), internal
-errors, the run summary, attribution, severity, fingerprinting, the payload
-models and their round-trip, and the platform probes.
+All five kinds are wired and exercised end to end on Linux: the death verdicts
+above, both stall states plus the busy-not-stuck case that must stay silent,
+both collection shapes, internal errors from a worker and from a plain
+single-process run, and the run summary. Every payload round-trips through
+`registry.parse` unchanged.
 
-Not yet wired into the engine: stall detection and collection-mismatch diffing.
-Both have a tested implementation and neither has a model in the union yet — a
-member with no producer would promise a payload that never arrives. The Windows
-and macOS probe paths are written from the platform APIs and have not been
-executed on those systems.
+The Windows and macOS probe paths are written from the platform APIs and have
+not been executed on those systems. `STALLED_SILENT` and the Windows NTSTATUS
+decodes have no test that produces them.

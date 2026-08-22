@@ -69,12 +69,13 @@ class Incident(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    #: True for incidents that end the session rather than costing it one
-    #: worker. xdist replaces a dead worker and carries on; it cannot carry on
-    #: past an internal error, and cannot finish at all while a worker is
-    #: wedged. Read by severity, which raises a framework-owned defect that
-    #: ends the run above informational - no test is at fault, so nothing else
-    #: will ever surface it.
+    #: True for kinds that end the session rather than costing it one worker.
+    #: xdist replaces a dead worker and carries on; it cannot carry on past an
+    #: internal error, and cannot finish at all while a worker is wedged. Read
+    #: by severity, which raises a framework-owned defect that ends the run
+    #: above informational - no test is at fault, so nothing else will ever
+    #: surface it. Kinds where it depends on the instance override
+    #: ``ends_this_run``.
     ends_run: ClassVar[bool] = False
 
     kind: str
@@ -102,6 +103,10 @@ class Incident(BaseModel):
 
     # -- what the engine asks each kind ----------------------------------
 
+    def ends_this_run(self) -> bool:
+        """Whether *this* incident ended the session. Constant for most kinds."""
+        return type(self).ends_run
+
     def stack_lines(self) -> tuple[list[str], bool]:
         """The text to read frames out of, and whether it reads outermost
         first. faulthandler prints deepest first; tracebacks do not."""
@@ -110,6 +115,11 @@ class Incident(BaseModel):
     def suspect_nodeid(self) -> str | None:
         """A test to fall back to when no stack named anybody."""
         return None
+
+    def suspect_basis_for(self, path: str) -> str:
+        """Why that test points at whoever it points at. A guess has to say
+        what kind of guess it is."""
+        return f"owner of the test in flight ({path})"
 
     def fingerprint_parts(self) -> list[str]:
         """What makes this incident the same incident as another one.

@@ -8,9 +8,8 @@ was written from without the reader having to know which fields to expect:
     incident = parse(json.loads(row))     # -> WorkerDeathIncident, ...
     print(incident)                       # the alert text, again
 
-Two kinds documented on the hook are absent here on purpose - ``worker_stall``
-and ``collection_mismatch`` are not yet raised, and a union member with no
-producer would promise a payload that never arrives.
+Every kind the plugin raises is a member. A model with no producer would
+promise a payload that never arrives, so nothing is listed here speculatively.
 """
 
 from __future__ import annotations
@@ -20,12 +19,20 @@ from typing import Annotated, Any, Union
 from pydantic import Field, TypeAdapter
 
 from .base import Capabilities, Frame, Incident
+from .collection import CollectionMismatchIncident, CollectionVariant
 from .death import WorkerDeathIncident
 from .internal_error import InternalErrorIncident
+from .stall import WorkerStallIncident
 from .summary import RunSummaryIncident
 
 AnyIncident = Annotated[
-    Union[WorkerDeathIncident, InternalErrorIncident, RunSummaryIncident],
+    Union[
+        WorkerDeathIncident,
+        WorkerStallIncident,
+        CollectionMismatchIncident,
+        InternalErrorIncident,
+        RunSummaryIncident,
+    ],
     Field(discriminator="kind"),
 ]
 
@@ -45,11 +52,14 @@ def json_schema() -> dict[str, Any]:
 __all__ = [
     "AnyIncident",
     "Capabilities",
+    "CollectionMismatchIncident",
+    "CollectionVariant",
     "Frame",
     "Incident",
     "InternalErrorIncident",
     "RunSummaryIncident",
     "WorkerDeathIncident",
+    "WorkerStallIncident",
     "json_schema",
     "parse",
 ]

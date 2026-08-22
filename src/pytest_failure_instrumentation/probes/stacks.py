@@ -1,4 +1,8 @@
-"""Asking a live process for its stack.\n\n    Needs both a signal to send and a handler able to answer it, so Windows\n    has neither and a stall there is reported without a stack rather than\n    with a guess."""
+"""Asking a live process for its stack.
+
+Needs both a signal to send and a handler able to answer it. Windows has
+neither, so a stall there is reported without a stack rather than with a guess.
+"""
 
 from __future__ import annotations
 

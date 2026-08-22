@@ -70,8 +70,29 @@ class SlowTestWatchdog:
         faulthandler.cancel_dump_traceback_later()
 
 
+#: Lines faulthandler writes before the first thread, which say what kind of
+#: dump this is.
+BANNERS = ("Fatal Python error", "Timeout (")
+
+#: Frames only ever present on the thread running a test. What makes a dump
+#: useful is finding *that* thread, not the first one printed.
+RUNTEST_MARKERS = (
+    "pytest_runtest_protocol",
+    "runtestprotocol",
+    "pytest_runtest_call",
+    "pytest_pyfunc_call",
+)
+
+OWN_PACKAGE = "/pytest_failure_instrumentation/"
+
+
 def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
-    """The head of a dump - most recent call first.
+    """One thread's stack out of a dump - most recent call first.
+
+    A dump is written with ``all_threads=True``, so it holds several stacks and
+    picking the wrong one blames the wrong code. The first one printed is
+    almost never the interesting one: in a pytest worker it is this plugin's
+    own heartbeat thread, and after that execnet's receiver.
 
     ``offset`` reads only what was appended past a known point, so a stack
     written now is never confused with one written earlier.
@@ -84,12 +105,51 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
         return []
     if not lines:
         return []
-    banner = lines[0] if lines[0].startswith("Fatal Python error") else None
-    for index, line in enumerate(lines):
+
+    banner = lines[0] if lines[0].startswith(BANNERS) else None
+    sections = _thread_sections(lines)
+    if not sections:
+        return lines[:limit]
+
+    section = _most_relevant(sections)[:limit]
+    return ([banner] + section) if banner else section
+
+
+def _thread_sections(lines: list[str]) -> list[list[str]]:
+    sections: list[list[str]] = []
+    for line in lines:
         if line.startswith(("Current thread", "Thread 0x")):
-            section = lines[index : index + limit]
-            return ([banner] + section) if banner else section
-    return lines[:limit]
+            sections.append([line])
+        elif sections:
+            sections[-1].append(line)
+    return sections
+
+
+def _most_relevant(sections: list[list[str]]) -> list[str]:
+    """The thread worth reporting, in descending order of certainty.
+
+    A fatal signal and an on-demand SIGUSR1 both label the thread they reached
+    as "Current thread", and that is the answer. ``dump_traceback_later``
+    labels nothing - it dumps from a C timer thread - so a slow test has to be
+    found by what is on its stack instead.
+    """
+    for section in sections:
+        if section[0].startswith("Current thread"):
+            return section
+    for section in sections:
+        if any(marker in line for marker in RUNTEST_MARKERS for line in section):
+            return section
+    for section in sections:
+        if not _entirely_ours(section):
+            return section
+    return sections[0]
+
+
+def _entirely_ours(section: list[str]) -> bool:
+    frames = [line for line in section if line.lstrip().startswith('File "')]
+    return bool(frames) and all(
+        OWN_PACKAGE in line.replace("\\", "/") for line in frames
+    )
 
 
 def size(path: Path) -> int:
