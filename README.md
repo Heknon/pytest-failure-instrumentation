@@ -249,7 +249,7 @@ must never sit in the column a reader takes for a finding.
 | `SIGKILLED` | `-9`, counter flat — host OOM, CI cancellation, external kill |
 | `NATIVE_CRASH` | SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, or a Windows NTSTATUS |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP — a request to stop, not a defect |
-| `SELF_EXIT` | clean exit code, no signal |
+| `SELF_EXIT` | any exit code with no signal, `0` included — a worker that left the run was not asked to |
 | `PROBABLY_SIGNALLED` | exit code 128–191, a wrapper ate the signal |
 | `UNKNOWN` | no status obtainable (remote gateway) |
 
@@ -372,7 +372,11 @@ and `run_ending` reflects which of the two happened.
 to a 256-byte slot with `os.pwrite` — one syscall, no append, no growth, and a
 file that is the same size after a million tests as after one. That is what
 separates "died in teardown" from "died mid-call": pytest's own `logfinish`
-fires only after the whole protocol, so it cannot tell them apart.
+fires only after the whole protocol, so it cannot tell them apart. A node id
+too long for the slot has its *tail* trimmed, never the record: a parametrized
+id runs past 256 bytes routinely, and truncating the encoded record leaves it
+unparseable — which costs the reader the phase and the counters as well, and
+reports a worker that died mid-call as one that died before running anything.
 
 **The exit status, taken from the OS.** Where a `Popen` object survives, its
 return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
@@ -520,6 +524,9 @@ much as the operating system, so each gets its own job:
 - **without `pytest-xdist`**, where `pytest_testnodedown` has no hookspec at
   all and an unspecced hookimpl is a registration error — the failure mode that
   once made a plain `pytest` run report nothing.
+- **against the declared minimums**, `pytest==7.0.1` on Python 3.9. Every other
+  job installs whatever is newest, so a hook signature or an ini type that
+  arrived later would pass all of them and fail on a user's pinned pytest.
 
 ## Status
 

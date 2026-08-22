@@ -161,6 +161,56 @@ def test_the_phase_is_recorded_because_pytest_cannot_tell_you(distributed):
     assert death.test_in_flight == "test_crash.py::test_dies_in_teardown"
 
 
+def test_a_parametrized_node_id_still_names_the_test_that_died(distributed):
+    """A real node id is long: a path, a class, and a parameter set spelling
+    out the case. It has to survive the fixed-size slot it is written to, or
+    the one fact this plugin exists to recover - which test was in flight - is
+    the one it loses, and the death is reported as one that happened before any
+    test ran."""
+    distributed.pytester.makepyfile(
+        test_crash="""
+        import pytest
+
+        import victim
+
+        CASE = "currency=EUR-region=emea-tier=enterprise-window=2024-01-01-shard=07"
+
+
+        def test_filler():
+            assert True
+
+
+        @pytest.mark.parametrize("case", [CASE])
+        def test_invoice_reconciliation_matrix_for_the_quarterly_close(case):
+            victim.native_call(1)
+        """
+    )
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.verdict == "NATIVE_CRASH"
+    assert death.phase == "call"
+    assert death.tests_started == 1
+    assert death.test_in_flight is not None
+    assert death.test_in_flight.startswith(
+        "test_crash.py::test_invoice_reconciliation_matrix_for_the_quarterly_close"
+    )
+    assert "before running any test" not in str(death)
+
+
+def test_the_run_id_is_the_one_xdist_writes_in_its_own_logs(distributed):
+    """Correlating an incident with the run it came from means using xdist's
+    id for that run, not one invented here - and every incident in the run has
+    to carry the same one."""
+    distributed.pytester.makepyfile(test_crash=crashing_test("victim.native_call(1)"))
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    # xdist's testrunuid is a uuid4 hex; the fallback is prefixed "run-".
+    assert len(death.run_id) == 32 and not death.run_id.startswith("run-")
+    assert {incident.run_id for incident in incidents} == {death.run_id}
+
+
 @pytest.mark.skipif(
     sys.platform != "linux",
     reason="RLIMIT_AS is not reliably enforced outside Linux",

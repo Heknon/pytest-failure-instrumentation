@@ -11,11 +11,13 @@ arrives is not a crash - and namespaced to this distribution, the way
 ``incident`` is a pydantic model, one class per kind, discriminated on
 ``incident.kind``:
 
-===================== ==========================================
-``worker_death``      ``incidents.death.WorkerDeathIncident``
-``internal_error``    ``incidents.internal_error.InternalErrorIncident``
-``run_summary``       ``incidents.summary.RunSummaryIncident``
-===================== ==========================================
+======================= ==================================================
+``worker_death``        ``incidents.death.WorkerDeathIncident``
+``worker_stall``        ``incidents.stall.WorkerStallIncident``
+``collection_mismatch`` ``incidents.collection.CollectionMismatchIncident``
+``internal_error``      ``incidents.internal_error.InternalErrorIncident``
+``run_summary``         ``incidents.summary.RunSummaryIncident``
+======================= ==================================================
 
 They share ``kind``, ``verdict``, ``confidence``, ``severity``, ``owner``,
 ``fingerprint``, ``run_id``, ``worker`` and ``evidence``; the rest belongs to
@@ -24,11 +26,14 @@ have nothing to say to each other. ``str(incident)`` is the alert text.
 ``incidents.registry.parse`` turns a stored row back into its own model, and
 ``registry.json_schema()`` is the contract for a table migration.
 
-Two further kinds - ``collection_mismatch`` and ``worker_stall`` - are
-implemented but not yet raised; neither reaches ``pytest_testnodedown`` or
-``pytest_internalerror``, which is the reason they need a source of their own.
-``run_summary`` is emitted once at the end of every run, so its *absence* means
-the controller died too.
+The first three need xdist; the last two are raised by any run. ``worker_stall``
+and ``collection_mismatch`` reach no pytest hook at all - a wedged worker is the
+absence of anything being said, and xdist writes a collection disagreement only
+into its own log - so the engine sources them itself. ``run_summary`` is emitted
+once at the end of every run, so its *absence* means the controller died too.
+
+A stall is assessed on a watcher thread, so an implementation of this hook can
+be called from a thread other than the one running the session.
 """
 
 from __future__ import annotations

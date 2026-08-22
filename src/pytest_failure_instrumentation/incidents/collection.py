@@ -21,12 +21,11 @@ from typing import Any, ClassVar, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..analysis.collection import SAMPLE_SIZE, CollectionTracker
+from .base import Incident
 
 #: Variant rows in the alert text. Beyond this the report says how many more
 #: there were rather than printing a page of near-identical blocks.
 VARIANTS_SHOWN = 4
-from .base import Incident
-
 WORKERS_SHOWN = 4
 
 

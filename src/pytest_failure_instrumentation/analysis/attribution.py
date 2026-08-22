@@ -90,7 +90,8 @@ class Attributor:
             # happened to make.
             framework = next(
                 (f for f in frames
-                 if any(marker in f["file"] for marker in FRAMEWORK_MARKERS)),
+                 if any(marker in comparable(f["file"])
+                        for marker in FRAMEWORK_MARKERS)),
                 None,
             )
             chosen = framework or frames[0]

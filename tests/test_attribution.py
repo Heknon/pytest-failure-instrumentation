@@ -95,6 +95,23 @@ def test_a_stack_with_no_owned_frame_is_a_finding_not_a_shrug():
     assert blame["blamed_frame"]["module"] in {"gateway_base", "loadscope"}
 
 
+def test_the_framework_is_found_in_a_frame_written_the_platform_s_own_way():
+    """A real dump reports paths with the platform's separator, and on Windows
+    that is a backslash. Every other comparison here goes through
+    ``comparable``; the one that picks the framework frame out of an all-runtime
+    stack has to as well, or it silently blames the stdlib call instead."""
+    attributor = Attributor(("yourcore",))
+    native = os.path.join(os.sep, "venv", "Lib", "site-packages")
+    blame = attributor.blame(
+        frames_for(
+            os.path.join(sysconfig.get_paths()["stdlib"], "threading.py"),
+            os.path.join(native, "xdist", "dsession.py"),
+        )
+    )
+    assert blame["owner"] == "runtime"
+    assert blame["blamed_frame"]["module"] == "dsession"
+
+
 def test_no_frames_at_all_is_unknown():
     blame = Attributor(("yourcore",)).blame([])
     assert blame == {"top_frame": None, "blamed_frame": None, "owner": "unknown"}

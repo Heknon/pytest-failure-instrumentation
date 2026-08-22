@@ -13,6 +13,13 @@ The file is written by exactly one process and read by exactly one other. A
 single ``pwrite`` of a small buffer is not formally atomic, so the reader
 tolerates a torn read by retrying once; a stale-but-valid record is always
 better than a crash in the reader.
+
+What a fixed slot costs is a bound on the record, and the node id is the only
+field that can approach it - a parametrized id runs to hundreds of characters.
+So the *node id* is trimmed to fit, never the encoded record: a truncated JSON
+object does not parse, and the reader then loses the phase and the counters
+too, and reports a worker that died mid-test as one that died before running
+anything.
 """
 
 from __future__ import annotations
@@ -24,6 +31,11 @@ from pathlib import Path
 from typing import Any
 
 SLOT_SIZE = 256
+
+#: Marks a node id that did not fit the slot, so a reader can tell a trimmed
+#: id from a short one. The tail goes because the head - the module and the
+#: test - is what attribution, fingerprinting and the alert text all read.
+TRIMMED = "..."
 
 
 class WorkerState:
@@ -46,24 +58,16 @@ class WorkerState:
         # pwrite is one syscall but Unix-only; seek+write is the portable
         # equivalent and still cheap enough for a per-phase write.
         self._pwrite = getattr(os, "pwrite", None)
+        #: The last id that had to be trimmed, and what it was trimmed to.
+        #: update() runs six times per test with the same id, and the search
+        #: below is the only expensive thing in this file.
+        self._trimmed: tuple[str, str] | None = None
 
     def update(self, **fields: Any) -> None:
         for name, value in fields.items():
             setattr(self, name, value)
         self.sequence += 1
-        payload = json.dumps(
-            {
-                "sequence": self.sequence,
-                "time": round(time.time(), 3),
-                "pid": self.pid,
-                "nodeid": self.nodeid,
-                "phase": self.phase,
-                "tests_started": self.tests_started,
-                "tests_finished": self.tests_finished,
-            }
-        )
-        encoded = payload.encode("utf-8")[: SLOT_SIZE - 1] + b"\n"
-        payload_bytes = encoded.ljust(SLOT_SIZE)
+        payload_bytes = self._encode().ljust(SLOT_SIZE)
         try:
             if self._pwrite is not None:
                 self._pwrite(self._descriptor, payload_bytes, 0)
@@ -72,6 +76,58 @@ class WorkerState:
                 os.write(self._descriptor, payload_bytes)
         except OSError:
             pass  # never let bookkeeping break a test run
+
+    def _encode(self) -> bytes:
+        """The record as bytes, with the node id trimmed until it fits.
+
+        Trimming the encoded JSON instead would save a byte count and lose the
+        record: the reader gets an unparseable object and falls back to knowing
+        nothing at all about the worker, which is the one thing this file
+        exists to prevent.
+        """
+        stamp = round(time.time(), 3)
+        encoded = self._record(self.nodeid, stamp)
+        if len(encoded) <= SLOT_SIZE - 1 or not self.nodeid:
+            return encoded
+
+        if self._trimmed is not None and self._trimmed[0] == self.nodeid:
+            # The same id arrives six times per test. Re-checked rather than
+            # trusted, because the counters beside it gain a digit as the run
+            # goes on and a fit is a fit of the whole record.
+            cached = self._record(self._trimmed[1], stamp)
+            if len(cached) <= SLOT_SIZE - 1:
+                return cached
+
+        # The longest prefix that still fits, found by search rather than by
+        # subtracting an overflow: json escaping means a character is not a
+        # byte, and a quote or a non-ASCII parameter costs several. Adding a
+        # character can only lengthen the record, so the fit is monotone and
+        # the search is exact. It runs once per oversized id, not per write.
+        low, high = 0, len(self.nodeid)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = self._record(self.nodeid[:middle] + TRIMMED, stamp)
+            if len(candidate) <= SLOT_SIZE - 1:
+                low = middle
+            else:
+                high = middle - 1
+        trimmed = self.nodeid[:low] + TRIMMED if low else ""
+        self._trimmed = (self.nodeid, trimmed)
+        return self._record(trimmed, stamp)
+
+    def _record(self, nodeid: str | None, stamp: float) -> bytes:
+        payload = json.dumps(
+            {
+                "sequence": self.sequence,
+                "time": stamp,
+                "pid": self.pid,
+                "nodeid": nodeid,
+                "phase": self.phase,
+                "tests_started": self.tests_started,
+                "tests_finished": self.tests_finished,
+            }
+        )
+        return payload.encode("utf-8") + b"\n"
 
     def close(self) -> None:
         try:
