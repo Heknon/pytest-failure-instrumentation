@@ -455,15 +455,20 @@ much as the operating system, so each gets its own job:
 
 ## Status
 
-All five kinds are wired and exercised end to end on all three platforms: every
-death verdict above, both stall states plus the busy-not-stuck case that must
-stay silent, both collection shapes, internal errors from a worker and from a
-plain single-process run, the gh-1362 reproduction quoted above, and the run
-summary. The Windows NTSTATUS decode runs against a process that really exits
-with one.
+All five kinds and every verdict in the tables above are covered, on all three
+platforms.
 
-`STALLED_SILENT` — a stall assessed with the watchdog switched off, so there is
-no passive evidence either way — has no test that produces it.
+Most are produced for real: a worker is crashed, killed, signalled, wedged or
+made to disagree about its collection, and the incident is read back from the
+hook. Two cannot be, by anyone: `OOM_KILLED` needs a kernel that has just
+killed something, and `UNKNOWN` needs a remote gateway with no local process to
+query. Those branches are exercised against a constructed incident instead — as
+are the Windows NTSTATUS decodes, which additionally run against a process that
+really exits with one.
+
+The opt-in paths are covered too: the memory ceiling turning an uncatchable
+kill into a `MemoryError` that names the test, and the high-water snapshot
+naming the line holding the memory.
 
 The first cross-platform run paid for itself twice. It found that a Windows
 `\Lib\` in `sysconfig` and a `\lib\` in a traceback made every stdlib frame

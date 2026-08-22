@@ -80,10 +80,13 @@ def break_pytest():
 class Runner:
     def __init__(self, pytester: pytest.Pytester) -> None:
         self.pytester = pytester
+        #: What the inner run itself reported, for the cases where the point is
+        #: that the failure stayed inside the process.
+        self.result: Any = None
 
     def run(self, *arguments: str, timeout: float = 300.0) -> list[Incident]:
         try:
-            self.pytester.runpytest_subprocess(*arguments, timeout=timeout)
+            self.result = self.pytester.runpytest_subprocess(*arguments, timeout=timeout)
         except self.pytester.TimeoutExpired:  # type: ignore[attr-defined]
             # A wedged worker is the point of some of these; the incident is
             # already on disk by then.

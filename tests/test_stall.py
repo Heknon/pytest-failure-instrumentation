@@ -131,3 +131,43 @@ def test_a_stall_is_reported_once_not_every_poll(distributed):
     )
     incidents = distributed.run("-n", "2", *STALL_ARGUMENTS, "test_hang.py", timeout=180)
     assert len(distributed.of_kind(incidents, "worker_stall")) == 1
+
+
+def test_a_stall_with_the_watchdog_off_says_so_rather_than_guessing(distributed):
+    """No heartbeat was ever written, so there is no passive evidence either
+    way. The worker is silent and that is the whole finding - it must not be
+    dressed up as a diagnosis, so the confidence says low."""
+    distributed.pytester.makepyfile(
+        test_hang="""
+        import threading
+
+        never_set = threading.Event()
+
+
+        def test_filler():
+            assert True
+
+
+        def test_deadlocks():
+            never_set.wait(25)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        "-o", "failure_watchdog=false",
+        "-o", "failure_stall_seconds=6",
+        "test_hang.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.verdict == "STALLED_SILENT"
+    assert stall.state == "SILENT"
+    assert stall.confidence == "low"
+    # Nothing was measured, so nothing is reported as measured.
+    assert stall.cpu_rate is None
+    assert stall.heartbeat_age_seconds is None
+    assert any("never wrote a heartbeat" in line for line in stall.evidence)
+    # The state file is written regardless of the watchdog, so the test in
+    # flight is still known.
+    assert stall.test_in_flight == "test_hang.py::test_deadlocks"

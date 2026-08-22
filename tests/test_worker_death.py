@@ -101,18 +101,27 @@ def test_a_stop_signal_is_not_a_defect(distributed):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="NTSTATUS is a Windows exit code")
-def test_a_windows_ntstatus_is_decoded_as_the_fault_it_stands_for(distributed):
+@pytest.mark.parametrize(
+    "status, verdict, meaning",
+    [
+        (0xC0000005, "NATIVE_CRASH", "access violation"),
+        (0xC000013A, "INTERRUPTED", "control-C"),
+    ],
+)
+def test_a_windows_ntstatus_is_decoded_as_what_it_stands_for(
+    distributed, status, verdict, meaning
+):
     """The decode table is unit-tested everywhere; this is the only place a
     real process actually exits with one of those codes."""
     distributed.pytester.makepyfile(
-        test_crash=crashing_test("victim.exit_with_ntstatus()")
+        test_crash=crashing_test(f"victim.exit_with_ntstatus({status})")
     )
     incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
 
     death = distributed.only(incidents, "worker_death")
-    assert death.exit_status == 0xC0000005
-    assert death.verdict == "NATIVE_CRASH"
-    assert "access violation" in death.exit_status_meaning
+    assert death.exit_status == status
+    assert death.verdict == verdict
+    assert meaning in death.exit_status_meaning
     # TerminateProcess leaves no dump, so there is no frame to blame at all.
     # What is left is the test that was in flight, offered as a lead: it names
     # whoever owns the test module, which is not the same claim as knowing
@@ -120,6 +129,19 @@ def test_a_windows_ntstatus_is_decoded_as_the_fault_it_stands_for(distributed):
     assert death.owner == "unknown"
     assert death.suspect_owner == "customer-code"
     assert "test_crash.py" in (death.suspect_basis or "")
+
+
+def test_a_wrapped_signal_is_not_mistaken_for_a_chosen_exit_code(distributed):
+    """Shells and container runtimes report a signal death as 128 + signal
+    rather than passing the signal through, so the code alone is a convention
+    and the confidence has to say so."""
+    distributed.pytester.makepyfile(test_crash=crashing_test("victim.hard_exit(143)"))
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.exit_status == 143
+    assert death.verdict == "PROBABLY_SIGNALLED"
+    assert death.confidence == "low"
 
 
 def test_the_phase_is_recorded_because_pytest_cannot_tell_you(distributed):
@@ -139,6 +161,38 @@ def test_the_phase_is_recorded_because_pytest_cannot_tell_you(distributed):
     assert death.test_in_flight == "test_crash.py::test_dies_in_teardown"
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="RLIMIT_AS is not reliably enforced outside Linux",
+)
+def test_a_memory_ceiling_turns_a_silent_kill_into_a_traceback(distributed):
+    """The opt-in cap makes the allocation fail *inside* the process.
+
+    An OOM kill leaves no exception, no traceback and no node id, because
+    SIGKILL cannot be caught. A ceiling trades a hard limit per worker for a
+    MemoryError that names the test - which is the whole point of offering it.
+    """
+    distributed.pytester.makepyfile(
+        test_greedy="""
+        def test_filler():
+            assert True
+
+
+        def test_allocates_too_much():
+            held = bytearray(4 * 1024 ** 3)
+            assert held
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2", "-o", "failure_memory_limit_mb=2048", "test_greedy.py", timeout=180
+    )
+
+    # The worker survived, so there is nothing for this plugin to report.
+    assert distributed.of_kind(incidents, "worker_death") == []
+    distributed.result.assert_outcomes(passed=1, failed=1)
+    distributed.result.stdout.fnmatch_lines(["*MemoryError*"])
+
+
 def test_the_capabilities_of_the_machine_are_recorded(distributed):
     distributed.pytester.makepyfile(test_crash=crashing_test("victim.native_call(1)"))
     incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
@@ -149,3 +203,49 @@ def test_the_capabilities_of_the_machine_are_recorded(distributed):
     # A figure that is absent must be distinguishable from a healthy one.
     assert death.capabilities.resident_memory
     assert death.product_version == "1.2.3"
+
+
+def test_the_opt_in_probes_name_the_line_holding_the_memory(distributed):
+    """tracemalloc and the object census are off by default because walking
+    the heap on a worker near its ceiling is what makes things worse. Switched
+    on, a high-water snapshot is what attributes a memory problem to a source
+    line - the OOM equivalent of a stack."""
+    distributed.pytester.makepyfile(
+        test_greedy="""
+        import time
+
+        import victim
+
+        HELD = []
+
+
+        def test_filler():
+            assert True
+
+
+        def test_grows_then_dies():
+            HELD.append(bytearray(64 * 1024 * 1024))
+            time.sleep(3)          # outlive one watchdog tick
+            victim.native_call(1)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        "-o", "failure_high_water_mb=1",
+        "-o", "failure_heartbeat_interval=1",
+        "-o", "failure_tracemalloc_depth=1",
+        "-o", "failure_object_census=true",
+        "test_greedy.py",
+        timeout=180,
+    )
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.high_water, "the watchdog crossed no mark"
+    mark = death.high_water[-1]
+    assert mark["rss_mb"] >= 1
+    assert mark["nodeid"] == "test_greedy.py::test_grows_then_dies"
+    # The allocating line, which is the whole reason the depth setting exists.
+    assert any(
+        "test_greedy.py" in entry["file"] for entry in mark["top_allocations"]
+    ), mark["top_allocations"]
+    assert mark["objects_by_type"]
