@@ -55,7 +55,7 @@ def test_a_missing_test_is_reported_as_membership(distributed, monkeypatch):
     assert baseline.role == "baseline"
     assert baseline.test_count == 3
     assert odd.kind == "membership"
-    assert odd.missing_sample == ["test_suite.py::test_two"]
+    assert odd.missing == ["test_suite.py::test_two"]
     assert odd.modules == ["test_suite.py"]
     # No stack names anybody, but the module that differs has an owner.
     assert mismatch.suspect_owner

@@ -20,7 +20,7 @@ from typing import Any, ClassVar, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..analysis.collection import CollectionTracker
+from ..analysis.collection import SAMPLE_SIZE, CollectionTracker
 from .base import Incident
 
 WORKERS_SHOWN = 4
@@ -45,8 +45,11 @@ class CollectionVariant(BaseModel):
 
     missing_count: int = 0
     extra_count: int = 0
-    missing_sample: list[str] = Field(default_factory=list)
-    extra_sample: list[str] = Field(default_factory=list)
+    #: The differing ids themselves, capped at analysis.collection.IDS_KEPT.
+    #: Compare against missing_count and extra_count to see whether the cap
+    #: was reached - those are the true totals.
+    missing: list[str] = Field(default_factory=list)
+    extra: list[str] = Field(default_factory=list)
     modules: list[str] = Field(default_factory=list)
     module_count: int = 0
     first_divergence_index: Optional[int] = None
@@ -114,15 +117,20 @@ class CollectionVariant(BaseModel):
     def _samples(self) -> list[str]:
         """Diff notation, because everyone already reads it: - is what the
         baseline had, + is what this worker had instead."""
-        lines = [f"    - {identifier}" for identifier in self.missing_sample]
-        lines += [f"    + {identifier}" for identifier in self.extra_sample]
-        withheld = (self.missing_count - len(self.missing_sample)) + (
-            self.extra_count - len(self.extra_sample)
+        lines = [f"    - {identifier}" for identifier in self.missing[:SAMPLE_SIZE]]
+        lines += [f"    + {identifier}" for identifier in self.extra[:SAMPLE_SIZE]]
+        withheld = (self.missing_count - min(len(self.missing), SAMPLE_SIZE)) + (
+            self.extra_count - min(len(self.extra), SAMPLE_SIZE)
         )
         if withheld > 0:
             # Never silently truncate: a sample that looks like the whole
             # story is worse than no sample.
-            lines.append(f"    and {withheld} more")
+            carried = len(self.missing) + len(self.extra)
+            total = self.missing_count + self.extra_count
+            lines.append(
+                f"    and {withheld} more"
+                + ("" if carried >= total else f" ({carried} of {total} in the payload)")
+            )
         return lines
 
     def _order_detail(self) -> list[str]:
@@ -183,7 +191,7 @@ class CollectionMismatchIncident(Incident):
         # No stack to attribute, but the ids that differ have owners: whoever
         # owns the module that appeared on one machine and not another.
         for variant in self.variants:
-            for identifier in variant.missing_sample + variant.extra_sample:
+            for identifier in variant.missing + variant.extra:
                 return identifier
         return None
 
@@ -204,12 +212,14 @@ class CollectionMismatchIncident(Incident):
         for variant in self.variants:
             lines.extend(variant.describe())
         if self.variant_files:
-            # The samples above are three ids out of possibly thousands; the
-            # reader who needs the rest should not have to ask where they went.
+            # The whole collections, for whoever still has the machine. The
+            # difference - the part anyone actually needs - travels in the
+            # incident, because these files are on a runner that may already
+            # be gone by the time the alert is read.
             directory = Path(next(iter(self.variant_files.values()))).parent
             lines.append(
-                f"full id lists in {directory} - one collection-<digest>.txt "
-                f"per collection"
+                f"whole collections written to {directory}; the difference "
+                "above travels in the incident"
             )
         return lines
 

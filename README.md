@@ -288,7 +288,7 @@ Sixty workers never produce sixty collections. They produce two or three
     baseline: 1 worker collected 3 tests, and everything below is measured against that list
     1 worker is missing 1 test, in test_collect.py (gw1)
         - test_collect.py::test_two
-    full id lists in .pytest-failures - one collection-<digest>.txt per collection
+    whole collections written to .pytest-failures; the difference above travels in the incident
     · xdist addresses tests by position rather than by id, so any difference between the lists is fatal - a reordering as much as a missing test
     · the initial collections disagreed, so the run was aborted
 ```
@@ -314,11 +314,19 @@ identity follows, samples use diff notation, and a truncated sample always says
 how much it withheld — a sample that looks like the whole story is worse than
 no sample at all.
 
-Full id lists go to `collection-<digest>.txt` rather than into the payload —
-sixty workers times fifty thousand node ids is hundreds of megabytes, so only
-the digest is held per worker and the id list once per variant. An order
-difference instead reports where the two lists first disagree, which is the one
-fact a unified diff of a reordered list destroys.
+**The whole difference travels in the payload**, not just the three ids the
+text prints. `missing` and `extra` carry every differing node id, up to 500 per
+side, with `missing_count` and `extra_count` as the true totals so you can see
+whether that cap was reached. The distinction matters: a *collection* is
+unbounded — sixty workers times fifty thousand node ids is hundreds of
+megabytes — but a *difference* is almost always one test or one module's worth.
+Only the digest is held per worker, and the whole collections are written to
+`collection-<digest>.txt` for whoever still has the machine. That file is on a
+runner which may be gone by the time anyone reads the alert, which is exactly
+why the difference itself does not live there.
+
+An order difference instead reports where the two lists first disagree, which
+is the one fact a unified diff of a reordered list destroys.
 
 A mismatch is run-ending *usually*, not always: xdist aborts when the initial
 collections disagree, but silently drops a worker that registers a differing

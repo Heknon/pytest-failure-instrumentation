@@ -167,8 +167,8 @@ MANY_WORKERS = CollectionMismatchIncident(
             "test_count": 259,
             "missing_count": 50,
             "extra_count": 9,
-            "missing_sample": ["test_legacy.py::a", "test_legacy.py::b"],
-            "extra_sample": ["test_shipping.py::c"],
+            "missing": [f"test_legacy.py::m{n}" for n in range(50)],
+            "extra": [f"test_shipping.py::e{n}" for n in range(9)],
             "modules": ["test_legacy.py", "test_shipping.py"],
             "module_count": 2,
         },
@@ -190,16 +190,27 @@ def test_a_variant_reads_as_a_sentence_about_what_it_did():
     assert "3 workers differ: 50 missing, 9 extra (gw3, gw11, gw19)" in str(MANY_WORKERS)
 
 
-def test_samples_use_diff_notation():
+def test_the_text_shows_a_sample_in_diff_notation():
     rendered = str(MANY_WORKERS)
-    assert "- test_legacy.py::a" in rendered
-    assert "+ test_shipping.py::c" in rendered
+    assert "- test_legacy.py::m0" in rendered
+    assert "+ test_shipping.py::e0" in rendered
+    # Three per side in the text, however many the payload carries.
+    assert rendered.count("        - ") == 3
+    assert rendered.count("        + ") == 3
 
 
-def test_a_truncated_sample_says_how_much_was_withheld():
+def test_the_text_says_how_much_it_is_not_showing():
     """A sample that looks like the whole story is worse than no sample."""
-    # 50 missing and 9 extra, of which 2 and 1 are shown.
-    assert "and 56 more" in str(MANY_WORKERS)
+    # 59 differing ids, six of them printed.
+    assert "and 53 more" in str(MANY_WORKERS)
+
+
+def test_the_payload_carries_every_differing_id_even_though_the_text_does_not():
+    """The alert is read by a person; the payload is read by a database, and
+    the files on disk are on a machine you may never see again."""
+    odd = MANY_WORKERS.variants[1]
+    assert len(odd.missing) == odd.missing_count == 50
+    assert len(odd.extra) == odd.extra_count == 9
 
 
 def test_several_modules_move_off_the_headline():
@@ -221,7 +232,7 @@ def test_one_module_stays_in_the_sentence():
                 "workers": ["gw1"],
                 "worker_count": 1,
                 "missing_count": 1,
-                "missing_sample": ["test_orders.py::a"],
+                "missing": ["test_orders.py::a"],
                 "modules": ["test_orders.py"],
                 "module_count": 1,
             },

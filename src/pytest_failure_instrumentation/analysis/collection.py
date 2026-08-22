@@ -18,6 +18,15 @@ import hashlib
 import re
 from typing import Any, Iterable, Optional
 
+#: How many differing ids the payload carries per side. The *collection* is
+#: unbounded and stays on disk; the *difference* is what a reader needs and is
+#: almost always small - one test, or one module's worth. A conftest that fails
+#: to import a whole tree is the case this cap exists for, and it records what
+#: it dropped rather than trimming quietly.
+IDS_KEPT = 500
+
+#: How many of those the alert text shows. A payload is read by a database; a
+#: line of text is read by a person.
 SAMPLE_SIZE = 3
 MODULES_SHOWN = 5
 
@@ -94,7 +103,7 @@ class CollectionTracker:
         )
         return variants
 
-    def summarise(self, sample_size: int = SAMPLE_SIZE) -> dict[str, Any]:
+    def summarise(self, ids_kept: int = IDS_KEPT) -> dict[str, Any]:
         """Every minority variant, described against the majority."""
         variants = self.variants()
         baseline = variants[0]
@@ -107,7 +116,7 @@ class CollectionTracker:
                 dict(
                     variant,
                     role="differs",
-                    **difference(baseline_identifiers, identifiers, sample_size),
+                    **difference(baseline_identifiers, identifiers, ids_kept),
                 )
             )
         return {
@@ -119,7 +128,7 @@ class CollectionTracker:
 
 
 def difference(
-    baseline: list[str], variant: list[str], sample_size: int = SAMPLE_SIZE
+    baseline: list[str], variant: list[str], ids_kept: int = IDS_KEPT
 ) -> dict[str, Any]:
     baseline_set, variant_set = set(baseline), set(variant)
     missing = sorted(baseline_set - variant_set)
@@ -141,8 +150,8 @@ def difference(
             ),
             "modules": [],
             "module_count": 0,
-            "missing_sample": [],
-            "extra_sample": [],
+            "missing": [],
+            "extra": [],
         }
 
     changed = missing + extra
@@ -153,10 +162,10 @@ def difference(
         "extra_count": len(extra),
         "first_divergence_index": None,
         "first_divergence": [],
-        # Sorted, so the same mismatch samples the same ids on every run and
-        # the fingerprint does not drift with worker timing.
-        "missing_sample": missing[:sample_size],
-        "extra_sample": extra[:sample_size],
+        # Sorted, so the same mismatch reports the same ids in the same order
+        # on every run and the fingerprint does not drift with worker timing.
+        "missing": missing[:ids_kept],
+        "extra": extra[:ids_kept],
         "modules": modules[:MODULES_SHOWN],
         "module_count": len(modules),
     }

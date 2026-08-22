@@ -40,7 +40,7 @@ def test_sixty_workers_two_variants():
     assert odd["workers"] == ["gw59"]
     assert odd["kind"] == "membership"
     assert odd["missing_count"] == 1
-    assert odd["missing_sample"] == ["test_module.py::c"]
+    assert odd["missing"] == ["test_module.py::c"]
 
 
 def test_only_one_id_list_is_kept_per_variant():
@@ -78,13 +78,28 @@ def test_a_late_worker_is_marked_as_a_replacement():
     assert odd["replacements"] == ["gw1_replacement"]
 
 
-def test_samples_are_stable_across_runs():
-    # Sorted, so worker timing never moves the sample and the fingerprint
-    # does not drift between runs of the same defect.
+def test_the_whole_difference_travels_not_a_sample_of_it():
+    """The collection is unbounded and stays on disk; the difference is what a
+    reader needs and is almost always small."""
+    result = collection.difference(identifiers(*"abcdefghij"), identifiers("a"))
+    assert result["missing_count"] == 9
+    assert result["missing"] == identifiers(*"bcdefghij")
+
+
+def test_an_enormous_difference_is_capped_and_says_so():
+    baseline = [f"test_module.py::test_{n:05d}" for n in range(2000)]
+    result = collection.difference(baseline, [])
+    # The count is the truth; the list is what would fit.
+    assert result["missing_count"] == 2000
+    assert len(result["missing"]) == collection.IDS_KEPT
+
+
+def test_ids_are_stable_across_runs():
+    # Sorted, so worker timing never reorders them and the fingerprint does
+    # not drift between runs of the same defect.
     first = collection.difference(identifiers("a", "b", "c", "d"), identifiers("a"))
     second = collection.difference(identifiers("a", "b", "c", "d"), identifiers("a"))
-    assert first["missing_sample"] == second["missing_sample"]
-    assert first["missing_sample"] == identifiers("b", "c")[:2] + ["test_module.py::d"][:1]
+    assert first["missing"] == second["missing"] == identifiers("b", "c", "d")
 
 
 def test_workers_are_ordered_the_way_they_are_numbered():
