@@ -21,6 +21,10 @@ from typing import Any, ClassVar, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..analysis.collection import SAMPLE_SIZE, CollectionTracker
+
+#: Variant rows in the alert text. Beyond this the report says how many more
+#: there were rather than printing a page of near-identical blocks.
+VARIANTS_SHOWN = 4
 from .base import Incident
 
 WORKERS_SHOWN = 4
@@ -40,8 +44,11 @@ class CollectionVariant(BaseModel):
     #: only in its own log.
     replacements: list[str] = Field(default_factory=list)
     role: str = "differs"
-    #: "baseline", "membership" or "order".
+    #: "baseline", "membership", "order", or "uncompared" when the id lists
+    #: needed to diff this variant were not held.
     kind: str = "membership"
+    #: False when this variant was never diffed against the baseline.
+    compared: bool = True
 
     missing_count: int = 0
     extra_count: int = 0
@@ -63,11 +70,18 @@ class CollectionVariant(BaseModel):
         pointer to a file and belongs at the end of the line it labels.
         """
         if self.role == "baseline":
+            # The clause about what it is measured against is added by
+            # details(), which is the only place that knows whether anything
+            # below it was actually compared.
             return [
                 f"baseline: {_workers(self.worker_count)} collected "
-                f"{self.test_count} tests, and everything below is measured "
-                "against that list"
+                f"{self.test_count} tests"
             ]
+        if self.kind == "uncompared" or not self.compared:
+            return [
+                f"{_workers(self.worker_count)} collected {self.test_count} "
+                f"tests, not compared {self._who()}"
+            ] + self._replacement_note()
         if self.kind == "order":
             return [f"{_workers(self.worker_count)} collected the same "
                     f"{self.test_count} tests in a different order {self._who()}"
@@ -174,6 +188,12 @@ class CollectionMismatchIncident(Incident):
     #: digest -> the file holding that variant's full id list. Sixty workers
     #: times fifty thousand ids does not belong in an alert.
     variant_files: dict[str, str] = Field(default_factory=dict)
+    #: The workers collected the same tests, and only the parameter values
+    #: differ. A different problem with a different fix, so it is not reported
+    #: as tests appearing and disappearing.
+    parameters_unstable: bool = False
+    #: The parametrized tests responsible, named without their parameters.
+    unstable_tests: list[str] = Field(default_factory=list)
 
     def ends_this_run(self) -> bool:
         # xdist aborts when the initial collections disagree, but a worker that
@@ -195,10 +215,27 @@ class CollectionMismatchIncident(Incident):
                 return identifier
         return None
 
+    def _unstable_detail(self) -> list[str]:
+        lines = [
+            "the tests are the same on every worker - only the parameter "
+            "values differ, so these are not tests appearing and disappearing"
+        ]
+        for identifier in self.unstable_tests:
+            lines.append(f"    {identifier}")
+        lines.append(
+            "a parametrize whose values are drawn at collection time - a random "
+            "number, a timestamp, an unordered set - gives every worker a "
+            "different id for the same test"
+        )
+        return lines
+
     def suspect_basis_for(self, path: str) -> str:
         return f"owner of a module the workers disagreed about ({path})"
 
     def fingerprint_parts(self) -> list[str]:
+        if self.parameters_unstable:
+            # The ids themselves change every run; the test names do not.
+            return [self.kind, self.verdict, ",".join(self.unstable_tests)]
         modules: list[str] = []
         for variant in self.variants:
             modules.extend(variant.modules)
@@ -209,9 +246,27 @@ class CollectionMismatchIncident(Incident):
             f"{_workers(self.worker_count)} produced "
             f"{self.variant_count} different collections"
         ]
-        for variant in self.variants:
+        if self.parameters_unstable:
+            # The variant rows would be one near-identical block per worker,
+            # every one of them the same finding said differently.
+            return lines + self._unstable_detail()
+
+        for variant in self.variants[:VARIANTS_SHOWN]:
             lines.extend(variant.describe())
-        if self.variant_files:
+        if any(
+            variant.compared for variant in self.variants if variant.role != "baseline"
+        ):
+            lines[1] += ", and everything below is measured against that list"
+        withheld = len(self.variants) - VARIANTS_SHOWN
+        if withheld > 0:
+            lines.append(f"and {withheld} more collections, not shown")
+        if any(not variant.compared for variant in self.variants):
+            lines.append(
+                "collections marked \"not compared\" had no id list held: past "
+                "a handful of variants the lists are dropped, because one "
+                "variant per worker is what this is designed not to store"
+            )
+        if self.variant_files and not self.parameters_unstable:
             # The whole collections, for whoever still has the machine. The
             # difference - the part anyone actually needs - travels in the
             # incident, because these files are on a runner that may already
@@ -227,24 +282,39 @@ class CollectionMismatchIncident(Incident):
 def build(tracker: CollectionTracker, directory: Path) -> CollectionMismatchIncident:
     summary = tracker.summarise()
     variants = [CollectionVariant(**variant) for variant in summary["variants"]]
+    unstable = tracker.parameters_unstable
     order_only = all(
         variant.kind == "order" for variant in variants if variant.role != "baseline"
     )
+    if unstable:
+        verdict = "COLLECTION_PARAMETERS_UNSTABLE"
+    elif order_only:
+        verdict = "COLLECTION_ORDER_DIFFERS"
+    else:
+        verdict = "COLLECTION_MEMBERSHIP_DIFFERS"
+
     incident = CollectionMismatchIncident(
         worker="controller",
-        verdict="COLLECTION_ORDER_DIFFERS" if order_only else "COLLECTION_MEMBERSHIP_DIFFERS",
+        verdict=verdict,
         confidence="high",
         variant_count=summary["variant_count"],
         worker_count=summary["worker_count"],
         baseline_digest=summary["baseline_digest"],
         variants=variants,
         variant_files=write_variant_files(tracker, directory),
+        parameters_unstable=unstable,
+        unstable_tests=tracker.unstable_tests() if unstable else [],
         evidence=[
             "xdist addresses tests by position rather than by id, so any "
             "difference between the lists is fatal - a reordering as much as a "
             "missing test",
         ],
     )
+    if unstable:
+        incident.evidence.append(
+            "every worker collected the same tests; stripping the parameters "
+            "from the ids makes the collections identical"
+        )
     # Which of xdist's two behaviours happened is the difference between a run
     # that stopped and a run that quietly lost a worker.
     incident.evidence.append(
@@ -263,8 +333,7 @@ def write_variant_files(tracker: CollectionTracker, directory: Path) -> dict[str
         directory.mkdir(parents=True, exist_ok=True)
     except OSError:
         return written
-    for variant in tracker.variants():
-        digest = variant["digest"]
+    for digest in tracker.identifiers_by_digest:
         path = directory / f"collection-{digest}.txt"
         try:
             path.write_text(

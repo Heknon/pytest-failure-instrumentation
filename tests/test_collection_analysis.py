@@ -113,3 +113,66 @@ def test_workers_are_ordered_the_way_they_are_numbered():
 
 def test_digest_depends_on_order():
     assert collection.digest_of(["a", "b"]) != collection.digest_of(["b", "a"])
+
+
+# -- ids that are not stable between workers -----------------------------
+
+
+def parametrized(worker: int, count: int = 3):
+    """One parametrized test whose values are drawn per worker."""
+    return [f"test_pricing.py::test_rounding[{worker}.{n}]" for n in range(count)]
+
+
+def test_the_same_tests_with_different_parameters_are_not_missing_tests():
+    tracker = collection.CollectionTracker()
+    for worker in range(8):
+        tracker.record(f"gw{worker}", identifiers("a", "b") + parametrized(worker))
+
+    assert tracker.has_mismatch is True
+    assert tracker.parameters_unstable is True
+    # Named without their parameters, which is the only stable part.
+    assert tracker.unstable_tests() == ["test_pricing.py::test_rounding"]
+
+
+def test_genuinely_different_tests_are_not_blamed_on_parameters():
+    tracker = collection.CollectionTracker()
+    tracker.record("gw0", identifiers("a", "b"))
+    tracker.record("gw1", identifiers("a"))
+    assert tracker.parameters_unstable is False
+
+
+def test_agreement_is_never_reported_as_unstable():
+    tracker = collection.CollectionTracker()
+    for worker in range(4):
+        tracker.record(f"gw{worker}", identifiers("a") + parametrized(0))
+    assert tracker.parameters_unstable is False
+
+
+def test_one_variant_per_worker_does_not_hold_one_collection_per_worker():
+    """The case the digest exists to avoid: unstable ids turn "a handful of
+    variants" into "one per worker", and holding them all is the hundreds of
+    megabytes this was designed not to store."""
+    tracker = collection.CollectionTracker()
+    for worker in range(40):
+        tracker.record(f"gw{worker}", identifiers("a") + parametrized(worker, 50))
+
+    assert len(tracker.digest_by_worker) == 40
+    assert len(tracker.identifiers_by_digest) == collection.VARIANTS_KEPT
+    # The counts stay right for every variant, held or not.
+    assert all(entry["test_count"] == 51 for entry in tracker.variants())
+
+
+def test_a_variant_with_no_list_held_is_reported_as_uncompared():
+    """Diffing two lists that were never kept reports "the same tests in a
+    different order" - a finding invented out of missing data."""
+    tracker = collection.CollectionTracker()
+    for worker in range(9):
+        tracker.record(f"gw{worker}", identifiers(*"abcdefghij"[: worker + 1]))
+
+    described = tracker.summarise()["variants"]
+    dropped = [entry for entry in described if entry["kind"] == "uncompared"]
+    assert dropped, "expected some variant to have been dropped"
+    for entry in dropped:
+        assert entry["compared"] is False
+        assert entry.get("missing_count", 0) == 0
+        assert entry.get("extra_count", 0) == 0

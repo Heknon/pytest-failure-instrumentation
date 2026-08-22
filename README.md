@@ -277,6 +277,7 @@ question can change its answer — see below.
 |---|---|
 | `COLLECTION_MEMBERSHIP_DIFFERS` | a test exists on one machine and not another |
 | `COLLECTION_ORDER_DIFFERS` | same tests, different sequence — fatal too, since xdist addresses tests by position |
+| `COLLECTION_PARAMETERS_UNSTABLE` | same tests, different *parameter values* — a parametrize that is not deterministic |
 
 Sixty workers never produce sixty collections. They produce two or three
 *variants*, so this reports one row per variant, measured against the largest:
@@ -327,6 +328,29 @@ why the difference itself does not live there.
 
 An order difference instead reports where the two lists first disagree, which
 is the one fact a unified diff of a reordered list destroys.
+
+**A parametrize whose values are drawn at collection time** — `random`, a
+timestamp, an unordered set — gives every worker a different id for the same
+test, and reported as membership that reads as thousands of tests appearing and
+disappearing. It is caught by asking a second question: are these the same
+tests once the parameters are stripped from the ids? When they are, the report
+names the parametrized tests responsible and drops the per-variant rows, which
+would otherwise be one near-identical block per worker:
+
+```
+[collection_mismatch] COLLECTION_PARAMETERS_UNSTABLE  severity=needs-triage  run-ending
+    8 workers produced 8 different collections
+    the tests are the same on every worker - only the parameter values differ, so these are not tests appearing and disappearing
+        test_pricing.py::test_rounding
+    a parametrize whose values are drawn at collection time - a random number, a timestamp, an unordered set - gives every worker a different id for the same test
+```
+
+That case is also why full id lists are held for only the first few variants.
+"A handful of variants" is the assumption the whole design rests on, and
+unstable ids turn it into one variant per worker. Past that limit a variant is
+reported as `not compared` rather than diffed against a list nobody kept —
+comparing two absent lists reports "the same tests in a different order", which
+is a finding invented out of missing data.
 
 A mismatch is run-ending *usually*, not always: xdist aborts when the initial
 collections disagree, but silently drops a worker that registers a differing

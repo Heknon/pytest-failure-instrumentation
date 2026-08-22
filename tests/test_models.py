@@ -239,3 +239,41 @@ def test_one_module_stays_in_the_sentence():
         ],
     )
     assert "1 worker is missing 1 test, in test_orders.py (gw1)" in str(single)
+
+
+def test_unstable_parameters_replace_the_variant_rows_entirely():
+    """One near-identical block per worker, every one of them the same finding
+    said differently, is worse than no detail at all."""
+    incident = CollectionMismatchIncident(
+        worker="controller",
+        verdict="COLLECTION_PARAMETERS_UNSTABLE",
+        worker_count=8,
+        variant_count=8,
+        parameters_unstable=True,
+        unstable_tests=["test_pricing.py::test_rounding"],
+        variants=[
+            {"digest": f"d{n}", "workers": [f"gw{n}"], "worker_count": 1}
+            for n in range(8)
+        ],
+    )
+    rendered = str(incident)
+    assert "only the parameter values differ" in rendered
+    assert "test_pricing.py::test_rounding" in rendered
+    assert "missing" not in rendered
+    assert "baseline" not in rendered
+
+
+def test_the_fingerprint_of_unstable_parameters_does_not_move_between_runs():
+    """The ids change every run; the test names do not."""
+    def incident(names):
+        return CollectionMismatchIncident(
+            worker="controller",
+            verdict="COLLECTION_PARAMETERS_UNSTABLE",
+            parameters_unstable=True,
+            unstable_tests=names,
+        )
+
+    same = incident(["test_pricing.py::test_rounding"])
+    again = incident(["test_pricing.py::test_rounding"])
+    assert same.fingerprint_parts() == again.fingerprint_parts()
+    assert same.fingerprint_parts() != incident(["test_other.py::test_x"]).fingerprint_parts()

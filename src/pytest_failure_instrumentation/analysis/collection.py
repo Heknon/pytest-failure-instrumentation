@@ -18,6 +18,11 @@ import hashlib
 import re
 from typing import Any, Iterable, Optional
 
+#: How many distinct collections keep their full id list. The design assumes a
+#: handful of variants; a suite whose ids are not stable produces one per
+#: worker, which is the hundreds-of-megabytes case the digest exists to avoid.
+VARIANTS_KEPT = 5
+
 #: How many differing ids the payload carries per side. The *collection* is
 #: unbounded and stays on disk; the *difference* is what a reader needs and is
 #: almost always small - one test, or one module's worth. A conftest that fails
@@ -29,6 +34,15 @@ IDS_KEPT = 500
 #: line of text is read by a person.
 SAMPLE_SIZE = 3
 MODULES_SHOWN = 5
+
+
+#: A parametrized node id ends in its parameters. Stripping them asks a
+#: different question: are these the same *tests*, or genuinely different ones?
+PARAMETERS = re.compile(r"\[.*\]$")
+
+
+def without_parameters(identifier: str) -> str:
+    return PARAMETERS.sub("", identifier)
 
 
 def worker_key(worker: str) -> list:
@@ -55,7 +69,13 @@ class CollectionTracker:
 
     def __init__(self) -> None:
         self.digest_by_worker: dict[str, str] = {}
+        #: The same collections with parameters stripped. Cheap to keep, and
+        #: it is the only way to tell "different tests" from "the same tests
+        #: with different parameter values".
+        self.stable_digest_by_worker: dict[str, str] = {}
         self.identifiers_by_digest: dict[str, list[str]] = {}
+        #: Kept for every digest, including the ones whose list was dropped.
+        self.count_by_digest: dict[str, int] = {}
         #: Workers that registered after scheduling began. xdist drops a
         #: replacement whose collection differs instead of aborting the run,
         #: and says so only in its own log.
@@ -66,14 +86,49 @@ class CollectionTracker:
     ) -> None:
         digest = digest_of(identifiers)
         self.digest_by_worker[worker] = digest
-        # One full list per distinct collection, not one per worker.
-        self.identifiers_by_digest.setdefault(digest, identifiers)
+        self.stable_digest_by_worker[worker] = digest_of(
+            without_parameters(identifier) for identifier in identifiers
+        )
+        self.count_by_digest[digest] = len(identifiers)
+        # One full list per distinct collection, not one per worker - and only
+        # for the first few, since "distinct collection" stops being a small
+        # number the moment ids are unstable.
+        if (
+            digest not in self.identifiers_by_digest
+            and len(self.identifiers_by_digest) < VARIANTS_KEPT
+        ):
+            self.identifiers_by_digest[digest] = identifiers
         if replacement:
             self.replacements.add(worker)
 
     @property
     def has_mismatch(self) -> bool:
         return len(set(self.digest_by_worker.values())) > 1
+
+    @property
+    def parameters_unstable(self) -> bool:
+        """The workers collected the same tests with different parameters.
+
+        A parametrize that draws its values at collection time - a random
+        number, a timestamp, a set iteration order - gives every worker a
+        different id for the same test. Reported as a membership difference it
+        reads as thousands of missing tests, which is both wrong and the wrong
+        thing to go and fix.
+        """
+        return (
+            self.has_mismatch
+            and len(set(self.stable_digest_by_worker.values())) == 1
+        )
+
+    def unstable_tests(self, limit: int = MODULES_SHOWN) -> list[str]:
+        """The test functions whose parametrized ids differ, without the ids."""
+        kept = list(self.identifiers_by_digest.values())
+        if len(kept) < 2:
+            return []
+        common = set(kept[0]).intersection(*(set(other) for other in kept[1:]))
+        everything = set(kept[0]).union(*(set(other) for other in kept[1:]))
+        differing = {without_parameters(one) for one in everything - common}
+        return sorted(differing)[:limit]
 
     def variants(self) -> list[dict[str, Any]]:
         """Distinct collections, largest group first - the majority leads."""
@@ -85,7 +140,7 @@ class CollectionTracker:
                 "digest": digest,
                 "workers": sorted(workers, key=worker_key),
                 "worker_count": len(workers),
-                "test_count": len(self.identifiers_by_digest.get(digest, [])),
+                "test_count": self.count_by_digest.get(digest, 0),
                 "replacements": sorted(set(workers) & self.replacements, key=worker_key),
             }
             for digest, workers in grouped.items()
@@ -109,14 +164,29 @@ class CollectionTracker:
         baseline = variants[0]
         baseline_identifiers = self.identifiers_by_digest.get(baseline["digest"], [])
 
-        described = [dict(baseline, role="baseline", kind="baseline")]
+        # A variant whose list was dropped cannot be diffed, and neither can
+        # anything else if the baseline's was. Saying so is the only honest
+        # option: comparing two empty lists reports "the same tests in a
+        # different order", which is a finding invented out of missing data.
+        have_baseline = baseline["digest"] in self.identifiers_by_digest
+
+        described = [dict(baseline, role="baseline", kind="baseline", compared=True)]
         for variant in variants[1:]:
-            identifiers = self.identifiers_by_digest.get(variant["digest"], [])
+            if not have_baseline or variant["digest"] not in self.identifiers_by_digest:
+                described.append(
+                    dict(variant, role="differs", kind="uncompared", compared=False)
+                )
+                continue
             described.append(
                 dict(
                     variant,
                     role="differs",
-                    **difference(baseline_identifiers, identifiers, ids_kept),
+                    compared=True,
+                    **difference(
+                        baseline_identifiers,
+                        self.identifiers_by_digest[variant["digest"]],
+                        ids_kept,
+                    ),
                 )
             )
         return {
