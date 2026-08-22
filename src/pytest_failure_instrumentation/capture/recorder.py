@@ -41,6 +41,11 @@ class WorkerRecorder:
         )
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
+        # A test that outlives this dumps its own stack - no signal, so it
+        # works on Windows and interrupts no syscall.
+        self.slow_test = crash_stack.SlowTestWatchdog(
+            self._crash_stream, settings.slow_test_seconds
+        )
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
@@ -101,8 +106,12 @@ class WorkerRecorder:
     def pytest_sessionstart(self, session: pytest.Session) -> None:
         # After configure, so this wins over pytest's own faulthandler plugin,
         # which registers trylast and points the handler at shared stderr.
-        armed = crash_stack.arm(self._crash_stream)
-        self.events.record("faulthandler_armed", live_stack=armed)
+        on_demand = crash_stack.arm_fatal_handler(self._crash_stream)
+        self.events.record(
+            "faulthandler_armed",
+            on_demand_stack=on_demand,
+            slow_test_seconds=self.slow_test.timeout if self.slow_test.enabled else None,
+        )
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
@@ -126,7 +135,11 @@ class WorkerRecorder:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase
         self.state.update(nodeid=nodeid, phase=phase)
+        if phase == "call":
+            self.slow_test.start_test()
         yield
+        if phase == "call":
+            self.slow_test.end_test()
         if phase == "teardown":
             self.state.tests_finished += 1
         if self.heartbeat is not None:
