@@ -334,16 +334,25 @@ timestamp, an unordered set — gives every worker a different id for the same
 test, and reported as membership that reads as thousands of tests appearing and
 disappearing. It is caught by asking a second question: are these the same
 tests once the parameters are stripped from the ids? When they are, the report
-names the parametrized tests responsible and drops the per-variant rows, which
-would otherwise be one near-identical block per worker:
+names the parametrized tests responsible, drops the per-variant rows — which
+would otherwise be one near-identical block per worker — and prints what each
+of a few workers actually collected:
 
 ```
 [collection_mismatch] COLLECTION_PARAMETERS_UNSTABLE  severity=needs-triage  run-ending
-    8 workers produced 8 different collections
+    6 workers produced 6 different collections
     the tests are the same on every worker - only the parameter values differ, so these are not tests appearing and disappearing
-        test_pricing.py::test_rounding
-    a parametrize whose values are drawn at collection time - a random number, a timestamp, an unordered set - gives every worker a different id for the same test
+        test_billing.py::test_invoice
+            gw0 collected acct-1791, acct-3471, acct-6305, acct-7468
+            gw1 collected acct-2186, acct-2542, acct-6991, acct-9779
+            gw2 collected acct-1614, acct-1950, acct-4517, acct-9313
+    compare those values: a parametrize evaluated at collection time - a random number, a timestamp, an unordered set, a call to something live - gives every worker a different id for the same test, and xdist requires the ids to match
 ```
+
+The values are the diagnosis. Naming the test says where to look; three rows
+of disjoint account ids say a fetch is running at collection time, and three
+rows of floating-point noise say a random number is. Neither is apparent from
+one worker's list, which is the only thing xdist ever shows you.
 
 That case is also why full id lists are held for only the first few variants.
 "A handful of variants" is the assumption the whole design rests on, and

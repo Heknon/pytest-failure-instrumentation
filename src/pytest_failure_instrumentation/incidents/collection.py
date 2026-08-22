@@ -30,6 +30,16 @@ from .base import Incident
 WORKERS_SHOWN = 4
 
 
+class UnstableParameters(BaseModel):
+    """One parametrized test, and what a few workers produced for it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    test: str
+    #: worker id -> the parameter values that worker collected.
+    workers: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class CollectionVariant(BaseModel):
     """One distinct collection, and how it differs from the majority."""
 
@@ -194,6 +204,9 @@ class CollectionMismatchIncident(Incident):
     parameters_unstable: bool = False
     #: The parametrized tests responsible, named without their parameters.
     unstable_tests: list[str] = Field(default_factory=list)
+    #: What a few workers actually produced for each of them. This is the part
+    #: that makes the cause visible rather than merely located.
+    parameter_samples: list[UnstableParameters] = Field(default_factory=list)
 
     def ends_this_run(self) -> bool:
         # xdist aborts when the initial collections disagree, but a worker that
@@ -220,12 +233,18 @@ class CollectionMismatchIncident(Incident):
             "the tests are the same on every worker - only the parameter "
             "values differ, so these are not tests appearing and disappearing"
         ]
-        for identifier in self.unstable_tests:
-            lines.append(f"    {identifier}")
+        if not self.parameter_samples:
+            lines.extend(f"    {identifier}" for identifier in self.unstable_tests)
+        for sample in self.parameter_samples:
+            lines.append(f"    {sample.test}")
+            for row in sample.workers:
+                values = ", ".join(row.get("values", []))
+                lines.append(f"        {row.get('worker')} collected {values}")
         lines.append(
-            "a parametrize whose values are drawn at collection time - a random "
-            "number, a timestamp, an unordered set - gives every worker a "
-            "different id for the same test"
+            "compare those values: a parametrize evaluated at collection time - "
+            "a random number, a timestamp, an unordered set, a call to something "
+            "live - gives every worker a different id for the same test, and "
+            "xdist requires the ids to match"
         )
         return lines
 
@@ -304,6 +323,11 @@ def build(tracker: CollectionTracker, directory: Path) -> CollectionMismatchInci
         variant_files=write_variant_files(tracker, directory),
         parameters_unstable=unstable,
         unstable_tests=tracker.unstable_tests() if unstable else [],
+        parameter_samples=(
+            [UnstableParameters(**sample) for sample in tracker.parameter_samples()]
+            if unstable
+            else []
+        ),
         evidence=[
             "xdist addresses tests by position rather than by id, so any "
             "difference between the lists is fatal - a reordering as much as a "

@@ -277,3 +277,27 @@ def test_the_fingerprint_of_unstable_parameters_does_not_move_between_runs():
     again = incident(["test_pricing.py::test_rounding"])
     assert same.fingerprint_parts() == again.fingerprint_parts()
     assert same.fingerprint_parts() != incident(["test_other.py::test_x"]).fingerprint_parts()
+
+
+def test_the_values_appear_under_the_test_that_produced_them():
+    incident = CollectionMismatchIncident(
+        worker="controller",
+        verdict="COLLECTION_PARAMETERS_UNSTABLE",
+        worker_count=6,
+        variant_count=6,
+        parameters_unstable=True,
+        unstable_tests=["test_billing.py::test_invoice"],
+        parameter_samples=[
+            {
+                "test": "test_billing.py::test_invoice",
+                "workers": [
+                    {"worker": "gw0", "values": ["acct-1791", "acct-3471"]},
+                    {"worker": "gw1", "values": ["acct-2186", "acct-2542"]},
+                ],
+            }
+        ],
+    )
+    lines = [line.strip() for line in str(incident).splitlines()]
+    assert "test_billing.py::test_invoice" in lines
+    assert "gw0 collected acct-1791, acct-3471" in lines
+    assert "gw1 collected acct-2186, acct-2542" in lines

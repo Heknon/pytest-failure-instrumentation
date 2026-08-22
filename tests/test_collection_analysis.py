@@ -176,3 +176,36 @@ def test_a_variant_with_no_list_held_is_reported_as_uncompared():
         assert entry["compared"] is False
         assert entry.get("missing_count", 0) == 0
         assert entry.get("extra_count", 0) == 0
+
+
+def test_the_values_each_worker_produced_are_reported_side_by_side():
+    """Naming the test says where to look. Seeing the values says what you
+    are looking at - float noise reads as a random number, and a row of live
+    ids reads as a fetch running at collection time."""
+    tracker = collection.CollectionTracker()
+    for worker in range(6):
+        tracker.record(
+            f"gw{worker}",
+            identifiers("a")
+            + [f"test_billing.py::test_invoice[acct-{worker}{n}]" for n in range(4)],
+        )
+
+    samples = tracker.parameter_samples()
+    assert len(samples) == 1
+    assert samples[0]["test"] == "test_billing.py::test_invoice"
+
+    rows = samples[0]["workers"]
+    assert len(rows) == 3, "a few workers, not all of them"
+    assert [row["worker"] for row in rows] == ["gw0", "gw1", "gw2"]
+    assert rows[0]["values"] == ["acct-00", "acct-01", "acct-02", "acct-03"]
+    # Different workers, genuinely different values - which is the finding.
+    assert rows[0]["values"] != rows[1]["values"]
+
+
+def test_a_long_parameter_value_is_truncated_rather_than_wrapping():
+    long_value = "x" * 200
+    assert len(collection.parameter_of(f"test_a.py::test_b[{long_value}]")) <= 48
+
+
+def test_a_test_with_no_parameters_contributes_no_values():
+    assert collection.without_parameters("test_a.py::test_b") == "test_a.py::test_b"

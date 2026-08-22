@@ -45,6 +45,13 @@ def without_parameters(identifier: str) -> str:
     return PARAMETERS.sub("", identifier)
 
 
+def parameter_of(identifier: str, limit: int = 48) -> str:
+    """The bracketed part, which is pytest's rendering of the value itself."""
+    stripped = without_parameters(identifier)
+    value = identifier[len(stripped) :].strip("[]")
+    return value if len(value) <= limit else value[: limit - 1] + "\u2026"
+
+
 def worker_key(worker: str) -> list:
     """Sort gw3 before gw11.
 
@@ -119,6 +126,39 @@ class CollectionTracker:
             self.has_mismatch
             and len(set(self.stable_digest_by_worker.values())) == 1
         )
+
+    def parameter_samples(
+        self, workers_shown: int = 3, values_shown: int = 4
+    ) -> list[dict[str, Any]]:
+        """What each of a few workers actually produced, side by side.
+
+        Naming the test says where to look; this says what you are looking at.
+        Floating-point noise reads as a random number, and a row of ids from a
+        live system reads as a fetch running at collection time - neither of
+        which is apparent from one worker's list alone.
+        """
+        representative: dict[str, str] = {}
+        for worker in sorted(self.digest_by_worker, key=worker_key):
+            representative.setdefault(self.digest_by_worker[worker], worker)
+
+        samples = []
+        for test in self.unstable_tests():
+            rows = []
+            for digest, identifiers in self.identifiers_by_digest.items():
+                worker = representative.get(digest)
+                values = [
+                    parameter_of(identifier)
+                    for identifier in identifiers
+                    if without_parameters(identifier) == test
+                    and identifier != test
+                ]
+                if worker and values:
+                    rows.append({"worker": worker, "values": values[:values_shown]})
+                if len(rows) >= workers_shown:
+                    break
+            if rows:
+                samples.append({"test": test, "workers": rows})
+        return samples
 
     def unstable_tests(self, limit: int = MODULES_SHOWN) -> list[str]:
         """The test functions whose parametrized ids differ, without the ids."""
