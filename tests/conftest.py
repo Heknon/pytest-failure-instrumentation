@@ -9,8 +9,6 @@ round-trip on every scenario rather than in one test of its own.
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -30,6 +28,43 @@ def pytest_failure_incident(incident):
     with open({INCIDENT_FILE!r}, "a") as handle:
         handle.write(incident.model_dump_json() + "\\n")
 """
+
+VICTIM_MODULE = '''
+import ctypes
+import os
+import sys
+
+ACCESS_VIOLATION = 0xC0000005
+
+
+def native_call(pointer):
+    """A fault in native code, the way a C extension produces one.
+
+    On POSIX this is a SIGSEGV and the process is gone before anything can
+    react. Windows is different: ctypes wraps every foreign function call in
+    structured exception handling and turns an access violation into an
+    OSError, so the worker survives it and there is no death to report at all.
+
+    Dereferencing a pointer object is not wrapped that way, so it is tried
+    first. If the process is somehow still alive afterwards it exits with the
+    status the OS would have given it - which is what the exit-status probe and
+    the NTSTATUS decode table have to handle either way.
+    """
+    if sys.platform != "win32":
+        return ctypes.string_at(pointer)
+
+    ctypes.cast(pointer, ctypes.POINTER(ctypes.c_char)).contents
+    kernel32 = ctypes.windll.kernel32
+    kernel32.TerminateProcess(kernel32.GetCurrentProcess(), ACCESS_VIOLATION)
+
+
+def hard_exit(code):
+    os._exit(code)
+
+
+def break_pytest():
+    raise RuntimeError("victim broke pytest's machinery")
+'''
 
 
 class Runner:
@@ -82,24 +117,7 @@ def runner(pytester: pytest.Pytester) -> Runner:
         failure_product_version = 1.2.3
         """
     )
-    pytester.makepyfile(
-        victim="""
-        import ctypes
-        import os
-
-
-        def native_call(pointer):
-            return ctypes.string_at(pointer)
-
-
-        def hard_exit(code):
-            os._exit(code)
-
-
-        def break_pytest():
-            raise RuntimeError("victim broke pytest's machinery")
-        """
-    )
+    (pytester.path / "victim.py").write_text(VICTIM_MODULE, encoding="utf-8")
     return Runner(pytester)
 
 

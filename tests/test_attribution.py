@@ -3,11 +3,22 @@ depend on where the runner installed anything."""
 
 from __future__ import annotations
 
+import sysconfig
+
 from pytest_failure_instrumentation.analysis.attribution import Attributor
+
+# Taken from the interpreter rather than written down: a runner installs Python
+# wherever it likes, and a hardcoded /usr/lib path only looks like the stdlib
+# on the machine it was written on.
+STDLIB = sysconfig.get_paths()["stdlib"].replace("\\", "/")
 
 
 def frames_for(*paths):
     return [f'  File "{path}", line 4 in do_something' for path in paths]
+
+
+def test_the_stdlib_is_runtime_wherever_it_is_installed():
+    assert Attributor(("yourcore",)).owner_of(f"{STDLIB}/ctypes/__init__.py") == "runtime"
 
 
 def test_a_frame_in_your_package_is_yours():
@@ -49,7 +60,7 @@ def test_blame_walks_outward_past_the_runtime():
     attributor = Attributor(("yourcore",))
     blame = attributor.blame(
         frames_for(
-            "/usr/lib/python3.11/ctypes/__init__.py",
+            f"{STDLIB}/ctypes/__init__.py",
             "/srv/app/yourcore/engine.py",
             "/home/someone/suite/test_api.py",
         )
@@ -83,7 +94,7 @@ def test_a_traceback_is_read_outermost_first():
         frames_for(
             "/home/someone/suite/test_api.py",
             "/srv/app/yourcore/engine.py",
-            "/usr/lib/python3.11/ctypes/__init__.py",
+            f"{STDLIB}/ctypes/__init__.py",
         ),
         reverse=True,
     )
