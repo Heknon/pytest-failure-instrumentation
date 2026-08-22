@@ -239,6 +239,15 @@ never read as a healthy one.
 anybody, the test that was in flight is a lead worth recording — but a guess
 must never sit in the column a reader takes for a finding.
 
+### Handing one to an agent
+
+An incident is written to be read without context, which is most of what an LLM
+triaging a CI failure lacks. `.claude/skills/reading-failure-incidents/SKILL.md`
+is that context in one file: the anatomy of the alert text, what each shared
+field licenses a reader to conclude, the verdicts per kind, and the handful of
+places where the text is a summary and the payload is the number — so an agent
+reports what the incident found rather than what a `-9` looks like.
+
 ## Verdicts
 
 ### A worker died
