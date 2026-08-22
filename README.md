@@ -56,11 +56,17 @@ Disable it entirely with `-p no:failure_instrumentation`.
 `incident.kind`. A segfault's resident memory and a run summary's exit code
 have nothing to say to each other, so they are not fields of the same object:
 
-| `kind` | Model |
-|---|---|
-| `worker_death` | `WorkerDeathIncident` |
-| `internal_error` | `InternalErrorIncident` |
-| `run_summary` | `RunSummaryIncident` |
+| `kind` | Model | Raised on |
+|---|---|---|
+| `worker_death` | `WorkerDeathIncident` | needs xdist |
+| `internal_error` | `InternalErrorIncident` | any run |
+| `run_summary` | `RunSummaryIncident` | any run |
+
+Only worker deaths are a distributed problem. An internal error ends a
+single-process run just as finally, through a path that produces no terminal
+summary at all, and the run summary is what says a run reached its end — so
+the plugin registers whether or not you run under xdist, and a plain `pytest`
+gets both.
 
 They share `verdict`, `confidence`, `severity`, `owner`, `fingerprint`,
 `run_id`, `worker` and `evidence`. `str(incident)` is the alert text — the

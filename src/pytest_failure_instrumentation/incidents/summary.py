@@ -1,8 +1,11 @@
 """One per run, whose *absence* is the finding.
 
-Every other incident says something went wrong. This one says the controller
-reached the end and reported it - so a run with no summary is a run whose
-controller died, which no hook can tell you from inside the process.
+Every other incident says something went wrong. This one says the process that
+was doing the reporting reached the end - so a run with no summary is a run
+whose controller died, which nothing inside that process can tell you.
+
+Emitted for a single-process run as much as a distributed one; it is not a
+report about workers.
 """
 
 from __future__ import annotations
@@ -26,6 +29,10 @@ class RunSummaryIncident(Incident):
     incidents: dict[str, int] = Field(default_factory=dict)
     raised: int = 0
     duplicates_suppressed: int = 0
+    #: Whether the run was distributed. The same summary is emitted either
+    #: way, and a reader triaging one needs to know which kinds could have
+    #: arrived: a single-process run has no workers to lose.
+    distributed: bool = False
     #: How many of them ended the session. pytest's exit status at session
     #: finish is reported before INTERNAL_ERROR is applied, so a run killed by
     #: an internal error can still show 0 above; this is what contradicts it.
@@ -37,12 +44,13 @@ class RunSummaryIncident(Incident):
         return f"[{self.kind}] {self.verdict}  severity={self.severity}"
 
     def details(self) -> list[str]:
+        mode = "distributed" if self.distributed else "single process"
         if not self.raised:
-            return ["no incidents"]
+            return [f"no incidents ({mode})"]
         line = f"{self.raised} incident(s) over {len(self.incidents)} distinct fingerprint(s)"
         if self.run_ending_incidents:
             line += f", {self.run_ending_incidents} run-ending"
-        return [line]
+        return [f"{line} ({mode})"]
 
 
 def build(
@@ -51,9 +59,10 @@ def build(
     raised: int,
     suppressed: int,
     run_ending: int = 0,
+    distributed: bool = False,
 ) -> RunSummaryIncident:
     return RunSummaryIncident(
-        worker="controller",
+        worker="controller" if distributed else "main",
         verdict="RUN_FINISHED",
         confidence="high",
         exitstatus=int(exitstatus),
@@ -61,6 +70,7 @@ def build(
         raised=raised,
         duplicates_suppressed=suppressed,
         run_ending_incidents=run_ending,
+        distributed=distributed,
         evidence=[
             f"run ended with exit status {exitstatus}",
             f"{raised} incident(s) raised, {suppressed} duplicate(s) suppressed "

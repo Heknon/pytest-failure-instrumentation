@@ -39,11 +39,11 @@ def pytest_configure(config: pytest.Config) -> None:
         )
         return
 
-    # The controller side only makes sense under xdist: without workers there
-    # are no worker deaths, and pytest reports its own failures perfectly well.
-    if not config.pluginmanager.hasplugin("xdist"):
-        return
-
+    # Registered whether or not xdist is in the picture. Two of the three
+    # sources are plain pytest - an internal error ends any run, distributed or
+    # not, and the run summary is what says a run reached its end at all. Only
+    # worker deaths need xdist, and that hookimpl declares itself optional so
+    # its spec being absent is not an error.
     from .incidents.engine import IncidentEngine
 
     config.pluginmanager.register(

@@ -4,12 +4,18 @@ Four of the five sources never reach ``pytest_testnodedown`` or
 ``pytest_internalerror``, which is why a product hooking only those two sees a
 fraction of what goes wrong:
 
-* a worker process dies            - pytest_testnodedown
-* pytest raises an internal error  - pytest_internalerror
+* a worker process dies            - pytest_testnodedown          (xdist)
 * workers collect different tests  - pytest_xdist_node_collection_finished
 * a worker stops reporting         - polled here, since a hang fires no hook
+* pytest raises an internal error  - pytest_internalerror           (any run)
 * the run ends                     - a summary whose absence means the
-                                     controller died too
+                                     process died                   (any run)
+
+The last two are not distributed problems and this engine does not assume it
+is running under xdist: an internal error ends a single-process run just as
+finally, and pytest reports it through a path that produces no terminal summary
+at all. The xdist-only hookimpl below is declared optionalhook so that its spec
+being absent is not a registration error.
 
 Each source builds its own model (one module per kind); everything after that
 is identical for all of them and lives in ``raise_incident``: blame, severity,
@@ -44,6 +50,10 @@ class IncidentEngine:
         self.directory = settings.directory
         self.attributor = Attributor(settings.packages)
         self.baseline_oom_kills = probes.cgroup_oom_kills()
+        self.distributed = bool(
+            config.pluginmanager.hasplugin("xdist")
+            and config.getoption("dist", "no") != "no"
+        )
 
         self.run_id = "unknown"
         self.seen: dict[str, int] = {}
@@ -53,6 +63,10 @@ class IncidentEngine:
         self._prepare_directory()
 
     def _prepare_directory(self) -> None:
+        # Only workers write evidence here, so a single-process run has no
+        # reason to leave an empty directory in somebody's repository.
+        if not self.distributed:
+            return
         # Stale files from an earlier run would be read as this one's evidence.
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -120,6 +134,7 @@ class IncidentEngine:
             "PYTEST_RUN_ID", f"run-{int(time.time())}"
         )
 
+    @pytest.hookimpl(optionalhook=True)
     def pytest_testnodedown(self, node: Any, error: object) -> None:
         if not error:
             return  # a clean shutdown is not an incident
@@ -146,6 +161,11 @@ class IncidentEngine:
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         self.raise_incident(
             summary.build(
-                exitstatus, self.seen, self.raised, self.suppressed, self.run_ending
+                exitstatus,
+                self.seen,
+                self.raised,
+                self.suppressed,
+                self.run_ending,
+                self.distributed,
             )
         )
