@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "Where to publish a dry run from the current branch"
+        description: "Where to publish from the current branch"
         type: choice
-        options: [testpypi, none]
+        options: [testpypi, pypi]
         default: testpypi
 
 permissions:
@@ -154,9 +154,8 @@ jobs:
         run: pytest -q
 
   publish:
-    name: Publish to ${{ (github.event_name == 'push' && 'PyPI') || inputs.repository }}
+    name: Publish to ${{ (github.event_name == 'push' && 'pypi') || inputs.repository }}
     needs: [build, verify]
-    if: github.event_name == 'push' || inputs.repository == 'testpypi'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Trusted publishing: PyPI verifies this workflow's OIDC identity, so there
@@ -170,8 +169,8 @@ jobs:
     # this file's, so it cannot be removed by editing a branch. Waiting for a
     # reviewer does not count against timeout-minutes.
     environment:
-      name: ${{ (github.event_name == 'push' && 'pypi') || 'testpypi' }}
-      url: ${{ (github.event_name == 'push' && 'https://pypi.org/p/pytest-failure-instrumentation') || 'https://test.pypi.org/p/pytest-failure-instrumentation' }}
+      name: ${{ (github.event_name == 'push' && 'pypi') || inputs.repository }}
+      url: ${{ ((github.event_name == 'push' || inputs.repository == 'pypi') && 'https://pypi.org/p/pytest-failure-instrumentation') || 'https://test.pypi.org/p/pytest-failure-instrumentation' }}
     permissions:
       id-token: write
 
@@ -183,15 +182,20 @@ jobs:
 
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          repository-url: ${{ (github.event_name == 'push' && 'https://upload.pypi.org/legacy/') || 'https://test.pypi.org/legacy/' }}
+          repository-url: ${{ ((github.event_name == 'push' || inputs.repository == 'pypi') && 'https://upload.pypi.org/legacy/') || 'https://test.pypi.org/legacy/' }}
           print-hash: true
 
   release:
-    # Last, and only for a tag: a GitHub release pointing at a version PyPI
-    # rejected would be worse than no release at all.
-    name: GitHub release
+    # Last, and only once PyPI has accepted the upload: a release pointing at a
+    # version PyPI rejected would be worse than no release at all.
+    #
+    # The tag is created here rather than being required up front, because the
+    # runner's token can write one and not every place a release is started
+    # from can. A tag push still works and skips straight past this - the tag
+    # then already exists and the version was checked against it in build.
+    name: Tag and release
     needs: [build, publish]
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.repository == 'pypi'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -207,12 +211,28 @@ jobs:
           name: distribution
           path: dist
 
+      - name: Make sure the published commit is tagged
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${{ needs.build.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag already exists, which is the tag-push path"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "pytest-failure-instrumentation ${{ needs.build.outputs.version }}"
+            git push origin "$tag"
+            echo "tagged $GITHUB_SHA as $tag"
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
+          gh release create "$TAG" dist/* \
+            --title "$TAG" \
             --generate-notes \
             --verify-tag \
             ${{ needs.build.outputs.prerelease == 'true' && '--prerelease' || '' }}
