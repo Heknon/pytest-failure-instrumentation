@@ -1,0 +1,415 @@
+"""Platform probes, each declaring where its number came from.
+
+Nothing here may raise, and nothing here may lie. A probe either returns a
+value together with the mechanism that produced it, or ``None`` - because an
+alert that reports peak memory as if it were current memory is worse than an
+alert that admits it could not measure.
+
+Coverage differs by platform, and the differences are not cosmetic:
+
+======================  =========  =========  =========
+capability              Linux      macOS      Windows
+======================  =========  =========  =========
+current resident size   procfs     psutil*    psapi
+system free memory      procfs     psutil*    kernel32
+container memory limit  cgroups    n/a        n/a
+OOM-kill counter        cgroups    n/a        n/a (no OOM killer)
+exit status of a child  waitid     waitid     GetExitCodeProcess
+stack from a live       SIGUSR1    SIGUSR1    unavailable
+process
+======================  =========  =========  =========
+
+\\* macOS falls back to peak resident size from ``getrusage`` when psutil is
+absent, flagged as a peak so nobody reads it as a current figure.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import signal
+import sys
+from pathlib import Path
+from typing import Any
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def _psutil() -> Any:
+    try:
+        import psutil
+
+        return psutil
+    except Exception:
+        return None
+
+
+# -- memory ---------------------------------------------------------------
+
+
+def resident_megabytes() -> tuple[int | None, str]:
+    """Current resident set size, and how it was obtained."""
+    if IS_LINUX:
+        try:
+            with open("/proc/self/statm", "rb") as handle:
+                pages = int(handle.read().split()[1])
+            return round(pages * os.sysconf("SC_PAGE_SIZE") / 1048576), "procfs"
+        except (OSError, IndexError, ValueError):
+            pass
+
+    psutil = _psutil()
+    if psutil is not None:
+        try:
+            return round(psutil.Process().memory_info().rss / 1048576), "psutil"
+        except Exception:
+            pass
+
+    if IS_WINDOWS:
+        value = _windows_working_set()
+        if value is not None:
+            return value, "psapi"
+
+    if IS_MACOS:
+        try:
+            import resource
+
+            # ru_maxrss is bytes on macOS, and it is a *peak*: reported as
+            # such so it is never mistaken for the current figure.
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return round(peak / 1048576), "rusage-peak"
+        except Exception:
+            pass
+
+    return None, "unavailable"
+
+
+def _windows_working_set() -> int | None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        counters = Counters()
+        counters.cb = ctypes.sizeof(Counters)
+        if not kernel32.K32GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            return None
+        return round(counters.WorkingSetSize / 1048576)
+    except Exception:
+        return None
+
+
+def system_available_megabytes() -> tuple[int | None, str]:
+    """Free memory on the machine.
+
+    Without a cgroup counter this is what separates an OOM kill from a
+    cancellation: a worker killed with gigabytes free was not out of memory.
+    """
+    if IS_LINUX:
+        try:
+            with open("/proc/meminfo", "rb") as handle:
+                for line in handle:
+                    if line.startswith(b"MemAvailable:"):
+                        return round(int(line.split()[1]) / 1024), "procfs"
+        except (OSError, IndexError, ValueError):
+            pass
+
+    psutil = _psutil()
+    if psutil is not None:
+        try:
+            return round(psutil.virtual_memory().available / 1048576), "psutil"
+        except Exception:
+            pass
+
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class Status(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = Status()
+            status.dwLength = ctypes.sizeof(Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(  # type: ignore[attr-defined]
+                ctypes.byref(status)
+            ):
+                return round(status.ullAvailPhys / 1048576), "kernel32"
+        except Exception:
+            pass
+
+    return None, "unavailable"
+
+
+def cgroup_oom_kills() -> int | None:
+    """Linux only. Elsewhere there is no such counter to read."""
+    if not IS_LINUX:
+        return None
+    for path in (
+        "/sys/fs/cgroup/memory.events",
+        "/sys/fs/cgroup/memory/memory.oom_control",
+    ):
+        try:
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                name, _, value = line.partition(" ")
+                if name == "oom_kill":
+                    return int(value)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def cgroup_memory() -> dict[str, Any] | None:
+    if not IS_LINUX:
+        return None
+    values: dict[str, Any] = {}
+    for name, path in (
+        ("current_mb", "/sys/fs/cgroup/memory.current"),
+        ("peak_mb", "/sys/fs/cgroup/memory.peak"),
+        ("max_mb", "/sys/fs/cgroup/memory.max"),
+    ):
+        try:
+            raw = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if raw == "max":
+            values[name] = None
+            continue
+        try:
+            values[name] = round(int(raw) / 1048576)
+        except ValueError:
+            continue
+    return values or None
+
+
+def memory_limit() -> dict[str, Any]:
+    """The ceiling this process will actually hit, and where it comes from."""
+    try:
+        import resource
+
+        for name in ("RLIMIT_AS", "RLIMIT_DATA"):
+            constant = getattr(resource, name, None)
+            if constant is None:
+                continue
+            soft, _ = resource.getrlimit(constant)
+            if soft != resource.RLIM_INFINITY:
+                return {"limit_mb": round(soft / 1048576), "limit_source": name}
+    except Exception:
+        pass  # no resource module on Windows
+
+    if IS_LINUX:
+        for path in (
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ):
+            try:
+                raw = Path(path).read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if raw in ("max", ""):
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                continue
+            if value < (1 << 62):  # cgroup v1's "unlimited" sentinel
+                return {"limit_mb": round(value / 1048576), "limit_source": path}
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemTotal:"):
+                    return {
+                        "limit_mb": round(int(line.split()[1]) / 1024),
+                        "limit_source": "MemTotal",
+                    }
+        except OSError:
+            pass
+
+    psutil = _psutil()
+    if psutil is not None:
+        try:
+            return {
+                "limit_mb": round(psutil.virtual_memory().total / 1048576),
+                "limit_source": "psutil-total",
+            }
+        except Exception:
+            pass
+
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            total = ctypes.c_ulonglong(0)
+            if ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory(  # type: ignore[attr-defined]
+                ctypes.byref(total)
+            ):
+                return {"limit_mb": round(total.value / 1024), "limit_source": "kernel32"}
+        except Exception:
+            pass
+
+    return {"limit_mb": None, "limit_source": None}
+
+
+# -- process exit ---------------------------------------------------------
+
+
+def exit_status(pid: int | None, popen: Any, timeout: float = 5.0) -> tuple[int | None, str | None, str]:
+    """(status, kind, source) for a process that has ended.
+
+    POSIX hands a child's status to its parent exactly once; ``waitid`` with
+    ``WNOWAIT`` reads it without consuming it, so whoever owns the process can
+    still reap normally. Windows has no such rule: any handle you can open
+    answers, which makes it the easier platform here.
+    """
+    if popen is not None and getattr(popen, "returncode", None) is not None:
+        return int(popen.returncode), None, "popen.returncode"
+
+    if pid and hasattr(os, "waitid"):
+        result = _waitid_status(pid, timeout)
+        if result is not None:
+            return result
+
+    if pid and IS_WINDOWS:
+        result = _windows_exit_status(pid)
+        if result is not None:
+            return result
+
+    if popen is not None:
+        try:
+            status = popen.poll()
+            if status is None:
+                status = popen.wait(timeout=timeout)
+            return int(status), None, "popen.wait"
+        except Exception:
+            pass
+
+    return None, None, "unavailable"
+
+
+def _waitid_status(pid: int, timeout: float) -> tuple[int, str | None, str] | None:
+    import time
+
+    flags = os.WEXITED | os.WNOWAIT | os.WNOHANG  # type: ignore[attr-defined]
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            info = os.waitid(os.P_PID, pid, flags)  # type: ignore[attr-defined]
+        except (ChildProcessError, OSError, ValueError):
+            return None
+        if info is not None:
+            break
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+    if info.si_code == os.CLD_EXITED:  # type: ignore[attr-defined]
+        return int(info.si_status), "exited", "waitid"
+    if info.si_code == os.CLD_DUMPED:  # type: ignore[attr-defined]
+        return -int(info.si_status), "killed-core-dumped", "waitid"
+    if info.si_code == os.CLD_KILLED:  # type: ignore[attr-defined]
+        return -int(info.si_status), "killed", "waitid"
+    return None
+
+
+def _windows_exit_status(pid: int) -> tuple[int, str | None, str] | None:
+    psutil = _psutil()
+    if psutil is not None:
+        try:
+            return int(psutil.Process(pid).wait(timeout=5)), "exited", "psutil"
+        except Exception:
+            pass
+    try:
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return None
+            if code.value == STILL_ACTIVE:
+                return None
+            return int(code.value), "exited", "GetExitCodeProcess"
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+# -- live stacks ----------------------------------------------------------
+
+
+def can_request_stack() -> bool:
+    """Whether a stalled worker can be asked for its stack.
+
+    Needs both a signal to send and a handler able to answer it. Windows has
+    neither, so a stall there is reported without a stack rather than with a
+    guess.
+    """
+    import faulthandler
+
+    return hasattr(signal, "SIGUSR1") and hasattr(faulthandler, "register")
+
+
+def request_stack(pid: int) -> bool:
+    if not can_request_stack():
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)  # type: ignore[attr-defined]
+        return True
+    except OSError:
+        return False
+
+
+# -- summary --------------------------------------------------------------
+
+
+def capabilities() -> dict[str, Any]:
+    """What this machine can and cannot tell us.
+
+    Recorded on every alert: on mixed, customer-controlled machines the reader
+    needs to know whether a missing field means "fine" or "unmeasurable here".
+    """
+    resident, resident_source = resident_megabytes()
+    available, available_source = system_available_megabytes()
+    return {
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "python": platform.python_version(),
+        "resident_memory": resident_source if resident is not None else "unavailable",
+        "system_memory": available_source if available is not None else "unavailable",
+        "cgroup_oom_counter": cgroup_oom_kills() is not None,
+        "exit_status": "waitid" if hasattr(os, "waitid") else ("windows" if IS_WINDOWS else "popen-only"),
+        "live_stack": can_request_stack(),
+        "psutil": _psutil() is not None,
+    }
