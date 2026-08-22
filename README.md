@@ -1,27 +1,162 @@
 # pytest-failure-instrumentation
 
-When a pytest-xdist worker dies, this is all you get:
+Most test failures explain themselves. A `pytest_runtest_makereport` gives you
+an assertion, a traceback and a node id, and there is nothing left to
+investigate.
+
+The failures that happen *outside* the call phase explain nothing. A worker is
+killed, a run wedges, workers disagree about which tests exist, pytest raises
+inside its own machinery — and what reaches your reporting is a placeholder
+string, a line in a log, or nothing at all. This plugin records what those
+failures cannot say for themselves, works out whose code is responsible, and
+hands you one structured incident per problem.
+
+```
+[worker_death] NATIVE_CRASH  severity=critical  owner=product
+    blamed on engine.py:6 in native_call
+    in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
+    · died while running test_crashes.py::test_crashes (call)
+    · exit status -11 - SIGSEGV: segmentation fault in native code (pid 805, via waitid)
+    · the worker wrote a stack before dying
+    · segmentation fault in native code
+```
+
+## The problem
+
+When a pytest-xdist worker dies, this is the whole report:
 
 ```
 [gw7] node down: Not properly terminated
 ```
 
-That string is a placeholder xdist substitutes when a worker's channel closed
-without the remote sending anything. An OOM kill, a segfault in a C extension
-and a stray `os._exit()` are indistinguishable at that point, because the cause
-never left the dead process. A worker that *stalls* is worse still: no hook
-fires at all, and the run simply never ends.
+An OOM kill, a segfault in a C extension and a stray `os._exit(1)` are
+indistinguishable at that point. Not because nobody bothered to print the
+difference — because by the time anything can ask, the difference is gone.
+There are three independent reasons, and all three have to be worked around
+separately.
 
-This records what a dying process cannot say afterwards, works out whose code
-is responsible, and hands you one incident per problem.
+**1. The cause never leaves the process.** SIGSEGV and SIGKILL end a process
+without running any Python. No `finally`, no `atexit`, no `__del__`, no
+`pytest_sessionfinish`. Whatever the worker knew about what it was doing, it
+knew only in memory, and that memory is gone. Anything you want to know
+afterwards has to have been written down *before* — while the run was healthy
+and the cost of writing it lands on every passing test.
+
+**2. The exit status is read and thrown away.** The kernel keeps one number
+that separates all these cases, and the parent process is the only thing
+allowed to read it. execnet does read it — `Group.terminate` calls
+`gw._io.wait()` in `execnet/multi.py` — and discards the return value. Nothing
+in xdist asks for it either.
+
+**3. There is no field to put it in.** In `xdist/workermanage.py`,
+`process_from_remote` handles the channel closing: it asks execnet for a remote
+error, and when there is none — because the remote never got to send anything —
+substitutes a literal string:
+
+```python
+err = "Not properly terminated"  # lost connection?
+```
+
+That string is then passed to `pytest_testnodedown(node, error)` as the error.
+The hook is not withholding the cause. By the time it fires, the placeholder is
+genuinely all that exists.
+
+### Why you never see a `MemoryError`
+
+The most common way a worker dies is also the one Python is least able to
+report. On Linux, `malloc` returning successfully is not a promise that the
+memory exists — overcommit hands out address space and resolves it on first
+touch. There is no allocation failure for CPython to raise `MemoryError` from.
+The process is killed later, from outside, with SIGKILL, which cannot be
+caught, blocked or handled.
+
+And the exit status is `-9` for *all* of it: the kernel OOM killer, a cgroup
+limit, a cancelled CI job, a `kill -9` from a stray script. There is no
+distinct code for "out of memory". The only in-process evidence that separates
+them is the cgroup v2 `memory.events` `oom_kill` counter, which is why
+`OOM_KILLED` is claimed only when that counter moved during this run, and
+`SIGKILLED` — "something killed it, and here is what that could have been" —
+when it did not.
+
+### The failures that reach no hook at all
+
+Worker death at least fires a hook. Three others do not.
+
+**A worker that stalls.** `pytest_testnodedown` needs a dead process; a wedged
+one is alive. And the controller hears from a worker only when a phase
+*completes*, so from outside, a twenty-minute test and a deadlock are the same
+event: nothing. The run does not fail — it never ends, and CI kills the job an
+hour later with no artifact naming a test.
+
+**Workers that collected different tests.** xdist notices, writes a unified
+diff per differing worker into its own log, and aborts. Nothing structured
+reaches a hook. With sixty workers and one odd node that is fifty-nine complete
+diffs, every one of them naming the majority as the deviation.
+
+**An internal error.** pytest sets `ExitCode.INTERNAL_ERROR`, which is not in
+`summary_exit_codes` in `_pytest/terminal.py` — so `pytest_terminal_summary`
+never fires for it. Under xdist it is worse: a worker's internal error is
+relayed to the controller as a flat string and re-raised there, so the
+`INTERNALERROR>` block you read names xdist's frame, not the failure.
+
+## Who this is for
+
+**You ship a library into other people's test suites.** Their run dies and the
+bug report names your package. Nothing in the output can confirm or refute it,
+and "cannot reproduce" is not an answer anyone accepts. `owner` is the field
+that settles it — `product`, `third-party`, `customer-code` or `runtime` — and
+it comes from a stack, not from a guess.
+
+**You own CI for a large suite.** Runs fail with no test named. Was that the
+OOM killer, or the runner getting reclaimed mid-job? `-9` is identical either
+way, and the answer decides whether you buy more memory or file a ticket with
+your CI vendor.
+
+**Your suite hangs sometimes.** Nothing fails, the job times out, and there is
+no evidence at all because the process that would produce it is the one that is
+stuck. `worker_stall` names the test, says whether the thread is blocked or the
+whole process is frozen, and prints the stack of the thread actually stuck.
+
+**You run enough workers that they disagree.** A conftest keyed on an
+environment variable, a machine-dependent skip, a plugin that collects
+conditionally. The run aborts and the reason is buried in N−1 diffs.
+
+**You are collecting failures across machines you do not control.**
+`fingerprint` groups recurrences so one defect on twelve workers is one row
+with a count, and `capabilities` records what each machine could measure — so a
+missing memory figure on a customer's Windows box reads as "unmeasurable here"
+rather than "fine".
+
+## A worked example: xdist #1362
+
+A worker dies in the window after it has sent its collection but before
+scheduling begins, while a second worker is still collecting. The stale entry
+in `registered_collections` is never cleaned up, and the run dies with a
+`KeyError` naming an object rather than a problem
+([pytest-dev/pytest-xdist#1362](https://github.com/pytest-dev/pytest-xdist/issues/1362)).
+
+This is what the plugin reports for it — two incidents, because two things went
+wrong:
 
 ```
-[worker_death] NATIVE_CRASH  severity=critical  owner=product
-    blamed on engine.py:5 in native_call
-    in flight test_crash.py::test_uses_native_path  phase=call
-    · died while running test_crash.py::test_uses_native_path (call)
-    · exit status -11 - SIGSEGV: segmentation fault in native code (pid 19201, via waitid)
+[worker_death] SIGKILLED  severity=needs-triage  owner=unknown
+    no test in flight  started=0 finished=0
+    · died before running any test (startup or collection)
+    · exit status -9 - SIGKILL: uncatchable kill (OOM killer or external kill) (pid 21780, via waitid)
+    · resident memory 31 MB at last checkpoint
+    · SIGKILL with no cgroup OOM event: a host-level OOM killer, a container or CI cancellation, or an external kill
+
+[internal_error] INTERNAL_ERROR  severity=high  owner=runtime  run-ending
+    blamed on loadscope.py:275 in _assign_work_unit
+    KeyError: <WorkerController gw1>
+    · raised on the controller itself and captured first-hand
+    · raised above informational: a framework-owned defect that ended the run - no test is at fault, so nothing else will surface it
 ```
+
+`owner=runtime` is the load-bearing part. No test is at fault and no worker is
+at fault, so nothing else in the run will ever surface this — which is exactly
+why it is the one case where a framework defect is raised *above*
+informational.
 
 ## Install
 
@@ -29,7 +164,8 @@ is responsible, and hands you one incident per problem.
 pip install pytest-failure-instrumentation
 ```
 
-It registers itself. Implement one hook to receive what it finds:
+It registers itself as a `pytest11` entry point. Implement one hook to receive
+what it finds:
 
 ```python
 # conftest.py, or your own plugin
@@ -64,21 +200,12 @@ have nothing to say to each other, so they are not fields of the same object:
 | `internal_error` | `InternalErrorIncident` | any run |
 | `run_summary` | `RunSummaryIncident` | any run |
 
-The last two are not distributed problems. An internal error ends a
-single-process run just as finally, through a path that produces no terminal
-summary at all, and the run summary is what says a run reached its end — so
-the plugin registers whether or not you run under xdist, and a plain `pytest`
-gets both.
-
-Three of the five reach no hook at all. `pytest_testnodedown` needs a dead
-process and `pytest_internalerror` needs an exception; a wedged worker produces
-neither, and disagreeing collections produce neither. Those are found by
-polling and by comparing, which is why hooking only the two pytest offers shows
-a fraction of what goes wrong.
+The last two are not distributed problems, so the plugin registers whether or
+not you run under xdist and a plain `pytest` gets both.
 
 They share `verdict`, `confidence`, `severity`, `owner`, `fingerprint`,
-`run_id`, `worker` and `evidence`. `str(incident)` is the alert text — the
-blocks quoted in this README are what it prints. A stored row comes back as the
+`run_id`, `worker` and `evidence`. `str(incident)` is the alert text — every
+block quoted in this README is what it prints. A stored row comes back as the
 model it was written from, and the union is a schema you can migrate a table
 against:
 
@@ -98,14 +225,17 @@ itself failed.
 
 **`severity`** follows from ownership rather than from how loud the failure
 was, so a customer's segfaulting test does not page you. The exception is a
-framework defect that ends the run: nobody's test is at fault, so nothing else
-will ever surface it.
+framework defect that ends the run, above.
 
 **`fingerprint`** is stable across runs and excludes worker id, pid and
 timings, so one defect on twelve workers is one incident with a count.
 
-**`capabilities`** says what the machine could measure. A missing memory figure
-on a customer's Windows box means "unmeasurable here", not "fine".
+**`capabilities`** says what the machine could measure, so an absent figure is
+never read as a healthy one.
+
+**`suspect_owner`** is kept apart from `owner` on purpose. When no stack names
+anybody, the test that was in flight is a lead worth recording — but a guess
+must never sit in the column a reader takes for a finding.
 
 ## Verdicts
 
@@ -121,13 +251,9 @@ on a customer's Windows box means "unmeasurable here", not "fine".
 | `PROBABLY_SIGNALLED` | exit code 128–191, a wrapper ate the signal |
 | `UNKNOWN` | no status obtainable (remote gateway) |
 
-An exit status of `-9` is identical for the OOM killer, a cancelled CI job and
-a stray `kill`, so only the cgroup counter licenses the OOM verdict. Without
-it, the honest answer is that it was killed.
-
 ### A worker stalled
 
-Silence proves nothing on its own: the controller only hears from a worker when
+Silence proves nothing on its own: the controller hears from a worker only when
 a phase *completes*, so a twenty-minute test and a deadlock look identical from
 outside. What separates them is the worker's own heartbeat, which carries CPU
 time.
@@ -141,8 +267,7 @@ time.
 
 The verdict is reached from beats already on disk. A stack is asked for
 *afterwards*, once the decision is made, because asking a wedged process a
-question can change its answer — a raw syscall in native code that ignores
-`EINTR` returns early when a signal lands, and the stall resumes.
+question can change its answer — see below.
 
 ### Workers collected different tests
 
@@ -151,41 +276,102 @@ question can change its answer — a raw syscall in native code that ignores
 | `COLLECTION_MEMBERSHIP_DIFFERS` | a test exists on one machine and not another |
 | `COLLECTION_ORDER_DIFFERS` | same tests, different sequence — fatal too, since xdist addresses tests by position |
 
-xdist compares every worker against whichever registered first and writes a
-full unified diff per differing worker. Sixty workers with one odd node is
-fifty-nine complete diffs, each naming the majority as the deviation. Sixty
-workers do not produce sixty collections — they produce two or three
+Sixty workers never produce sixty collections. They produce two or three
 *variants*, so this reports one row per variant, measured against the largest:
 
 ```
-[collection_mismatch] COLLECTION_MEMBERSHIP_DIFFERS  severity=needs-triage  run-ending
+[collection_mismatch] COLLECTION_MEMBERSHIP_DIFFERS  severity=needs-triage  owner=unknown  run-ending
+    no stack; suspect customer-code (owner of a module the workers disagreed about (test_collect.py))
     2 distinct collections across 2 workers
     a1c0eb3811bc: 1 worker(s), 3 tests (gw0) - majority, used as the baseline
     b85f154135e6: 1 worker(s), 2 tests (gw1) - 1 missing, 0 extra
       across one module: test_collect.py
       missing: test_collect.py::test_two
+    · 2 distinct collections across 2 workers
+    · xdist compares every worker against whichever registered first and emits a full diff per differing worker; this is one row per variant, measured against the majority
 ```
 
-Full id lists are written to `collection-<digest>.txt` rather than carried in
-the payload. An order difference reports where the two lists first disagree,
-which is the one fact a unified diff of a reordered list destroys.
+Full id lists go to `collection-<digest>.txt` rather than into the payload —
+sixty workers times fifty thousand node ids is hundreds of megabytes, so only
+the digest is held per worker and the id list once per variant. An order
+difference reports where the two lists first disagree, which is the one fact a
+unified diff of a reordered list destroys.
+
+A mismatch is run-ending *usually*, not always: xdist aborts when the initial
+collections disagree, but silently drops a worker that registers a differing
+collection after scheduling has begun. The run then continues one worker short,
+and `run_ending` reflects which of the two happened.
+
+## How it knows
+
+**A fixed-size state file.** Which test and phase is open right now is written
+to a 256-byte slot with `os.pwrite` — one syscall, no append, no growth, and a
+file that is the same size after a million tests as after one. That is what
+separates "died in teardown" from "died mid-call": pytest's own `logfinish`
+fires only after the whole protocol, so it cannot tell them apart.
+
+**The exit status, taken from the OS.** Where a `Popen` object survives, its
+return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
+`WNOWAIT` reads the status *without consuming it*, so execnet's own reaping
+still works afterwards and nothing is broken by looking. Only a parent may do
+this, which is why it happens on the controller, and why a remote gateway
+honestly reports `UNKNOWN` rather than guessing.
+
+**faulthandler, pointed at a per-worker file.** pytest's own faulthandler
+plugin enables at configure time with `trylast`, aimed at shared stderr where
+every worker's output interleaves. This claims the handler back afterwards, in
+`pytest_sessionstart`. Its C handler is async-signal-safe and writes *while the
+GIL is held* — which is the case that matters, since native code holding the
+GIL is exactly what a frozen worker looks like.
+
+**Choosing the right thread out of a dump.** A dump written with
+`all_threads=True` holds every thread, and the first one printed in a pytest
+worker is this plugin's own heartbeat thread; the second is execnet's receiver.
+Reporting the first section would blame the instrumentation for the failure it
+came to explain. The section reported is the one the fault or signal reached
+(`Current thread`), else the one carrying pytest's runtest protocol, else
+anything that is not ours.
+
+**A watchdog the worker arms on itself.** The obvious design has the controller
+signal a stalled worker and let faulthandler answer. It has two flaws: Windows
+has no `SIGUSR1` and `os.kill` there cannot deliver one, and on POSIX the
+signal *perturbs the subject* — PEP 475 makes Python retry on `EINTR`, but a C
+extension blocked in a raw syscall need not, so it returns early and the stall
+being measured disappears. So each test arms
+`faulthandler.dump_traceback_later` instead. It works on every platform,
+interrupts no syscall, and still dumps while native code holds the GIL. The
+signal path remains as an extra, for asking an already-diagnosed worker for a
+fresher stack.
+
+**A heartbeat carrying CPU time.** One line every five seconds per worker,
+bounded by wall-clock rather than by how many tests run. `time.process_time()`
+in each beat is what turns silence into a verdict: alive with no CPU is
+blocked, stopped is frozen, alive and burning is a slow test that must be
+reported as nothing at all.
+
+**Evidence written before it is needed.** Every mechanism above puts its output
+on disk during the healthy part of the run, because a process that is about to
+be killed gets no warning. The controller reads files, never the corpse.
 
 ## Cost
 
-The rule is that a passing test must cost as close to nothing as possible,
-because that is the overwhelming majority of what runs.
+A passing test must cost as close to nothing as possible, because that is the
+overwhelming majority of what runs.
 
 - Per test: two fixed-size writes to a file that never grows, plus arming a
   watchdog timer (~78 µs). No append log, no `/proc` read, no allocation
   tracking.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
-  memory — bounded by wall-clock time, not by how many tests run.
+  memory.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
-  line) and the live-object census (walking the heap on a worker near its
-  ceiling is exactly the instrumentation that makes things worse).
+  line) and the live-object census — walking the heap on a worker near its
+  ceiling is exactly the instrumentation that makes things worse.
 - pydantic is imported on the controller, and only when xdist is active. A
   worker never loads it, so nothing about the per-test path changed when the
   payload became typed.
+- Nothing in the reporting path may raise. A failure while gathering an
+  incident degrades it to what survived, because an exception in a reporting
+  hook becomes an `INTERNALERROR` that ends the customer's run.
 
 ## Settings
 
@@ -203,6 +389,11 @@ because that is the overwhelming majority of what runs.
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
 
+`failure_memory_limit_mb` is worth a note: an `RLIMIT_AS` cap makes the
+allocation fail *inside* the process, so you get a `MemoryError` with a
+traceback and a node id instead of an uncatchable kill with neither. It costs
+you a hard ceiling per worker, which is why it is opt-in.
+
 ## Platform coverage
 
 | Capability | Linux | macOS | Windows |
@@ -214,23 +405,16 @@ because that is the overwhelming majority of what runs.
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
 
-Windows has no `SIGUSR1` and `os.kill` there cannot deliver one, so a stalled
-worker cannot be asked for a stack on demand. It is asked in advance instead:
-every test arms `faulthandler.dump_traceback_later`, so anything that outlives
-`failure_slow_test_seconds` writes its own stack. That works everywhere, and it
-interrupts no syscall — a signal can nudge a C extension blocked in a syscall
-that ignores `EINTR`, resuming the very stall being measured.
-
 `psutil` is never required, only ever an upgrade: `pip install
 pytest-failure-instrumentation[psutil]`.
 
 ## Status
 
-All five kinds are wired and exercised end to end on Linux: the death verdicts
+All five kinds are wired and exercised end to end on Linux: every death verdict
 above, both stall states plus the busy-not-stuck case that must stay silent,
 both collection shapes, internal errors from a worker and from a plain
-single-process run, and the run summary. Every payload round-trips through
-`registry.parse` unchanged.
+single-process run, the gh-1362 reproduction quoted above, and the run summary.
+Every payload round-trips through `registry.parse` unchanged.
 
 The Windows and macOS probe paths are written from the platform APIs and have
 not been executed on those systems. `STALLED_SILENT` and the Windows NTSTATUS

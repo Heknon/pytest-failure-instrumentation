@@ -1,4 +1,9 @@
-"""How much memory this process holds, and what the ceiling is.\n\n    Every function returns its value together with the mechanism that produced\n    it. macOS without psutil can only offer a *peak* figure from getrusage, and\n    reporting that as a current one would be a lie the reader cannot detect."""
+"""How much memory this process holds, and what the ceiling is.
+
+Every function returns its value together with the mechanism that produced it.
+macOS without psutil can only offer a *peak* figure from getrusage, and
+reporting that as a current one would be a lie the reader cannot detect.
+"""
 
 from __future__ import annotations
 

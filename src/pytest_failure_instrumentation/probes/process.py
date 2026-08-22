@@ -1,4 +1,10 @@
-"""Retrieving the exit status of a worker process.\n\n    POSIX hands a child's status to its parent exactly once, so waitid with\n    WNOWAIT reads it without consuming it and whoever owns the process can\n    still reap normally. Windows has no such rule: any handle you can open\n    answers. Decoding what the number *means* lives in analysis/exit_status."""
+"""Retrieving the exit status of a worker process.
+
+POSIX hands a child's status to its parent exactly once, so ``waitid`` with
+``WNOWAIT`` reads it without consuming it and whoever owns the process can
+still reap normally. Windows has no such rule: any handle you can open
+answers. Decoding what the number *means* lives in analysis/exit_status.
+"""
 
 from __future__ import annotations
 

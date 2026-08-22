@@ -34,8 +34,8 @@ class RunSummaryIncident(Incident):
     #: arrived: a single-process run has no workers to lose.
     distributed: bool = False
     #: How many of them ended the session. pytest's exit status at session
-    #: finish is reported before INTERNAL_ERROR is applied, so a run killed by
-    #: an internal error can still show 0 above; this is what contradicts it.
+    #: finish is sometimes reported before INTERNAL_ERROR is applied, so a run
+    #: killed by an internal error can still show 0 above; this contradicts it.
     run_ending_incidents: int = 0
 
     def headline(self) -> str:
@@ -82,7 +82,10 @@ def build(
                 "is what pytest reported at session finish, before it applied "
                 "INTERNAL_ERROR"
             ]
-            if run_ending
+            # Only when the exit status does not already show it: pytest applies
+            # INTERNAL_ERROR after some paths through sessionfinish and before
+            # others, so the note is a correction, not a caption.
+            if run_ending and exitstatus == 0
             else []
         ),
     )
