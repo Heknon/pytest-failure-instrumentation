@@ -63,6 +63,7 @@ wrong conclusion. Check this list before quoting a figure back to anyone.
 | `suspect_owner` | who did it | who *might* have; set only when no stack named anybody |
 | `started=N finished=M` | throughput | where in the worker's life it died. `started=1 finished=0` is a death on the very first test, not a leak accumulating over a long worker lifetime |
 | `missing` / `extra` | the whole difference | capped at 500 per side. `missing_count` / `extra_count` are the true totals |
+| `test_in_flight` | the node id, verbatim | written to a fixed-size slot, so a very long id is elided from the middle and marked `...` — head and tail are kept, since the module is at the front and a parametrized hash at the end. Match on the parts, not the whole string, and do not report an elided id as the test's real name |
 | `exitstatus` on a `run_summary` | the run's outcome | sometimes reported before pytest applies `INTERNAL_ERROR`; `run_ending_incidents` is the one to trust when they disagree |
 
 ## The shared fields
@@ -119,7 +120,7 @@ replaces it:
 | `SIGKILLED` | `-9`, counter flat | something outside the container: host-level OOM, CI/container cancellation, runner preemption, an external kill |
 | `NATIVE_CRASH` | fatal signal, or a Windows NTSTATUS | the blamed frame — a C extension or a ctypes call |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP | nothing, unless the run was not meant to be stopped |
-| `SELF_EXIT` | clean code, no signal | `sys.exit()`, `os._exit()`, or a plugin aborting |
+| `SELF_EXIT` | an exit status and no signal — **including 0** | `sys.exit()`, `os._exit()`, or a plugin aborting. A worker that left without being asked to has gone wrong whatever number it exited with, so a clean 0 here is a finding, not an all-clear |
 | `PROBABLY_SIGNALLED` | exit code 128–191 | a wrapper that ate the signal; the true one did not survive |
 | `UNKNOWN` | no status obtainable (remote gateway) | nothing — do not guess one |
 
