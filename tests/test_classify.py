@@ -19,7 +19,22 @@ from pytest_failure_instrumentation.incidents.death import WorkerDeathIncident
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 
-STACK = ['  File "/srv/app/victim.py", line 6 in native_call']
+#: What faulthandler writes when the process is dying. The banner is not
+#: decoration: it is the only thing separating this from the dump a slow test
+#: leaves behind while going on to pass.
+FATAL_DUMP = [
+    "Fatal Python error: Segmentation fault",
+    "Current thread 0x00007f0000000000 (most recent call first):",
+    '  File "/srv/app/victim.py", line 6 in native_call',
+]
+
+#: The same shape, from ``dump_traceback_later``. The test it belongs to may
+#: still be running, and may still pass.
+TIMEOUT_DUMP = [
+    "Timeout (0:00:02)!",
+    "Thread 0x00007f0000000000 (most recent call first):",
+    '  File "/srv/app/victim.py", line 6 in slow_call',
+]
 
 
 def death(**fields) -> WorkerDeathIncident:
@@ -106,11 +121,40 @@ def test_a_clean_code_with_no_dump_is_the_worker_leaving_on_its_own():
     assert any("os._exit()" in line for line in evidence)
 
 
-def test_a_dump_outranks_a_clean_exit_code():
+def test_a_fatal_dump_outranks_a_clean_exit_code():
     """On Windows abort() exits with 3, exactly as a deliberate os._exit(3)
     does. The dump is the only thing that tells them apart."""
-    verdict, confidence, _ = verdict_of(exit_status=3, crash_stack=STACK)
+    verdict, confidence, _ = verdict_of(exit_status=3, crash_stack=FATAL_DUMP)
     assert (verdict, confidence) == ("NATIVE_CRASH", "medium")
+
+
+def test_a_slow_test_dump_does_not_outrank_anything():
+    """A watchdog dump is written by tests that go on to pass.
+
+    Read as crash evidence it turns every deliberate exit into a NATIVE_CRASH -
+    and on the Windows path above, where the dump *is* the evidence, that is
+    every ``os._exit(3)`` in a suite with one slow test in it.
+    """
+    verdict, _, evidence = verdict_of(exit_status=3, crash_stack=TIMEOUT_DUMP)
+    assert verdict == "SELF_EXIT"
+    assert not any("wrote a fatal stack" in line for line in evidence)
+    assert any("not written by a dying process" in line for line in evidence)
+
+
+def test_a_slow_test_dump_does_not_hide_a_wrapped_signal():
+    """The dump branch sits above the 128+signal one, so a stale stack used to
+    swallow the convention as well."""
+    verdict, _, _ = verdict_of(exit_status=143, crash_stack=TIMEOUT_DUMP)
+    assert verdict == "PROBABLY_SIGNALLED"
+
+
+def test_only_a_fatal_dump_is_offered_for_blame():
+    """Attribution walks whatever stack_lines() hands it. A watchdog dump names
+    a test that was not running when the worker died - if that test is in the
+    product's own package, an unrelated clean exit pages somebody."""
+    assert death(exit_status=3, crash_stack=TIMEOUT_DUMP).stack_lines() == ([], False)
+    lines, reverse = death(exit_status=3, crash_stack=FATAL_DUMP).stack_lines()
+    assert lines == FATAL_DUMP and reverse is False
 
 
 def test_no_status_at_all_is_unknown_rather_than_assumed():

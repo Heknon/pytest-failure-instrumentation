@@ -19,6 +19,13 @@ in a path where almost nothing else is.
 The signal handler is still registered on POSIX, but only as an extra: a way to
 ask for a *fresh* stack once the controller has already decided a worker is
 stalled, when the risk of nudging an already-wedged process is acceptable.
+
+The two dumps go to two files. A watchdog dump means "this test is taking a
+while" and is written by tests that go on to pass; a fatal dump means the
+process is ending. Sharing one file made the first indistinguishable from the
+second, so a slow test that passed could be read afterwards as the crash that
+killed the worker - and blamed for it. ``.crash`` holds fatal and on-demand
+dumps; ``.slow`` holds the watchdog's.
 """
 
 from __future__ import annotations
@@ -70,9 +77,15 @@ class SlowTestWatchdog:
         faulthandler.cancel_dump_traceback_later()
 
 
+#: What faulthandler writes before the first thread when the process is dying.
+FATAL_BANNER = "Fatal Python error"
+
+#: What ``dump_traceback_later`` writes. The test may well go on to pass.
+TIMEOUT_BANNER = "Timeout ("
+
 #: Lines faulthandler writes before the first thread, which say what kind of
 #: dump this is.
-BANNERS = ("Fatal Python error", "Timeout (")
+BANNERS = (FATAL_BANNER, TIMEOUT_BANNER)
 
 #: Frames only ever present on the thread running a test. What makes a dump
 #: useful is finding *that* thread, not the first one printed.
@@ -150,6 +163,17 @@ def _mentions_us(section: list[str]) -> bool:
     deprioritised for containing any frame of ours, not only for being all
     ours."""
     return any(OWN_PACKAGE in line.replace("\\", "/") for line in section)
+
+
+def is_fatal(lines: list[str]) -> bool:
+    """Whether a dump was written by a process that was ending.
+
+    A watchdog dump and a crash dump are the same shape, and only the banner
+    separates them. On Windows that separation is load-bearing: ``abort()``
+    exits with 3, exactly as a deliberate ``os._exit(3)`` does, so the dump is
+    the only evidence that one was a crash.
+    """
+    return bool(lines) and lines[0].startswith(FATAL_BANNER)
 
 
 def size(path: Path) -> int:

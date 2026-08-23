@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, "claude/**"]
+    # master is the default branch. Listing only main meant nothing on the
+    # branch everything merges into was ever tested, and the badge in the
+    # README reported on whatever last ran somewhere else.
+    branches: [master, main, "claude/**"]
   pull_request:
   workflow_dispatch:
 
@@ -11,6 +14,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    # Cheap, and it fails first. The source carries `# noqa` and `# type:
+    # ignore` markers, which are only worth writing if something checks them.
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]" ruff mypy
+
+      - name: Ruff
+        run: ruff check src tests
+
+      - name: Mypy
+        run: mypy
+
   test:
     # The probes are platform code - procfs, psapi, waitid, GetExitCodeProcess,
     # cgroup counters - and the Windows and macOS paths cannot be exercised on

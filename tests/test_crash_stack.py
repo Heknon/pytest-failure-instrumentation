@@ -110,3 +110,14 @@ def test_offset_reads_only_what_was_added(pytester):
 
 def test_a_missing_file_is_not_an_error(pytester):
     assert crash_stack.read(pytester.path / "nothing.crash") == []
+
+
+def test_a_fatal_banner_is_what_marks_a_dump_as_a_death():
+    """The two dumps are the same shape. On the Windows path a dump is the only
+    thing separating abort() from a deliberate os._exit(3), so the banner is
+    the whole distinction and not a caption on it."""
+    assert crash_stack.is_fatal(["Fatal Python error: Segmentation fault", "  File..."])
+    assert not crash_stack.is_fatal(["Timeout (0:00:02)!", "  File..."])
+    # An on-demand SIGUSR1 dump has no banner at all, and it is not a death.
+    assert not crash_stack.is_fatal(["Thread 0x00007f00 (most recent call first):"])
+    assert not crash_stack.is_fatal([])

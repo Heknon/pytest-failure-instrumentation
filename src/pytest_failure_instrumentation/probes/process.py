@@ -63,8 +63,6 @@ def exit_status(pid: int | None, popen: Any, timeout: float = 5.0) -> tuple[int 
 
 
 def _waitid_status(pid: int, timeout: float) -> tuple[int, str | None, str] | None:
-    import time
-
     flags = os.WEXITED | os.WNOWAIT | os.WNOHANG  # type: ignore[attr-defined]
     deadline = time.monotonic() + timeout
     while True:

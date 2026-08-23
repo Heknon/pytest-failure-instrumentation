@@ -41,6 +41,10 @@ class Assessment:
     heartbeat_age: Optional[float] = None
     #: The caller should wait one heartbeat interval and call ``confirm``.
     needs_confirmation: bool = False
+    #: Set when this particular assessment is weaker than the state usually
+    #: warrants - a BLOCKED reached without a CPU figure is the same verdict
+    #: resting on half the evidence, and has to say so.
+    confidence: Optional[str] = None
 
 
 def last_beat_time(beats: list[dict[str, Any]]) -> float:
@@ -112,6 +116,22 @@ def _from_cpu(
             reason=f"burning {rate:.2f} cores: slow, not stuck",
             cpu_rate=rate,
             heartbeat_age=age,
+        )
+    if rate is None:
+        # One beat, or two stamped at the same instant. "It burned nothing" and
+        # "we could not tell" are different findings, and the difference is the
+        # whole basis of this verdict - a worker at full tilt produces exactly
+        # this input when its beats collide. Still worth reporting, since the
+        # heartbeat is alive and the worker has been silent past the limit, but
+        # not at the confidence a measured zero earns.
+        return Assessment(
+            state="BLOCKED",
+            reason="the heartbeat is still running but no CPU figure could be "
+            "measured, so this rests on the silence alone - a busy worker "
+            "cannot be ruled out",
+            cpu_rate=None,
+            heartbeat_age=age,
+            confidence="low",
         )
     return Assessment(
         state="BLOCKED",

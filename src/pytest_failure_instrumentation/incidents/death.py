@@ -16,7 +16,8 @@ from pydantic import ConfigDict, Field
 
 from .. import probes
 from ..analysis import classify, exit_status
-from ..capture import crash_stack, events as event_log
+from ..capture import crash_stack
+from ..capture import events as event_log
 from ..capture.state import read_state
 from .base import CgroupMemory, Incident
 
@@ -55,6 +56,18 @@ class WorkerDeathIncident(Incident):
     crash_stack: list[str] = Field(default_factory=list)
 
     def stack_lines(self) -> tuple[list[str], bool]:
+        """Frames to attribute the death to - only from a dump that belongs
+        to it.
+
+        A dump without a fatal banner was written by a process that went on
+        living: an on-demand stack taken while the worker was merely stalled,
+        say. Blaming the death on it names whatever that stack happened to be
+        doing, which can be a different test in a different module that passed
+        - and if that module is the product's, an unrelated clean exit pages
+        somebody at severity=critical.
+        """
+        if not crash_stack.is_fatal(self.crash_stack):
+            return [], False
         return self.crash_stack, False  # faulthandler prints deepest first
 
     def suspect_nodeid(self) -> str | None:

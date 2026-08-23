@@ -7,6 +7,7 @@ expensive probes are off, and no memory ceiling is imposed.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,17 @@ from typing import Any
 import pytest
 
 DEFAULT_DIRECTORY = ".pytest-failures"
+
+#: Below this the heartbeat thread costs more than it measures. Clamped here
+#: rather than in the thread, because the controller decides what counts as a
+#: stale beat from the same number - and two different answers to "how often
+#: does a worker beat" make a healthy worker look frozen.
+MIN_HEARTBEAT_INTERVAL = 1.0
+
+
+class FailureInstrumentationWarning(UserWarning):
+    """Raised for a setting this plugin could not use, and for setup it had to
+    give up on. Never an error: nothing here is worth ending a run over."""
 
 
 @dataclass(frozen=True)
@@ -31,6 +43,8 @@ class Settings:
     stall_seconds: float
     stack_probe: bool
     worker_count: int
+    #: Set on workers only; the controller mints it and pushes it down.
+    run_id: str | None = None
 
 
 def add_options(parser: pytest.Parser) -> None:
@@ -84,9 +98,20 @@ def _flag(config: pytest.Config, name: str) -> bool:
 
 
 def _number(config: pytest.Config, name: str, fallback: float) -> float:
+    """A setting that cannot be read falls back, but says so.
+
+    Silently substituting the default turns ``failure_stall_seconds = 5m`` into
+    a stall detector the reader believes they configured and never hear from.
+    """
+    raw = config.getini(name)
     try:
-        return float(config.getini(name) or fallback)
+        return float(raw or fallback)
     except (ValueError, TypeError):
+        warnings.warn(
+            f"{name}={raw!r} is not a number; using {fallback} instead",
+            FailureInstrumentationWarning,
+            stacklevel=2,
+        )
         return fallback
 
 
@@ -97,7 +122,10 @@ def resolve(config: pytest.Config) -> Settings:
         packages=tuple(config.getini("failure_packages") or ()),
         product_version=config.getini("failure_product_version") or None,
         watchdog=_flag(config, "failure_watchdog"),
-        heartbeat_interval=_number(config, "failure_heartbeat_interval", 5.0),
+        heartbeat_interval=max(
+            MIN_HEARTBEAT_INTERVAL,
+            _number(config, "failure_heartbeat_interval", 5.0),
+        ),
         tracemalloc_depth=int(_number(config, "failure_tracemalloc_depth", 0)),
         object_census=_flag(config, "failure_object_census"),
         high_water_mb=int(_number(config, "failure_high_water_mb", 0)),
@@ -106,4 +134,8 @@ def resolve(config: pytest.Config) -> Settings:
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe"),
         worker_count=int(workerinput.get("workercount", 1) or 1),
+        # Pushed into workerinput by the controller (see IncidentEngine's
+        # pytest_configure_node), so both sides of a run stamp their evidence
+        # with the same id and a stale file from an earlier run is recognisable.
+        run_id=str(workerinput.get("failure_run_id") or "") or None,
     )

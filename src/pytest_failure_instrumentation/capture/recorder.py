@@ -20,7 +20,8 @@ from typing import Any
 
 import pytest
 
-from . import crash_stack, memory as memory_capture
+from . import crash_stack
+from . import memory as memory_capture
 from .events import EventLog
 from .heartbeat import Heartbeat
 from .state import WorkerState
@@ -30,21 +31,47 @@ class WorkerRecorder:
     def __init__(self, directory: Path, worker_id: str, settings: Any) -> None:
         self.worker_id = worker_id
         self.directory = directory
-        directory.mkdir(parents=True, exist_ok=True)
-
-        self.state = WorkerState(directory / f"{worker_id}.state", os.getpid())
-        self.events = EventLog(directory / f"{worker_id}.events")
-        # Never closed: faulthandler keeps it for the process lifetime, so a
-        # crash during interpreter shutdown still gets written.
-        self._crash_stream = (directory / f"{worker_id}.crash").open(
-            "w", buffering=1, encoding="utf-8"
-        )
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
+        # Filled as each resource is opened, so close() works on a recorder
+        # that never finished being built.
+        self._open_resources: list[Any] = []
+        try:
+            self._open(directory, worker_id, settings)
+        except Exception:
+            # The caller turns this into "instrumentation is off for this
+            # worker" and carries on; leaving descriptors open behind it would
+            # make a failed setup cost more than a working one.
+            self.close()
+            raise
+
+    def _open(self, directory: Path, worker_id: str, settings: Any) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+
+        self.state = self._track(
+            WorkerState(directory / f"{worker_id}.state", os.getpid())
+        )
+        self.events = self._track(
+            EventLog(directory / f"{worker_id}.events", settings.run_id)
+        )
+        # Never closed in the happy path: faulthandler keeps these for the
+        # process lifetime, so a crash during interpreter shutdown still gets
+        # written.
+        #
+        # Two files, not one. A watchdog dump is written by tests that go on to
+        # pass; a fatal dump means the process is ending. Sharing a file made
+        # them indistinguishable afterwards, and a slow test that passed could
+        # be read as the crash that killed the worker.
+        self._crash_stream = self._track(
+            (directory / f"{worker_id}.crash").open("w", buffering=1, encoding="utf-8")
+        )
+        self._slow_stream = self._track(
+            (directory / f"{worker_id}.slow").open("w", buffering=1, encoding="utf-8")
+        )
         # A test that outlives this dumps its own stack - no signal, so it
         # works on Windows and interrupts no syscall.
         self.slow_test = crash_stack.SlowTestWatchdog(
-            self._crash_stream, settings.slow_test_seconds
+            self._slow_stream, settings.slow_test_seconds
         )
 
         self._apply_memory_limit(settings)
@@ -59,21 +86,34 @@ class WorkerRecorder:
         )
         self.state.update()
 
+    def _track(self, resource: Any) -> Any:
+        self._open_resources.append(resource)
+        return resource
+
     # -- setup -----------------------------------------------------------
 
     def _apply_memory_limit(self, settings: Any) -> None:
-        """Turn a silent OOM kill into a MemoryError attributed to a test."""
+        """Turn a silent OOM kill into a MemoryError attributed to a test.
+
+        A ceiling that cannot be applied is recorded and shrugged off. Refusing
+        to start over it would mean this plugin ended a run that was going to
+        work, which is a worse outcome than any report it could have produced.
+        """
         if settings.memory_limit_mb <= 0:
             return
         try:
             import resource
         except ImportError:
             return  # Windows has no RLIMIT
-        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-        limit = settings.memory_limit_mb * 1024 * 1024
-        if hard != resource.RLIM_INFINITY:
-            limit = min(limit, hard)
-        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+        try:
+            _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            limit = settings.memory_limit_mb * 1024 * 1024
+            if hard != resource.RLIM_INFINITY:
+                limit = min(limit, hard)
+            resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+        except (OSError, ValueError) as failure:
+            self.events.record("memory_limit_refused", detail=repr(failure))
+            return
         self.events.record("memory_limit_applied", limit_mb=settings.memory_limit_mb)
 
     def _start_monitors(self, settings: Any) -> None:
@@ -154,6 +194,16 @@ class WorkerRecorder:
         self.events.record(
             "internal_error", detail=str(excrepr), nodeid=self.state.nodeid
         )
+
+    def close(self) -> None:
+        """Undo whatever was already set up. Called when construction failed
+        part-way, so a half-built recorder does not leak the descriptors it
+        managed to open before the failure."""
+        while self._open_resources:
+            try:
+                self._open_resources.pop().close()
+            except Exception:  # noqa: BLE001 - cleanup must not raise either
+                pass
 
     def pytest_sessionfinish(self, exitstatus: int) -> None:
         if self.heartbeat is not None:

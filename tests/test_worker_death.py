@@ -249,3 +249,55 @@ def test_the_opt_in_probes_name_the_line_holding_the_memory(distributed):
         "test_greedy.py" in entry["file"] for entry in mark["top_allocations"]
     ), mark["top_allocations"]
     assert mark["objects_by_type"]
+
+
+def test_a_slow_test_that_passed_is_not_the_crash_that_killed_the_worker(distributed):
+    """The watchdog dump and the fatal dump used to share a file.
+
+    A test that outlives failure_slow_test_seconds writes a stack and then goes
+    on to pass. Read afterwards as crash evidence, it turned the *next* test's
+    deliberate exit into a NATIVE_CRASH and blamed the frame it happened to
+    hold - a function that was not running, in a test that succeeded. When that
+    frame is in the product's own package, an unrelated clean exit arrives as
+    severity=critical, owner=product.
+    """
+    distributed.pytester.makepyfile(
+        victim_slow="""
+        import time
+
+
+        def slow_product_call():
+            time.sleep(4)
+        """
+    )
+    distributed.pytester.makepyfile(
+        test_slow_then_exit="""
+        import os
+
+        import victim_slow
+
+
+        def test_is_merely_slow():
+            victim_slow.slow_product_call()
+
+
+        def test_leaves_on_purpose():
+            os._exit(3)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "1",
+        "-o", "failure_slow_test_seconds=2",
+        "-o", "failure_packages=victim_slow",
+        "test_slow_then_exit.py",
+        timeout=180,
+    )
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.verdict == "SELF_EXIT"
+    assert death.test_in_flight == "test_slow_then_exit.py::test_leaves_on_purpose"
+    # Nothing to blame, so nobody is blamed - and above all not the package
+    # whose only involvement was being slow once.
+    assert death.blamed_frame is None
+    assert death.owner != "product"
+    assert death.severity != "critical"

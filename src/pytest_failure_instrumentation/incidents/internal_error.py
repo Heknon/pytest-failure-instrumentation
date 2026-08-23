@@ -5,6 +5,15 @@ error as a flat string and re-raises it on the controller, so the INTERNALERROR
 block names xdist's frame rather than the failure. The worker records the real
 one as it happens; this prefers that, and says which it used.
 
+Preferring the worker's copy is only right when it is a copy of *this* failure.
+Three things can put an unrelated record in the evidence directory - a previous
+run that left its files behind, a single-process run reading a distributed
+run's leftovers, and a second worker that failed earlier in this one - and a
+captured event chosen without checking is reported at high confidence, under
+the wrong worker's name, describing an exception that did not happen. So a
+candidate has to belong to this run and has to match the failure the controller
+is holding; otherwise the controller's own text is the honest answer.
+
 pytest also excludes INTERNAL_ERROR from the exit codes that get a terminal
 summary, so ``pytest_terminal_summary`` never runs and nothing else reports it.
 """
@@ -56,12 +65,18 @@ class InternalErrorIncident(Incident):
         return lines
 
 
-def build(excrepr: object, directory: Path, worker: str | None = None) -> InternalErrorIncident:
+def build(
+    excrepr: object,
+    directory: Path,
+    worker: str | None = None,
+    run_id: str | None = None,
+    distributed: bool = True,
+) -> InternalErrorIncident:
     text = str(excrepr)
-    captured = _captured(directory)
+    captured = _captured(directory, run_id) if distributed else []
     if worker is not None:
         captured = [item for item in captured if item["worker"] == worker]
-    chosen = captured[0] if captured else None
+    chosen = _matching(captured, text)
     detail = chosen["detail"] if chosen else text
 
     if chosen:
@@ -88,6 +103,31 @@ def build(excrepr: object, directory: Path, worker: str | None = None) -> Intern
     )
 
 
+def _matching(
+    captured: list[dict[str, Any]], text: str
+) -> Optional[dict[str, Any]]:
+    """The captured record that is this failure, or none of them.
+
+    The exception line is what ties a worker's first-hand record to the string
+    the controller was handed. Without that tie a second worker's earlier
+    failure - or a file left behind by a previous run - is indistinguishable
+    from the real one, and picking the first is picking alphabetically.
+    """
+    if not captured:
+        return None
+    wanted = _exception_line(text)
+    if wanted:
+        matching = [
+            item for item in captured if _exception_line(item["detail"]) == wanted
+        ]
+        if matching:
+            return matching[0]
+    # No exception line to compare - a bare INTERNALERROR block, say. One
+    # candidate is unambiguous; several are a guess, and a guess reported as
+    # first-hand is worse than the controller's own second-hand text.
+    return captured[0] if len(captured) == 1 else None
+
+
 def _exception_line(detail: str) -> str:
     found = ""
     for line in detail.splitlines():
@@ -97,10 +137,10 @@ def _exception_line(detail: str) -> str:
     return found[:300]
 
 
-def _captured(directory: Path) -> list[dict[str, Any]]:
+def _captured(directory: Path, run_id: str | None) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for path in sorted(directory.glob("*.events")):
-        events = event_log.read_events(path)
+        events = event_log.of_run(event_log.read_events(path), run_id)
         for event in event_log.internal_errors(events):
             results.append(
                 {

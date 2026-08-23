@@ -68,3 +68,35 @@ def test_cpu_rate_needs_two_beats():
 def test_cpu_rate_of_a_zero_length_window_is_unmeasurable():
     # Not zero: "we could not tell" and "it burned nothing" are different.
     assert stall.cpu_rate(beats((100.0, 5.0), (100.0, 5.0))) is None
+
+
+def test_an_unmeasurable_cpu_rate_is_not_a_measured_zero():
+    """One beat gives no rate at all. Treating that as "burned nothing" turns
+    the absence of a measurement into the evidence the verdict rests on - and
+    a worker at full tilt produces exactly this input when its beats collide.
+    """
+    verdict = stall.assess(
+        beats((99.0, 1.0)), now=100.0, silent_for=60.0, interval=5.0
+    )
+    assert verdict.state == "BLOCKED"
+    assert verdict.cpu_rate is None
+    # Same verdict, half the evidence, and it has to say so.
+    assert verdict.confidence == "low"
+    assert "no CPU figure could be measured" in verdict.reason
+
+
+def test_a_zero_length_window_is_not_a_measured_zero_either():
+    # 98 CPU-seconds between two beats stamped at the same instant.
+    verdict = stall.assess(
+        beats((99.0, 1.0), (99.0, 99.0)), now=100.0, silent_for=60.0, interval=5.0
+    )
+    assert verdict.state == "BLOCKED"
+    assert verdict.confidence == "low"
+
+
+def test_a_measured_zero_keeps_the_confidence_it_earns():
+    verdict = stall.assess(
+        beats((90.0, 5.0), (100.0, 5.0)), now=100.0, silent_for=60.0, interval=5.0
+    )
+    assert verdict.cpu_rate == 0.0
+    assert verdict.confidence is None  # the state's own confidence stands

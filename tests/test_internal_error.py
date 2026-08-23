@@ -6,7 +6,9 @@ summary, so pytest_terminal_summary never fires for one of these.
 
 from __future__ import annotations
 
-from .conftest import needs_xdist
+import json
+
+from .conftest import INCIDENT_FILE, _has_xdist, needs_xdist
 
 BOOM_PLUGIN = """
 import os
@@ -60,3 +62,50 @@ def test_a_workers_error_is_captured_where_it_was_raised(runner, monkeypatch):
     assert any("on the worker itself" in line for line in failure.evidence)
     # Attributed to whoever wrote the failing hook, not to xdist's re-raise.
     assert failure.owner == "product"
+
+
+def test_a_previous_runs_evidence_is_not_reported_as_this_ones(runner, monkeypatch):
+    """The evidence directory outlives a run.
+
+    A distributed run leaves its worker events behind; a single-process run
+    does not clean them, because it writes nothing there itself. Preferring a
+    captured worker record without checking which run wrote it reported the
+    *old* failure - under a worker id that does not exist in this run, at high
+    confidence, with the controller's real error discarded entirely.
+    """
+    runner.pytester.makepyfile(test_suite=SUITE)
+    runner.pytester.makepyfile(boom_plugin=BOOM_PLUGIN)
+
+    if _has_xdist():
+        # Run one: a worker fails, and its record stays on disk.
+        monkeypatch.setenv("BOOM_ON", "gw1")
+        runner.pytester.runpytest_subprocess(
+            "-n", "2", "-p", "boom_plugin", "test_suite.py", timeout=180
+        )
+        assert list((runner.pytester.path / ".pytest-failures").glob("*.events"))
+    else:
+        # No xdist: forge the leftovers a distributed run would have left.
+        evidence = runner.pytester.path / ".pytest-failures"
+        evidence.mkdir(exist_ok=True)
+        (evidence / "gw1.events").write_text(
+            json.dumps(
+                {
+                    "event": "internal_error",
+                    "run_id": "some-earlier-run",
+                    "detail": "RuntimeError: an older failure entirely",
+                    "nodeid": "test_gone.py::test_gone",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    # Run two: a different failure, in a process that has no workers at all.
+    (runner.pytester.path / INCIDENT_FILE).unlink(missing_ok=True)
+    monkeypatch.setenv("BOOM_ON", "main")
+    incidents = runner.run("-p", "no:xdist", "-p", "boom_plugin", "test_suite.py")
+
+    failure = runner.only(incidents, "internal_error")
+    assert failure.worker == "controller"
+    assert any("on the controller itself" in line for line in failure.evidence)
+    assert "victim broke pytest" in failure.exception

@@ -72,6 +72,18 @@ def test_run_ending_is_a_property_of_the_kind():
     assert WorkerDeathIncident(worker="gw1").ends_this_run() is False
 
 
+def test_a_degraded_collection_mismatch_still_reports_the_run_as_over():
+    """ends_this_run() reads the variants, and a degraded incident has none.
+
+    Falling through to "the run carried on" understated a run xdist had
+    already aborted - and the flag is what raises a framework defect above
+    informational, so the alert was quieter as well as wrong.
+    """
+    degraded = CollectionMismatchIncident.degraded("controller", KeyError("digest"))
+    assert degraded.variants == []
+    assert degraded.ends_this_run() is True
+
+
 def test_a_dropped_replacement_does_not_end_the_run():
     """xdist aborts when the initial collections disagree, but silently drops a
     worker that registers a differing collection after scheduling began."""
@@ -301,3 +313,34 @@ def test_the_values_appear_under_the_test_that_produced_them():
     assert "test_billing.py::test_invoice" in lines
     assert "gw0 collected acct-1791, acct-3471" in lines
     assert "gw1 collected acct-2186, acct-2542" in lines
+
+
+def test_a_partial_collection_report_says_it_is_partial():
+    """Which variant holds the majority is only settled once every worker has
+    voted, so a report assembled without them all must not read as final."""
+    partial = CollectionMismatchIncident(
+        worker="controller",
+        worker_count=3,
+        variant_count=2,
+        complete=False,
+    )
+    assert "of the workers that answered" in str(partial)
+
+    whole = CollectionMismatchIncident(
+        worker="controller", worker_count=8, variant_count=2
+    )
+    assert "of the workers that answered" not in str(whole)
+
+
+def test_a_stall_says_why_it_has_no_stack_rather_than_blaming_the_platform():
+    silent = WorkerStallIncident(
+        worker="gw1",
+        stack_probed=False,
+        stack_unavailable_reason="failure_stack_probe is off, so the worker "
+        "was left undisturbed",
+    )
+    assert "no stack: failure_stack_probe is off" in str(silent)
+
+    # Nothing to explain when a stack was obtained.
+    answered = WorkerStallIncident(worker="gw1", stack=["  File \"x.py\", line 1 in f"])
+    assert "no stack:" not in str(answered)

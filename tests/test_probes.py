@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -119,3 +120,16 @@ def test_a_posix_signal_status_is_left_alone():
     if sys.platform == "win32":
         pytest.skip("negative statuses are signals only on POSIX")
     assert process.unsigned_on_windows(-9) == -9
+
+
+# -- the package as a dependency -----------------------------------------
+
+
+def test_the_package_ships_its_types():
+    """PEP 561. The typed payload is the product, and without this marker a
+    consumer writing `incident: WorkerDeathIncident` against registry.parse()
+    gets Any - which is the opposite of what a discriminated union is for."""
+    import pytest_failure_instrumentation
+
+    root = Path(pytest_failure_instrumentation.__file__).parent
+    assert (root / "py.typed").is_file()

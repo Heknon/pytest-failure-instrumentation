@@ -21,11 +21,11 @@ from typing import Any, ClassVar, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..analysis.collection import SAMPLE_SIZE, CollectionTracker
+from .base import Incident
 
 #: Variant rows in the alert text. Beyond this the report says how many more
 #: there were rather than printing a page of near-identical blocks.
 VARIANTS_SHOWN = 4
-from .base import Incident
 
 WORKERS_SHOWN = 4
 
@@ -193,6 +193,10 @@ class CollectionMismatchIncident(Incident):
 
     variant_count: int = 0
     worker_count: int = 0
+    #: False when a worker died still owing a collection, so the counts below
+    #: describe the workers that answered rather than the whole run. Which
+    #: variant is the majority is only meaningful once everyone has voted.
+    complete: bool = True
     baseline_digest: str = ""
     variants: list[CollectionVariant] = Field(default_factory=list)
     #: digest -> the file holding that variant's full id list. Sixty workers
@@ -214,7 +218,11 @@ class CollectionMismatchIncident(Incident):
         # carries on a worker short.
         differing = [variant for variant in self.variants if variant.role != "baseline"]
         if not differing:
-            return False
+            # No variants at all means this is a degraded incident - gathering
+            # the detail failed. The mismatch itself was real, so fall back to
+            # what the kind normally does rather than reporting a run that
+            # carried on when it did not.
+            return type(self).ends_run
         return not all(
             variant.replacements and len(variant.replacements) == variant.worker_count
             for variant in differing
@@ -264,6 +272,7 @@ class CollectionMismatchIncident(Incident):
         lines = [
             f"{_workers(self.worker_count)} produced "
             f"{self.variant_count} different collections"
+            + ("" if self.complete else ", of the workers that answered")
         ]
         if self.parameters_unstable:
             # The variant rows would be one near-identical block per worker,
@@ -298,7 +307,9 @@ class CollectionMismatchIncident(Incident):
         return lines
 
 
-def build(tracker: CollectionTracker, directory: Path) -> CollectionMismatchIncident:
+def build(
+    tracker: CollectionTracker, directory: Path, complete: bool = True
+) -> CollectionMismatchIncident:
     summary = tracker.summarise()
     variants = [CollectionVariant(**variant) for variant in summary["variants"]]
     unstable = tracker.parameters_unstable
@@ -318,6 +329,7 @@ def build(tracker: CollectionTracker, directory: Path) -> CollectionMismatchInci
         confidence="high",
         variant_count=summary["variant_count"],
         worker_count=summary["worker_count"],
+        complete=complete,
         baseline_digest=summary["baseline_digest"],
         variants=variants,
         variant_files=write_variant_files(tracker, directory),
@@ -338,6 +350,12 @@ def build(tracker: CollectionTracker, directory: Path) -> CollectionMismatchInci
         incident.evidence.append(
             "every worker collected the same tests; stripping the parameters "
             "from the ids makes the collections identical"
+        )
+    if not complete:
+        incident.evidence.append(
+            "a worker ended without registering a collection, so this compares "
+            "the ones that answered - which variant holds the majority is only "
+            "settled once every worker has reported"
         )
     # Which of xdist's two behaviours happened is the difference between a run
     # that stopped and a run that quietly lost a worker.

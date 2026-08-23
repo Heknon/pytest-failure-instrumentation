@@ -33,17 +33,34 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from .. import probes
-from ..analysis import fingerprint as fingerprint_of, severity as severity_of
+from ..analysis import fingerprint as fingerprint_of
+from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
 from . import collection, death, internal_error, stall, summary
 from .base import Capabilities, Incident, frame_from
+
+#: Suffixes this plugin writes, one file per worker. Anything else in the
+#: evidence directory belongs to somebody else.
+OWNED_SUFFIXES = (".state", ".events", ".crash", ".slow")
+
+#: The one file that is not per worker. It is a ``.txt``, and deleting every
+#: ``.txt`` to catch it took a coverage report and a build log with it - so it
+#: is matched by the name this plugin gave it instead.
+COLLECTION_PREFIX = "collection-"
+
+
+def _is_ours(path: Path) -> bool:
+    if path.suffix in OWNED_SUFFIXES:
+        return True
+    return path.name.startswith(COLLECTION_PREFIX) and path.suffix == ".txt"
 
 
 class IncidentEngine:
@@ -58,9 +75,16 @@ class IncidentEngine:
             and config.getoption("dist", "no") != "no"
         )
 
-        self.run_id = "unknown"
+        # Minted here rather than at session start: the workers have to be
+        # told, and pytest_configure_node fires before any of them exist. xdist
+        # keeps its own testrunuid on an object the controller cannot reach in
+        # every version, so this owns one instead of hoping for that one.
+        self.run_id = os.environ.get("PYTEST_RUN_ID") or f"run-{uuid.uuid4().hex[:16]}"
         self.collections = CollectionTracker()
         self.reported_mismatch = False
+        #: Workers that went down before registering a collection. They are
+        #: never going to, so they are subtracted from what is waited for.
+        self.workers_lost: set[str] = set()
         #: Last time each live worker said anything, and which are wedged
         #: already - shared with the watcher thread below.
         self.activity: dict[str, float] = {}
@@ -81,10 +105,14 @@ class IncidentEngine:
         if not self.distributed:
             return
         # Stale files from an earlier run would be read as this one's evidence.
+        # Only files this plugin writes are removed: failure_directory is a
+        # natural thing to point at an existing artifacts directory, and a
+        # green run that deletes somebody's coverage report has done more
+        # damage than any failure it might have explained.
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             for path in self.directory.iterdir():
-                if path.suffix in {".events", ".state", ".crash", ".txt", ".json"}:
+                if path.is_file() and _is_ours(path):
                     path.unlink()
         except OSError:
             pass
@@ -195,10 +223,6 @@ class IncidentEngine:
     # -- sources ---------------------------------------------------------
 
     def pytest_sessionstart(self, session: pytest.Session) -> None:
-        manager = getattr(session.config, "_xdist_nodemanager", None)
-        self.run_id = getattr(manager, "testrunuid", None) or os.environ.get(
-            "PYTEST_RUN_ID", f"run-{int(time.time())}"
-        )
         # Only distributed runs can strand a worker. A single process that
         # wedges takes this detector down with it.
         if self.distributed and self.settings.stall_seconds > 0:
@@ -208,6 +232,18 @@ class IncidentEngine:
                 daemon=True,
             )
             self.watcher.start()
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_configure_node(self, node: Any) -> None:
+        """Hand each worker the run id, so its evidence says which run wrote it.
+
+        Without this the controller and its workers stamp different ids, and a
+        file left behind by an earlier run reads as part of this one.
+        """
+        try:
+            node.workerinput["failure_run_id"] = self.run_id
+        except Exception:  # noqa: BLE001 - a missing id only costs the check
+            pass
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_testnodeready(self, node: Any) -> None:
@@ -227,12 +263,58 @@ class IncidentEngine:
         # replacement for one that died. xdist drops it silently if what it
         # collected differs, so the run continues a worker short.
         self.collections.record(worker, list(ids), replacement=self.tests_seen > 0)
+        self._report_mismatch(partial=False)
 
-        if not self.collections.has_mismatch or self.reported_mismatch:
+    def _expected_collections(self) -> int:
+        """How many collections this run should produce before anyone judges.
+
+        xdist brings a worker up and lets it collect before starting the next,
+        so "how many are ready" tracks "how many have reported" exactly and
+        answers nothing. The number of gateway specs is the real total, and it
+        is the one xdist itself waits for; it also resolves ``-n auto``, which
+        no option value does at this point. Workers already lost are
+        subtracted, since a dead one will never register.
+        """
+        expected = 0
+        session = self.config.pluginmanager.get_plugin("dsession")
+        specs = getattr(getattr(session, "nodemanager", None), "specs", None)
+        if specs:
+            expected = len(specs)
+        if not expected:
+            try:
+                expected = int(self.config.getoption("numprocesses", 0) or 0)
+            except (TypeError, ValueError):
+                expected = 0
+        with self.lock:
+            expected -= len(self.workers_lost)
+        # Never wait for fewer than have already answered: an unrecognised
+        # topology should report late rather than not at all.
+        return max(expected, len(self.collections.digest_by_worker))
+
+    def _report_mismatch(self, partial: bool) -> None:
+        """Report a disagreement once, and only once every opinion is in.
+
+        Reporting on the first two differing digests describes whichever two
+        workers won the race: at sixty workers that is "2 workers produced 2
+        different collections", and the majority-against-minority framing this
+        whole kind is built on never happens. So it waits - and session finish
+        passes ``partial`` to report what it has if a worker died still owing
+        a collection.
+        """
+        if self.reported_mismatch or not self.collections.has_mismatch:
+            return
+        try:
+            recorded = len(self.collections.digest_by_worker)
+            waiting = not partial and recorded < self._expected_collections()
+        except Exception:  # noqa: BLE001 - this runs inside an xdist hook, and
+            waiting = False  # an exception here is an INTERNALERROR
+        if waiting:
             return
         self.reported_mismatch = True
         try:
-            incident: Incident = collection.build(self.collections, self.directory)
+            incident: Incident = collection.build(
+                self.collections, self.directory, complete=not partial
+            )
         except Exception as failure:  # noqa: BLE001
             incident = collection.CollectionMismatchIncident.degraded(
                 "controller", failure
@@ -244,6 +326,11 @@ class IncidentEngine:
         worker = getattr(getattr(node, "gateway", None), "id", "unknown")
         with self.lock:
             self.activity.pop(worker, None)
+            if worker not in self.collections.digest_by_worker:
+                self.workers_lost.add(worker)
+        # One fewer collection to wait for, which may be the one that was
+        # holding a mismatch back.
+        self._report_mismatch(partial=False)
         if not error:
             return  # a clean shutdown is not an incident
         try:
@@ -258,7 +345,12 @@ class IncidentEngine:
 
     def pytest_internalerror(self, excrepr: object) -> None:
         try:
-            incident: Incident = internal_error.build(excrepr, self.directory)
+            incident: Incident = internal_error.build(
+                excrepr,
+                self.directory,
+                run_id=self.run_id,
+                distributed=self.distributed,
+            )
         except Exception as failure:  # noqa: BLE001
             incident = internal_error.InternalErrorIncident.degraded(
                 "controller", failure, context=str(excrepr)[-2000:]
@@ -269,6 +361,10 @@ class IncidentEngine:
         self.stop.set()
         if self.watcher is not None:
             self.watcher.join(timeout=2.0)
+        # A worker that died still owing a collection means the full set never
+        # arrives. Report what was seen rather than nothing at all, flagged as
+        # incomplete so the worker counts are not read as the whole picture.
+        self._report_mismatch(partial=True)
         self.raise_incident(
             summary.build(
                 exitstatus,

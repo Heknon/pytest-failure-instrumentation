@@ -10,6 +10,7 @@ from __future__ import annotations
 import signal
 from typing import TYPE_CHECKING
 
+from ..capture import crash_stack
 from . import exit_status as status_table
 
 if TYPE_CHECKING:  # importing it for real would close a cycle: death -> classify
@@ -63,8 +64,17 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             "gateways have no local process to query"
         )
 
-    if incident.crash_stack:
-        evidence.append("the worker wrote a stack before dying")
+    fatal_dump = crash_stack.is_fatal(incident.crash_stack)
+    if fatal_dump:
+        evidence.append("the worker wrote a fatal stack before dying")
+    elif incident.crash_stack:
+        # A dump with no fatal banner did not come from a dying process. It is
+        # still context, but it is not evidence of a crash and must not be
+        # allowed to outrank the exit status below.
+        evidence.append(
+            "a stack is present but was not written by a dying process; it is "
+            "context, not evidence of a crash"
+        )
 
     if status is not None and status < 0:
         received = -status
@@ -91,7 +101,11 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         verdict, description = status_table.WINDOWS_STATUS[status]
         return verdict, "high", evidence + [description]
 
-    if incident.crash_stack:
+    if fatal_dump:
+        # On Windows abort() exits with 3, exactly as a deliberate os._exit(3)
+        # does, so the dump is the only thing that separates them - which is
+        # why it has to be a dump the dying process wrote, and not the one a
+        # slow test left behind an hour earlier.
         return "NATIVE_CRASH", "medium", evidence
 
     if status is not None and 128 < status < 192:

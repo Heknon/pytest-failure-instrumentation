@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import sys
 
-import pytest
-
 from .conftest import needs_xdist
 
 pytestmark = needs_xdist
@@ -171,3 +169,77 @@ def test_a_stall_with_the_watchdog_off_says_so_rather_than_guessing(distributed)
     # The state file is written regardless of the watchdog, so the test in
     # flight is still known.
     assert stall.test_in_flight == "test_hang.py::test_deadlocks"
+
+
+def test_the_stack_reason_names_the_setting_not_the_platform(distributed):
+    """Three different reasons produced one sentence.
+
+    "this platform cannot ask a live process for one" is true on Windows and
+    false everywhere else, and it was printed just as readily to somebody who
+    had turned the probe off themselves.
+    """
+    distributed.pytester.makepyfile(
+        test_hang="""
+        import threading
+
+        never_set = threading.Event()
+
+
+        def test_filler():
+            assert True
+
+
+        def test_deadlocks():
+            never_set.wait(25)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2", *STALL_ARGUMENTS,
+        "-o", "failure_stack_probe=false",
+        "test_hang.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.stack_probed is False
+    assert stall.stack_unavailable_reason is not None
+    assert "failure_stack_probe is off" in stall.stack_unavailable_reason
+    assert "platform" not in stall.stack_unavailable_reason
+    # The watchdog dump is still there to read, so a stack is reported anyway
+    # and the reason never has to be printed.
+    assert stall.stack
+    assert "no stack:" not in str(stall)
+
+
+def test_a_sub_second_heartbeat_setting_does_not_manufacture_a_frozen_worker(distributed):
+    """The worker clamped the interval to a floor and the controller did not,
+    so below the floor the controller's staleness window was shorter than the
+    worker's actual cadence - and a plainly blocked worker confirmed as FROZEN,
+    reported as native code holding the GIL."""
+    distributed.pytester.makepyfile(
+        test_hang="""
+        import threading
+
+        never_set = threading.Event()
+
+
+        def test_filler():
+            assert True
+
+
+        def test_deadlocks():
+            never_set.wait(25)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        "-o", "failure_stall_seconds=6",
+        "-o", "failure_heartbeat_interval=0.05",
+        "-o", "failure_slow_test_seconds=5",
+        "test_hang.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.verdict == "STALLED_BLOCKED"
+    assert not any("holding the GIL" in line for line in stall.evidence)

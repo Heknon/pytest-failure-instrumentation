@@ -380,9 +380,10 @@ return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
 still works afterwards and nothing is broken by looking. Only a parent may do
 this, which is why it happens on the controller, and why a remote gateway
 honestly reports `UNKNOWN` rather than guessing. macOS does not expose
-`os.waitid` at all and falls back to the `Popen` object, which is why
-`capabilities` records the mechanism that answered rather than the one the
-platform was assumed to have. On Windows the code is normalised to its
+`os.waitid` at all and falls back to the `Popen` object. `capabilities.exit_status`
+records which mechanism this machine *has*; `exit_status_source` on the incident
+records which one actually answered — so a figure is never read as having come
+from a mechanism that was never used. On Windows the code is normalised to its
 unsigned form first: an NTSTATUS is above 2³¹, so `0xC000013A` arrives signed
 or unsigned depending on who answered — and a negative status means "killed by
 signal N" to everything downstream.
@@ -393,6 +394,15 @@ every worker's output interleaves. This claims the handler back afterwards, in
 `pytest_sessionstart`. Its C handler is async-signal-safe and writes *while the
 GIL is held* — which is the case that matters, since native code holding the
 GIL is exactly what a frozen worker looks like.
+
+**Two dump files, not one.** A fatal dump goes to `<worker>.crash`; the
+slow-test watchdog's goes to `<worker>.slow`. They are the same shape and only
+the banner separates them — `Fatal Python error` against `Timeout (…)` — and a
+watchdog dump is written by tests that go on to *pass*. Sharing one file made
+"a stack exists" ambiguous, and on the Windows path where the dump is the only
+thing distinguishing `abort()` from `os._exit(3)`, ambiguous means a slow test
+that passed can be reported as the crash that killed the worker, blamed on
+whatever that stack happened to be doing.
 
 **Choosing the right thread out of a dump.** A dump written with
 `all_threads=True` holds every thread, and the first one printed in a pytest
@@ -428,9 +438,10 @@ be killed gets no warning. The controller reads files, never the corpse.
 A passing test must cost as close to nothing as possible, because that is the
 overwhelming majority of what runs.
 
-- Per test: two fixed-size writes to a file that never grows, plus arming a
-  watchdog timer (~78 µs). No append log, no `/proc` read, no allocation
-  tracking.
+- Per test: six fixed-size writes to a file that never grows — two per phase,
+  one as it opens and one as it closes, which is what separates "died in
+  teardown" from "died mid-call" — plus arming a watchdog timer (~78 µs). No
+  append log, no `/proc` read, no allocation tracking.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
   memory.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
@@ -450,7 +461,7 @@ overwhelming majority of what runs.
 | `failure_packages` | — | Your top-level packages, for attribution |
 | `failure_directory` | `.pytest-failures` | Where evidence is written |
 | `failure_watchdog` | `true` | Memory and liveness sampling |
-| `failure_heartbeat_interval` | `5.0` | Seconds between liveness beats |
+| `failure_heartbeat_interval` | `5.0` | Seconds between liveness beats (floor 1.0) |
 | `failure_tracemalloc_depth` | `0` | 1 names the allocating line for OOM attribution |
 | `failure_object_census` | `false` | Count live objects at a high-water mark |
 | `failure_high_water_mb` | auto | Memory mark for a snapshot; defaults to a share of the discovered limit |
@@ -520,6 +531,16 @@ much as the operating system, so each gets its own job:
 - **without `pytest-xdist`**, where `pytest_testnodedown` has no hookspec at
   all and an unspecced hookimpl is a registration error — the failure mode that
   once made a plain `pytest` run report nothing.
+
+`ruff` and `mypy` run as their own job, and fail first because they are cheap.
+The source carries `# noqa` and `# type: ignore` markers, which are only worth
+writing if something reads them.
+
+Two of the tests are about the plugin rather than about a failure: a run whose
+evidence directory cannot be created has to keep running, and a directory
+shared with somebody else's artifacts has to come out of a run with those
+artifacts still in it. A reporting tool that ends a run, or eats a file, has
+cost more than the failure it came to explain.
 
 ## Releasing
 

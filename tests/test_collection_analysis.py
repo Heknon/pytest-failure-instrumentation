@@ -209,3 +209,31 @@ def test_a_long_parameter_value_is_truncated_rather_than_wrapping():
 
 def test_a_test_with_no_parameters_contributes_no_values():
     assert collection.without_parameters("test_a.py::test_b") == "test_a.py::test_b"
+
+
+def test_a_duplicated_id_is_a_difference_not_a_reordering():
+    """Set arithmetic cannot see a duplicate at all: the lists differ in length
+    while the difference comes out empty, which was reported as "the same N
+    tests in a different order" - with an N that contradicted the test count on
+    the line above it, and no divergence index, because neither exists.
+    """
+    baseline = ["m.py::a", "m.py::b"]
+    variant = ["m.py::a", "m.py::b", "m.py::a"]
+
+    result = collection.difference(baseline, variant)
+    assert result["kind"] == "membership"
+    assert result["extra"] == ["m.py::a"]
+    assert result["extra_count"] == 1
+    assert result["missing_count"] == 0
+
+
+def test_a_dropped_duplicate_is_reported_as_missing():
+    result = collection.difference(["m.py::a", "m.py::a"], ["m.py::a"])
+    assert result["kind"] == "membership"
+    assert result["missing"] == ["m.py::a"]
+
+
+def test_a_genuine_reordering_is_still_an_order_difference():
+    result = collection.difference(["m.py::a", "m.py::b"], ["m.py::b", "m.py::a"])
+    assert result["kind"] == "order"
+    assert result["first_divergence_index"] == 0

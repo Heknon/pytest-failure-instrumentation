@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from .conftest import needs_xdist
 
 SUITE = """
@@ -69,3 +71,27 @@ def test_one_defect_on_many_workers_is_one_incident_with_a_count(runner):
     assert len(deaths) == 1
     assert summary.incidents[deaths[0].fingerprint] == 1 + summary.duplicates_suppressed
     assert summary.raised == len(incidents) - 1  # every incident but this one
+
+
+@needs_xdist
+def test_the_controller_and_its_workers_agree_on_the_run_id(runner):
+    """run_id is what tells one run's evidence from another's.
+
+    It used to be read off an xdist attribute the controller cannot reach in
+    every version, so it silently fell back to a bare timestamp - and the
+    workers, which never saw it at all, stamped nothing. Two ids for one run
+    is the same as no id.
+    """
+    runner.pytester.makepyfile(test_suite=SUITE)
+    incidents = runner.run("-n", "2", "test_suite.py", timeout=180)
+
+    summary = runner.only(incidents, "run_summary")
+    assert summary.run_id and summary.run_id != "unknown"
+
+    stamped = {
+        json.loads(line).get("run_id")
+        for path in (runner.pytester.path / ".pytest-failures").glob("*.events")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    assert stamped == {summary.run_id}

@@ -47,8 +47,47 @@ failure_instrumentation = "pytest_failure_instrumentation.plugin"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# PEP 561. The payload is the product here - a consumer writing
+# `incident: WorkerDeathIncident` against registry.parse() gets Any without
+# this file, which is the opposite of what a typed union is for.
+[tool.setuptools.package-data]
+pytest_failure_instrumentation = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The integration tests run a real pytest in a subprocess, and a wedged worker
-# is the point of some of them - so no test may hang the suite indefinitely.
 addopts = "-ra"
+# The integration tests wedge a worker on purpose. Each bounds its own inner
+# run (see tests/conftest.py), and this is the backstop for anything that gets
+# past that - an unbounded hang in CI costs the whole 25-minute job.
+faulthandler_timeout = 900
+filterwarnings = [
+    # This plugin only ever warns when it has given up on something. In its own
+    # suite that is a failure, except where a test asks for it on purpose.
+    "error::pytest_failure_instrumentation.config.FailureInstrumentationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I", "UP", "W"]
+ignore = [
+    # The alert text is the product, and several of these strings are the
+    # sentences a reader sees. Wrapping them to satisfy a linter makes them
+    # harder to grep for than to read.
+    "E501",
+    # `X | None` over `Optional[X]`. Correct from 3.10, and wrong here: these
+    # are pydantic fields, and pydantic evaluates the annotation at class
+    # creation. On 3.9 - which this package supports and CI runs - evaluating
+    # `int | None` raises TypeError, so the model cannot be defined at all.
+    # `from __future__ import annotations` defers the evaluation; it does not
+    # remove it.
+    "UP007",
+    "UP045",
+]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["src"]
+ignore_missing_imports = true

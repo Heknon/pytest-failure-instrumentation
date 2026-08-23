@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Iterable, Optional
+from collections import Counter
+from collections.abc import Iterable
+from typing import Any, Optional
 
 #: How many distinct collections keep their full id list. The design assumes a
 #: handful of variants; a suite whose ids are not stable produces one per
@@ -145,15 +147,15 @@ class CollectionTracker:
         for test in self.unstable_tests():
             rows = []
             for digest, identifiers in self.identifiers_by_digest.items():
-                worker = representative.get(digest)
+                shown_by = representative.get(digest)
                 values = [
                     parameter_of(identifier)
                     for identifier in identifiers
                     if without_parameters(identifier) == test
                     and identifier != test
                 ]
-                if worker and values:
-                    rows.append({"worker": worker, "values": values[:values_shown]})
+                if shown_by and values:
+                    rows.append({"worker": shown_by, "values": values[:values_shown]})
                 if len(rows) >= workers_shown:
                     break
             if rows:
@@ -175,7 +177,7 @@ class CollectionTracker:
         grouped: dict[str, list[str]] = {}
         for worker, digest in self.digest_by_worker.items():
             grouped.setdefault(digest, []).append(worker)
-        variants = [
+        variants: list[dict[str, Any]] = [
             {
                 "digest": digest,
                 "workers": sorted(workers, key=worker_key),
@@ -240,9 +242,18 @@ class CollectionTracker:
 def difference(
     baseline: list[str], variant: list[str], ids_kept: int = IDS_KEPT
 ) -> dict[str, Any]:
-    baseline_set, variant_set = set(baseline), set(variant)
-    missing = sorted(baseline_set - variant_set)
-    extra = sorted(variant_set - baseline_set)
+    """What one collection has that the other does not.
+
+    Counted, not set-compared. A collection can hold the same node id twice -
+    a plugin appending to ``items``, a parametrize generating a colliding id -
+    and set arithmetic cannot see that at all: the two lists differ in length
+    while the difference comes out empty, which was then reported as "the same
+    tests in a different order" with a test count that contradicted the line
+    above it. A multiset says what actually differs, once per occurrence.
+    """
+    baseline_counts, variant_counts = Counter(baseline), Counter(variant)
+    missing = sorted((baseline_counts - variant_counts).elements())
+    extra = sorted((variant_counts - baseline_counts).elements())
 
     if not missing and not extra:
         # Same tests, different sequence. No sample of ids explains that - the

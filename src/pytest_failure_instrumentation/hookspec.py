@@ -9,13 +9,24 @@ arrives is not a crash - and namespaced to this distribution, the way
         alerts.send(str(incident))
 
 ``incident`` is a pydantic model, one class per kind, discriminated on
-``incident.kind``:
+``incident.kind``. All five are raised:
 
-===================== ==========================================
-``worker_death``      ``incidents.death.WorkerDeathIncident``
-``internal_error``    ``incidents.internal_error.InternalErrorIncident``
-``run_summary``       ``incidents.summary.RunSummaryIncident``
-===================== ==========================================
+========================= ==================================================== =============
+``worker_death``          ``incidents.death.WorkerDeathIncident``               needs xdist
+``worker_stall``          ``incidents.stall.WorkerStallIncident``               needs xdist
+``collection_mismatch``   ``incidents.collection.CollectionMismatchIncident``   needs xdist
+``internal_error``        ``incidents.internal_error.InternalErrorIncident``    any run
+``run_summary``           ``incidents.summary.RunSummaryIncident``              any run
+========================= ==================================================== =============
+
+Three of them reach no pytest hook of their own, which is why they need a
+source of their own: a stall is polled for, because the absence of anything
+being said fires nothing; a collection mismatch is assembled from
+``pytest_xdist_node_collection_finished``; and an internal error under xdist
+arrives on the controller as a re-raised string.
+
+``run_summary`` is emitted once at the end of every run, so its *absence*
+means the controller died too.
 
 They share ``kind``, ``verdict``, ``confidence``, ``severity``, ``owner``,
 ``fingerprint``, ``run_id``, ``worker`` and ``evidence``; the rest belongs to
@@ -23,12 +34,6 @@ the kind, because a segfault's resident memory and a run summary's exit code
 have nothing to say to each other. ``str(incident)`` is the alert text.
 ``incidents.registry.parse`` turns a stored row back into its own model, and
 ``registry.json_schema()`` is the contract for a table migration.
-
-Two further kinds - ``collection_mismatch`` and ``worker_stall`` - are
-implemented but not yet raised; neither reaches ``pytest_testnodedown`` or
-``pytest_internalerror``, which is the reason they need a source of their own.
-``run_summary`` is emitted once at the end of every run, so its *absence* means
-the controller died too.
 """
 
 from __future__ import annotations
