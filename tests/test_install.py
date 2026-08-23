@@ -160,9 +160,17 @@ def test_the_settings_actually_change_the_attribution(framework_run):
     framework_run.pytester.makepyfile(
         fwcore="""
         import ctypes
+        import os
+        import sys
 
 
         def boom():
+            # ctypes wraps every foreign call in structured exception handling
+            # on Windows, so an access violation comes back as an OSError and
+            # the worker lives. abort() is a real death there - the same split
+            # the shared victim module makes, for the same reason.
+            if sys.platform == "win32":
+                os.abort()
             ctypes.string_at(1)
         """
     )

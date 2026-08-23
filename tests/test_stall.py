@@ -266,17 +266,25 @@ def test_the_test_that_is_wedged_now_is_blamed_and_not_an_earlier_slow_one(distr
 
 
         def test_zzz_wedges():
-            never_set.wait(30)
+            never_set.wait(90)
         """
     )
     incidents = distributed.run(
         "-n", "1",
+        # One worker, so both tests write to the same dump file - and no
+        # replacement, or the fresh worker wedges in its turn and a second
+        # stall is correct but not what is being measured.
+        "--max-worker-restart=0",
         "-o", "failure_slow_test_seconds=2",
-        "-o", "failure_stall_seconds=8",
+        # Comfortably past anything a cold runner can spend getting to the
+        # first report: at eight seconds a slow macOS worker was still in the
+        # *first* test when the stall was assessed, and the assertion below
+        # then read as the bug it exists to catch.
+        "-o", "failure_stall_seconds=20",
         "-o", "failure_heartbeat_interval=2",
         "-o", "failure_stack_probe=false",
         "test_two_slow.py",
-        timeout=180,
+        timeout=240,
     )
 
     stall = distributed.only(incidents, "worker_stall")

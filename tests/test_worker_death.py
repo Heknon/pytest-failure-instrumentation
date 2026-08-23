@@ -344,6 +344,12 @@ def test_a_slow_test_that_passed_is_not_the_crash_that_killed_the_worker(distrib
     )
     incidents = distributed.run(
         "-n", "1",
+        # Both tests have to land on one worker, so the dump the first leaves
+        # is on the file the second's death is read from. And the worker must
+        # not be replaced: xdist reschedules the crashed test onto a fresh
+        # worker, which exits on purpose too, and a second death is then
+        # correct rather than a bug - but it is not what this is measuring.
+        "--max-worker-restart=0",
         "-o", "failure_slow_test_seconds=2",
         "-o", "failure_packages=victim_slow",
         "test_slow_then_exit.py",

@@ -186,7 +186,15 @@ class Incident(BaseModel):
         ]
         if context:
             evidence.append(context)
-        return cls(worker=worker, verdict="INSTRUMENTATION_FAILED", evidence=evidence)
+        # `kind` is deliberately not defaulted on the base - a subclass that
+        # forgot it would otherwise be emitted under a meaningless one, and
+        # test_the_base_is_never_emitted_directly holds that line. Every
+        # concrete kind supplies it as a Literal default, so the call below is
+        # complete for every class this is ever reached on; mypy only sees the
+        # base, where it is not.
+        return cls(  # type: ignore[call-arg]
+            worker=worker, verdict="INSTRUMENTATION_FAILED", evidence=evidence
+        )
 
 
 def frame_from(raw: dict[str, Any] | None) -> Frame | None:
