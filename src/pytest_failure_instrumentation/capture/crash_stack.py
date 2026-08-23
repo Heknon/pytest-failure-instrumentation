@@ -73,19 +73,19 @@ class SlowTestWatchdog:
 
     So the dump is taken by the heartbeat thread, from Python, holding the
     GIL. Nothing else can be mutating what is being walked, which makes it
-    safe by construction rather than by luck; this object is a heartbeat
-    observer for that reason and does nothing on its own.
+    safe by construction rather than by luck; this object is one of the
+    heartbeat's tickers for that reason and does nothing on its own.
 
     What that costs is the one case the timer covered and this cannot: native
-    code holding the GIL. No Python thread runs then, so no dump is written -
-    but the heartbeat stops too, which is exactly how such a worker is
-    diagnosed, and on POSIX the controller can still signal it for a stack.
-    On Windows it leaves none. That is a real loss, and a much smaller one
-    than instrumentation that crashes the workers it is watching.
+    code holding the GIL. No Python thread runs then, so nothing here can be
+    asked to write anything. :class:`FrozenInterpreterFallback` covers exactly
+    that, with the same C timer armed so that it can only fire once nothing is
+    executing for it to trip over.
 
-    The cadence can only be as fine as the heartbeat, since that is what
-    drives it: a ``failure_heartbeat_interval`` longer than
-    ``failure_slow_test_seconds`` becomes the real interval between dumps.
+    The cadence is as fine as the heartbeat's *wake*, which is a second - not
+    its beat, which is five. A dump is a rare thing on a healthy suite and a
+    deadline check is a float comparison, so there is no reason for the first
+    stack of a wedged test to wait for the next beat.
     """
 
     def __init__(self, path: Path, timeout: float) -> None:
@@ -126,10 +126,10 @@ class SlowTestWatchdog:
         if self._on_disk:
             self._discard()
 
-    def observe(self, resident: Optional[int], nodeid: Optional[str]) -> None:
-        """The heartbeat's observer protocol. Its arguments are for the memory
-        monitor; this one only needs to be told that time has passed."""
-        self.tick()
+    def stop(self) -> None:
+        """The heartbeat's ticker protocol. Nothing to wind down: what is on
+        disk at the end of a run is the last test's, and the next run clears
+        the directory before it reads anything."""
 
     def tick(self) -> None:
         started = self._started_at
@@ -184,6 +184,77 @@ class SlowTestWatchdog:
             self.path.unlink()
         except OSError:
             pass  # bookkeeping must never break a run
+
+
+class FrozenInterpreterFallback:
+    """faulthandler's C timer, armed so that it can only fire safely.
+
+    The watchdog above cannot write anything when native code holds the GIL:
+    no Python thread runs, so nothing can be asked to take a dump. That is the
+    case the C timer exists for - it dumps without the GIL - and it is also
+    the case that makes the C timer dangerous, because a dump landing while
+    the interpreter is *executing* walks frames that are being torn down and
+    segfaults the worker.
+
+    Both are true at once, and the way to have the first without the second is
+    to arm the timer so that it can only fire when the interpreter has stopped
+    executing. The heartbeat pushes the deadline forward on every beat. While
+    Python runs at all the timer is always in the future and never fires; when
+    several beats in a row are missed it fires once, and by then nothing is
+    executing for it to trip over.
+
+    Missing beats for that long has one realistic cause. A thread that holds
+    the GIL and never releases it is running C, not Python. A main thread
+    running Python releases the GIL every few milliseconds, so the heartbeat
+    would have been scheduled long before the deadline; and a machine loaded
+    badly enough to starve a daemon thread for three intervals would starve
+    the timer's thread with it.
+
+    Its dump goes to its own file. It means something different from the
+    watchdog's - not "this test is slow" but "this process stopped responding"
+    - and a reader that cannot tell them apart cannot say which.
+    """
+
+    #: Beats that have to be missed before the deadline passes. Two would be
+    #: one slipped beat on a loaded runner; three is a process that is not
+    #: running Python.
+    MISSED_BEATS = 3
+
+    def __init__(self, stream: TextIO, interval: float) -> None:
+        self.stream = stream
+        self.timeout = interval * self.MISSED_BEATS
+        self.enabled = self.timeout > 0
+
+    def rearm(self) -> None:
+        """Push the deadline out by another window.
+
+        ``repeat=False``: one dump is the whole answer here. A frozen
+        interpreter's stack does not change, and a repeat would keep dumping
+        into a process that may be recovering - which is the unsafe case.
+        """
+        if not self.enabled:
+            return
+        try:
+            faulthandler.dump_traceback_later(
+                self.timeout, repeat=False, file=self.stream, exit=False
+            )
+        except (RuntimeError, ValueError):
+            self.enabled = False  # nothing here is worth failing a run over
+
+    def tick(self) -> None:
+        self.rearm()
+
+    def stop(self) -> None:
+        """Disarm before the heartbeat does, or the deadline outlives it.
+
+        Session teardown is Python running flat out with nothing left to push
+        the deadline forward, which is precisely the window the arming above
+        exists to stay out of.
+        """
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except (RuntimeError, ValueError):
+            pass
 
 
 #: What faulthandler writes before the first thread when the process is dying.

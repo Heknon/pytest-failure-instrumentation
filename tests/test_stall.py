@@ -12,13 +12,20 @@ from .conftest import needs_xdist
 
 pytestmark = needs_xdist
 
-# Detected around 8s in; the test releases at 25s so the run ends on its own.
-# The slow-test watchdog is dropped to 5s as well, because that is the path
+# Detected around 13s in; the tests release at 25s so the run ends on its own.
+# The slow-test watchdog is dropped to 4s as well, because that is the path
 # that has to produce a stack on Windows - where no signal can ask for one.
+#
+# The margin between the two is what these numbers are really about, and it
+# used to be one second. The watchdog measures from when the *worker* started
+# the test and the stall from when the *controller* last heard anything, and
+# on a loaded runner the gap between those is seconds - so a stall assessed at
+# six read a file the watchdog had not written yet, and the tests below saw an
+# empty stack where the point was that there is one.
 STALL_ARGUMENTS = (
-    "-o", "failure_stall_seconds=6",
+    "-o", "failure_stall_seconds=10",
     "-o", "failure_heartbeat_interval=2",
-    "-o", "failure_slow_test_seconds=5",
+    "-o", "failure_slow_test_seconds=4",
 )
 
 
@@ -113,6 +120,51 @@ def test_native_code_holding_the_gil_is_frozen_not_blocked(distributed):
     assert stall.stack
     # Windows can be asked for a stack only in advance, never on demand.
     assert stall.stack_probed is (sys.platform != "win32")
+
+
+def test_a_worker_that_stopped_running_python_still_leaves_a_stack(distributed):
+    """The one stack nothing else in this plugin can take.
+
+    Native code holding the GIL means no Python thread runs, so the slow-test
+    watchdog - which is a Python thread - writes nothing. On POSIX the
+    controller can still signal for one; on Windows it cannot, and this is the
+    only path there is. The probe is switched off here so that path is what is
+    being measured, on every platform rather than only the one that needs it.
+    """
+    distributed.pytester.makepyfile(
+        test_frozen="""
+        import ctypes
+        import sys
+
+
+        def test_filler():
+            assert True
+
+
+        def test_freezes():
+            if sys.platform == "win32":
+                ctypes.PyDLL("kernel32").Sleep(20000)
+            else:
+                ctypes.PyDLL(None).sleep(20)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        *STALL_ARGUMENTS,
+        "-o", "failure_stack_probe=false",
+        "test_frozen.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.verdict == "STALLED_FROZEN"
+    assert stall.stack, "a worker frozen inside native code left no stack"
+    assert stall.stack_source == "frozen-fallback"
+    # Which is worth saying out loud: the frames look exactly like a watchdog
+    # dump, and they mean something much stronger.
+    assert any("stopped running Python" in line for line in stall.details())
+    assert stall.blamed_frame is not None
+    assert stall.blamed_frame.function == "test_freezes"
 
 
 def test_a_stall_is_reported_once_not_every_poll(distributed):

@@ -51,7 +51,7 @@ from .base import Capabilities, Incident, frame_from
 #: Suffixes this plugin writes, one file per worker. Anything else in the
 #: evidence directory belongs to somebody else.
 #: ``.part`` is a watchdog dump that was being written when the run ended.
-OWNED_SUFFIXES = (".state", ".events", ".crash", ".slow", ".part")
+OWNED_SUFFIXES = (".state", ".events", ".crash", ".slow", ".frozen", ".part")
 
 #: The one file that is not per worker. It is a ``.txt``, and deleting every
 #: ``.txt`` to catch it took a coverage report and a build log with it - so it

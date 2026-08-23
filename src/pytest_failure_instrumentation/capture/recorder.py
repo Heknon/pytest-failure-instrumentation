@@ -74,6 +74,18 @@ class WorkerRecorder:
             directory / f"{worker_id}.slow",
             settings.slow_test_seconds if settings.watchdog else 0.0,
         )
+        # And the one stack the watchdog above can never take: the worker's
+        # own threads cannot run while native code holds the GIL. Never
+        # closed, for the same reason as the crash stream - the C timer keeps
+        # the descriptor and may write to it long after Python has stopped.
+        self._frozen_stream = (
+            directory / f"{worker_id}.frozen"
+        ).open("w", buffering=1, encoding="utf-8")
+        self._open_resources.append(self._frozen_stream)
+        self.frozen = crash_stack.FrozenInterpreterFallback(
+            self._frozen_stream,
+            settings.heartbeat_interval if settings.watchdog else 0.0,
+        )
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
@@ -138,7 +150,11 @@ class WorkerRecorder:
         self.heartbeat = Heartbeat(
             self.events.record,
             interval=settings.heartbeat_interval,
-            observers=[self.monitor, self.slow_test],
+            observers=[self.monitor],
+            # Every wake rather than every beat: one is watching a deadline
+            # and the other is pushing one out, and both are wrong if they
+            # only happen every fifth second.
+            tickers=[self.slow_test, self.frozen],
         )
         self.heartbeat.start()
 

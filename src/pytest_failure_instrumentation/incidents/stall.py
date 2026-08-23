@@ -34,6 +34,18 @@ STACK_LINES = 14
 
 CONFIDENCE = {"BLOCKED": "high", "FROZEN": "high", "SILENT": "low"}
 
+#: Which file a passive stack came out of, in the order they are tried, and
+#: what each one means. The watchdog writes while a test is merely taking a
+#: while; the fallback writes only once the worker's own threads have stopped
+#: running, which is why it is worth naming separately.
+PASSIVE_SOURCES = ((".slow", "watchdog"), (".frozen", "frozen-fallback"), (".crash", "crash"))
+
+SOURCE_WORDING = {
+    "watchdog": "the slow-test watchdog",
+    "frozen-fallback": "the fallback timer, after the worker stopped running Python",
+    "crash": "the worker, into its crash file",
+}
+
 
 class WorkerStallIncident(Incident):
     model_config = ConfigDict(extra="forbid")
@@ -70,6 +82,11 @@ class WorkerStallIncident(Incident):
     #: watchdog dump can be most of ``failure_slow_test_seconds`` old, and a
     #: reader cannot tell the two apart from the frames alone.
     stack_age_seconds: Optional[float] = None
+    #: Which mechanism left the stack: "probe", "watchdog", "frozen-fallback"
+    #: or "crash". They mean different things - the third is the interpreter
+    #: having stopped responding, which is a finding in itself - and the
+    #: frames look identical.
+    stack_source: Optional[str] = None
 
     def raw_stack(self) -> list[str]:
         return self.stack
@@ -97,13 +114,15 @@ class WorkerStallIncident(Incident):
         if not self.stack and self.stack_unavailable_reason:
             lines.append(f"no stack: {self.stack_unavailable_reason}")
         elif self.stack and not self.stack_probed and self.stack_age_seconds is not None:
-            # A stack nobody asked for was left by the slow-test watchdog while
-            # the run went on around it. Reading it as a picture of now is the
-            # mistake to head off, so it says where it came from as well as
-            # when - a fresh one from the watchdog is still not a probe.
+            # A stack nobody asked for was left while the run went on around
+            # it. Reading it as a picture of now is the mistake to head off,
+            # so it says where it came from as well as when - a fresh one from
+            # the watchdog is still not a probe, and one from the fallback
+            # says something the frames do not.
             lines.append(
-                f"stack written {self.stack_age_seconds:.0f}s ago by the "
-                "slow-test watchdog, not taken just now"
+                f"stack written {self.stack_age_seconds:.0f}s ago by "
+                f"{SOURCE_WORDING.get(self.stack_source or '', 'the worker')}, "
+                "not taken just now"
             )
         return lines
 
@@ -136,7 +155,7 @@ def build(
 
     state = read_state(directory / f"{worker}.state")
     pid = state.get("pid") or event_log.worker_pid(events)
-    stack, probed, why, written = _stack(directory, worker, pid, stack_probe)
+    stack, probed, why, written, source = _stack(directory, worker, pid, stack_probe)
 
     return WorkerStallIncident(
         worker=worker,
@@ -160,6 +179,7 @@ def build(
         stack_age_seconds=(
             round(max(0.0, time.time() - written), 1) if written is not None else None
         ),
+        stack_source=source,
         evidence=[
             f"no report from {worker} for {silent_for:.0f}s while the run continued",
             verdict.reason,
@@ -169,14 +189,15 @@ def build(
 
 def _stack(
     directory: Path, worker: str, pid: Optional[int], allowed: bool
-) -> tuple[list[str], bool, Optional[str], Optional[float]]:
+) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
     """Ask the worker for a stack, and read only what it added.
 
     Returns the stack, whether anything was asked for, why not when nothing
-    was, and when the stack it found was written. A test that outlived
-    ``failure_slow_test_seconds`` has already dumped one unprompted into its
-    own file, so a stack may be here without anything having been signalled -
-    and that one describes whenever the watchdog last fired rather than now.
+    was, when the stack it found was written, and which mechanism wrote it. A
+    test that outlived ``failure_slow_test_seconds`` has already dumped one
+    unprompted into its own file, so a stack may be here without anything
+    having been signalled - and that one describes whenever the watchdog last
+    fired rather than now.
     """
     crash_file = directory / f"{worker}.crash"
     try:
@@ -187,15 +208,16 @@ def _stack(
     why = _cannot_probe(pid, allowed)
     if why is not None or pid is None:
         # Whatever the worker wrote on its own is still evidence.
-        stack, written = _passive_stack(directory, worker)
-        return stack, False, why, written
+        stack, written, source = _passive_stack(directory, worker)
+        return stack, False, why, written, source
     if not probes.request_stack(pid):
-        stack, written = _passive_stack(directory, worker)
+        stack, written, source = _passive_stack(directory, worker)
         return (
             stack,
             False,
             "the worker could not be signalled; it may already be gone",
             written,
+            source,
         )
 
     deadline = time.time() + STACK_WAIT_SECONDS
@@ -208,18 +230,20 @@ def _stack(
                     True,
                     None,
                     time.time(),  # it was written in answer to the signal
+                    "probe",
                 )
         except OSError:
             break
     fresh = crash_stack.read(crash_file, limit=STACK_LINES)
     if fresh:
-        return fresh, True, None, crash_stack.written_at(crash_file)
-    stack, written = _passive_stack(directory, worker)
+        return fresh, True, None, crash_stack.written_at(crash_file), "probe"
+    stack, written, source = _passive_stack(directory, worker)
     return (
         stack,
         True,
         None if stack else "the worker was signalled but wrote nothing back",
         written,
+        source,
     )
 
 
@@ -234,16 +258,20 @@ def _cannot_probe(pid: Optional[int], allowed: bool) -> Optional[str]:
     return None
 
 
-def _passive_stack(directory: Path, worker: str) -> tuple[list[str], Optional[float]]:
+def _passive_stack(
+    directory: Path, worker: str
+) -> tuple[list[str], Optional[float], Optional[str]]:
     """Whatever the worker dumped on its own, without being asked, and when.
 
     The slow-test watchdog's file first: a wedged test outlives the timeout, so
-    that is where a stalled worker's stack normally is. The crash file is the
-    fallback, and on Windows the watchdog is the only source there is.
+    that is where a stalled worker's stack normally is. Then the fallback's,
+    which is the only one written when native code holds the GIL and the
+    worker's own threads cannot run - on Windows that is the only way such a
+    stack exists at all. The crash file last.
     """
-    for suffix in (".slow", ".crash"):
+    for suffix, source in PASSIVE_SOURCES:
         path = directory / f"{worker}{suffix}"
         lines = crash_stack.read(path, limit=STACK_LINES)
         if lines:
-            return lines, crash_stack.written_at(path)
-    return [], None
+            return lines, crash_stack.written_at(path), source
+    return [], None, None

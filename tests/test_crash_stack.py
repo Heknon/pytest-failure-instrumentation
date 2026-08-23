@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from pytest_failure_instrumentation.capture import crash_stack
 
 HEARTBEAT_SECTION = """\
@@ -306,6 +308,58 @@ def test_the_dumping_thread_is_not_reported_as_the_stalled_one(tmp_path):
     lines = crash_stack.read(path, limit=20)
     assert any("leaky_client" in line for line in lines)
     assert not any("heartbeat.py" in line for line in lines)
+
+
+def test_the_fallback_timer_never_fires_while_the_heartbeat_is_beating(tmp_path):
+    """This is the whole safety argument, so it is asserted rather than argued.
+
+    faulthandler's C timer dumps without the GIL and can segfault a worker
+    that is executing Python when it fires. It is armed so that it cannot:
+    every beat pushes the deadline out, so while anything Python runs at all
+    the deadline is always in the future.
+    """
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream:
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.05)
+        assert fallback.timeout == pytest.approx(0.15)
+
+        deadline = time.time() + 1.5  # ten times the deadline it holds
+        while time.time() < deadline:
+            fallback.tick()
+            time.sleep(0.02)
+        assert path.stat().st_size == 0, "the timer fired while beats were arriving"
+
+        # And when the beats stop, it fires - once, which is the whole answer
+        # for a process that is no longer changing.
+        time.sleep(0.5)
+        first = path.read_text(encoding="utf-8")
+        assert first.startswith("Timeout (")
+        time.sleep(0.5)
+        assert path.read_text(encoding="utf-8") == first, "the timer repeated"
+
+        fallback.stop()
+
+
+def test_the_fallback_is_disarmed_before_the_thread_that_holds_it_back(tmp_path):
+    """Session teardown is Python running flat out with nothing left to push
+    the deadline forward - the one window the arming exists to stay out of."""
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream:
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.05)
+        fallback.tick()
+        fallback.stop()
+        time.sleep(0.4)
+        assert path.stat().st_size == 0
+
+
+def test_a_worker_with_the_watchdog_off_arms_nothing(tmp_path):
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream:
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0)
+        assert not fallback.enabled
+        fallback.tick()
+        time.sleep(0.3)
+        assert path.stat().st_size == 0
 
 
 # -- which phases the watchdog covers --------------------------------------

@@ -355,8 +355,22 @@ def test_a_stall_says_when_an_unprompted_stack_was_taken():
         stack=['  File "x.py", line 1 in f'],
         stack_probed=False,
         stack_age_seconds=182.0,
+        stack_source="watchdog",
     )
     assert "stack written 182s ago by the slow-test watchdog" in str(left_behind)
+
+    # And which mechanism, because they do not mean the same thing. A dump
+    # from the fallback timer is not "this test is taking a while" - it is the
+    # worker's own threads having stopped running, which the frames alone
+    # cannot say.
+    frozen = WorkerStallIncident(
+        worker="gw1",
+        stack=['  File "x.py", line 1 in f'],
+        stack_probed=False,
+        stack_age_seconds=182.0,
+        stack_source="frozen-fallback",
+    )
+    assert "stopped running Python" in str(frozen)
 
     # A probed stack is current, and saying anything about its age would only
     # invite the reader to discount it.

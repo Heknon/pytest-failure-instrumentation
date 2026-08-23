@@ -500,8 +500,9 @@ every worker's output interleaves. This claims the handler back afterwards, in
 GIL is held* — which is the case that matters, since native code holding the
 GIL is exactly what a frozen worker looks like.
 
-**Two dump files, not one.** A fatal dump goes to `<worker>.crash`; the
-slow-test watchdog's goes to `<worker>.slow`. They are the same shape and only
+**Separate dump files.** A fatal dump goes to `<worker>.crash`; the slow-test
+watchdog's goes to `<worker>.slow`, and the frozen-interpreter fallback's to
+`<worker>.frozen`. They are the same shape and only
 the banner separates them — `Fatal Python error` against `Timeout (…)` — and a
 watchdog dump is written by tests that go on to *pass*. Sharing one file made
 "a stack exists" ambiguous, and on the Windows path where the dump is the only
@@ -570,16 +571,24 @@ the worker segfaults. Over a suite whose tests were four times the cadence
 long, that killed the worker in 10 runs out of 10, against 0 with the repeat
 turned off; it left the dump ending mid-frame with a nonsense line number, and
 the crash file empty because the fault was inside the dumper. Instrumentation
-that crashes what it is watching is worse than no instrumentation, so the dump
-is taken from the heartbeat thread instead, in Python, holding the GIL —
-nothing else can be mutating what is being walked.
+that crashes what it is watching is worse than no instrumentation, so the
+cadence is driven from the heartbeat thread instead, in Python, holding the
+GIL — nothing else can be mutating what is being walked.
 
-What that costs is the case the C timer was there for: native code holding the
-GIL, where no Python thread runs and no dump is written. The heartbeat stops
-too, which is precisely how such a worker is diagnosed, and on POSIX it can
-still be signalled for a stack. On Windows it leaves none. Since the heartbeat
-is what drives the cadence, a `failure_heartbeat_interval` longer than
-`failure_slow_test_seconds` becomes the real interval between dumps.
+**A fallback for the one stack a Python thread cannot take.** When native code
+holds the GIL, no Python thread runs and the watchdog above writes nothing.
+That is the case the C timer exists for, and also the case that makes it
+dangerous — so it is armed such that it can only fire when it is safe. Every
+heartbeat pushes its deadline out by three intervals, so while Python runs at
+all the deadline is always in the future and the timer never fires; when three
+beats in a row are missed it fires once, and by then nothing is executing for
+it to trip over. Missing beats for that long has one realistic cause: a thread
+holding the GIL and running C. A main thread running Python releases the GIL
+every few milliseconds, and a machine loaded badly enough to starve a daemon
+thread for three intervals would starve the timer's own thread with it. The
+dump goes to `<worker>.frozen`, because it means something the watchdog's does
+not — not "this test is slow" but "this process stopped responding" — and the
+incident says which file its stack came out of in `stack_source`.
 
 **A heartbeat carrying CPU time.** One line every five seconds per worker,
 bounded by wall-clock rather than by how many tests run. `time.process_time()`
@@ -605,7 +614,8 @@ overwhelming majority of what runs.
   heartbeat thread, and an unlink when the test ends. Nothing accumulates
   across tests, and nothing is written for a test that finishes in time.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
-  memory.
+  memory. Per second, per worker: two deadline comparisons and a timer rearm,
+  which is why the first stack of a wedged test does not wait for a beat.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.
