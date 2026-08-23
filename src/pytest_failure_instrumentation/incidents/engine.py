@@ -30,10 +30,8 @@ instrumentation had done more damage than the failure it came to explain.
 
 from __future__ import annotations
 
-import os
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +42,7 @@ from ..analysis import fingerprint as fingerprint_of
 from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
+from ..config import Settings
 from . import collection, death, internal_error, stall, summary
 from .base import Capabilities, Incident, frame_from
 
@@ -64,7 +63,7 @@ def _is_ours(path: Path) -> bool:
 
 
 class IncidentEngine:
-    def __init__(self, config: pytest.Config, settings: Any) -> None:
+    def __init__(self, config: pytest.Config, settings: Settings) -> None:
         self.config = config
         self.settings = settings
         self.directory = settings.directory
@@ -75,11 +74,12 @@ class IncidentEngine:
             and config.getoption("dist", "no") != "no"
         )
 
-        # Minted here rather than at session start: the workers have to be
-        # told, and pytest_configure_node fires before any of them exist. xdist
-        # keeps its own testrunuid on an object the controller cannot reach in
-        # every version, so this owns one instead of hoping for that one.
-        self.run_id = os.environ.get("PYTEST_RUN_ID") or f"run-{uuid.uuid4().hex[:16]}"
+        # One owner for the run id: whoever installed the plugin. It is minted
+        # there rather than here because the workers have to be told, and
+        # pytest_configure_node fires before any of them exist - and because a
+        # framework installing this by hand may want its own CI build id in
+        # the column that groups a run's incidents together.
+        self.run_id = settings.run_id or "unknown"
         self.collections = CollectionTracker()
         self.reported_mismatch = False
         #: Workers that went down before registering a collection. They are
@@ -235,15 +235,24 @@ class IncidentEngine:
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_configure_node(self, node: Any) -> None:
-        """Hand each worker the run id, so its evidence says which run wrote it.
+        """Hand each worker the run id and the settings in force.
 
-        Without this the controller and its workers stamp different ids, and a
-        file left behind by an earlier run reads as part of this one.
+        The run id, because without it the controller and its workers stamp
+        different ids and a file left behind by an earlier run reads as part
+        of this one.
+
+        The settings, because a worker is a different process. Ini it can read
+        for itself; a framework's settings, computed in Python on the
+        controller, do not exist there at all - and the framework's own code
+        may not even be loaded in the worker to recompute them. Sending them
+        also removes the last way the two sides can disagree about a number
+        they both act on.
         """
         try:
             node.workerinput["failure_run_id"] = self.run_id
-        except Exception:  # noqa: BLE001 - a missing id only costs the check
-            pass
+            node.workerinput["failure_settings"] = self.settings.as_payload()
+        except Exception:  # noqa: BLE001 - a worker falling back to ini is a
+            pass  # worse answer than this one, not a broken run
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_testnodeready(self, node: Any) -> None:

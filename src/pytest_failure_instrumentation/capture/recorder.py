@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from ..config import Settings
 from . import crash_stack
 from . import memory as memory_capture
 from .events import EventLog
@@ -28,7 +29,7 @@ from .state import WorkerState
 
 
 class WorkerRecorder:
-    def __init__(self, directory: Path, worker_id: str, settings: Any) -> None:
+    def __init__(self, directory: Path, worker_id: str, settings: Settings) -> None:
         self.worker_id = worker_id
         self.directory = directory
         self.heartbeat: Heartbeat | None = None
@@ -45,7 +46,7 @@ class WorkerRecorder:
             self.close()
             raise
 
-    def _open(self, directory: Path, worker_id: str, settings: Any) -> None:
+    def _open(self, directory: Path, worker_id: str, settings: Settings) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
         self.state = self._track(
@@ -92,7 +93,7 @@ class WorkerRecorder:
 
     # -- setup -----------------------------------------------------------
 
-    def _apply_memory_limit(self, settings: Any) -> None:
+    def _apply_memory_limit(self, settings: Settings) -> None:
         """Turn a silent OOM kill into a MemoryError attributed to a test.
 
         A ceiling that cannot be applied is recorded and shrugged off. Refusing
@@ -116,7 +117,7 @@ class WorkerRecorder:
             return
         self.events.record("memory_limit_applied", limit_mb=settings.memory_limit_mb)
 
-    def _start_monitors(self, settings: Any) -> None:
+    def _start_monitors(self, settings: Settings) -> None:
         if not settings.watchdog:
             return
         memory_capture.enable_tracemalloc(settings.tracemalloc_depth)

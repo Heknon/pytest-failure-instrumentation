@@ -28,6 +28,10 @@ arrives on the controller as a re-raised string.
 ``run_summary`` is emitted once at the end of every run, so its *absence*
 means the controller died too.
 
+A framework that installs this itself, rather than letting the entry point do
+it, gets the same hook: ``install`` registers this spec if the entry point was
+disabled - see :mod:`.registration`.
+
 They share ``kind``, ``verdict``, ``confidence``, ``severity``, ``owner``,
 ``fingerprint``, ``run_id``, ``worker`` and ``evidence``; the rest belongs to
 the kind, because a segfault's resident memory and a run summary's exit code

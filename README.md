@@ -188,6 +188,68 @@ failure_product_version = 4.2.0
 Without the hook it still writes its evidence to `.pytest-failures/`.
 Disable it entirely with `-p no:failure_instrumentation`.
 
+## Installing it from your own framework
+
+If you ship a test framework rather than consume one, ini is the wrong place
+for these settings. Your packages, your artifact directory and your build id
+are things your framework already knows, and an ini block every consuming team
+has to copy — and keep in step with you — is a migration that never finishes.
+
+Call `install` from your plugin instead:
+
+```python
+# yourframework/pytest_plugin.py
+from pytest_failure_instrumentation import install
+
+def pytest_configure(config):
+    install(config,
+            packages=deployment.owned_packages,
+            directory=deployment.artifact_dir,
+            product_version=deployment.version,
+            run_id=ci.build_id)
+```
+
+Keyword arguments layer on top of whatever ini said, so a team that has set
+`failure_stall_seconds` keeps it. Passing a whole `Settings` instead replaces
+ini entirely, for when your framework owns the configuration outright:
+
+```python
+from pytest_failure_instrumentation import Settings, install
+
+install(config, Settings(packages=("yourcore",), stall_seconds=600))
+```
+
+`Settings` has a default for every field, coerces a list of packages and a
+string path to what it needs, and enforces its own invariants — so a
+hand-built one cannot skip a floor that a resolved one obeys.
+
+Three things this handles for you:
+
+**Load order.** A conftest's `pytest_configure` runs before this plugin's, and
+a plugin loaded as an entry point runs *after* it. Registration here is
+`trylast` and only claims what nobody has installed, so your settings win
+either way.
+
+**Workers.** A worker is a separate process. Settings you computed in Python do
+not exist there and your framework's code may not even be loaded — so whatever
+is in force is pushed down through `workerinput`, and a worker prefers it over
+anything it could read itself. `run_id` travels with it, which is what lets a
+build id group a whole run's incidents.
+
+**Turning auto-registration off.** `-p no:failure_instrumentation` skips the
+entry point entirely; `install` puts back the hookspec so `pytest_failure_incident`
+still reaches its implementers. Note that it also skips `pytest_addoption`, so
+`failure_*` ini keys become unknown config options — which is the point if your
+framework owns the settings, and a reason to leave the entry point enabled and
+just call `install` if it does not.
+
+`install` is idempotent and returns the settings in force. A second call keeps
+the first one's and warns rather than silently losing to it;
+`installed_settings(config)` reads them back. Like everything else here it
+warns instead of raising — the one exception is a misspelled setting name,
+which is your bug and is worth an error rather than a run that quietly
+attributes nothing.
+
 ## What you get
 
 `incident` is a pydantic model, one class per kind, discriminated on

@@ -1,0 +1,209 @@
+"""Installing the plugin yourself, with settings you computed.
+
+The ``pytest11`` entry point covers the ordinary case: ``pip install`` and the
+plugin configures itself from ini. A framework that wraps pytest and ships it
+to its own teams usually cannot use that. Its settings come from its own
+configuration - a service catalogue, a deploy manifest, an environment it
+already parsed - and asking every consuming team to copy an ini block that
+must stay in step with it is a migration that never finishes.
+
+    from pytest_failure_instrumentation import Settings, install
+
+    def pytest_configure(config):
+        install(config, packages=deployment.owned_packages,
+                        directory=deployment.artifact_dir)
+
+``install`` is the whole interface. It is idempotent, it works whether or not
+the entry point loaded, and it may be called from a conftest or from another
+plugin's ``pytest_configure``.
+
+Three things make that work, and each of them was a way to get this wrong:
+
+**Ordering.** A conftest's ``pytest_configure`` runs before an entry point's,
+and one entry point's runs in an order nobody controls. Measured against this
+plugin, a framework shipped as a conftest ran first and a framework shipped as
+a package ran *second* - so the obvious "register in pytest_configure" would
+have honoured a framework distributed one way and silently ignored the other.
+The entry point's own hookimpl is therefore ``trylast``: it registers only
+what nobody has already installed, after everyone else has had their turn.
+
+**Workers.** A worker is a different process. Settings resolved from ini are
+resolved again there and come out the same; settings computed in Python on the
+controller do not exist there at all, and the framework's code may not even be
+loaded. So whatever settings end up in force are pushed down through
+``workerinput``, and a worker prefers them over anything it could read itself.
+
+**Overriding versus replacing.** Passing keyword overrides layers them on top
+of whatever ini said, which is what a framework setting one or two fields
+wants. Passing a whole ``Settings`` replaces ini entirely, which is what a
+framework that owns the configuration wants. Both are useful and they are not
+the same, so they are spelled differently.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+import warnings
+from typing import Any, Optional
+
+import pytest
+
+from . import hookspec
+from .config import FailureInstrumentationWarning, Settings, resolve
+
+#: Where the settings in force are kept, so a later caller can see them and
+#: the entry point can tell "already installed" from "nobody has yet".
+STASH_KEY = "_failure_instrumentation_settings"
+
+CONTROLLER_NAME = "failure-instrumentation-controller"
+WORKER_NAME = "failure-instrumentation-worker"
+
+
+def installed_settings(config: pytest.Config) -> Optional[Settings]:
+    """The settings in force for this run, or None if nothing is installed."""
+    return getattr(config, STASH_KEY, None)
+
+
+def install(
+    config: pytest.Config,
+    settings: Optional[Settings] = None,
+    **overrides: Any,
+) -> Optional[Settings]:
+    """Register the plugin on ``config`` with the settings you want.
+
+    ``settings`` replaces what ini would have said; ``overrides`` are applied
+    on top of it, or on top of ini when no ``settings`` is given. Returns the
+    settings actually in force, or None if the plugin could not be installed
+    at all - which is reported as a warning, never an exception, because a
+    reporting tool that ends the run has cost more than any failure it might
+    have explained.
+
+    Calling this twice is safe. The second call does not rebuild a recorder
+    that has already opened its files; it warns if it was asked for something
+    different, so a second framework quietly losing to the first is visible.
+    """
+    try:
+        wanted = _resolve(config, settings, overrides)
+    except TypeError:
+        raise  # a misspelled setting is the caller's bug, and worth raising
+    except Exception as failure:  # noqa: BLE001 - see the docstring
+        _warn(f"settings could not be resolved: {failure!r}")
+        return None
+
+    existing = installed_settings(config)
+    if existing is not None:
+        # A caller that did not name a run id is not asking to change it, so
+        # the comparison must not turn a freshly minted one into a difference.
+        asked_for = wanted.with_overrides(run_id=wanted.run_id or existing.run_id)
+        if asked_for != existing:
+            _warn(
+                "failure instrumentation is already installed on this run and "
+                "keeps the settings it was built with; the later call asked "
+                f"for {_difference(existing, asked_for)}"
+            )
+        return existing
+
+    if wanted.run_id is None:
+        # Only the controller reaches this: a worker was handed one. Minted at
+        # install time rather than at session start, because the workers have
+        # to be told and they are configured before any session hook runs. Not
+        # minted while resolving, because resolving also happens on the path
+        # that only compares.
+        wanted = wanted.with_overrides(run_id=_new_run_id())
+
+    _ensure_hookspecs(config)
+    plugin = _build(config, wanted)
+    if plugin is None:
+        return None
+
+    setattr(config, STASH_KEY, wanted)
+    config.pluginmanager.register(
+        plugin, WORKER_NAME if hasattr(config, "workerinput") else CONTROLLER_NAME
+    )
+    return wanted
+
+
+# -- the parts of that ----------------------------------------------------
+
+
+def _resolve(
+    config: pytest.Config, settings: Optional[Settings], overrides: dict[str, Any]
+) -> Settings:
+    from_run = resolve(config)
+    base = from_run if settings is None else settings.with_overrides(
+        # A caller handing over a whole Settings cannot know the worker count:
+        # that is xdist's answer about this process, not a preference.
+        worker_count=from_run.worker_count,
+        # Their run id stands if they set one - correlating incidents with a
+        # CI build id is a reason to install this by hand in the first place.
+        run_id=settings.run_id or from_run.run_id,
+    )
+    return base.with_overrides(**overrides)
+
+
+def _new_run_id() -> str:
+    return os.environ.get("PYTEST_RUN_ID") or f"run-{uuid.uuid4().hex[:16]}"
+
+
+def _build(config: pytest.Config, settings: Settings) -> Any:
+    if hasattr(config, "workerinput"):
+        from .capture.recorder import WorkerRecorder
+
+        worker_id = config.workerinput["workerid"]
+        return _built(
+            lambda: WorkerRecorder(settings.directory, worker_id, settings), "worker"
+        )
+
+    # Registered whether or not xdist is in the picture. Two of the five kinds
+    # are not distributed problems - an internal error ends a single-process
+    # run just as finally, and the run summary is what says a run reached its
+    # end at all.
+    from .incidents.engine import IncidentEngine
+
+    return _built(lambda: IncidentEngine(config, settings), "run")
+
+
+def _ensure_hookspecs(config: pytest.Config) -> None:
+    """Add the hookspec if the entry point did not.
+
+    ``-p no:failure_instrumentation`` skips ``pytest_addhooks`` along with
+    everything else, and adding a spec twice is an error - so this asks
+    whether the spec is already there rather than trying and catching.
+
+    Asking must be about the *specification*, not the attribute. Registering a
+    conftest that implements ``pytest_failure_incident`` creates a hook caller
+    with no spec behind it, so the attribute exists while the hook is still
+    unspecced - and pluggy fails the whole session at ``check_pending`` with
+    "unknown hook", before a test has run.
+    """
+    hook = getattr(config.hook, "pytest_failure_incident", None)
+    if hook is None or not hook.has_spec():
+        config.pluginmanager.add_hookspecs(hookspec)
+
+
+def _built(build: Any, what: str) -> Any:
+    """Whatever ``build`` returns, or None and a warning.
+
+    Registration is the one place this plugin touches the filesystem before
+    anything has gone wrong, and it is allowed to fail: a read-only image, a
+    vanished mount, a name already taken by a file.
+    """
+    try:
+        return build()
+    except Exception as failure:  # noqa: BLE001 - see the module docstring
+        _warn(f"failure instrumentation is off for this {what}: {failure!r}")
+        return None
+
+
+def _difference(existing: Settings, wanted: Settings) -> str:
+    changed = [
+        f"{name}={getattr(wanted, name)!r} (in force: {getattr(existing, name)!r})"
+        for name in vars(type(existing)).get("__dataclass_fields__", {})
+        if getattr(existing, name) != getattr(wanted, name)
+    ]
+    return ", ".join(changed) or "the same settings"
+
+
+def _warn(message: str) -> None:
+    warnings.warn(message, FailureInstrumentationWarning, stacklevel=3)

@@ -3,23 +3,31 @@
 Defaults are chosen so that installing the plugin and doing nothing costs a
 run almost nothing: the watchdog samples on a timer rather than per test, the
 expensive probes are off, and no memory ceiling is imposed.
+
+There are two ways settings arrive. Most runs read them from ini, which is
+what ``resolve`` does. A framework that wraps pytest usually cannot: its
+values come from its own configuration, computed in Python, and it wants them
+applied without asking every team to copy an ini block. Those runs build a
+``Settings`` and hand it to :func:`.install`. Both paths end in the same
+frozen object, and the invariants below are enforced on the object rather than
+in ``resolve``, so a hand-built one cannot skip them.
 """
 
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
 DEFAULT_DIRECTORY = ".pytest-failures"
 
-#: Below this the heartbeat thread costs more than it measures. Clamped here
-#: rather than in the thread, because the controller decides what counts as a
-#: stale beat from the same number - and two different answers to "how often
-#: does a worker beat" make a healthy worker look frozen.
+#: Below this the heartbeat thread costs more than it measures. Clamped on the
+#: object rather than where a setting is read, because the controller decides
+#: what counts as a stale beat from the same number - and two different
+#: answers to "how often does a worker beat" make a healthy worker look frozen.
 MIN_HEARTBEAT_INTERVAL = 1.0
 
 
@@ -30,21 +38,95 @@ class FailureInstrumentationWarning(UserWarning):
 
 @dataclass(frozen=True)
 class Settings:
-    directory: Path
-    packages: tuple[str, ...]
-    product_version: str | None
-    watchdog: bool
-    heartbeat_interval: float
-    tracemalloc_depth: int
-    object_census: bool
-    high_water_mb: int
-    memory_limit_mb: int
-    slow_test_seconds: float
-    stall_seconds: float
-    stack_probe: bool
-    worker_count: int
-    #: Set on workers only; the controller mints it and pushes it down.
-    run_id: str | None = None
+    """Everything this plugin reads, and the only thing :func:`.install` takes.
+
+    Every field has a default, so a caller states what it cares about and
+    leaves the rest alone::
+
+        Settings(packages=("yourcore",), directory=Path("/var/log/evidence"))
+
+    ``__post_init__`` coerces and clamps, because this is a public type now: a
+    framework passing ``packages=["a", "b"]`` or ``directory="/tmp/x"`` means
+    the obvious thing, and a heartbeat interval below the floor is the bug the
+    floor exists to prevent whichever way the object was built.
+    """
+
+    directory: Path = Path(DEFAULT_DIRECTORY)
+    #: Your own top-level packages, for attribution.
+    packages: tuple[str, ...] = ()
+    product_version: Optional[str] = None
+    watchdog: bool = True
+    heartbeat_interval: float = 5.0
+    tracemalloc_depth: int = 0
+    object_census: bool = False
+    high_water_mb: int = 0
+    memory_limit_mb: int = 0
+    slow_test_seconds: float = 120.0
+    stall_seconds: float = 300.0
+    stack_probe: bool = True
+    #: How many workers share the machine. Per worker, never sent between
+    #: processes - the controller's copy would be wrong on every worker.
+    worker_count: int = 1
+    #: Which run this is. Minted by the controller and pushed down; likewise
+    #: never copied from one process's settings to another's.
+    run_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "directory", Path(self.directory))
+        object.__setattr__(self, "packages", tuple(self.packages))
+        object.__setattr__(
+            self,
+            "heartbeat_interval",
+            max(MIN_HEARTBEAT_INTERVAL, float(self.heartbeat_interval)),
+        )
+
+    def with_overrides(self, **overrides: Any) -> Settings:
+        """A copy with some fields changed, rejecting names that do not exist.
+
+        A silently ignored ``pacakges=`` is a framework shipping unattributed
+        incidents to every one of its customers and nobody finding out.
+        """
+        unknown = sorted(set(overrides) - _FIELD_NAMES)
+        if unknown:
+            raise TypeError(
+                f"unknown failure-instrumentation setting(s): {', '.join(unknown)}. "
+                f"Known settings: {', '.join(sorted(_FIELD_NAMES))}"
+            )
+        return replace(self, **overrides) if overrides else self
+
+    # -- crossing a process boundary --------------------------------------
+
+    def as_payload(self) -> dict[str, Any]:
+        """A form execnet can carry to a worker.
+
+        Only primitives: execnet serialises a fixed set of builtin types and
+        nothing else, so ``Path`` and the tuple both have to be flattened.
+        Per-process fields are left out rather than sent and ignored - the
+        controller's worker count is not any worker's worker count.
+        """
+        return {
+            "directory": str(self.directory),
+            "packages": list(self.packages),
+            "product_version": self.product_version,
+            "watchdog": self.watchdog,
+            "heartbeat_interval": self.heartbeat_interval,
+            "tracemalloc_depth": self.tracemalloc_depth,
+            "object_census": self.object_census,
+            "high_water_mb": self.high_water_mb,
+            "memory_limit_mb": self.memory_limit_mb,
+            "slow_test_seconds": self.slow_test_seconds,
+            "stall_seconds": self.stall_seconds,
+            "stack_probe": self.stack_probe,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any], **per_process: Any) -> Settings:
+        """The inverse, plus the fields that only this process can answer."""
+        known = {name: value for name, value in payload.items() if name in _FIELD_NAMES}
+        return cls(**known, **per_process)
+
+
+_FIELD_NAMES = {field.name for field in fields(Settings)}
 
 
 def add_options(parser: pytest.Parser) -> None:
@@ -93,8 +175,25 @@ def add_options(parser: pytest.Parser) -> None:
     )
 
 
-def _flag(config: pytest.Config, name: str) -> bool:
-    return str(config.getini(name)).strip().lower() not in ("false", "0", "no", "")
+def _ini(config: pytest.Config, name: str, fallback: Any) -> Any:
+    """An ini value, or the fallback when the option is not registered at all.
+
+    ``-p no:failure_instrumentation`` means ``add_options`` never ran, and a
+    framework installing this by hand is exactly the case where that happens.
+    Asking pytest for an unregistered ini key raises, so the absence is treated
+    as "not configured" rather than allowed to end the run.
+    """
+    try:
+        return config.getini(name)
+    except (ValueError, KeyError):
+        return fallback
+
+
+def _flag(config: pytest.Config, name: str, fallback: bool) -> bool:
+    raw = _ini(config, name, None)
+    if raw is None:
+        return fallback
+    return str(raw).strip().lower() not in ("false", "0", "no", "")
 
 
 def _number(config: pytest.Config, name: str, fallback: float) -> float:
@@ -103,7 +202,7 @@ def _number(config: pytest.Config, name: str, fallback: float) -> float:
     Silently substituting the default turns ``failure_stall_seconds = 5m`` into
     a stall detector the reader believes they configured and never hear from.
     """
-    raw = config.getini(name)
+    raw = _ini(config, name, None)
     try:
         return float(raw or fallback)
     except (ValueError, TypeError):
@@ -116,26 +215,39 @@ def _number(config: pytest.Config, name: str, fallback: float) -> float:
 
 
 def resolve(config: pytest.Config) -> Settings:
+    """The settings this process should use, before anyone overrides them.
+
+    On a worker the controller's copy wins where it exists: a framework that
+    built its settings in Python has no ini for the worker to re-read, and even
+    where there is one, two processes resolving separately is two chances to
+    disagree.
+    """
     workerinput: dict[str, Any] = getattr(config, "workerinput", {}) or {}
+    worker_count = int(workerinput.get("workercount", 1) or 1)
+    # Pushed into workerinput by the controller (see IncidentEngine's
+    # pytest_configure_node), so both sides of a run stamp their evidence with
+    # the same id and a stale file from an earlier run is recognisable.
+    run_id = str(workerinput.get("failure_run_id") or "") or None
+
+    handed_down = workerinput.get("failure_settings")
+    if handed_down:
+        return Settings.from_payload(
+            dict(handed_down), worker_count=worker_count, run_id=run_id
+        )
+
     return Settings(
-        directory=Path(config.getini("failure_directory") or DEFAULT_DIRECTORY),
-        packages=tuple(config.getini("failure_packages") or ()),
-        product_version=config.getini("failure_product_version") or None,
-        watchdog=_flag(config, "failure_watchdog"),
-        heartbeat_interval=max(
-            MIN_HEARTBEAT_INTERVAL,
-            _number(config, "failure_heartbeat_interval", 5.0),
-        ),
+        directory=Path(_ini(config, "failure_directory", "") or DEFAULT_DIRECTORY),
+        packages=tuple(_ini(config, "failure_packages", ()) or ()),
+        product_version=_ini(config, "failure_product_version", "") or None,
+        watchdog=_flag(config, "failure_watchdog", True),
+        heartbeat_interval=_number(config, "failure_heartbeat_interval", 5.0),
         tracemalloc_depth=int(_number(config, "failure_tracemalloc_depth", 0)),
-        object_census=_flag(config, "failure_object_census"),
+        object_census=_flag(config, "failure_object_census", False),
         high_water_mb=int(_number(config, "failure_high_water_mb", 0)),
         memory_limit_mb=int(_number(config, "failure_memory_limit_mb", 0)),
         slow_test_seconds=_number(config, "failure_slow_test_seconds", 120.0),
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
-        stack_probe=_flag(config, "failure_stack_probe"),
-        worker_count=int(workerinput.get("workercount", 1) or 1),
-        # Pushed into workerinput by the controller (see IncidentEngine's
-        # pytest_configure_node), so both sides of a run stamp their evidence
-        # with the same id and a stale file from an earlier run is recognisable.
-        run_id=str(workerinput.get("failure_run_id") or "") or None,
+        stack_probe=_flag(config, "failure_stack_probe", True),
+        worker_count=worker_count,
+        run_id=run_id,
     )
