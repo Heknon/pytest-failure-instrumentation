@@ -301,3 +301,112 @@ def test_a_slow_test_that_passed_is_not_the_crash_that_killed_the_worker(distrib
     assert death.blamed_frame is None
     assert death.owner != "product"
     assert death.severity != "critical"
+
+
+@posix_only
+def test_a_probe_stack_left_behind_is_dated_and_not_called_a_crash(distributed):
+    """A worker diagnosed as stalled is asked for a stack, and that answer is
+    written to the crash file. If the worker is then killed, that stack is the
+    only one on file - older than the death, and not written by it.
+
+    Saying "the worker wrote a stack before dying" of it is true only in the
+    most useless sense, so the report says when it was written instead.
+    """
+    distributed.pytester.makepyfile(
+        test_hang_then_die="""
+        import os
+        import signal
+        import threading
+
+        never_set = threading.Event()
+
+
+        def test_filler():
+            assert True
+
+
+        def test_wedges_then_is_killed():
+            never_set.wait(14)
+            os.kill(os.getpid(), signal.SIGKILL)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        "-o", "failure_stall_seconds=6",
+        "-o", "failure_heartbeat_interval=2",
+        # High, so nothing the watchdog wrote can be mistaken for the probe.
+        "-o", "failure_slow_test_seconds=600",
+        "test_hang_then_die.py",
+        timeout=180,
+    )
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.verdict == "SIGKILLED"
+    assert death.crash_stack, "the probe answered, so there is a stack on file"
+    assert death.crash_stack_age_seconds is not None
+    assert any(
+        "not written by a dying process" in line and "before this report" in line
+        for line in death.evidence
+    ), death.evidence
+
+
+@posix_only
+def test_a_real_crash_outranks_a_probe_stack_taken_earlier(distributed):
+    """Both end up in the same file, the probe first. The dump that describes
+    the death is the last one, and it is the one that has to be blamed."""
+    distributed.pytester.makepyfile(
+        victim_slow="""
+        import ctypes
+        import threading
+
+        never_set = threading.Event()
+
+
+        def wait_then_crash():
+            never_set.wait(14)
+            ctypes.string_at(1)
+        """
+    )
+    distributed.pytester.makepyfile(
+        test_c="""
+        import victim_slow
+
+
+        def test_filler():
+            assert True
+
+
+        def test_stalls_then_segfaults():
+            victim_slow.wait_then_crash()
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        "-o", "failure_stall_seconds=6",
+        "-o", "failure_heartbeat_interval=2",
+        "-o", "failure_slow_test_seconds=600",
+        "-o", "failure_packages=victim_slow",
+        "test_c.py",
+        timeout=180,
+    )
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.verdict == "NATIVE_CRASH"
+    assert death.crash_stack[0].startswith("Fatal Python error")
+    assert death.blamed_frame is not None
+    assert death.blamed_frame.function == "wait_then_crash"
+    assert any("wrote a fatal stack as it died" in line for line in death.evidence)
+
+
+def test_a_worker_that_dumped_nothing_is_not_given_a_stack_age(distributed):
+    """The crash file is created empty when the worker starts, so its mtime
+    answers whether or not anything was ever written to it. An age attached to
+    no stack reads as a stack the reader then cannot find."""
+    distributed.pytester.makepyfile(
+        test_crash=crashing_test("victim.hard_exit(3)")
+    )
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.crash_stack == []
+    assert death.crash_stack_age_seconds is None

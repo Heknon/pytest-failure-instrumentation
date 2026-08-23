@@ -38,6 +38,13 @@ def memory_evidence(incident: WorkerDeathIncident) -> list[str]:
     return evidence
 
 
+def _written_ago(age: float | None) -> str:
+    """A stack is evidence about a moment, so say which moment."""
+    if age is None:
+        return ""
+    return f", {age:.0f}s before this report" if age >= 1 else ", moments before"
+
+
 def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
     """Returns (verdict, confidence, evidence)."""
     status = incident.exit_status
@@ -66,14 +73,17 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
 
     fatal_dump = crash_stack.is_fatal(incident.crash_stack)
     if fatal_dump:
-        evidence.append("the worker wrote a fatal stack before dying")
+        evidence.append("the worker wrote a fatal stack as it died")
     elif incident.crash_stack:
         # A dump with no fatal banner did not come from a dying process. It is
         # still context, but it is not evidence of a crash and must not be
-        # allowed to outrank the exit status below.
+        # allowed to outrank the exit status below. How old it is decides
+        # whether it is context at all: a stack from a slow test four minutes
+        # ago describes a test that has since finished.
         evidence.append(
-            "a stack is present but was not written by a dying process; it is "
-            "context, not evidence of a crash"
+            "a stack is on file but was not written by a dying process"
+            + _written_ago(incident.crash_stack_age_seconds)
+            + " - it is context, not evidence of a crash"
         )
 
     if status is not None and status < 0:

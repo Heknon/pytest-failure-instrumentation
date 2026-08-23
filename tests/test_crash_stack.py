@@ -8,6 +8,8 @@ writes them.
 
 from __future__ import annotations
 
+import time
+
 from pytest_failure_instrumentation.capture import crash_stack
 
 HEARTBEAT_SECTION = """\
@@ -121,3 +123,75 @@ def test_a_fatal_banner_is_what_marks_a_dump_as_a_death():
     # An on-demand SIGUSR1 dump has no banner at all, and it is not a death.
     assert not crash_stack.is_fatal(["Thread 0x00007f00 (most recent call first):"])
     assert not crash_stack.is_fatal([])
+
+
+# -- which dump, when a file holds several --------------------------------
+
+TWO_DUMPS = """Timeout (0:00:02)!
+Thread 0x00007f00 (most recent call first):
+  File "/app/test_a.py", line 5 in test_that_was_slow_and_passed
+
+Timeout (0:00:02)!
+Thread 0x00007f00 (most recent call first):
+  File "/app/test_a.py", line 9 in test_that_is_wedged_now
+"""
+
+
+def test_the_latest_dump_is_the_one_that_describes_now(tmp_path):
+    """dump_traceback_later(repeat=True) writes one dump per timeout for as
+    long as a test runs, so a worker wedged for a minute leaves dozens.
+
+    Reading from the top returns the oldest - the stack of whatever was slow
+    *first*, which may be a test that has since finished and passed. Every
+    fresher dump of the test actually stuck sits in the same file, unread.
+    """
+    path = tmp_path / "gw0.slow"
+    path.write_text(TWO_DUMPS, encoding="utf-8")
+
+    lines = crash_stack.read(path)
+    assert any("test_that_is_wedged_now" in line for line in lines)
+    assert not any("test_that_was_slow_and_passed" in line for line in lines)
+
+
+def test_a_fatal_dump_wins_over_an_earlier_probe_in_the_same_file(tmp_path):
+    """An on-demand stack taken while a worker was merely stalled is written
+    to the crash file too, and it comes first. The dump that describes the
+    death is the last one."""
+    path = tmp_path / "gw0.crash"
+    path.write_text(
+        "Current thread 0x00007f00 (most recent call first):\n"
+        '  File "/app/lib.py", line 3 in waiting_around\n'
+        "\n"
+        "Fatal Python error: Segmentation fault\n"
+        "\n"
+        "Current thread 0x00007f00 (most recent call first):\n"
+        '  File "/app/lib.py", line 9 in the_frame_that_faulted\n',
+        encoding="utf-8",
+    )
+
+    lines = crash_stack.read(path)
+    assert lines[0].startswith("Fatal Python error")
+    assert any("the_frame_that_faulted" in line for line in lines)
+    assert not any("waiting_around" in line for line in lines)
+
+
+def test_a_single_dump_is_unaffected(tmp_path):
+    path = tmp_path / "gw0.slow"
+    path.write_text(
+        "Timeout (0:00:02)!\n"
+        "Thread 0x00007f00 (most recent call first):\n"
+        '  File "/app/test_a.py", line 5 in only_one\n',
+        encoding="utf-8",
+    )
+    assert any("only_one" in line for line in crash_stack.read(path))
+
+
+def test_when_a_dump_was_written_is_recoverable(tmp_path):
+    """A stack is evidence about a moment. Without this the reader cannot tell
+    one taken just now from one the watchdog left behind minutes ago."""
+    path = tmp_path / "gw0.slow"
+    path.write_text(TWO_DUMPS, encoding="utf-8")
+
+    written = crash_stack.written_at(path)
+    assert written is not None and time.time() - written < 60
+    assert crash_stack.written_at(tmp_path / "nothing-here.slow") is None

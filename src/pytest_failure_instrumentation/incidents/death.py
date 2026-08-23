@@ -9,6 +9,7 @@ for.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional
 
@@ -54,6 +55,10 @@ class WorkerDeathIncident(Incident):
     high_water: Optional[list[dict[str, Any]]] = None
 
     crash_stack: list[str] = Field(default_factory=list)
+    #: How long before this report the dump on file was written. Around zero
+    #: for a fatal dump, which is written as the process dies. Large for
+    #: anything else on file, which is the case worth saying out loud.
+    crash_stack_age_seconds: Optional[float] = None
 
     def stack_lines(self) -> tuple[list[str], bool]:
         """Frames to attribute the death to - only from a dump that belongs
@@ -91,6 +96,8 @@ def build(
     baseline_oom_kills: int | None,
 ) -> WorkerDeathIncident:
     worker = node.gateway.id
+    crash_file = directory / f"{worker}.crash"
+    dump = crash_stack.read(crash_file, limit=40)
     events = event_log.read_events(directory / f"{worker}.events")
     state = read_state(directory / f"{worker}.state")
     pid = state.get("pid") or event_log.worker_pid(events)
@@ -117,11 +124,21 @@ def build(
         cgroup=CgroupMemory(**cgroup) if cgroup else None,
         cgroup_oom_kills=oom_kills,
         cgroup_oom_kills_since_start=_delta(oom_kills, baseline_oom_kills),
-        crash_stack=crash_stack.read(directory / f"{worker}.crash", limit=40),
+        crash_stack=dump,
+        # Only when there is something to date. The file is created empty at
+        # worker start, so its mtime answers even when no dump was ever
+        # written - and an age attached to nothing reads as a stack the
+        # reader cannot find.
+        crash_stack_age_seconds=_age_of(crash_file) if dump else None,
         high_water=event_log.high_water_marks(events)[-1:] or None,
     )
     incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
     return incident
+
+
+def _age_of(path: Path) -> float | None:
+    written = crash_stack.written_at(path)
+    return None if written is None else round(max(0.0, time.time() - written), 1)
 
 
 def _last_available(events: list[dict[str, Any]]) -> int | None:

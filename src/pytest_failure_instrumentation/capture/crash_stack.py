@@ -33,7 +33,7 @@ from __future__ import annotations
 import faulthandler
 import signal
 from pathlib import Path
-from typing import TextIO
+from typing import Optional, TextIO
 
 from ..probes import stacks
 
@@ -100,25 +100,31 @@ OWN_PACKAGE = "/pytest_failure_instrumentation/"
 
 
 def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
-    """One thread's stack out of a dump - most recent call first.
+    """One thread's stack out of the *latest* dump - most recent call first.
 
-    A dump is written with ``all_threads=True``, so it holds several stacks and
-    picking the wrong one blames the wrong code. The first one printed is
-    almost never the interesting one: in a pytest worker it is this plugin's
-    own heartbeat thread, and after that execnet's receiver.
+    Two things have to be picked correctly here, and getting either wrong
+    blames code that was not running.
+
+    **Which dump.** A file holds as many dumps as were written to it, and
+    ``dump_traceback_later(repeat=True)`` writes one every timeout for as long
+    as a test runs - so a worker wedged for a minute leaves dozens. Reading
+    from the top returns the oldest, which is the stack of whatever was slow
+    *first*: a test that may have finished, passed, and been forgotten. Only
+    the last dump describes the present.
+
+    **Which thread within it.** A dump is written with ``all_threads=True``, so
+    it holds several stacks. The first printed is almost never the interesting
+    one: in a pytest worker it is this plugin's own heartbeat thread, and after
+    that execnet's receiver.
 
     ``offset`` reads only what was appended past a known point, so a stack
     written now is never confused with one written earlier.
     """
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            handle.seek(offset)
-            lines = [line.rstrip() for line in handle if line.strip()]
-    except OSError:
-        return []
+    lines = _lines(path, offset)
     if not lines:
         return []
 
+    lines = _latest_dump(lines)
     banner = lines[0] if lines[0].startswith(BANNERS) else None
     sections = _thread_sections(lines)
     if not sections:
@@ -126,6 +132,40 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
 
     section = _most_relevant(sections)[:limit]
     return ([banner] + section) if banner else section
+
+
+def _lines(path: Path, offset: int = 0) -> list[str]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            return [line.rstrip() for line in handle if line.strip()]
+    except OSError:
+        return []
+
+
+def _latest_dump(lines: list[str]) -> list[str]:
+    """Everything from the last banner on.
+
+    A banner is what starts a dump, so the last one starts the last dump. Dumps
+    with no banner at all - an on-demand SIGUSR1 stack - cannot be split this
+    way, which is why the caller that asks for one reads from a recorded offset
+    instead of relying on this.
+    """
+    starts = [index for index, line in enumerate(lines) if line.startswith(BANNERS)]
+    return lines[starts[-1]:] if starts else lines
+
+
+def written_at(path: Path) -> Optional[float]:
+    """When this file was last written to, which is when its last dump landed.
+
+    A stack is evidence about a moment, and the reader has no way to tell a
+    stack taken just now from one the watchdog left behind minutes ago unless
+    the report says which it is.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def _thread_sections(lines: list[str]) -> list[list[str]]:

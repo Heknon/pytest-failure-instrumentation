@@ -466,13 +466,31 @@ thing distinguishing `abort()` from `os._exit(3)`, ambiguous means a slow test
 that passed can be reported as the crash that killed the worker, blamed on
 whatever that stack happened to be doing.
 
-**Choosing the right thread out of a dump.** A dump written with
-`all_threads=True` holds every thread, and the first one printed in a pytest
-worker is this plugin's own heartbeat thread; the second is execnet's receiver.
-Reporting the first section would blame the instrumentation for the failure it
-came to explain. The section reported is the one the fault or signal reached
-(`Current thread`), else the one carrying pytest's runtest protocol, else
-anything that is not ours.
+**Choosing the right dump, and the right thread inside it.** Two things have to
+be picked here, and getting either wrong blames code that was not running.
+
+A file holds as many dumps as were written to it, and the watchdog repeats —
+`dump_traceback_later(repeat=True)` writes one every timeout for as long as a
+test runs, so a worker wedged for a minute leaves dozens. The dump that
+describes the present is the *last* one; the first is whatever was slow
+earliest, which may be a test that has since finished and passed. The same
+applies to the crash file, where an on-demand stack taken while a worker was
+merely stalled precedes the fatal dump that ends it.
+
+Within that dump, `all_threads=True` means every thread is present, and the
+first printed in a pytest worker is this plugin's own heartbeat thread; the
+second is execnet's receiver. Reporting the first section would blame the
+instrumentation for the failure it came to explain. The section reported is the
+one the fault or signal reached (`Current thread`), else the one carrying
+pytest's runtest protocol, else anything that is not ours.
+
+**Saying how old a stack is.** A stack is evidence about a moment, and the
+frames look the same whether they were taken just now or left behind four
+minutes ago. A stall that could be probed reports a current stack; one that
+falls back to the watchdog's file says `stack written 47s ago by the slow-test
+watchdog, not taken just now`, and carries `stack_age_seconds`. A death reports
+`crash_stack_age_seconds` alongside, so a dump that predates the death reads as
+the context it is rather than as the crash.
 
 **A watchdog the worker arms on itself.** The obvious design has the controller
 signal a stalled worker and let faulthandler answer. It has two flaws: Windows

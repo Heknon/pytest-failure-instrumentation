@@ -243,3 +243,76 @@ def test_a_sub_second_heartbeat_setting_does_not_manufacture_a_frozen_worker(dis
     stall = distributed.only(incidents, "worker_stall")
     assert stall.verdict == "STALLED_BLOCKED"
     assert not any("holding the GIL" in line for line in stall.evidence)
+
+
+def test_the_test_that_is_wedged_now_is_blamed_and_not_an_earlier_slow_one(distributed):
+    """The watchdog repeats, so a wedged worker's file fills with dumps.
+
+    Reading the file from the top returned the *first* one - the stack of a
+    test that was merely slow, finished, and passed. The incident then named
+    the wedged test in test_in_flight and blamed a different, passing test in
+    the field a reader takes for the finding.
+    """
+    distributed.pytester.makepyfile(
+        test_two_slow="""
+        import threading
+        import time
+
+        never_set = threading.Event()
+
+
+        def test_aaa_slow_but_passes():
+            time.sleep(4)
+
+
+        def test_zzz_wedges():
+            never_set.wait(30)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "1",
+        "-o", "failure_slow_test_seconds=2",
+        "-o", "failure_stall_seconds=8",
+        "-o", "failure_heartbeat_interval=2",
+        "-o", "failure_stack_probe=false",
+        "test_two_slow.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.test_in_flight == "test_two_slow.py::test_zzz_wedges"
+    assert stall.blamed_frame is not None
+    assert stall.blamed_frame.function == "test_zzz_wedges"
+    assert not any("test_aaa_slow_but_passes" in line for line in stall.stack)
+
+
+def test_a_stack_nobody_asked_for_says_when_it_was_taken(distributed):
+    """A probed stack is current; a watchdog dump can be most of
+    failure_slow_test_seconds old. The frames look identical either way, so
+    the report has to be the thing that distinguishes them."""
+    distributed.pytester.makepyfile(
+        test_hang="""
+        import threading
+
+        never_set = threading.Event()
+
+
+        def test_filler():
+            assert True
+
+
+        def test_deadlocks():
+            never_set.wait(25)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2", *STALL_ARGUMENTS,
+        "-o", "failure_stack_probe=false",
+        "test_hang.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.stack and stall.stack_probed is False
+    assert stall.stack_age_seconds is not None
+    assert "by the slow-test watchdog, not taken just now" in str(stall)

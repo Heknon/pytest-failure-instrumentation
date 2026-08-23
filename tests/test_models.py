@@ -344,3 +344,46 @@ def test_a_stall_says_why_it_has_no_stack_rather_than_blaming_the_platform():
     # Nothing to explain when a stack was obtained.
     answered = WorkerStallIncident(worker="gw1", stack=["  File \"x.py\", line 1 in f"])
     assert "no stack:" not in str(answered)
+
+
+def test_a_stall_says_when_an_unprompted_stack_was_taken():
+    """The frames look the same whether the stack was taken just now or left
+    by the watchdog four minutes ago, so the report has to be what says which.
+    """
+    left_behind = WorkerStallIncident(
+        worker="gw1",
+        stack=['  File "x.py", line 1 in f'],
+        stack_probed=False,
+        stack_age_seconds=182.0,
+    )
+    assert "stack written 182s ago by the slow-test watchdog" in str(left_behind)
+
+    # A probed stack is current, and saying anything about its age would only
+    # invite the reader to discount it.
+    probed = WorkerStallIncident(
+        worker="gw1",
+        stack=['  File "x.py", line 1 in f'],
+        stack_probed=True,
+        stack_age_seconds=0.0,
+    )
+    assert "not taken just now" not in str(probed)
+
+
+def test_a_death_dates_a_stack_that_did_not_come_from_the_death():
+    """An on-demand stack taken while the worker was merely stalled ends up in
+    the same file. Reported as "the worker wrote a stack before dying" it is
+    true only in the most useless sense."""
+    from pytest_failure_instrumentation.analysis import classify
+
+    stale = WorkerDeathIncident(
+        worker="gw1",
+        exit_status=-9,
+        crash_stack=["Current thread 0x1 (most recent call first):",
+                     '  File "x.py", line 1 in waiting'],
+        crash_stack_age_seconds=47.0,
+    )
+    _verdict, _confidence, evidence = classify.of(stale)
+    assert any(
+        "not written by a dying process" in line and "47s before this report" in line
+        for line in evidence
+    ), evidence
