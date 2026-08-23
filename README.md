@@ -286,6 +286,13 @@ is your call. `incident.raw_stack()` returns them as lines whatever the kind is;
 `top_frame` and `blamed_frame` are the two already parsed, each with `file`,
 `line`, `function`, `module` and `owner`.
 
+What you get is the deepest frames of *one* thread from the most recent dump —
+the other threads in a worker are this plugin's own heartbeat and execnet's
+receiver, and reporting those blames the instrumentation. It is capped (40
+frames for a death, 14 for a stall, 4000 characters for an internal error) and
+a cut stack ends with `... and N more frames` rather than pretending to be
+whole. The complete dump stays in `<worker>.crash` on the runner.
+
 ```python
 def pytest_failure_incident(incident):
     body = str(incident)
@@ -530,7 +537,14 @@ the context it is rather than as the crash.
 
 **A watchdog the worker arms on itself, on a cadence.** `dump_traceback_later`
 is armed with `repeat=True`, so a test that goes on running keeps refreshing
-its stack and whatever is on disk is at most one timeout old. That bound is the
+its stack and whatever is on disk is at most one timeout old. It is armed at
+the start of *setup* and cancelled at the end of *teardown*, so a fixture
+blocking on a container and a finalizer blocking on a connection are covered
+as well as the test body — those are the commonest real hangs there are, and
+the state slot has always told them apart. Armed once for the whole test
+rather than per phase, because `dump_traceback_later` resets the timer each
+time it is called: re-arming per phase would mean a test that spent most of
+the interval in setup and the rest in the call never reached it. That bound is the
 point: on Windows nothing can ask a live process for a stack, so this is the
 only one a stalled worker will ever have. The default is 20 seconds, and the
 file is emptied when the test ends — only the running test's dumps are ever
@@ -567,9 +581,10 @@ overwhelming majority of what runs.
   one as it opens and one as it closes, which is what separates "died in
   teardown" from "died mid-call" — plus arming a watchdog timer (~78 µs). No
   append log, no `/proc` read, no allocation tracking.
-- Per test that outlives `failure_slow_test_seconds`: one ~5 KB stack dump
-  every interval, written by a C timer thread that does not hold the GIL, and
-  a truncate when the test ends. Nothing accumulates across tests.
+- Per test that outlives `failure_slow_test_seconds` (measured setup through
+  teardown): one ~5 KB stack dump every interval, written by a C timer thread
+  that does not hold the GIL, and a truncate when the test ends. Nothing
+  accumulates across tests.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
   memory.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
@@ -594,7 +609,7 @@ overwhelming majority of what runs.
 | `failure_object_census` | `false` | Count live objects at a high-water mark |
 | `failure_high_water_mb` | auto | Memory mark for a snapshot; defaults to a share of the discovered limit |
 | `failure_memory_limit_mb` | `0` | Soft cap (POSIX) turning an OOM kill into a `MemoryError` |
-| `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack |
+| `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
 

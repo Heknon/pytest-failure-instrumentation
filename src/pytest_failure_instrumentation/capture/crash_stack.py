@@ -161,10 +161,23 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
     banner = lines[0] if lines[0].startswith(BANNERS) else None
     sections = _thread_sections(lines)
     if not sections:
-        return lines[:limit]
+        return _capped(lines, limit)
 
-    section = _most_relevant(sections)[:limit]
+    section = _capped(_most_relevant(sections), limit)
     return ([banner] + section) if banner else section
+
+
+def _capped(lines: list[str], limit: int) -> list[str]:
+    """The deepest ``limit`` lines, saying so when there were more.
+
+    A stack cut off without a word reads as the whole story: the deepest
+    frames are the ones kept, so what is missing is the outer half - the part
+    that says who called it. A reader who cannot see that it was cut has no
+    reason to go and look at the file that holds the rest.
+    """
+    if len(lines) <= limit:
+        return list(lines)
+    return lines[:limit] + [f"... and {len(lines) - limit} more frames"]
 
 
 def _lines(path: Path, offset: int = 0) -> list[str]:

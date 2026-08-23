@@ -231,3 +231,93 @@ def test_a_suite_of_fast_tests_never_pays_for_the_reset(tmp_path):
         watchdog.start_test()
         watchdog.end_test()
     assert path.read_text(encoding="utf-8") == ""
+
+
+# -- which phases the watchdog covers --------------------------------------
+
+
+class RecordingWatchdog:
+    """Stands in for the real one, so the phases can be asserted directly."""
+
+    def __init__(self):
+        self.calls = []
+
+    def start_test(self):
+        self.calls.append("arm")
+
+    def end_test(self):
+        self.calls.append("cancel")
+
+
+def drive(recorder, phase):
+    """Run one phase hookwrapper end to end."""
+    step = recorder._phase(phase, "test_x.py::test_y")
+    next(step)
+    list(step)
+
+
+def test_the_watchdog_covers_the_whole_test_and_is_armed_once(tmp_path):
+    """Armed at setup and cancelled at teardown.
+
+    Not per phase: dump_traceback_later resets the timer every time it is
+    called, so re-arming at each phase would mean a test that spent most of
+    the interval in setup and the rest in the call never reached it - the
+    timer would keep starting over and no stack would ever be written.
+    """
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(
+        tmp_path, "gw0", Settings(watchdog=False, slow_test_seconds=5)
+    )
+    watchdog = RecordingWatchdog()
+    recorder.slow_test = watchdog
+    try:
+        for phase in ("setup", "call", "teardown"):
+            drive(recorder, phase)
+    finally:
+        recorder.close()
+
+    assert watchdog.calls == ["arm", "cancel"]
+
+
+def test_a_test_that_never_reaches_teardown_still_re_arms_next_time(tmp_path):
+    """A missed cancel self-heals: the next setup calls dump_traceback_later
+    again, which resets the timer rather than stacking a second one."""
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(
+        tmp_path, "gw0", Settings(watchdog=False, slow_test_seconds=5)
+    )
+    watchdog = RecordingWatchdog()
+    recorder.slow_test = watchdog
+    try:
+        drive(recorder, "setup")   # a test that dies before teardown
+        drive(recorder, "setup")   # the next one
+    finally:
+        recorder.close()
+
+    assert watchdog.calls == ["arm", "arm"]
+
+
+def test_a_cut_stack_says_it_was_cut(tmp_path):
+    """The deepest frames are the ones kept, so what a cap removes is the
+    outer half - the part that says who called it. Cut without a word, the
+    remainder reads as the whole story and nobody goes looking for the rest.
+    """
+    path = tmp_path / "gw0.crash"
+    path.write_text(
+        "Fatal Python error: Segmentation fault\n"
+        "Current thread 0x00007f00 (most recent call first):\n"
+        + "".join(f'  File "/app/a.py", line {n} in frame_{n}\n' for n in range(50)),
+        encoding="utf-8",
+    )
+
+    lines = crash_stack.read(path, limit=10)
+    assert lines[-1] == "... and 41 more frames"
+    # The banner still leads, so is_fatal and the verdict are unaffected.
+    assert crash_stack.is_fatal(lines)
+
+    # And nothing is added when nothing was dropped.
+    assert not any("more frames" in line for line in crash_stack.read(path, limit=200))

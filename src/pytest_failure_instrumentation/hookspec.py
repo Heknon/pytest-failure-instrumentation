@@ -57,6 +57,13 @@ kind it is::
 each with ``file``, ``line``, ``function``, ``module`` and ``owner``. The kinds
 keep their own raw fields too - ``crash_stack``, ``stack``, ``detail`` - and
 ``raw_stack`` is only so that nobody has to switch on ``kind`` to reach them.
+
+It is one thread out of the most recent dump, not the whole file: the other
+threads in a worker are this plugin's heartbeat and execnet's receiver, and
+reporting those blames the instrumentation for the failure it came to explain.
+It is capped as well - 40 frames for a death, 14 for a stall, 4000 characters
+for an internal error - and a cut stack ends with ``... and N more frames``
+rather than passing for a whole one.
 ``incidents.registry.parse`` turns a stored row back into its own model, and
 ``registry.json_schema()`` is the contract for a table migration.
 """

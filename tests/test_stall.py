@@ -361,3 +361,90 @@ def test_a_worker_wedged_longer_than_the_cadence_has_a_stack(distributed):
     # And it is recent, because the cadence keeps refreshing it.
     assert stall.stack_age_seconds is not None
     assert stall.stack_age_seconds <= 10
+
+
+def test_a_fixture_that_blocks_in_setup_is_named(distributed):
+    """A fixture blocking on a container, a connection or a service is one of
+    the commonest real hangs there is, and the watchdog used to cover only the
+    call phase - so this class of hang produced no stack at all."""
+    distributed.pytester.makepyfile(
+        test_setup_hang="""
+        import threading
+
+        import pytest
+
+        never_set = threading.Event()
+
+
+        @pytest.fixture
+        def slow_container():
+            never_set.wait(40)
+            yield
+
+
+        def test_filler():
+            assert True
+
+
+        def test_needs_container(slow_container):
+            assert True
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        "-o", "failure_slow_test_seconds=4",
+        "-o", "failure_stall_seconds=12",
+        "-o", "failure_heartbeat_interval=2",
+        "-o", "failure_stack_probe=false",
+        "test_setup_hang.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.phase == "setup"
+    assert stall.stack, "a hang in setup left no stack"
+    assert stall.blamed_frame is not None
+    assert stall.blamed_frame.function == "slow_container"
+
+
+def test_a_finalizer_that_blocks_in_teardown_is_named(distributed):
+    """The state slot has always told "died in teardown" from "died mid-call",
+    so a stack that stops at the call was the odd one out."""
+    distributed.pytester.makepyfile(
+        test_teardown_hang="""
+        import threading
+
+        import pytest
+
+        never_set = threading.Event()
+
+
+        @pytest.fixture
+        def leaky_client():
+            yield
+            never_set.wait(40)
+
+
+        def test_filler():
+            assert True
+
+
+        def test_uses_client(leaky_client):
+            assert True
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        "-o", "failure_slow_test_seconds=4",
+        "-o", "failure_stall_seconds=12",
+        "-o", "failure_heartbeat_interval=2",
+        "-o", "failure_stack_probe=false",
+        "test_teardown_hang.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.phase == "teardown"
+    assert stall.stack, "a hang in teardown left no stack"
+    assert stall.blamed_frame is not None
+    assert stall.blamed_frame.function == "leaky_client"

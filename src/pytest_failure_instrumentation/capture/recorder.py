@@ -176,10 +176,23 @@ class WorkerRecorder:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase
         self.state.update(nodeid=nodeid, phase=phase)
-        if phase == "call":
+        # Armed once for the whole test rather than per phase, and armed from
+        # setup rather than from the call.
+        #
+        # A fixture that blocks on a container, a connection or a service is
+        # one of the commonest real hangs there is, and a finalizer closing
+        # any of them is the next - the state slot has always distinguished
+        # "died in teardown" from "died mid-call" for exactly that reason.
+        # Covering only the call left both of those with no stack at all.
+        #
+        # Once, not per phase, because dump_traceback_later resets the timer
+        # every time it is called: re-arming at each phase would mean a test
+        # that spent most of the interval in setup and the rest in the call
+        # never reached it.
+        if phase == "setup":
             self.slow_test.start_test()
         yield
-        if phase == "call":
+        if phase == "teardown":
             self.slow_test.end_test()
         if phase == "teardown":
             self.state.tests_finished += 1
