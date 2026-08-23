@@ -17,8 +17,11 @@ comes in two forms carrying the same facts:
   `registry.json_schema()` is the contract for the whole union.
 
 Everything the alert prints is in the payload; the reverse is not true, because
-the text is trimmed for a reader. So take anything quantitative from the
-payload when you have it.
+the text is trimmed for a reader. **For anything quantitative — counts, id
+lists, per-worker samples — read the payload, not the text**, and where you
+only have the text, say a number is what was *shown* rather than what there is.
+Nothing licenses extrapolating past what the incident actually compared: two
+variants recorded means two were compared, however many workers were running.
 
 Whoever is reading this usually has the alert and *not* the plugin's source, so
 this file carries the facts you would otherwise have to read `classify.py` and
@@ -51,7 +54,7 @@ wrong conclusion. Check this list before quoting a figure back to anyone.
 
 | Field | Reads as | Actually is |
 |---|---|---|
-| `silent_for_seconds` | how long the worker hung | the threshold it crossed (`failure_stall_seconds`, default 300). The hang went on after this until something killed the job — the incident is raised *at detection*, not at the end |
+| `silent_for_seconds` | how long the worker hung | the silence measured when the poll noticed it: at least `failure_stall_seconds` (default 300) and up to one poll interval more. The hang continued after this until something killed the job — the incident is raised *at detection*, not at the end. Close to the configured threshold, but never read that setting back out of it |
 | `rss_mb_at_death` | memory at the moment of death | the last heartbeat sample, up to one interval stale (default 5 s). A worker that ballooned inside one window still prints the old figure |
 | `· SIGKILL with no cgroup OOM event` | the counter was read and was flat | identical text whether it read zero **or could not be read at all**. `capabilities.cgroup_oom_counter` is the tiebreak: `true` means genuinely flat, `false` means unmeasurable, and OOM stays open |
 | a memory line with no `of a N MB cgroup limit` | no limit is being hit | no limit was *discovered*. These workers may not be memory-limited at all, in which case raising a container limit changes nothing |
@@ -214,6 +217,23 @@ is a run whose controller died**, which nothing inside that process could tell
 you. Worth checking alongside any other incident: its absence turns "one worker
 died" into "the whole job was killed". `incidents` maps fingerprint → count.
 
+## The decision each kind forces
+
+Every one of these reaches a person who has to do something before morning.
+The incident usually settles it, and saying so is most of the value.
+
+| Kind | Already true when you read it | What it argues for |
+|---|---|---|
+| `worker_death` | xdist started a replacement; the run went on | fix or route by `owner`; a retry is reasonable only when the cause was external (`SIGNAL_*`, a cancellation) |
+| `worker_stall` | the run has no path to completion and is burning runner time until a timeout | kill the job now rather than waiting it out. A `STALLED_BLOCKED` deadlock is deterministic, so a retry hangs the same way — the incident is worth more than the rerun, and it already holds the live stack you cannot get afterwards |
+| `collection_mismatch` | the run aborted, or quietly lost a worker | retrying repeats it — an unstable parametrize re-rolls its values, an environment-dependent collection diverges the same way again. Nothing improves until collection is deterministic |
+| `internal_error` | the session is over | nobody's test is at fault, so no test-level triage will surface it — it needs the framework or plugin owner |
+| `run_summary` | the run ended cleanly | nothing, except as the control: its absence next to another incident means the controller died too |
+
+`run_ending` is the field to automate on. An incident raised at detection can
+beat a CI timeout by the better part of an hour, and that lead time is only
+worth something if something acts on it.
+
 ## Settling it on the next run
 
 When the evidence runs out, these change what the *next* failure can tell you.
@@ -235,12 +255,16 @@ is unmeasurable or genuinely fine, `fingerprint` for whether it is new, and
 `evidence` for the reasoning — which is already written, so quote it rather than
 paraphrasing it.
 
-Then answer the question that was actually asked. The person on the other end
-usually has a decision in front of them — bump the memory, retry the job, page
-someone — and the incident either supports it or does not. Say which, and say
-what you would check next. A caveat that cannot change their decision is noise,
-however true it is; the point of these fields is to keep a reader from acting on
-something the run never established.
+Then answer the question that was actually asked, and lead with the answer —
+whether to bump the memory, retry the job, page someone. The incident either
+supports what they were about to do or it does not; say which in the first
+line, then show the evidence. A caveat that cannot change their decision is
+noise however true it is, and an answer they have to scroll through at 2am has
+spent the lead time the incident bought them.
+
+Say what you would check next, and separate it from what the run established.
+The whole point of these fields is to keep a reader from acting on something
+that was never shown.
 
 `.pytest-failures/` on the runner holds whole collections and raw dumps, and
 that machine is usually gone by the time anyone reads the alert — which is why
