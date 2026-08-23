@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    # master is the default branch. Listing only main meant nothing on the
-    # branch everything merges into was ever tested, and the badge in the
-    # README reported on whatever last ran somewhere else.
+    # master is the default branch here; main is kept in case it is ever
+    # renamed. Without the default branch listed, the one push that most
+    # needs a green tick is the one that gets none.
     branches: [master, main, "claude/**"]
   pull_request:
   workflow_dispatch:
@@ -109,6 +109,31 @@ jobs:
       - name: Show what this machine can measure
         run: |
           python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
+
+      - name: Test
+        run: pytest -q
+
+  oldest-supported:
+    # pyproject declares pytest>=7.0 and python>=3.9. Everything else in this
+    # workflow installs whatever is newest, so the floor is a claim nothing
+    # runs - and a hook signature or an ini type that only exists in a later
+    # pytest would pass every job here and fail on a user's pinned one.
+    name: ubuntu / oldest supported
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+
+      - name: Install the declared minimums
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . "pytest==7.0.1" "pytest-xdist==3.0.2"
 
       - name: Test
         run: pytest -q

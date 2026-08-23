@@ -42,8 +42,6 @@ the same, so they are spelled differently.
 
 from __future__ import annotations
 
-import os
-import uuid
 import warnings
 from typing import Any, Optional
 
@@ -104,14 +102,6 @@ def install(
             )
         return existing
 
-    if wanted.run_id is None:
-        # Only the controller reaches this: a worker was handed one. Minted at
-        # install time rather than at session start, because the workers have
-        # to be told and they are configured before any session hook runs. Not
-        # minted while resolving, because resolving also happens on the path
-        # that only compares.
-        wanted = wanted.with_overrides(run_id=_new_run_id())
-
     _ensure_hookspecs(config)
     plugin = _build(config, wanted)
     if plugin is None:
@@ -137,13 +127,11 @@ def _resolve(
         worker_count=from_run.worker_count,
         # Their run id stands if they set one - correlating incidents with a
         # CI build id is a reason to install this by hand in the first place.
+        # Left as None otherwise, which is what lets the engine prefer xdist's
+        # own id for the run over anything this plugin could invent.
         run_id=settings.run_id or from_run.run_id,
     )
     return base.with_overrides(**overrides)
-
-
-def _new_run_id() -> str:
-    return os.environ.get("PYTEST_RUN_ID") or f"run-{uuid.uuid4().hex[:16]}"
 
 
 def _build(config: pytest.Config, settings: Settings) -> Any:

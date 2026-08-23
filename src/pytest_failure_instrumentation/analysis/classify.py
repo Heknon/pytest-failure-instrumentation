@@ -124,10 +124,15 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             "container runtimes; the true signal was not passed through"
         ]
 
-    if status is not None and status > 0:
+    if status is not None:
+        # Zero included. A worker that left the run without being asked to has
+        # gone wrong whatever number it exited with, and os._exit(0) inside a
+        # test is a real way to do it - reported as UNKNOWN it reads as a
+        # status nobody could obtain, which is the one thing this is not.
         return "SELF_EXIT", "medium", evidence + [
             "the worker exited on its own: something called sys.exit() or "
             "os._exit(), or a plugin aborted"
         ]
 
+    # No status at all - a remote gateway, with no local process to ask.
     return "UNKNOWN", "low", evidence + memory_evidence(incident)

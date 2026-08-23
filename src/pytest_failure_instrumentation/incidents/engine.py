@@ -30,8 +30,10 @@ instrumentation had done more damage than the failure it came to explain.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -74,12 +76,14 @@ class IncidentEngine:
             and config.getoption("dist", "no") != "no"
         )
 
-        # One owner for the run id: whoever installed the plugin. It is minted
-        # there rather than here because the workers have to be told, and
-        # pytest_configure_node fires before any of them exist - and because a
-        # framework installing this by hand may want its own CI build id in
-        # the column that groups a run's incidents together.
-        self.run_id = settings.run_id or "unknown"
+        # xdist's own id for the run is the one a reader can line up against
+        # its logs, but it does not exist until xdist has started its workers -
+        # so it is resolved lazily below, with a fallback fixed now. A
+        # timestamp is not enough: two runs starting in the same second are
+        # common on CI, and they would share an id.
+        self._run_id_fallback = os.environ.get("PYTEST_RUN_ID") or (
+            f"run-{uuid.uuid4().hex[:12]}"
+        )
         self.collections = CollectionTracker()
         self.reported_mismatch = False
         #: Workers that went down before registering a collection. They are
@@ -221,6 +225,26 @@ class IncidentEngine:
         self.raise_incident(incident)
 
     # -- sources ---------------------------------------------------------
+
+    @property
+    def run_id(self) -> str:
+        """The id every piece of this run's evidence is stamped with.
+
+        xdist's own id is preferred, so an incident lines up with its logs. It
+        is read from the session plugin rather than stored: the node manager
+        that holds it is built inside xdist's own ``pytest_sessionstart``,
+        which may run after this one.
+
+        A framework that installed this by hand and named an id outranks both
+        - correlating incidents with a build id is a reason to install by hand
+        in the first place, and it is the only id that means anything outside
+        this process.
+        """
+        if self.settings.run_id:
+            return self.settings.run_id
+        session = self.config.pluginmanager.getplugin("dsession")
+        manager = getattr(session, "nodemanager", None)
+        return getattr(manager, "testrunuid", None) or self._run_id_fallback
 
     def pytest_sessionstart(self, session: pytest.Session) -> None:
         # Only distributed runs can strand a worker. A single process that

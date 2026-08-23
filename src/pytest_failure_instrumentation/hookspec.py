@@ -28,6 +28,9 @@ arrives on the controller as a re-raised string.
 ``run_summary`` is emitted once at the end of every run, so its *absence*
 means the controller died too.
 
+A stall is assessed on a watcher thread, so an implementation of this hook can
+be called from a thread other than the one running the session.
+
 A framework that installs this itself, rather than letting the entry point do
 it, gets the same hook: ``install`` registers this spec if the entry point was
 disabled - see :mod:`.registration`.

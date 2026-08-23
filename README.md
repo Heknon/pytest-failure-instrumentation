@@ -316,6 +316,15 @@ never read as a healthy one.
 anybody, the test that was in flight is a lead worth recording — but a guess
 must never sit in the column a reader takes for a finding.
 
+### Handing one to an agent
+
+An incident is written to be read without context, which is most of what an LLM
+triaging a CI failure lacks. `.claude/skills/reading-failure-incidents/SKILL.md`
+is that context in one file: the anatomy of the alert text, what each shared
+field licenses a reader to conclude, the verdicts per kind, and the handful of
+places where the text is a summary and the payload is the number — so an agent
+reports what the incident found rather than what a `-9` looks like.
+
 ## Verdicts
 
 ### A worker died
@@ -326,7 +335,7 @@ must never sit in the column a reader takes for a finding.
 | `SIGKILLED` | `-9`, counter flat — host OOM, CI cancellation, external kill |
 | `NATIVE_CRASH` | SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, or a Windows NTSTATUS |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP — a request to stop, not a defect |
-| `SELF_EXIT` | clean exit code, no signal |
+| `SELF_EXIT` | any exit code with no signal, `0` included — a worker that left the run was not asked to |
 | `PROBABLY_SIGNALLED` | exit code 128–191, a wrapper ate the signal |
 | `UNKNOWN` | no status obtainable (remote gateway) |
 
@@ -446,10 +455,22 @@ and `run_ending` reflects which of the two happened.
 ## How it knows
 
 **A fixed-size state file.** Which test and phase is open right now is written
-to a 256-byte slot with `os.pwrite` — one syscall, no append, no growth, and a
+to a fixed-size slot with `os.pwrite` — one syscall, no append, no growth, and a
 file that is the same size after a million tests as after one. That is what
 separates "died in teardown" from "died mid-call": pytest's own `logfinish`
-fires only after the whole protocol, so it cannot tell them apart.
+fires only after the whole protocol, so it cannot tell them apart. The slot is
+5 KiB, holding a node id of around 4950 characters whole — past any real one by
+an order of magnitude, since a path, a class, a test name and a couple of
+content hashes together use a twentieth of it. The size is close to free: one
+write of one buffer costs the same syscall from 256 bytes to 8 KiB, and 5 KiB
+per worker is 320 KiB across a 64-way run. An id longer than that gives up its
+*middle*, never the record: truncating the encoded record leaves it
+unparseable, which costs the reader
+the phase and the counters as well and reports a worker that died mid-call as
+one that died before running anything. The middle goes rather than the tail
+because both ends carry something the other does not — the head is the module
+attribution reads, and the tail is where a parametrize puts the value saying
+which case this was.
 
 **The exit status, taken from the OS.** Where a `Popen` object survives, its
 return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
@@ -644,6 +665,9 @@ much as the operating system, so each gets its own job:
 - **without `pytest-xdist`**, where `pytest_testnodedown` has no hookspec at
   all and an unspecced hookimpl is a registration error — the failure mode that
   once made a plain `pytest` run report nothing.
+- **against the declared minimums**, `pytest==7.0.1` on Python 3.9. Every other
+  job installs whatever is newest, so a hook signature or an ini type that
+  arrived later would pass all of them and fail on a user's pinned pytest.
 
 `ruff` and `mypy` run as their own job, and fail first because they are cheap.
 The source carries `# noqa` and `# type: ignore` markers, which are only worth

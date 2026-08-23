@@ -166,6 +166,18 @@ def test_a_dump_that_is_not_blamed_is_still_handed_to_the_caller():
     assert unblamed.raw_stack() == TIMEOUT_DUMP
 
 
+def test_exiting_zero_is_still_the_worker_leaving_on_its_own():
+    """A worker that ends mid-run has gone wrong whatever number it exited
+    with, and os._exit(0) inside a test is a real way to do it. Reported as
+    UNKNOWN it reads as a status nobody could obtain, which sends the reader
+    looking for a remote gateway that is not there."""
+    verdict, confidence, evidence = verdict_of(exit_status=0)
+    assert (verdict, confidence) == ("SELF_EXIT", "medium")
+    assert any("os._exit()" in line for line in evidence)
+    # And no memory figures: nothing about a clean exit points at RAM.
+    assert not any("resident memory" in line for line in evidence)
+
+
 def test_no_status_at_all_is_unknown_rather_than_assumed():
     verdict, confidence, evidence = verdict_of(exit_status=None)
     assert (verdict, confidence) == ("UNKNOWN", "low")
