@@ -387,3 +387,27 @@ def test_a_death_dates_a_stack_that_did_not_come_from_the_death():
         "not written by a dying process" in line and "47s before this report" in line
         for line in evidence
     ), evidence
+
+
+def test_every_kind_hands_its_stack_over_without_a_switch_on_kind():
+    """A caller adding frames to its own alert should not have to know that a
+    death calls it crash_stack, a stall calls it stack, and an internal error
+    keeps it in detail."""
+    death = WorkerDeathIncident(worker="gw1", crash_stack=["a", "b"])
+    stall = WorkerStallIncident(worker="gw1", stack=["c"])
+    internal = InternalErrorIncident(worker="gw1", detail="d\ne")
+
+    assert death.raw_stack() == ["a", "b"]
+    assert stall.raw_stack() == ["c"]
+    assert internal.raw_stack() == ["d", "e"]
+    # Nothing to show is an empty list, not None: a caller can always join it.
+    assert RunSummaryIncident(worker="main").raw_stack() == []
+
+
+def test_the_stack_stays_out_of_the_alert_text():
+    """Forty frames turn a readable incident into a wall, and whether they
+    belong in an alert is the caller's decision."""
+    death = WorkerDeathIncident(
+        worker="gw1", crash_stack=['  File "/app/x.py", line 3 in boom']
+    )
+    assert "/app/x.py" not in str(death)

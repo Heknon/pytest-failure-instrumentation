@@ -280,6 +280,21 @@ incident = registry.parse(json.loads(row))   # -> WorkerDeathIncident, ...
 registry.json_schema()
 ```
 
+**The stack** is in the payload but out of `str(incident)`, because forty
+frames turn a readable incident into a wall and whether they belong in an alert
+is your call. `incident.raw_stack()` returns them as lines whatever the kind is;
+`top_frame` and `blamed_frame` are the two already parsed, each with `file`,
+`line`, `function`, `module` and `owner`.
+
+```python
+def pytest_failure_incident(incident):
+    body = str(incident)
+    frames = incident.raw_stack()
+    if frames:
+        body += "\n\n" + "\n".join(frames)
+    alerts.send(body)
+```
+
 **`owner`** is the field that settles arguments — `product`, `third-party`,
 `customer-code`, `runtime`, or `unknown`. It comes from walking outward past
 runtime frames to the first one that belongs to somebody: the deepest frame is
@@ -492,7 +507,16 @@ watchdog, not taken just now`, and carries `stack_age_seconds`. A death reports
 `crash_stack_age_seconds` alongside, so a dump that predates the death reads as
 the context it is rather than as the crash.
 
-**A watchdog the worker arms on itself.** The obvious design has the controller
+**A watchdog the worker arms on itself, on a cadence.** `dump_traceback_later`
+is armed with `repeat=True`, so a test that goes on running keeps refreshing
+its stack and whatever is on disk is at most one timeout old. That bound is the
+point: on Windows nothing can ask a live process for a stack, so this is the
+only one a stalled worker will ever have. The default is 20 seconds, and the
+file is emptied when the test ends — only the running test's dumps are ever
+read, so the cadence costs one test's worth of dumps (about 5 KB each) rather
+than a run's. At rest a healthy suite leaves an empty file.
+
+The obvious design instead has the controller
 signal a stalled worker and let faulthandler answer. It has two flaws: Windows
 has no `SIGUSR1` and `os.kill` there cannot deliver one, and on POSIX the
 signal *perturbs the subject* — PEP 475 makes Python retry on `EINTR`, but a C
@@ -522,6 +546,9 @@ overwhelming majority of what runs.
   one as it opens and one as it closes, which is what separates "died in
   teardown" from "died mid-call" — plus arming a watchdog timer (~78 µs). No
   append log, no `/proc` read, no allocation tracking.
+- Per test that outlives `failure_slow_test_seconds`: one ~5 KB stack dump
+  every interval, written by a C timer thread that does not hold the GIL, and
+  a truncate when the test ends. Nothing accumulates across tests.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
   memory.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
@@ -546,9 +573,15 @@ overwhelming majority of what runs.
 | `failure_object_census` | `false` | Count live objects at a high-water mark |
 | `failure_high_water_mb` | auto | Memory mark for a snapshot; defaults to a share of the discovered limit |
 | `failure_memory_limit_mb` | `0` | Soft cap (POSIX) turning an OOM kill into a `MemoryError` |
-| `failure_slow_test_seconds` | `120` | A test outliving this dumps its own stack |
+| `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
+
+`failure_slow_test_seconds` and `failure_stall_seconds` are not independent.
+The stack a stalled worker is reported with is whatever the watchdog last
+wrote, so the cadence has to have fired before the stall is assessed — a stall
+judged sooner is judged with no stack at all, and on Windows that is every
+stall. Neither is clamped, but an inverted pair warns.
 
 `failure_memory_limit_mb` is worth a note: an `RLIMIT_AS` cap makes the
 allocation fail *inside* the process, so you get a `MemoryError` with a

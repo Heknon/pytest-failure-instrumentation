@@ -36,6 +36,24 @@ They share ``kind``, ``verdict``, ``confidence``, ``severity``, ``owner``,
 ``fingerprint``, ``run_id``, ``worker`` and ``evidence``; the rest belongs to
 the kind, because a segfault's resident memory and a run summary's exit code
 have nothing to say to each other. ``str(incident)`` is the alert text.
+
+**The stack is in the payload but not in that text.** Forty frames turn a
+readable incident into a wall, and whether they belong in an alert is a
+decision only you can make - so ``str(incident)`` gives you the one blamed
+frame and ``incident.raw_stack()`` gives you all of them, as lines, whichever
+kind it is::
+
+    def pytest_failure_incident(incident):
+        body = str(incident)
+        frames = incident.raw_stack()
+        if frames:
+            body += "\n\n" + "\n".join(frames)
+        alerts.send(body)
+
+``top_frame`` and ``blamed_frame`` are the two frames already parsed for you,
+each with ``file``, ``line``, ``function``, ``module`` and ``owner``. The kinds
+keep their own raw fields too - ``crash_stack``, ``stack``, ``detail`` - and
+``raw_stack`` is only so that nobody has to switch on ``kind`` to reach them.
 ``incidents.registry.parse`` turns a stored row back into its own model, and
 ``registry.json_schema()`` is the contract for a table migration.
 """

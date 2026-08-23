@@ -61,7 +61,12 @@ class Settings:
     object_census: bool = False
     high_water_mb: int = 0
     memory_limit_mb: int = 0
-    slow_test_seconds: float = 120.0
+    #: How long a test may run before it starts leaving a stack, and how often
+    #: it refreshes it after that - ``repeat=True``, so this is also the
+    #: staleness bound on the only stack a stalled worker has on Windows. The
+    #: file is emptied when the test ends, so the cadence costs one test's
+    #: worth of dumps rather than a run's.
+    slow_test_seconds: float = 20.0
     stall_seconds: float = 300.0
     stack_probe: bool = True
     #: How many workers share the machine. Per worker, never sent between
@@ -78,6 +83,31 @@ class Settings:
             self,
             "heartbeat_interval",
             max(MIN_HEARTBEAT_INTERVAL, float(self.heartbeat_interval)),
+        )
+        self._warn_if_a_stall_is_judged_before_it_has_evidence()
+
+    def _warn_if_a_stall_is_judged_before_it_has_evidence(self) -> None:
+        """The watchdog has to have fired before the stall is assessed.
+
+        These two settings look independent and are not: the stack a stalled
+        worker is reported with is whatever the watchdog last wrote, so a stall
+        judged sooner than the watchdog's first dump is judged with no stack at
+        all. On Windows, where nothing can ask a live process for one, that is
+        every stall. Nothing is clamped - both numbers are legitimate choices -
+        but silently losing the stack is the kind of absence this plugin exists
+        to stop people misreading.
+        """
+        if not self.watchdog or self.stall_seconds <= 0 or self.slow_test_seconds <= 0:
+            return  # one of the two is switched off, so there is no ordering
+        if self.slow_test_seconds < self.stall_seconds:
+            return
+        warnings.warn(
+            f"failure_slow_test_seconds ({self.slow_test_seconds:g}) is not below "
+            f"failure_stall_seconds ({self.stall_seconds:g}), so a stalled worker "
+            "is assessed before its watchdog has written a stack and will be "
+            "reported without one",
+            FailureInstrumentationWarning,
+            stacklevel=4,
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:
@@ -162,9 +192,11 @@ def add_options(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "failure_slow_test_seconds",
-        help="A test running longer than this dumps its own stack, so a hang "
-        "leaves evidence without anything having to signal it.",
-        default="120",
+        help="How long a test may run before it starts leaving a stack, and "
+        "how often it refreshes it after that. This is the only stack a "
+        "stalled worker has on Windows, so it doubles as the age of the "
+        "freshest evidence available. 0 disables.",
+        default="20",
     )
     parser.addini("failure_stall_seconds", help="Silence before a stall is assessed. 0 disables.", default="300")
     parser.addini(
@@ -245,7 +277,7 @@ def resolve(config: pytest.Config) -> Settings:
         object_census=_flag(config, "failure_object_census", False),
         high_water_mb=int(_number(config, "failure_high_water_mb", 0)),
         memory_limit_mb=int(_number(config, "failure_memory_limit_mb", 0)),
-        slow_test_seconds=_number(config, "failure_slow_test_seconds", 120.0),
+        slow_test_seconds=_number(config, "failure_slow_test_seconds", 20.0),
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe", True),
         worker_count=worker_count,

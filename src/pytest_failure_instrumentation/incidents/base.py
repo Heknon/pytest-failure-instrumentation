@@ -107,9 +107,25 @@ class Incident(BaseModel):
         """Whether *this* incident ended the session. Constant for most kinds."""
         return type(self).ends_run
 
-    def stack_lines(self) -> tuple[list[str], bool]:
-        """The text to read frames out of, and whether it reads outermost
-        first. faulthandler prints deepest first; tracebacks do not."""
+    def raw_stack(self) -> list[str]:
+        """Everything captured, as text, whatever kind this is.
+
+        For a caller adding the stack to its own alert. Deliberately kept out
+        of ``__str__``: forty frames turn a readable incident into a wall, and
+        whether they belong in an alert is a decision only the caller can
+        make. Which field holds them differs per kind, and this is so that
+        nobody has to switch on ``kind`` to find out.
+        """
+        return []
+
+    def blame_stack(self) -> tuple[list[str], bool]:
+        """The text to attribute *this failure* to, and whether it reads
+        outermost first. faulthandler prints deepest first; tracebacks do not.
+
+        Not the same as :meth:`raw_stack`, and the difference matters: a dump
+        that did not come from the failure is still worth handing to a reader
+        as context, and must still never be blamed for it.
+        """
         return [], False
 
     def suspect_nodeid(self) -> str | None:

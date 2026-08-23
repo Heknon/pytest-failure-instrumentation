@@ -49,7 +49,10 @@ class InternalErrorIncident(Incident):
     #: error itself, which is what makes worker attribution unreliable.
     first_hand: bool = True
 
-    def stack_lines(self) -> tuple[list[str], bool]:
+    def raw_stack(self) -> list[str]:
+        return self.detail.splitlines()
+
+    def blame_stack(self) -> tuple[list[str], bool]:
         return self.detail.splitlines(), True  # a traceback: outermost first
 
     def suspect_nodeid(self) -> str | None:

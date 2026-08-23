@@ -31,6 +31,7 @@ dumps; ``.slow`` holds the watchdog's.
 from __future__ import annotations
 
 import faulthandler
+import os
 import signal
 from pathlib import Path
 from typing import Optional, TextIO
@@ -55,26 +56,58 @@ def arm_fatal_handler(stream: TextIO) -> bool:
 
 
 class SlowTestWatchdog:
-    """Dumps the stack of any test that outlives ``timeout`` seconds."""
+    """Leaves a stack for any test still running after ``timeout`` seconds.
+
+    The timeout is a cadence, not just a threshold: ``repeat=True`` means a
+    test that goes on running keeps refreshing its stack, so whatever is on
+    disk describes the test that is running *now* and is at most one timeout
+    old. That is the only stack a stalled worker has on Windows, where nothing
+    can ask a live process for one.
+
+    Which is why the file is emptied when the test ends. Only the running
+    test's dumps are ever wanted - the controller reads the most recent one -
+    and keeping the rest turns a cheap cadence into a file that grows all run
+    for no reader. Emptied rather than rotated, because the whole point is
+    that there is nothing to keep.
+    """
 
     def __init__(self, stream: TextIO, timeout: float) -> None:
         self.stream = stream
         self.timeout = timeout
         self.enabled = timeout > 0
+        #: Set once the timer has been armed, so a suite of fast tests never
+        #: pays for the reset below.
+        self._armed = False
 
     def start_test(self) -> None:
         if not self.enabled:
             return
-        # repeat=True: a test stuck for an hour writes a stack every timeout,
-        # so the controller sees whether it is moving between dumps.
         faulthandler.dump_traceback_later(
             self.timeout, repeat=True, file=self.stream, exit=False
         )
+        self._armed = True
 
     def end_test(self) -> None:
         if not self.enabled:
             return
         faulthandler.cancel_dump_traceback_later()
+        if self._armed:
+            self._armed = False
+            self._empty()
+
+    def _empty(self) -> None:
+        """Truncate through the descriptor faulthandler writes to.
+
+        It holds the raw fd and writes at the fd's own offset, so the offset
+        has to be rewound as well - truncating alone would leave the next dump
+        written past a hole of NULs.
+        """
+        try:
+            descriptor = self.stream.fileno()
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        except (OSError, ValueError):
+            pass  # bookkeeping must never break a run
 
 
 #: What faulthandler writes before the first thread when the process is dying.

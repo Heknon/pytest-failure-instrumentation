@@ -316,3 +316,48 @@ def test_a_stack_nobody_asked_for_says_when_it_was_taken(distributed):
     assert stall.stack and stall.stack_probed is False
     assert stall.stack_age_seconds is not None
     assert "by the slow-test watchdog, not taken just now" in str(stall)
+
+
+def test_a_worker_wedged_longer_than_the_cadence_has_a_stack(distributed):
+    """The old 120s default left nothing at all for a shorter wedge.
+
+    The cadence is a staleness bound, not just a "this test is slow" threshold:
+    on Windows the watchdog is the only stack a stalled worker will ever have,
+    so a default that never fires means no stack for the whole class of hangs
+    that resolve, or get killed, inside two minutes.
+    """
+    distributed.pytester.makepyfile(
+        test_hang="""
+        import threading
+
+        never_set = threading.Event()
+
+
+        def test_filler():
+            assert True
+
+
+        def test_deadlocks():
+            never_set.wait(40)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2",
+        # The cadence has to be below the stall threshold or the worker is
+        # judged before the watchdog has written anything - see
+        # test_the_shipped_defaults_leave_a_stall_something_to_read.
+        "-o", "failure_slow_test_seconds=4",
+        "-o", "failure_stall_seconds=12",
+        "-o", "failure_heartbeat_interval=2",
+        "-o", "failure_stack_probe=false",
+        "test_hang.py",
+        timeout=180,
+    )
+
+    stall = distributed.only(incidents, "worker_stall")
+    assert stall.stack, "the cadence left no stack for a wedge outlasting it"
+    assert stall.blamed_frame is not None
+    assert stall.blamed_frame.function == "test_deadlocks"
+    # And it is recent, because the cadence keeps refreshing it.
+    assert stall.stack_age_seconds is not None
+    assert stall.stack_age_seconds <= 10

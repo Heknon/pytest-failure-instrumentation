@@ -144,7 +144,7 @@ class IncidentEngine:
 
     def _enrich(self, incident: Incident) -> None:
         """Everything that is the same whatever kind this is."""
-        lines, reverse = incident.stack_lines()
+        lines, reverse = incident.blame_stack()
         blame = self.attributor.blame(lines, reverse=reverse)
         incident.top_frame = frame_from(blame["top_frame"])
         incident.blamed_frame = frame_from(blame["blamed_frame"])

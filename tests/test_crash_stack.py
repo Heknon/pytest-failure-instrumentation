@@ -195,3 +195,39 @@ def test_when_a_dump_was_written_is_recoverable(tmp_path):
     written = crash_stack.written_at(path)
     assert written is not None and time.time() - written < 60
     assert crash_stack.written_at(tmp_path / "nothing-here.slow") is None
+
+
+# -- the watchdog's file, at rest and in flight ----------------------------
+
+
+def test_the_dump_file_is_emptied_when_the_test_that_filled_it_ends(tmp_path):
+    """The cadence is what makes a stalled worker's stack recent, and repeat=True
+    is what makes that cadence real - but only the running test's dumps are
+    ever read. Keeping the rest turns a cheap cadence into a file that grows
+    all run for no reader at all.
+    """
+    path = tmp_path / "gw0.slow"
+    with path.open("w", buffering=1, encoding="utf-8") as stream:
+        watchdog = crash_stack.SlowTestWatchdog(stream, timeout=0.2)
+        watchdog.start_test()
+        time.sleep(0.6)          # long enough for the timer to fire
+        assert path.stat().st_size > 0, "the watchdog wrote nothing to empty"
+        watchdog.end_test()
+        assert path.stat().st_size == 0
+
+        # And the descriptor is still usable: the next test's dump has to land
+        # at the start of the file rather than past a hole of NULs.
+        watchdog.start_test()
+        time.sleep(0.6)
+        watchdog.end_test()
+    assert "\x00" not in path.read_text(encoding="utf-8")
+
+
+def test_a_suite_of_fast_tests_never_pays_for_the_reset(tmp_path):
+    """Nothing was armed, so there is nothing to empty."""
+    path = tmp_path / "gw0.slow"
+    with path.open("w", buffering=1, encoding="utf-8") as stream:
+        watchdog = crash_stack.SlowTestWatchdog(stream, timeout=0)
+        watchdog.start_test()
+        watchdog.end_test()
+    assert path.read_text(encoding="utf-8") == ""

@@ -71,7 +71,10 @@ class WorkerStallIncident(Incident):
     #: reader cannot tell the two apart from the frames alone.
     stack_age_seconds: Optional[float] = None
 
-    def stack_lines(self) -> tuple[list[str], bool]:
+    def raw_stack(self) -> list[str]:
+        return self.stack
+
+    def blame_stack(self) -> tuple[list[str], bool]:
         return self.stack, False  # faulthandler prints deepest first
 
     def suspect_nodeid(self) -> Optional[str]:

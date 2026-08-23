@@ -60,7 +60,10 @@ class WorkerDeathIncident(Incident):
     #: anything else on file, which is the case worth saying out loud.
     crash_stack_age_seconds: Optional[float] = None
 
-    def stack_lines(self) -> tuple[list[str], bool]:
+    def raw_stack(self) -> list[str]:
+        return self.crash_stack
+
+    def blame_stack(self) -> tuple[list[str], bool]:
         """Frames to attribute the death to - only from a dump that belongs
         to it.
 

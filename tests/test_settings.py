@@ -38,7 +38,7 @@ DEFAULTS = {
     "failure_object_census": "false",
     "failure_high_water_mb": "0",
     "failure_memory_limit_mb": "0",
-    "failure_slow_test_seconds": "120",
+    "failure_slow_test_seconds": "20",
     "failure_stall_seconds": "300",
     "failure_stack_probe": "true",
 }
@@ -93,3 +93,29 @@ def test_every_setting_in_the_readme_table_is_registered():
 
     settings_module.add_options(Parser())
     assert sorted(registered) == sorted(DEFAULTS)
+
+
+def test_the_shipped_defaults_leave_a_stall_something_to_read():
+    """These two settings look independent and are not.
+
+    The stack a stalled worker is reported with is whatever the watchdog last
+    wrote, so the cadence has to have fired before the stall is assessed. At
+    the old 120s cadence a worker wedged for a minute left nothing at all -
+    and on Windows, where nothing can ask a live process for a stack, that was
+    every stall shorter than two minutes.
+    """
+    defaults = resolve(FakeConfig())
+    assert 0 < defaults.slow_test_seconds < defaults.stall_seconds
+
+
+def test_an_inverted_pair_says_what_it_will_cost():
+    with pytest.warns(FailureInstrumentationWarning, match="before its watchdog"):
+        resolve(FakeConfig(failure_slow_test_seconds="60", failure_stall_seconds="10"))
+
+
+def test_switching_either_one_off_is_not_an_inversion():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FailureInstrumentationWarning)
+        resolve(FakeConfig(failure_stall_seconds="0"))       # no stall detection
+        resolve(FakeConfig(failure_slow_test_seconds="0"))   # no watchdog
+        resolve(FakeConfig(failure_watchdog="false"))

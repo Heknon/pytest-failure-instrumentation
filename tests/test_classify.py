@@ -149,12 +149,21 @@ def test_a_slow_test_dump_does_not_hide_a_wrapped_signal():
 
 
 def test_only_a_fatal_dump_is_offered_for_blame():
-    """Attribution walks whatever stack_lines() hands it. A watchdog dump names
+    """Attribution walks whatever blame_stack() hands it. A watchdog dump names
     a test that was not running when the worker died - if that test is in the
     product's own package, an unrelated clean exit pages somebody."""
-    assert death(exit_status=3, crash_stack=TIMEOUT_DUMP).stack_lines() == ([], False)
-    lines, reverse = death(exit_status=3, crash_stack=FATAL_DUMP).stack_lines()
+    assert death(exit_status=3, crash_stack=TIMEOUT_DUMP).blame_stack() == ([], False)
+    lines, reverse = death(exit_status=3, crash_stack=FATAL_DUMP).blame_stack()
     assert lines == FATAL_DUMP and reverse is False
+
+
+def test_a_dump_that_is_not_blamed_is_still_handed_to_the_caller():
+    """Not blaming a stack is not the same as withholding it. A caller adding
+    frames to its own alert wants everything captured; only attribution has to
+    be careful about which dump it came from."""
+    unblamed = death(exit_status=3, crash_stack=TIMEOUT_DUMP)
+    assert unblamed.blame_stack() == ([], False)
+    assert unblamed.raw_stack() == TIMEOUT_DUMP
 
 
 def test_no_status_at_all_is_unknown_rather_than_assumed():
