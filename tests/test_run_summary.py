@@ -30,6 +30,19 @@ def test_no_evidence_directory_is_left_behind_by_a_plain_run(runner):
     assert not (runner.pytester.path / ".pytest-failures").exists()
 
 
+def test_a_run_without_xdist_still_gets_an_id_of_its_own(runner):
+    """xdist's id is the good one, and there is none without xdist. What
+    replaces it has to be unique per run: a timestamp is not, and two runs
+    starting in the same second on CI is ordinary."""
+    runner.pytester.makepyfile(test_suite=SUITE)
+    first = runner.only(runner.run("-p", "no:xdist", "test_suite.py"), "run_summary")
+    (runner.pytester.path / "incidents.jsonl").unlink()
+    second = runner.only(runner.run("-p", "no:xdist", "test_suite.py"), "run_summary")
+
+    assert first.run_id and first.run_id != "unknown"
+    assert first.run_id != second.run_id
+
+
 @needs_xdist
 def test_a_distributed_run_says_so(runner):
     runner.pytester.makepyfile(test_suite=SUITE)
