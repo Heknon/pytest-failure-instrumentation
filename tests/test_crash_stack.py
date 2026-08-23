@@ -200,37 +200,112 @@ def test_when_a_dump_was_written_is_recoverable(tmp_path):
 # -- the watchdog's file, at rest and in flight ----------------------------
 
 
-def test_the_dump_file_is_emptied_when_the_test_that_filled_it_ends(tmp_path):
-    """The cadence is what makes a stalled worker's stack recent, and repeat=True
-    is what makes that cadence real - but only the running test's dumps are
-    ever read. Keeping the rest turns a cheap cadence into a file that grows
-    all run for no reader at all.
+def test_a_test_that_outlives_the_timeout_has_its_stack_written(tmp_path):
+    """The watchdog does not run itself: the heartbeat ticks it.
+
+    A tick before the timeout writes nothing, and one after it writes a dump
+    headed the way faulthandler heads its own.
     """
     path = tmp_path / "gw0.slow"
-    with path.open("w", buffering=1, encoding="utf-8") as stream:
-        watchdog = crash_stack.SlowTestWatchdog(stream, timeout=0.2)
-        watchdog.start_test()
-        time.sleep(0.6)          # long enough for the timer to fire
-        assert path.stat().st_size > 0, "the watchdog wrote nothing to empty"
-        watchdog.end_test()
-        assert path.stat().st_size == 0
+    watchdog = crash_stack.SlowTestWatchdog(path, timeout=0.2)
 
-        # And the descriptor is still usable: the next test's dump has to land
-        # at the start of the file rather than past a hole of NULs.
-        watchdog.start_test()
-        time.sleep(0.6)
-        watchdog.end_test()
-    assert "\x00" not in path.read_text(encoding="utf-8")
+    watchdog.start_test()
+    watchdog.tick()
+    assert not path.exists(), "a test inside the timeout was dumped anyway"
+
+    time.sleep(0.25)
+    watchdog.tick()
+    lines = crash_stack.read(path, limit=40)
+    assert lines and lines[0].startswith("Timeout (")
+    assert any("test_a_test_that_outlives_the_timeout" in line for line in lines)
+
+
+def test_the_dump_is_dropped_when_the_test_that_left_it_ends(tmp_path):
+    """Only the running test's stack is ever read, and a stack belonging to a
+    test that finished is one somebody will read anyway."""
+    path = tmp_path / "gw0.slow"
+    watchdog = crash_stack.SlowTestWatchdog(path, timeout=0.05)
+
+    watchdog.start_test()
+    time.sleep(0.1)
+    watchdog.tick()
+    assert path.exists()
+
+    watchdog.end_test()
+    assert not path.exists()
+    assert not list(tmp_path.glob("*.part")), "a half-written dump was left behind"
+
+
+def test_the_cadence_is_per_test_and_not_per_tick(tmp_path):
+    """The heartbeat ticks far more often than the timeout, and each tick is a
+    dump of every thread in the process. Writing one per tick would turn a
+    twenty-second cadence into a five-second one nobody asked for."""
+    path = tmp_path / "gw0.slow"
+    watchdog = crash_stack.SlowTestWatchdog(path, timeout=0.2)
+
+    watchdog.start_test()
+    time.sleep(0.25)
+    watchdog.tick()
+    first = path.stat().st_mtime_ns
+
+    for _ in range(5):
+        watchdog.tick()
+    assert path.stat().st_mtime_ns == first, "a tick inside the cadence re-dumped"
+
+
+def test_a_reader_never_sees_half_a_dump(tmp_path):
+    """The controller reads this file while the worker is writing it, and
+    faulthandler prints one thread at a time. Half a dump holds the threads it
+    had reached and not the one running the test, so the report names whichever
+    was printed first - this plugin's own heartbeat. The file is therefore
+    written beside itself and renamed into place."""
+    path = tmp_path / "gw0.slow"
+    watchdog = crash_stack.SlowTestWatchdog(path, timeout=0)
+    watchdog.enabled = True  # a zero timeout is off; this test wants the write
+    watchdog._dump()
+
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("Timeout (")
+    assert text.rstrip().endswith(")") or "File " in text
+    # Renamed rather than written in place, so the previous dump stands until
+    # the new one is whole.
+    assert not list(tmp_path.glob("*.part"))
 
 
 def test_a_suite_of_fast_tests_never_pays_for_the_reset(tmp_path):
-    """Nothing was armed, so there is nothing to empty."""
+    """Nothing was written, so there is nothing to drop."""
     path = tmp_path / "gw0.slow"
-    with path.open("w", buffering=1, encoding="utf-8") as stream:
-        watchdog = crash_stack.SlowTestWatchdog(stream, timeout=0)
-        watchdog.start_test()
-        watchdog.end_test()
-    assert path.read_text(encoding="utf-8") == ""
+    watchdog = crash_stack.SlowTestWatchdog(path, timeout=0)
+    watchdog.start_test()
+    watchdog.tick()
+    watchdog.end_test()
+    assert not path.exists()
+
+
+def test_the_dumping_thread_is_not_reported_as_the_stalled_one(tmp_path):
+    """faulthandler labels whoever asked for the dump "Current thread", and the
+    thread that asks is this plugin's heartbeat.
+
+    Believing that label reported the heartbeat as the frozen test - on macOS
+    down to naming a psutil frame as the blamed function, in a run where the
+    thing that was actually wedged was a fixture finalizer.
+    """
+    path = tmp_path / "gw0.slow"
+    path.write_text(
+        "Timeout (0:00:20)!\n"
+        "Current thread 0x00000001 (most recent call first):\n"
+        '  File "/x/pytest_failure_instrumentation/capture/heartbeat.py", line 66 in _run\n'
+        '  File "/usr/lib/python3.11/threading.py", line 982 in run\n'
+        "\n"
+        "Thread 0x00000002 (most recent call first):\n"
+        '  File "/app/conftest.py", line 9 in leaky_client\n'
+        '  File "/x/_pytest/runner.py", line 113 in pytest_runtest_protocol\n',
+        encoding="utf-8",
+    )
+
+    lines = crash_stack.read(path, limit=20)
+    assert any("leaky_client" in line for line in lines)
+    assert not any("heartbeat.py" in line for line in lines)
 
 
 # -- which phases the watchdog covers --------------------------------------
@@ -257,12 +332,12 @@ def drive(recorder, phase):
 
 
 def test_the_watchdog_covers_the_whole_test_and_is_armed_once(tmp_path):
-    """Armed at setup and cancelled at teardown.
+    """Started at setup and stopped at teardown.
 
-    Not per phase: dump_traceback_later resets the timer every time it is
-    called, so re-arming at each phase would mean a test that spent most of
-    the interval in setup and the rest in the call never reached it - the
-    timer would keep starting over and no stack would ever be written.
+    Not per phase: the clock is what the timeout is measured against, so
+    restarting it at each phase would mean a test that spent most of the
+    interval in setup and the rest in the call never reached it - the clock
+    would keep starting over and no stack would ever be written.
     """
     from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
     from pytest_failure_instrumentation.config import Settings
@@ -282,8 +357,8 @@ def test_the_watchdog_covers_the_whole_test_and_is_armed_once(tmp_path):
 
 
 def test_a_test_that_never_reaches_teardown_still_re_arms_next_time(tmp_path):
-    """A missed cancel self-heals: the next setup calls dump_traceback_later
-    again, which resets the timer rather than stacking a second one."""
+    """A missed stop self-heals: the next setup restarts the clock rather than
+    leaving the previous test's running."""
     from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
     from pytest_failure_instrumentation.config import Settings
 

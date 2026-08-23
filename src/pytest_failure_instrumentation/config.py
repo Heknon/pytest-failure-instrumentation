@@ -195,7 +195,9 @@ def add_options(parser: pytest.Parser) -> None:
         help="How long a test may run before it starts leaving a stack, and "
         "how often it refreshes it after that. This is the only stack a "
         "stalled worker has on Windows, so it doubles as the age of the "
-        "freshest evidence available. 0 disables.",
+        "freshest evidence available. The heartbeat thread writes it, so it "
+        "needs failure_watchdog on and cannot be finer than "
+        "failure_heartbeat_interval. 0 disables.",
         default="20",
     )
     parser.addini("failure_stall_seconds", help="Silence before a stall is assessed. 0 disables.", default="300")

@@ -277,10 +277,11 @@ def test_the_test_that_is_wedged_now_is_blamed_and_not_an_earlier_slow_one(distr
         "--max-worker-restart=0",
         "-o", "failure_slow_test_seconds=2",
         # Comfortably past anything a cold runner can spend getting to the
-        # first report: at eight seconds a slow macOS worker was still in the
-        # *first* test when the stall was assessed, and the assertion below
-        # then read as the bug it exists to catch.
-        "-o", "failure_stall_seconds=20",
+        # first report: at eight seconds - and again at twenty - a slow macOS
+        # worker was still in the *first* test when the stall was assessed, and
+        # the assertion below then read as the bug it exists to catch. The
+        # wedge lasts ninety seconds, so the margin is free to be this wide.
+        "-o", "failure_stall_seconds=45",
         "-o", "failure_heartbeat_interval=2",
         "-o", "failure_stack_probe=false",
         "test_two_slow.py",
@@ -355,7 +356,11 @@ def test_a_worker_wedged_longer_than_the_cadence_has_a_stack(distributed):
         # judged before the watchdog has written anything - see
         # test_the_shipped_defaults_leave_a_stall_something_to_read.
         "-o", "failure_slow_test_seconds=4",
-        "-o", "failure_stall_seconds=12",
+        # Twelve was inside what a loaded macOS runner spends getting to the
+        # first report, so the stall was assessed against a worker that had not
+        # reached the hang yet. Twenty still leaves twenty-odd seconds of hang
+        # to be caught in.
+        "-o", "failure_stall_seconds=20",
         "-o", "failure_heartbeat_interval=2",
         "-o", "failure_stack_probe=false",
         "test_hang.py",
@@ -401,7 +406,11 @@ def test_a_fixture_that_blocks_in_setup_is_named(distributed):
     incidents = distributed.run(
         "-n", "2",
         "-o", "failure_slow_test_seconds=4",
-        "-o", "failure_stall_seconds=12",
+        # Twelve was inside what a loaded macOS runner spends getting to the
+        # first report, so the stall was assessed against a worker that had not
+        # reached the hang yet. Twenty still leaves twenty-odd seconds of hang
+        # to be caught in.
+        "-o", "failure_stall_seconds=20",
         "-o", "failure_heartbeat_interval=2",
         "-o", "failure_stack_probe=false",
         "test_setup_hang.py",
@@ -430,7 +439,7 @@ def test_a_finalizer_that_blocks_in_teardown_is_named(distributed):
         @pytest.fixture
         def leaky_client():
             yield
-            never_set.wait(40)
+            never_set.wait(45)
 
 
         def test_filler():
@@ -444,7 +453,11 @@ def test_a_finalizer_that_blocks_in_teardown_is_named(distributed):
     incidents = distributed.run(
         "-n", "2",
         "-o", "failure_slow_test_seconds=4",
-        "-o", "failure_stall_seconds=12",
+        # Twelve was inside what a loaded macOS runner spends getting to the
+        # first report, so the stall was assessed against a worker that had not
+        # reached the hang yet. Twenty still leaves twenty-odd seconds of hang
+        # to be caught in.
+        "-o", "failure_stall_seconds=20",
         "-o", "failure_heartbeat_interval=2",
         "-o", "failure_stack_probe=false",
         "test_teardown_hang.py",

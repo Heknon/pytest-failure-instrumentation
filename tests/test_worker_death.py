@@ -308,6 +308,42 @@ def test_the_opt_in_probes_name_the_line_holding_the_memory(distributed):
     assert mark["objects_by_type"]
 
 
+def test_the_watchdog_does_not_kill_the_workers_it_is_watching(distributed):
+    """The stack watchdog used to be ``faulthandler.dump_traceback_later``.
+
+    That dumps from a C thread which does not hold the GIL, walking every
+    other thread's frames while those threads push and pop them. A dump that
+    lands while the interpreter is *executing* - a phase boundary rather than
+    a sleep - reads a frame being torn down and the worker segfaults. With
+    ``repeat=True`` and a cadence a quarter of the test length, that was 10
+    runs out of 10 here; the file was left ending mid-frame, with a nonsense
+    line number, and the crash file empty because the fault was inside the
+    dumper.
+
+    So this runs a suite whose every test outlives the cadence several times
+    over, and asks for the one thing instrumentation must never do.
+    """
+    body = "\n".join(
+        f"def test_{index:02d}():\n    time.sleep(0.2)\n" for index in range(40)
+    )
+    distributed.pytester.makepyfile(test_churn=f"import time\n\n{body}")
+
+    incidents = distributed.run(
+        "-n", "1",
+        # Twelve or so dumps per test, every one of them landing somewhere the
+        # old timer could not safely look.
+        "-o", "failure_slow_test_seconds=0.05",
+        "-o", "failure_heartbeat_interval=0.5",
+        "test_churn.py",
+        timeout=180,
+    )
+
+    assert distributed.of_kind(incidents, "worker_death") == [], (
+        "the watchdog killed the worker it was watching"
+    )
+    distributed.result.assert_outcomes(passed=40)
+
+
 def test_a_slow_test_that_passed_is_not_the_crash_that_killed_the_worker(distributed):
     """The watchdog dump and the fatal dump used to share a file.
 

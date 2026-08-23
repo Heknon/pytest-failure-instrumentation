@@ -66,13 +66,13 @@ class WorkerRecorder:
         self._crash_stream = self._track(
             (directory / f"{worker_id}.crash").open("w", buffering=1, encoding="utf-8")
         )
-        self._slow_stream = self._track(
-            (directory / f"{worker_id}.slow").open("w", buffering=1, encoding="utf-8")
-        )
-        # A test that outlives this dumps its own stack - no signal, so it
-        # works on Windows and interrupts no syscall.
+        # A test that outlives this has its stack written for it - no signal,
+        # so it works on Windows and interrupts no syscall. The heartbeat
+        # thread does the writing (see SlowTestWatchdog), so a worker with the
+        # watchdog switched off has nothing to drive it and gets no dumps.
         self.slow_test = crash_stack.SlowTestWatchdog(
-            self._slow_stream, settings.slow_test_seconds
+            directory / f"{worker_id}.slow",
+            settings.slow_test_seconds if settings.watchdog else 0.0,
         )
 
         self._apply_memory_limit(settings)
@@ -138,7 +138,7 @@ class WorkerRecorder:
         self.heartbeat = Heartbeat(
             self.events.record,
             interval=settings.heartbeat_interval,
-            observers=[self.monitor],
+            observers=[self.monitor, self.slow_test],
         )
         self.heartbeat.start()
 
@@ -176,7 +176,7 @@ class WorkerRecorder:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase
         self.state.update(nodeid=nodeid, phase=phase)
-        # Armed once for the whole test rather than per phase, and armed from
+        # Started once for the whole test rather than per phase, and from
         # setup rather than from the call.
         #
         # A fixture that blocks on a container, a connection or a service is
@@ -185,10 +185,10 @@ class WorkerRecorder:
         # "died in teardown" from "died mid-call" for exactly that reason.
         # Covering only the call left both of those with no stack at all.
         #
-        # Once, not per phase, because dump_traceback_later resets the timer
-        # every time it is called: re-arming at each phase would mean a test
-        # that spent most of the interval in setup and the rest in the call
-        # never reached it.
+        # Once, not per phase, because the clock is what the timeout is
+        # measured against: restarting it at each phase would mean a test that
+        # spent most of the interval in setup and the rest in the call never
+        # reached it.
         if phase == "setup":
             self.slow_test.start_test()
         yield

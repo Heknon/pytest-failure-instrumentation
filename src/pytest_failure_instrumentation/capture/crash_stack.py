@@ -1,24 +1,17 @@
-"""Getting a stack out of a worker - by the worker's own timer, not a signal.
+"""Getting a stack out of a worker that is still running, without a signal.
 
-The obvious design is for the controller to signal a stalled worker and have
+The obvious design is for the controller to signal a slow worker and have
 faulthandler answer. It has two flaws. Windows has no SIGUSR1 and ``os.kill``
 there cannot deliver one, so the whole mechanism is absent. And on POSIX the
 signal *perturbs the subject*: a C extension blocked in a syscall that does not
 handle EINTR returns early when the signal lands, so the worker resumes and the
 stall being measured disappears.
 
-So the worker arms its own watchdog instead. ``dump_traceback_later`` runs a
-timer thread inside the process: arm it when a test starts, cancel it when the
-test ends, and any test outliving the timeout writes its own stack. It works on
-every platform, it interrupts no syscall, and it still dumps while native code
-holds the GIL - which is exactly the case a signal was needed for.
-
-Arming and cancelling costs about 78 microseconds per test, which is affordable
-in a path where almost nothing else is.
-
-The signal handler is still registered on POSIX, but only as an extra: a way to
-ask for a *fresh* stack once the controller has already decided a worker is
-stalled, when the risk of nudging an already-wedged process is acceptable.
+So the worker writes its own stack instead, on a cadence, while the test that
+is taking a while is still running. The signal handler is still registered on
+POSIX, but only as an extra: a way to ask for a *fresh* stack once the
+controller has already decided a worker is stalled, when the risk of nudging
+an already-wedged process is acceptable.
 
 The two dumps go to two files. A watchdog dump means "this test is taking a
 while" and is written by tests that go on to pass; a fatal dump means the
@@ -33,6 +26,8 @@ from __future__ import annotations
 import faulthandler
 import os
 import signal
+import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional, TextIO
 
@@ -58,62 +53,144 @@ def arm_fatal_handler(stream: TextIO) -> bool:
 class SlowTestWatchdog:
     """Leaves a stack for any test still running after ``timeout`` seconds.
 
-    The timeout is a cadence, not just a threshold: ``repeat=True`` means a
-    test that goes on running keeps refreshing its stack, so whatever is on
-    disk describes the test that is running *now* and is at most one timeout
-    old. That is the only stack a stalled worker has on Windows, where nothing
-    can ask a live process for one.
+    The timeout is a cadence, not just a threshold: a test that goes on
+    running keeps refreshing its stack, so whatever is on disk describes the
+    test that is running *now* and is at most one timeout old. That is the
+    only stack a stalled worker has on Windows, where nothing can ask a live
+    process for one.
 
-    Which is why the file is emptied when the test ends. Only the running
-    test's dumps are ever wanted - the controller reads the most recent one -
-    and keeping the rest turns a cheap cadence into a file that grows all run
-    for no reader. Emptied rather than rotated, because the whole point is
-    that there is nothing to keep.
+    **Why this is not faulthandler's own timer.** ``dump_traceback_later`` is
+    the obvious mechanism and is what this used to be. It dumps from a C
+    thread that does not hold the GIL, walking every other thread's frames
+    while those threads are pushing and popping them. A dump that lands while
+    the interpreter is *executing* rather than blocked reads a frame that is
+    being torn down, and the worker segfaults. That is not theoretical: over a
+    suite whose tests were four times the dump cadence long, a repeating timer
+    killed the worker in 10 runs out of 10, against 0 out of 10 with the
+    repeat turned off. The evidence is left on the file - the last dump ends
+    mid-frame with a nonsense line number, and the crash file is empty because
+    the fault is inside the dumper itself.
+
+    So the dump is taken by the heartbeat thread, from Python, holding the
+    GIL. Nothing else can be mutating what is being walked, which makes it
+    safe by construction rather than by luck; this object is a heartbeat
+    observer for that reason and does nothing on its own.
+
+    What that costs is the one case the timer covered and this cannot: native
+    code holding the GIL. No Python thread runs then, so no dump is written -
+    but the heartbeat stops too, which is exactly how such a worker is
+    diagnosed, and on POSIX the controller can still signal it for a stack.
+    On Windows it leaves none. That is a real loss, and a much smaller one
+    than instrumentation that crashes the workers it is watching.
+
+    The cadence can only be as fine as the heartbeat, since that is what
+    drives it: a ``failure_heartbeat_interval`` longer than
+    ``failure_slow_test_seconds`` becomes the real interval between dumps.
     """
 
-    def __init__(self, stream: TextIO, timeout: float) -> None:
-        self.stream = stream
+    def __init__(self, path: Path, timeout: float) -> None:
+        self.path = path
         self.timeout = timeout
         self.enabled = timeout > 0
-        #: Set once the timer has been armed, so a suite of fast tests never
-        #: pays for the reset below.
-        self._armed = False
+        #: When the running test started, or None between tests. Written by
+        #: the main thread and read by the heartbeat's; a single attribute
+        #: rather than a lock, because a tick that reads the previous value
+        #: is a dump one interval early or late and nothing worse.
+        self._started_at: Optional[float] = None
+        #: When this test was last dumped, so the cadence is per test rather
+        #: than per tick.
+        self._dumped_at: Optional[float] = None
+        #: Whether there is a dump to clean up. A suite of fast tests never
+        #: writes one, and must not pay a failing unlink per test to find out.
+        self._on_disk = False
 
     def start_test(self) -> None:
         if not self.enabled:
             return
-        faulthandler.dump_traceback_later(
-            self.timeout, repeat=True, file=self.stream, exit=False
-        )
-        self._armed = True
+        self._started_at = time.monotonic()
+        # The cadence is measured within a test, not across the run: a test
+        # that begins just after the previous one was dumped would otherwise
+        # wait out the rest of that interval before writing its own first.
+        self._dumped_at = None
 
     def end_test(self) -> None:
+        """Only the running test's stack is ever wanted.
+
+        A dump left behind by a test that finished describes a test that
+        finished, and the next reader has no way to know that. It is dated,
+        which is honest, but a stale file is still a file somebody will read.
+        """
         if not self.enabled:
             return
-        faulthandler.cancel_dump_traceback_later()
-        if self._armed:
-            self._armed = False
-            self._empty()
+        self._started_at = None
+        if self._on_disk:
+            self._discard()
 
-    def _empty(self) -> None:
-        """Truncate through the descriptor faulthandler writes to.
+    def observe(self, resident: Optional[int], nodeid: Optional[str]) -> None:
+        """The heartbeat's observer protocol. Its arguments are for the memory
+        monitor; this one only needs to be told that time has passed."""
+        self.tick()
 
-        It holds the raw fd and writes at the fd's own offset, so the offset
-        has to be rewound as well - truncating alone would leave the next dump
-        written past a hole of NULs.
+    def tick(self) -> None:
+        started = self._started_at
+        if not self.enabled or started is None:
+            return
+        now = time.monotonic()
+        if now - started < self.timeout:
+            return
+        if self._dumped_at is not None and now - self._dumped_at < self.timeout:
+            return
+        self._dumped_at = now
+        self._dump()
+
+    def _dump(self) -> None:
+        """Write the whole dump beside the file, then move it into place.
+
+        A reader on the controller cannot tell a file being written from a
+        finished one, and half a dump is worse than none: the threads
+        faulthandler had reached are there and the one running the test is
+        not, so the report names whichever thread happened to be printed
+        first - this plugin's own heartbeat. Renaming means every read sees a
+        complete dump, or the one before it.
+
+        The banner is faulthandler's own, because that is what this is - the
+        same dump on the same cadence, taken from a thread that is allowed to
+        walk the frames.
         """
+        temporary = self.path.with_name(self.path.name + ".part")
         try:
-            descriptor = self.stream.fileno()
-            os.ftruncate(descriptor, 0)
-            os.lseek(descriptor, 0, os.SEEK_SET)
-        except (OSError, ValueError):
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(f"{TIMEOUT_BANNER}{timedelta(seconds=self.timeout)})!\n")
+                handle.flush()  # faulthandler writes to the descriptor, not the buffer
+                faulthandler.dump_traceback(file=handle, all_threads=True)
+            os.replace(temporary, self.path)
+            self._on_disk = True
+        except (OSError, ValueError, RuntimeError):
+            # Bookkeeping must never break a run, and a missing stack costs
+            # the report a section rather than the run a worker. The cadence
+            # is not advanced, so the next tick tries again: Windows refuses
+            # the rename while a reader has the file open, and the reader is
+            # the controller assessing a stall - which is when the freshest
+            # stack matters most.
+            self._dumped_at = None
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    def _discard(self) -> None:
+        self._on_disk = False
+        try:
+            self.path.unlink()
+        except OSError:
             pass  # bookkeeping must never break a run
 
 
 #: What faulthandler writes before the first thread when the process is dying.
 FATAL_BANNER = "Fatal Python error"
 
-#: What ``dump_traceback_later`` writes. The test may well go on to pass.
+#: What a watchdog dump is headed with - faulthandler's own wording, since
+#: it is faulthandler's own dump. The test may well go on to pass.
 TIMEOUT_BANNER = "Timeout ("
 
 #: Lines faulthandler writes before the first thread, which say what kind of
@@ -138,12 +215,13 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
     Two things have to be picked correctly here, and getting either wrong
     blames code that was not running.
 
-    **Which dump.** A file holds as many dumps as were written to it, and
-    ``dump_traceback_later(repeat=True)`` writes one every timeout for as long
-    as a test runs - so a worker wedged for a minute leaves dozens. Reading
-    from the top returns the oldest, which is the stack of whatever was slow
-    *first*: a test that may have finished, passed, and been forgotten. Only
-    the last dump describes the present.
+    **Which dump.** A file holds as many dumps as were written to it. The
+    crash file accumulates: an on-demand stack taken while a worker was merely
+    stalled precedes the fatal dump that ends it. Reading from the top returns
+    the oldest, which is the stack of whatever went wrong *first* - and where
+    a file did once hold a run's worth of watchdog dumps, the oldest was a
+    test that had finished, passed and been forgotten. Only the last dump
+    describes the present.
 
     **Which thread within it.** A dump is written with ``all_threads=True``, so
     it holds several stacks. The first printed is almost never the interesting
@@ -228,12 +306,16 @@ def _most_relevant(sections: list[list[str]]) -> list[str]:
     """The thread worth reporting, in descending order of certainty.
 
     A fatal signal and an on-demand SIGUSR1 both label the thread they reached
-    as "Current thread", and that is the answer. ``dump_traceback_later``
-    labels nothing - it dumps from a C timer thread - so a slow test has to be
-    found by what is on its stack instead.
+    as "Current thread", and that is the answer.
+
+    Except when "Current thread" is *us*. A watchdog dump is taken by the
+    heartbeat thread, so faulthandler labels that one current - and taking the
+    label at its word reported this plugin's own heartbeat as the frozen test,
+    down to a psutil frame as the blamed function. A slow test has to be found
+    by what is on its stack instead.
     """
     for section in sections:
-        if section[0].startswith("Current thread"):
+        if section[0].startswith("Current thread") and not _mentions_us(section):
             return section
     for section in sections:
         if any(marker in line for marker in RUNTEST_MARKERS for line in section):

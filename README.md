@@ -512,20 +512,23 @@ whatever that stack happened to be doing.
 **Choosing the right dump, and the right thread inside it.** Two things have to
 be picked here, and getting either wrong blames code that was not running.
 
-A file holds as many dumps as were written to it, and the watchdog repeats —
-`dump_traceback_later(repeat=True)` writes one every timeout for as long as a
-test runs, so a worker wedged for a minute leaves dozens. The dump that
-describes the present is the *last* one; the first is whatever was slow
-earliest, which may be a test that has since finished and passed. The same
-applies to the crash file, where an on-demand stack taken while a worker was
-merely stalled precedes the fatal dump that ends it.
+A file holds as many dumps as were written to it, and the crash file
+accumulates: an on-demand stack taken while a worker was merely stalled
+precedes the fatal dump that ends it. The dump that describes the present is
+the *last* one. The watchdog's file holds only ever one, because each dump is
+written beside it and renamed into place — a reader that caught it mid-write
+would get the threads faulthandler had reached and not the one running the
+test.
 
-Within that dump, `all_threads=True` means every thread is present, and the
-first printed in a pytest worker is this plugin's own heartbeat thread; the
-second is execnet's receiver. Reporting the first section would blame the
-instrumentation for the failure it came to explain. The section reported is the
-one the fault or signal reached (`Current thread`), else the one carrying
-pytest's runtest protocol, else anything that is not ours.
+Within a dump, `all_threads=True` means every thread is present, and the first
+printed in a pytest worker is this plugin's own heartbeat thread; the second is
+execnet's receiver. Reporting the first section would blame the instrumentation
+for the failure it came to explain. The section reported is the one the fault
+or signal reached (`Current thread`), else the one carrying pytest's runtest
+protocol, else anything that is not ours. `Current thread` is skipped when it
+is *ours*: the watchdog's dump is taken by the heartbeat thread, so
+faulthandler labels that one current, and believing the label reported the
+heartbeat as the frozen test.
 
 **Saying how old a stack is.** A stack is evidence about a moment, and the
 frames look the same whether they were taken just now or left behind four
@@ -535,32 +538,48 @@ watchdog, not taken just now`, and carries `stack_age_seconds`. A death reports
 `crash_stack_age_seconds` alongside, so a dump that predates the death reads as
 the context it is rather than as the crash.
 
-**A watchdog the worker arms on itself, on a cadence.** `dump_traceback_later`
-is armed with `repeat=True`, so a test that goes on running keeps refreshing
-its stack and whatever is on disk is at most one timeout old. It is armed at
-the start of *setup* and cancelled at the end of *teardown*, so a fixture
-blocking on a container and a finalizer blocking on a connection are covered
-as well as the test body — those are the commonest real hangs there are, and
-the state slot has always told them apart. Armed once for the whole test
-rather than per phase, because `dump_traceback_later` resets the timer each
-time it is called: re-arming per phase would mean a test that spent most of
-the interval in setup and the rest in the call never reached it. That bound is the
-point: on Windows nothing can ask a live process for a stack, so this is the
-only one a stalled worker will ever have. The default is 20 seconds, and the
-file is emptied when the test ends — only the running test's dumps are ever
-read, so the cadence costs one test's worth of dumps (about 5 KB each) rather
-than a run's. At rest a healthy suite leaves an empty file.
+**A watchdog on a cadence, written by the heartbeat thread.** A test still
+running after `failure_slow_test_seconds` has its stack written for it, and
+keeps having it rewritten every interval, so whatever is on disk is at most one
+interval old. That bound is the point: on Windows nothing can ask a live
+process for a stack, so this is the only one a stalled worker will ever have.
+The clock starts at *setup* and stops at the end of *teardown*, so a fixture
+blocking on a container and a finalizer blocking on a connection are covered as
+well as the test body — those are the commonest real hangs there are, and the
+state slot has always told them apart. Once for the whole test rather than per
+phase, or a test that spent most of the interval in setup and the rest in the
+call would never reach it. The default is 20 seconds, and the file is dropped
+when the test ends, so only the running test's stack is ever on disk (about
+5 KB) and a healthy suite leaves nothing.
 
-The obvious design instead has the controller
-signal a stalled worker and let faulthandler answer. It has two flaws: Windows
-has no `SIGUSR1` and `os.kill` there cannot deliver one, and on POSIX the
-signal *perturbs the subject* — PEP 475 makes Python retry on `EINTR`, but a C
-extension blocked in a raw syscall need not, so it returns early and the stall
-being measured disappears. So each test arms
-`faulthandler.dump_traceback_later` instead. It works on every platform,
-interrupts no syscall, and still dumps while native code holds the GIL. The
-signal path remains as an extra, for asking an already-diagnosed worker for a
-fresher stack.
+The obvious design instead has the controller signal a stalled worker and let
+faulthandler answer. It has two flaws: Windows has no `SIGUSR1` and `os.kill`
+there cannot deliver one, and on POSIX the signal *perturbs the subject* —
+PEP 475 makes Python retry on `EINTR`, but a C extension blocked in a raw
+syscall need not, so it returns early and the stall being measured disappears.
+The signal path remains as an extra, for asking an already-diagnosed worker for
+a fresher stack.
+
+The next design, and what this was until it was measured, is
+`faulthandler.dump_traceback_later(repeat=True)`. It needs no signal and works
+on Windows, and it dumps even while native code holds the GIL — but it dumps
+from a C thread that does *not* hold the GIL, walking every other thread's
+frames while those threads push and pop them. A dump landing while the
+interpreter is executing rather than blocked reads a frame being torn down, and
+the worker segfaults. Over a suite whose tests were four times the cadence
+long, that killed the worker in 10 runs out of 10, against 0 with the repeat
+turned off; it left the dump ending mid-frame with a nonsense line number, and
+the crash file empty because the fault was inside the dumper. Instrumentation
+that crashes what it is watching is worse than no instrumentation, so the dump
+is taken from the heartbeat thread instead, in Python, holding the GIL —
+nothing else can be mutating what is being walked.
+
+What that costs is the case the C timer was there for: native code holding the
+GIL, where no Python thread runs and no dump is written. The heartbeat stops
+too, which is precisely how such a worker is diagnosed, and on POSIX it can
+still be signalled for a stack. On Windows it leaves none. Since the heartbeat
+is what drives the cadence, a `failure_heartbeat_interval` longer than
+`failure_slow_test_seconds` becomes the real interval between dumps.
 
 **A heartbeat carrying CPU time.** One line every five seconds per worker,
 bounded by wall-clock rather than by how many tests run. `time.process_time()`
@@ -579,12 +598,12 @@ overwhelming majority of what runs.
 
 - Per test: six fixed-size writes to a file that never grows — two per phase,
   one as it opens and one as it closes, which is what separates "died in
-  teardown" from "died mid-call" — plus arming a watchdog timer (~78 µs). No
-  append log, no `/proc` read, no allocation tracking.
+  teardown" from "died mid-call" — plus two clock reads. No append log, no
+  `/proc` read, no allocation tracking.
 - Per test that outlives `failure_slow_test_seconds` (measured setup through
-  teardown): one ~5 KB stack dump every interval, written by a C timer thread
-  that does not hold the GIL, and a truncate when the test ends. Nothing
-  accumulates across tests.
+  teardown): one ~5 KB stack dump every interval, written and renamed by the
+  heartbeat thread, and an unlink when the test ends. Nothing accumulates
+  across tests, and nothing is written for a test that finishes in time.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
   memory.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
@@ -609,7 +628,7 @@ overwhelming majority of what runs.
 | `failure_object_census` | `false` | Count live objects at a high-water mark |
 | `failure_high_water_mb` | auto | Memory mark for a snapshot; defaults to a share of the discovered limit |
 | `failure_memory_limit_mb` | `0` | Soft cap (POSIX) turning an OOM kill into a `MemoryError` |
-| `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown) |
+| `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
 
