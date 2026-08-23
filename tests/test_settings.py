@@ -6,7 +6,9 @@ reader believes they configured a stall detector and never hears from it.
 
 from __future__ import annotations
 
+import re
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -119,3 +121,25 @@ def test_switching_either_one_off_is_not_an_inversion():
         resolve(FakeConfig(failure_stall_seconds="0"))       # no stall detection
         resolve(FakeConfig(failure_slow_test_seconds="0"))   # no watchdog
         resolve(FakeConfig(failure_watchdog="false"))
+
+
+def test_the_two_places_the_version_is_written_agree():
+    """The release workflow reads pyproject and refuses a tag that disagrees
+    with it. It never reads ``__version__``.
+
+    So that one can drift unnoticed: a release publishing 0.2.0 while the
+    installed package reports 0.1.0 to anyone who asks it. Nothing else
+    catches that, because the check that exists is between the tag and
+    pyproject, not between pyproject and here.
+
+    Read with a regex rather than tomllib, which is 3.11+, and against the
+    source rather than the installed metadata, which is written at install
+    time and goes stale the moment pyproject is edited.
+    """
+    import pytest_failure_instrumentation
+
+    root = Path(pytest_failure_instrumentation.__file__).parent.parent.parent
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    declared = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
+    assert declared, "no version in pyproject.toml"
+    assert pytest_failure_instrumentation.__version__ == declared.group(1)

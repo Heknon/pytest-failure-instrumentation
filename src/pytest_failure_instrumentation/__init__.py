@@ -23,6 +23,6 @@ per-test path is unaffected by any of it.
 from .config import Settings
 from .registration import install, installed_settings
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["Settings", "__version__", "install", "installed_settings"]
