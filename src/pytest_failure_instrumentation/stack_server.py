@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import socketserver
 import threading
 import time
 import urllib.error
@@ -160,6 +161,31 @@ class _Server(ThreadingHTTPServer):
         #: whichever run happens to be hosting.
         self.evidence_root = evidence_root
         super().__init__(address, handler)
+
+    def server_bind(self) -> None:
+        """Bind without asking DNS who we are.
+
+        ``HTTPServer.server_bind`` fills in ``server_name`` with
+        ``socket.getfqdn(host)``, which is a *reverse DNS lookup performed
+        while the server is being constructed*. On a Linux desktop that costs
+        three milliseconds; on macOS it goes through mDNS and can take tens of
+        seconds, during which this thread is inside the constructor and the
+        session has no server at all.
+
+        That is not a hypothesis about macOS. It failed there, on every job:
+        every test that binds and serves timed out with the status still at
+        its initial value, because nothing past the constructor had run.
+
+        ``server_name`` is only ever used to fill in CGI variables and a
+        default ``Host`` header, and nothing here serves CGI or originates
+        requests. So the lookup buys nothing and is skipped: the address the
+        caller asked for is a better answer than whatever DNS says about it,
+        and it is available immediately.
+        """
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
 
     #: **Not** the inherited default on Windows, where SO_REUSEADDR means
     #: something else entirely: there it permits binding an address another
