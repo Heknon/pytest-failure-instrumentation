@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Optional
 
@@ -62,7 +63,10 @@ RATE_WINDOW = 4
 
 
 def snapshot(
-    directory: Path, served_by: Optional[dict[str, Any]] = None, now: Optional[float] = None
+    directory: Path,
+    served_by: Optional[dict[str, Any]] = None,
+    now: Optional[float] = None,
+    only: Optional[Collection[str]] = None,
 ) -> dict[str, Any]:
     """Every run under ``directory``, and every worker in each.
 
@@ -71,25 +75,66 @@ def snapshot(
     reason each has its own directory, and a view that showed only the run it
     happened to be served by would be blind to exactly the situation that
     motivates having a view at all.
+
+    ``only`` narrows it to named workers. A caller watching one test does not
+    want the other sixty-three read for it, and the saving is real rather than
+    cosmetic: the filter is applied to the directory listing, so a worker that
+    was not asked for costs a name comparison instead of a state read and an
+    event tail.
+
+    Runs left with no workers at all drop out, since a caller that asked about
+    ``gw0`` is not helped by three runs that do not have one. Names that
+    matched nothing anywhere are reported rather than silently dropped - a
+    caller cannot otherwise tell "not running" from "misspelt".
     """
     moment = time.time() if now is None else now
+    wanted = _wanted(only)
     runs = []
+    seen: set[str] = set()
     try:
         candidates = sorted(path for path in directory.iterdir() if path.is_dir())
     except OSError:
         candidates = []
     for path in candidates:
-        described = run(path, moment)
-        if described is not None:
-            runs.append(described)
-    return {
+        described = run(path, moment, only=wanted)
+        if described is None:
+            continue
+        seen.update(entry["worker"] for entry in described["workers"])
+        if wanted is not None and not described["workers"]:
+            continue
+        runs.append(described)
+
+    found: dict[str, Any] = {
         "served_by": served_by or {},
         "observed_at": round(moment, 3),
         "runs": runs,
     }
+    if wanted is not None:
+        found["filter"] = {
+            "workers": sorted(wanted),
+            "unmatched": sorted(wanted - seen),
+        }
+    return found
 
 
-def run(directory: Path, now: Optional[float] = None) -> Optional[dict[str, Any]]:
+def _wanted(only: Optional[Collection[str]]) -> Optional[set[str]]:
+    """The set to keep, or None for everything.
+
+    An empty request means "no filter" rather than "nothing": ``?worker=`` is
+    what a UI sends when its filter box is empty, and answering that with an
+    empty list would be technically defensible and useless.
+    """
+    if only is None:
+        return None
+    names = {name.strip() for name in only if name and name.strip()}
+    return names or None
+
+
+def run(
+    directory: Path,
+    now: Optional[float] = None,
+    only: Optional[Collection[str]] = None,
+) -> Optional[dict[str, Any]]:
     """One run, or None if this directory is not one of ours.
 
     The owner file is the test, not the name: ``failure_directory`` is a
@@ -101,7 +146,17 @@ def run(directory: Path, now: Optional[float] = None) -> Optional[dict[str, Any]
     if owner is None:
         return None
 
-    workers = [worker(state, moment) for state in sorted(directory.glob("*.state"))]
+    # Filtered by the name the listing already gave us, never by building a
+    # path out of one. These names arrive from an HTTP query, and a filename
+    # assembled from that is a directory traversal waiting to be found; the
+    # saving is the same either way, because what costs is reading the file
+    # rather than listing it.
+    wanted = _wanted(only)
+    workers = [
+        worker(state, moment)
+        for state in sorted(directory.glob("*.state"))
+        if wanted is None or state.stem in wanted
+    ]
     controller_pid = owner.get("pid")
     return {
         "session": directory.name,

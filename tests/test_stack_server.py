@@ -681,3 +681,37 @@ def test_the_workers_endpoint_is_listed_and_says_when_it_cannot_answer(serving):
 
     status, body = get(port, "/nothing")
     assert "/workers" in body["endpoints"]
+
+
+def test_the_workers_endpoint_takes_a_worker_filter(serving, tmp_path):
+    """Both spellings and both shapes, because a caller writes whichever
+    occurs to them and being strict would only produce a wrong answer."""
+    run = tmp_path / "run-abc123"
+    run.mkdir()
+    (run / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+    for name in ("gw0", "gw1", "gw2"):
+        (run / f"{name}.state").write_bytes(
+            json.dumps(
+                {"pid": os.getpid(), "nodeid": f"test_{name}.py::test_one", "time": time.time()}
+            ).encode()
+            + b"\n"
+        )
+
+    service = serving(0, directory=run)
+    assert wait_for(lambda: service.serving), service.status
+
+    def named(query: str) -> list[str]:
+        status, body = get(service.bound_port, "/workers" + query)
+        assert status == 200
+        return [entry["worker"] for entry in body["runs"][0]["workers"]]
+
+    assert named("") == ["gw0", "gw1", "gw2"]
+    assert named("?worker=gw1") == ["gw1"]
+    assert named("?worker=gw0,gw2") == ["gw0", "gw2"]
+    assert named("?worker=gw0&worker=gw2") == ["gw0", "gw2"]
+    assert named("?workers=gw1") == ["gw1"]
+    assert named("?worker=") == ["gw0", "gw1", "gw2"]
+
+    status, body = get(service.bound_port, "/workers?worker=gw9")
+    assert body["runs"] == []
+    assert body["filter"]["unmatched"] == ["gw9"]

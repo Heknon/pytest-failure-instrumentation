@@ -665,6 +665,23 @@ the run was writing anyway — no ptrace, no per-test cost, nothing written:
       "status": "working", "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0}]}]}
 ```
 
+`?worker=` narrows it to particular workers, which on a sixty-four-way run is
+the difference between reading one state file and reading all of them. Both
+spellings and both shapes work, and they mix:
+
+```console
+$ curl 'localhost:8080/workers?worker=gw1'
+$ curl 'localhost:8080/workers?worker=gw0,gw3'
+$ curl 'localhost:8080/workers?worker=gw0&worker=gw2'
+```
+
+Runs left with no matching worker drop out, and names that matched nothing
+anywhere come back under `filter.unmatched` — otherwise a caller cannot tell
+"not running" from "misspelt". An empty `?worker=` is treated as no filter,
+because that is what a UI sends when its filter box is empty. The names are
+compared against a directory listing and never joined onto one, so a value that
+looks like a path is just a name that matches nothing.
+
 The status vocabulary is [`analysis/stall.py`](#how-it-knows)'s truth table, as
 a live status rather than a post-hoc verdict:
 
