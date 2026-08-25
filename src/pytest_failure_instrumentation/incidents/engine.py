@@ -111,7 +111,9 @@ class IncidentEngine:
         self.session_id = os.environ.get("PYTEST_RUN_ID") or (
             f"run-{uuid.uuid4().hex[:12]}"
         )
-        #: Filled on first read and never recomputed - see the property.
+        #: Filled by the first read that finds a real id, and never
+        #: recomputed after that - see the property for why not the first read
+        #: of any kind.
         self._run_id: str | None = None
         self.collections = CollectionTracker()
         self.reported_mismatch = False
@@ -319,21 +321,39 @@ class IncidentEngine:
     def run_id(self) -> str:
         """The id every piece of this run's evidence is stamped with.
 
-        Resolved once and kept. Recomputing it meant an early read answering
-        with this process's own name and a later one with xdist's - two names
-        for one run, stamped onto different pieces of the same evidence.
-        Nothing reads it before xdist has built its node manager, so what gets
-        kept is xdist's; the directory is named separately, precisely so that
-        this can be left to settle on its own.
+        Kept once it is *authoritative*, and only then. The distinction is
+        load-bearing: this process's own name for itself is a stand-in that
+        exists from the start, and xdist's real one does not exist until xdist
+        has built its node manager. Caching whichever came first froze the
+        stand-in and every incident in the run then carried a name that
+        appears in nobody's logs.
+
+        And "whichever came first" is not under this plugin's control at all.
+        pytest's fixture collection walks every attribute of every registered
+        plugin object looking for fixtures, with a plain ``getattr`` - so
+        reading a property is something *pytest* does, at plugin registration
+        time, before any hook here has run. Measured on pytest 7.0.1, where it
+        happens through ``FixtureManager.parsefactories``; newer pytest
+        happened not to, which is the kind of difference that makes an
+        ordering assumption a bug waiting for a version bump.
+
+        So a property on a plugin object must have no lasting side effect, and
+        this one no longer does: an early read answers with the stand-in and
+        keeps nothing, and the first read once the real id exists is the one
+        that sticks.
 
         A framework that installed this by hand and named an id outranks both -
         correlating incidents with a build id is a reason to install by hand in
         the first place, and it is the only id that means anything outside this
         process. Then xdist's own, so an incident lines up with its logs.
         """
-        if self._run_id is None:
-            self._run_id = self._resolve_run_id()
-        return self._run_id
+        if self._run_id is not None:
+            return self._run_id
+        resolved = self._resolve_run_id()
+        if resolved != self.session_id:
+            # An answer rather than a stand-in, so it is safe to keep.
+            self._run_id = resolved
+        return resolved
 
     def _resolve_run_id(self) -> str:
         if self.settings.run_id:
