@@ -115,7 +115,12 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "$(ls dist/*.whl)" pytest-xdist
+          # The extra, rather than a copy of what it currently contains.
+          # pytest-xdist was written out here by hand, so anything added to
+          # [test] later would be missing from the one run that decides
+          # whether to publish - the gate quietly weakening without a line of
+          # this file changing.
+          python -m pip install "$(ls dist/*.whl)[test]"
 
       - name: Confirm the plugin registers from the installed package
         shell: bash
@@ -184,6 +189,15 @@ jobs:
         with:
           repository-url: ${{ ((github.event_name == 'push' || inputs.repository == 'pypi') && 'https://upload.pypi.org/legacy/') || 'https://test.pypi.org/legacy/' }}
           print-hash: true
+          # So that a run which uploaded and then failed on something after it
+          # can be re-run at all. Without this the second attempt offers PyPI
+          # files it already has, dies on them, and the tag and the release
+          # notes have to be finished by hand.
+          #
+          # It gives nothing away: PyPI will not replace a file that exists
+          # whatever this is set to. All it decides is whether "already there"
+          # ends the run or is stepped over.
+          skip-existing: true
 
   release:
     # Last, and only once PyPI has accepted the upload: a release pointing at a
@@ -216,8 +230,24 @@ jobs:
         run: |
           set -euo pipefail
           tag="v${{ needs.build.outputs.version }}"
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "$tag already exists, which is the tag-push path"
+
+          # ls-remote prints the tag object for an annotated tag and the commit
+          # for a lightweight one; asking for the peeled ref as well puts the
+          # commit on the last line either way.
+          at=$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" | awk 'END {print $1}')
+
+          if [ -n "$at" ]; then
+            # On a tag push this is the tag that started the run, so it agrees
+            # by construction. On a dispatch it need not: the tag can already
+            # sit on an older commit, and the release would then be written
+            # against that commit while PyPI holds what this run just built -
+            # the wrong thing under the right name, through the one door the
+            # version check in build does not cover.
+            if [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::$tag is already on $at, which is not the commit this run published ($GITHUB_SHA)"
+              exit 1
+            fi
+            echo "$tag already exists here, which is the tag-push path"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -231,8 +261,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$TAG" dist/* \
-            --title "$TAG" \
-            --generate-notes \
-            --verify-tag \
-            ${{ needs.build.outputs.prerelease == 'true' && '--prerelease' || '' }}
+          set -euo pipefail
+          # Same reason as skip-existing above: on a re-run the release is
+          # already there, and creating it a second time is an error rather
+          # than a no-op.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; replacing its files with the ones this run built"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag \
+              ${{ needs.build.outputs.prerelease == 'true' && '--prerelease' || '' }}
+          fi
