@@ -645,6 +645,64 @@ let one be drawn: a UI that can read the evidence directory needs no agreement
 about numbers, and it has to read that directory anyway to know which pid is
 running which test.
 
+### What is running where
+
+`GET /workers` answers the whole question in one request, assembled from files
+the run was writing anyway — no ptrace, no per-test cost, nothing written:
+
+```json
+{"served_by": {"service": "…", "pid": 17155}, "observed_at": 1787688175.421,
+ "runs": [{"session": "run-19d52c2ff8e2", "run_id": "757f3cc51790…",
+           "controller": {"pid": 17155, "alive": true},
+   "workers": [
+     {"worker": "gw0", "pid": 21615, "nodeid": "test_slow.py::test_alpha", "phase": "call",
+      "status": "blocked", "why": "heartbeat 0.5s old but no CPU progress: the test thread is waiting on something",
+      "process_exists": true, "heartbeat_age_s": 0.5, "cpu_rate": 0.001, "rss_mb": 32},
+     {"worker": "gw1", "pid": 21618, "nodeid": "test_slow.py::test_beta", "phase": "call",
+      "status": "gone", "why": "process 21618 no longer exists; last seen in call of test_slow.py::test_beta",
+      "process_exists": false},
+     {"worker": "gw2", "pid": 21621, "nodeid": "test_slow.py::test_gamma", "phase": "call",
+      "status": "working", "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0}]}]}
+```
+
+The status vocabulary is [`analysis/stall.py`](#how-it-knows)'s truth table, as
+a live status rather than a post-hoc verdict:
+
+| status | heartbeat | CPU | process |
+|---|---|---|---|
+| `working` | fresh | above 0.05 cores | exists |
+| `blocked` | fresh | below that | exists |
+| `frozen` | stale | — | exists |
+| `gone` | — | — | absent |
+| `unmeasured` | never any | — | — |
+
+Three files answer three different questions, and keeping them apart is what
+makes this cheap and correct. `.state` says *what* a worker is doing and is
+written before each phase runs, so it is ahead of anything the controller
+knows — but a twenty-minute test writes nothing for twenty minutes, so a stale
+record says nothing about liveness. `.events` carries a heartbeat every few
+seconds whatever the test is doing, and the CPU time on each beat is the only
+thing separating a worker that is *working* from one that is *stuck*. The pid
+answers the narrowest question of the three, about a number that can be reused.
+
+Two details that are easy to get wrong and are handled here:
+
+- **A killed worker is a zombie until its parent reaps it**, and the kernel
+  accepts signals for it the whole time — so a `kill(pid, 0)` check reports a
+  worker killed a moment ago as alive, which is the opposite of what a crash
+  view is for. Linux answers from procfs; psutil answers where it is
+  installed; elsewhere the heartbeat carries the finding instead.
+- **`cpu_rate: null` is not zero.** "It burned nothing" and "we could not
+  measure" are different findings, and a worker at full tilt whose beats
+  collide produces the second.
+
+Nothing here signals a worker or asks it anything: every verdict comes from
+beats already on disk, because asking a wedged process a question can dissolve
+the stall you were measuring.
+
+`nodeid` and `phase` are `null` between tests, and a very long `nodeid` is
+trimmed from both ends with `nodeid_elided: true` saying so.
+
 ### Finding the server
 
 A drawn port is written to `callstack-<pid>.json` in **this run's** evidence

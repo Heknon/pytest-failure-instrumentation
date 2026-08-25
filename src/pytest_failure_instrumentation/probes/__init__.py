@@ -11,7 +11,7 @@ from .memory import (
     resident_megabytes,
     system_available_megabytes,
 )
-from .process import exit_status
+from .process import exit_status, is_running
 from .pyspy import dump as external_stack
 from .stacks import can_request_stack, own_threads, request_stack
 
@@ -23,6 +23,7 @@ __all__ = [
     "resident_megabytes",
     "system_available_megabytes",
     "exit_status",
+    "is_running",
     "can_request_stack",
     "external_stack",
     "own_threads",
