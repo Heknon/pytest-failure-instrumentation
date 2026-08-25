@@ -59,8 +59,15 @@ def pytest_configure(config):
 
 def pytest_sessionstart(session):
     settings = installed_settings(session.config)
-    where = "worker" if hasattr(session.config, "workerinput") else "controller"
-    with open("installed.jsonl", "a") as handle:
+    worker = getattr(session.config, "workerinput", None)
+    where = "worker" if worker else "controller"
+    # A file per process. Two xdist workers reach this at the same moment, and
+    # a shared append is only indivisible where the platform makes it so - on
+    # Windows one worker's line simply was not there, and the run that noticed
+    # was a release deciding whether to publish. Nothing here needs the writes
+    # interleaved in one file, so they are not.
+    with open(f"installed-{{worker['workerid'] if worker else 'controller'}}.jsonl",
+              "a", encoding="utf-8") as handle:
         handle.write(json.dumps({{
             "where": where,
             "packages": list(settings.packages),
@@ -74,10 +81,17 @@ def pytest_sessionstart(session):
 
 
 def installs(pytester) -> list[dict]:
-    path = pytester.path / "installed.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    """Every process's records, controller first and then the workers in order.
+
+    Sorted rather than in the order they happened to be written, which was
+    never anything a caller could rely on across two processes racing to the
+    same file.
+    """
+    return [
+        json.loads(line)
+        for path in sorted(pytester.path.glob("installed-*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
 
 
 @pytest.fixture
