@@ -317,24 +317,35 @@ def test_the_fallback_timer_never_fires_while_the_heartbeat_is_beating(tmp_path)
     that is executing Python when it fires. It is armed so that it cannot:
     every beat pushes the deadline out, so while anything Python runs at all
     the deadline is always in the future.
+
+    The interval is a half second rather than a twentieth because what the
+    first half asserts - that nothing fires while the beats arrive - is
+    measured against a wall clock, and at 0.05 the deadline it had to beat
+    was 0.15s. That is inside the ordinary scheduling noise of a loaded
+    runner: a single hiccup between two ticks fires the timer, which is what
+    happened on a macOS cell, and a run that reaches here through the release
+    is deciding whether to publish. A gap of a second and a half is not
+    scheduling noise. Nothing about the property moves - the beats still
+    arrive many times faster than the deadline they push, as they do in a
+    real worker - only the size of the stall it takes to break the test.
     """
     path = tmp_path / "gw0.frozen"
     with path.open("w", buffering=1, encoding="utf-8") as stream:
-        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.05)
-        assert fallback.timeout == pytest.approx(0.15)
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.5)
+        assert fallback.timeout == pytest.approx(1.5)
 
-        deadline = time.time() + 1.5  # ten times the deadline it holds
+        deadline = time.time() + 2.0
         while time.time() < deadline:
             fallback.tick()
-            time.sleep(0.02)
+            time.sleep(0.1)
         assert path.stat().st_size == 0, "the timer fired while beats were arriving"
 
         # And when the beats stop, it fires - once, which is the whole answer
         # for a process that is no longer changing.
-        time.sleep(0.5)
+        time.sleep(2.5)
         first = path.read_text(encoding="utf-8")
         assert first.startswith("Timeout (")
-        time.sleep(0.5)
+        time.sleep(2.0)
         assert path.read_text(encoding="utf-8") == first, "the timer repeated"
 
         fallback.stop()
