@@ -16,22 +16,28 @@ from .platform_flags import IS_WINDOWS, optional_psutil
 
 
 def is_running(pid: int) -> bool:
-    """Whether a process still exists. Never signals it.
+    """Whether a process still exists. Never touches it.
 
-    Signal 0 asks the kernel the question without delivering anything, which
-    matters here: every other way of finding out - a stack probe, an attach -
-    can perturb the process being asked about, and the whole point of this
-    check is to describe a worker without touching it.
+    **Signal 0 is a POSIX answer and only a POSIX answer.** On Windows
+    ``os.kill`` sends a console event for ``CTRL_C_EVENT`` and
+    ``CTRL_BREAK_EVENT`` and, for every other value including zero, calls
+    ``TerminateProcess`` with it. A liveness check written as ``os.kill(pid,
+    0)`` therefore *kills the worker it is asking about* there - and this one
+    is called for every worker on every request to the live view. So the
+    platform decides the mechanism before anything else does.
 
-    Errs towards "yes". EPERM means the process exists and is not ours to
-    signal, and an unreadable answer must not be turned into "it died": the
-    callers delete evidence and report workers as gone on the strength of this.
+    Errs towards "yes" everywhere. EPERM means the process exists and is not
+    ours to signal, and an unreadable answer must not be turned into "it
+    died": the callers delete evidence and report workers as gone on the
+    strength of this.
 
     A pid can be reused, so this answers "something with this pid exists"
     rather than "that worker is alive". It is the weakest of the three
     liveness signals for exactly that reason - the heartbeat is the one that
     says whether a worker is *progressing*.
     """
+    if IS_WINDOWS:
+        return _windows_is_running(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -39,6 +45,24 @@ def is_running(pid: int) -> bool:
     except (OSError, ValueError):
         return True
     return not _is_zombie(pid)
+
+
+def _windows_is_running(pid: int) -> bool:
+    """psutil's answer, which is a different mechanism from the POSIX one.
+
+    psutil is a dependency, so this is the ordinary path rather than a
+    fallback. If it is somehow not importable the answer is "yes", which costs
+    a stale entry in the live view and a run directory that outlives its run -
+    and never costs a worker reported dead while it is working, or evidence
+    deleted out from under a run that is still writing it.
+    """
+    psutil = optional_psutil()
+    if psutil is None:
+        return True
+    try:
+        return bool(psutil.pid_exists(pid))
+    except Exception:  # noqa: BLE001 - a liveness check must never raise
+        return True
 
 
 def _is_zombie(pid: int) -> bool:
@@ -51,11 +75,11 @@ def _is_zombie(pid: int) -> bool:
     the opposite of what a crash view is for. Measured: a worker sent SIGKILL
     mid-test reported as running rather than gone.
 
-    Linux answers from procfs, which this package already reads for memory.
-    psutil answers anywhere it happens to be installed. Where neither can, the
-    answer is "not a zombie" and the heartbeat carries the finding instead -
-    its beats stop either way, which is the slower signal but never the wrong
-    one.
+    Linux answers from procfs, which this package already reads for memory and
+    which is cheaper than building a psutil object per worker per request.
+    Everywhere else psutil answers. Where neither can, the answer is "not a
+    zombie" and the heartbeat carries the finding instead - its beats stop
+    either way, which is the slower signal but never the wrong one.
     """
     state = _procfs_state(pid)
     if state is not None:

@@ -133,3 +133,90 @@ def test_the_package_ships_its_types():
 
     root = Path(pytest_failure_instrumentation.__file__).parent
     assert (root / "py.typed").is_file()
+
+
+# -- liveness, which is a different mechanism per platform ----------------
+
+
+def test_windows_liveness_never_goes_through_os_kill(monkeypatch):
+    """``os.kill(pid, 0)`` is a POSIX question and a Windows *action*.
+
+    There, ``os.kill`` sends a console event for CTRL_C_EVENT and
+    CTRL_BREAK_EVENT and calls TerminateProcess for every other value -
+    including zero. A liveness check written the POSIX way would kill each
+    worker it inspected, and the live view inspects every worker on every
+    request. This test runs on POSIX too, because that is where the mistake
+    gets written.
+    """
+    from pytest_failure_instrumentation.probes import process as process_probe
+
+    killed = []
+    asked = []
+
+    class FakePsutil:
+        """Stands in for psutil so that *its* POSIX implementation - which
+        legitimately uses os.kill on this machine - cannot be mistaken for
+        ours. On Windows psutil takes an entirely different path."""
+
+        @staticmethod
+        def pid_exists(pid):
+            asked.append(pid)
+            return True
+
+    monkeypatch.setattr(process_probe, "IS_WINDOWS", True)
+    monkeypatch.setattr(process_probe, "optional_psutil", lambda: FakePsutil)
+    monkeypatch.setattr(process_probe.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    process_probe.is_running(os.getpid())
+
+    assert killed == [], "the Windows path reached os.kill, which terminates there"
+    assert asked == [os.getpid()], "the Windows path asked nothing at all"
+
+
+def test_windows_liveness_asks_psutil(monkeypatch):
+    from pytest_failure_instrumentation.probes import process as process_probe
+
+    monkeypatch.setattr(process_probe, "IS_WINDOWS", True)
+    asked = []
+
+    class FakePsutil:
+        @staticmethod
+        def pid_exists(pid):
+            asked.append(pid)
+            return False
+
+    monkeypatch.setattr(process_probe, "optional_psutil", lambda: FakePsutil)
+    assert process_probe.is_running(4321) is False
+    assert asked == [4321]
+
+
+def test_liveness_errs_towards_alive_when_it_cannot_tell(monkeypatch):
+    """A wrong "it died" deletes evidence and reports a working worker as
+    gone. A wrong "still there" costs a stale row."""
+    from pytest_failure_instrumentation.probes import process as process_probe
+
+    monkeypatch.setattr(process_probe, "IS_WINDOWS", True)
+    monkeypatch.setattr(process_probe, "optional_psutil", lambda: None)
+    assert process_probe.is_running(4321) is True
+
+    class Broken:
+        @staticmethod
+        def pid_exists(pid):
+            raise RuntimeError("psutil is unhappy")
+
+    monkeypatch.setattr(process_probe, "optional_psutil", lambda: Broken)
+    assert process_probe.is_running(4321) is True
+
+
+def test_a_permission_error_means_the_process_exists(monkeypatch):
+    """EPERM is the kernel saying there is something there that is not ours to
+    signal, which is an answer rather than a failure."""
+    from pytest_failure_instrumentation.probes import process as process_probe
+
+    monkeypatch.setattr(process_probe, "IS_WINDOWS", False)
+
+    def denied(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(process_probe.os, "kill", denied)
+    assert process_probe.is_running(4321) is True

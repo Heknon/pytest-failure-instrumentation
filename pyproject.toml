@@ -28,12 +28,17 @@ classifiers = [
 # pydantic types the incident payload. It is imported on the controller
 # only, and only when xdist is active - a worker never loads it, so the
 # per-test path stays what it was.
-dependencies = ["pytest>=7.0", "pydantic>=2.0"]
+# psutil is required rather than optional. It is the only cross-platform way
+# to ask whether a process is still there: on Windows os.kill(pid, 0) does not
+# ask anything, it calls TerminateProcess - so a liveness check written the
+# POSIX way kills the worker it is inspecting. It also carries the memory
+# figures on macOS and Windows, which procfs cannot.
+dependencies = ["pytest>=7.0", "pydantic>=2.0", "psutil>=5.9"]
 
 [project.optional-dependencies]
 test = ["pytest-xdist>=3.0"]
-# Only ever an upgrade: memory figures on macOS and Windows are better with it,
-# and every probe degrades to a declared "unavailable" without it.
+# Kept so that an existing pin on [psutil] keeps resolving. It is a required
+# dependency now, so this extra adds nothing.
 psutil = ["psutil>=5.9"]
 # The external stack reader, for the live server. Only needed to read a
 # process other than the one serving, and only when the server is switched on.

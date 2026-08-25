@@ -707,8 +707,11 @@ Two details that are easy to get wrong and are handled here:
 - **A killed worker is a zombie until its parent reaps it**, and the kernel
   accepts signals for it the whole time — so a `kill(pid, 0)` check reports a
   worker killed a moment ago as alive, which is the opposite of what a crash
-  view is for. Linux answers from procfs; psutil answers where it is
-  installed; elsewhere the heartbeat carries the finding instead.
+  view is for. Linux answers from procfs, which is cheaper than building a
+  psutil object per worker per request; everywhere else psutil answers.
+- **Liveness is a different mechanism per platform.** Signal 0 is a POSIX
+  question; on Windows it is not a question at all (see below), so the platform
+  picks the mechanism before anything else happens.
 - **`cpu_rate: null` is not zero.** "It burned nothing" and "we could not
   measure" are different findings, and a worker at full tilt whose beats
   collide produces the second.
@@ -909,7 +912,7 @@ you a hard ceiling per worker, which is why it is opt-in.
 | Test in flight, phase, exit status | yes | yes | yes |
 | Crash stack | yes | yes | yes |
 | Stack from a *slow or hung* test | yes | yes | yes |
-| Current memory | procfs | psutil, else peak only | psapi |
+| Current memory | procfs | psutil | psapi |
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
 | Live stack of another process (needs py-spy) | yes | root only | yes |
@@ -929,8 +932,13 @@ deliberate `os._exit(3)` gives. What separates a crash from a clean exit there
 is whether a dump was written, not the exit status, which is why the crash
 stack is evidence in its own right rather than a decoration on the verdict.
 
-`psutil` is never required, only ever an upgrade: `pip install
-pytest-failure-instrumentation[psutil]`.
+`psutil` is a dependency, not an upgrade. It is the only cross-platform way to
+ask whether a process is still there, and the POSIX way is actively dangerous
+on Windows: `os.kill(pid, 0)` sends a console event only for `CTRL_C_EVENT` and
+`CTRL_BREAK_EVENT`, and calls `TerminateProcess` for every other value —
+including zero. A liveness check written the obvious way would kill each worker
+it inspected, and the live view inspects every worker on every request. psutil
+also carries the memory figures on macOS and Windows, which procfs cannot.
 
 ## Tests
 
@@ -954,8 +962,11 @@ cgroup counters — and none of the Windows or macOS paths can be exercised on a
 Linux runner, which is the whole reason the matrix exists. Two axes matter as
 much as the operating system, so each gets its own job:
 
-- **without `psutil`**, which is what most people actually have. Every probe
-  has to degrade to a declared "unavailable" rather than to a wrong number.
+- **without `psutil`**, which is a dependency and can still be missing: a
+  wheel that will not build, an environment that stripped it. Every probe has
+  to degrade to a declared "unavailable" rather than to a wrong number, and the
+  liveness check has to keep erring towards "still there" rather than start
+  reporting working workers as dead.
 - **without `pytest-xdist`**, where `pytest_testnodedown` has no hookspec at
   all and an unspecced hookimpl is a registration error — the failure mode that
   once made a plain `pytest` run report nothing.
