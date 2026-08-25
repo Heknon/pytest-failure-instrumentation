@@ -58,6 +58,21 @@ jobs:
             fi
           fi
 
+          # And, whichever path this is, a tag for this version that already
+          # exists has to be on this commit. On a tag push that is true by
+          # construction; on a dispatch it need not be.
+          #
+          # It is checked here rather than only in the job that writes the
+          # tag, because that job runs after publish - so it would refuse the
+          # release only once PyPI already held the files, which is the
+          # failure it exists to prevent, half done and unrepeatable. A gate
+          # after the irreversible step is not a gate.
+          at=$(git ls-remote origin "refs/tags/v$version" "refs/tags/v$version^{}" | awk 'END {print $1}')
+          if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+            echo "::error::v$version is already on $at, not the commit this run would publish ($GITHUB_SHA)"
+            exit 1
+          fi
+
           # PEP 440 spells prereleases 1.2.0rc1, with no separator to split on.
           if printf '%s' "$version" | grep -Eq '(a|b|rc|dev)[0-9]*$'; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
