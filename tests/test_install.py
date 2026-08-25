@@ -14,6 +14,7 @@ point off has to leave a plugin that still functions.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -228,7 +229,14 @@ def test_settings_computed_on_the_controller_reach_every_worker(framework_run):
     for worker in workers:
         assert worker["packages"] == ["fwcore"]
         assert worker["product_version"] == "9.9.9"
-        assert worker["directory"] == "framework-evidence"
+        # The *resolved* directory: the framework named the parent, and the
+        # controller picked this run's own subdirectory under it. A worker
+        # cannot work that out for itself, so arriving at all proves it came
+        # from the controller.
+        assert Path(worker["directory"]).parent.name == "framework-evidence"
+    # And every worker was told the same one, or they would be writing their
+    # evidence into different runs.
+    assert len({worker["directory"] for worker in workers}) == 1
 
     # The evidence went where the framework said, not to the default.
     assert (framework_run.pytester.path / "framework-evidence").is_dir()

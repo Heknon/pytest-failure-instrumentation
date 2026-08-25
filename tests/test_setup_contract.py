@@ -55,26 +55,34 @@ def test_a_worker_that_cannot_write_evidence_does_not_end_the_run(runner):
 
 
 @needs_xdist
-def test_nothing_in_the_evidence_directory_that_is_not_ours_is_deleted(runner):
+def test_nothing_in_the_evidence_directory_that_is_not_ours_is_touched(runner):
     """failure_directory is a natural thing to point at an existing artifacts
     directory. Clearing stale evidence used to take every .txt and .json with
-    it, on a run where nothing failed at all."""
+    it, on a run where nothing failed at all.
+
+    A run keeps to its own directory now, so there is nothing at this level it
+    has any reason to delete - including the flat files an older version of
+    this plugin left here, which cannot be mistaken for this run's evidence
+    because this run does not look here for any."""
     runner.pytester.makepyfile(test_suite=SUITE)
     evidence = runner.pytester.path / "artifacts"
     evidence.mkdir()
     (evidence / "coverage.json").write_text('{"covered": 91}', encoding="utf-8")
     (evidence / "report.txt").write_text("somebody's build log", encoding="utf-8")
-    # Ours, from a previous run, and named the way this plugin names them.
     (evidence / "collection-deadbeef.txt").write_text("stale", encoding="utf-8")
     (evidence / "gw9.events").write_text("stale\n", encoding="utf-8")
 
     runner.run("-n", "2", "-o", "failure_directory=artifacts", "test_suite.py", timeout=180)
 
-    assert (evidence / "coverage.json").read_text(encoding="utf-8") == '{"covered": 91}'
-    assert (evidence / "report.txt").exists()
-    # Stale evidence still goes, or it would be read as this run's.
-    assert not (evidence / "collection-deadbeef.txt").exists()
-    assert not (evidence / "gw9.events").exists()
+    for survivor in ("coverage.json", "report.txt", "collection-deadbeef.txt", "gw9.events"):
+        assert (evidence / survivor).exists(), survivor
+
+    # And this run's own evidence went somewhere it cannot be confused with
+    # any of that.
+    runs = [path for path in evidence.iterdir() if path.is_dir()]
+    assert len(runs) == 1
+    assert (runs[0] / "owner.json").exists()
+    assert list(runs[0].glob("*.events"))
 
 
 @needs_xdist
@@ -99,3 +107,87 @@ def test_a_worker_death_is_still_reported_from_a_relocated_directory(runner):
         "-n", "2", "-o", "failure_directory=artifacts", "test_crash.py", timeout=180
     )
     assert runner.only(incidents, "worker_death").verdict == "NATIVE_CRASH"
+
+
+# -- one directory per run ------------------------------------------------
+
+
+def test_a_finished_runs_directory_is_pruned_and_a_live_one_is_not(tmp_path):
+    """Over, not old. Several runs happen at once - that is the whole reason
+    each has a directory - so age says nothing about whether one is finished.
+    """
+    import json
+    import os
+
+    from pytest_failure_instrumentation.incidents.engine import prune_finished_runs
+
+    live = tmp_path / "run-live"
+    finished = tmp_path / "run-finished"
+    for path, pid in ((live, os.getpid()), (finished, 999999)):
+        path.mkdir()
+        (path / "owner.json").write_text(json.dumps({"pid": pid}), encoding="utf-8")
+        (path / "gw0.events").write_text("evidence\n", encoding="utf-8")
+
+    prune_finished_runs(tmp_path)
+
+    assert live.exists() and (live / "gw0.events").exists()
+    assert not finished.exists()
+
+
+def test_a_directory_that_is_not_ours_is_never_pruned(tmp_path):
+    """The marker is what makes a directory ours to delete. Without it, this is
+    somebody's build output that happens to live beside our own."""
+    import json
+
+    from pytest_failure_instrumentation.incidents.engine import prune_finished_runs
+
+    stranger = tmp_path / "coverage-html"
+    stranger.mkdir()
+    (stranger / "index.html").write_text("<html>", encoding="utf-8")
+    # Even one that looks like ours but says nothing about who owns it.
+    unmarked = tmp_path / "run-abc123"
+    unmarked.mkdir()
+    (unmarked / "owner.json").write_text(json.dumps({"note": "not a pid"}), encoding="utf-8")
+
+    prune_finished_runs(tmp_path)
+
+    assert (stranger / "index.html").exists()
+    assert unmarked.exists()
+
+
+def test_pruning_a_directory_that_does_not_exist_is_not_an_error(tmp_path):
+    from pytest_failure_instrumentation.incidents.engine import prune_finished_runs
+
+    prune_finished_runs(tmp_path / "never-created")
+
+
+@needs_xdist
+def test_two_runs_sharing_a_directory_keep_their_evidence_apart(runner):
+    """The bug this layout exists to remove.
+
+    Every worker is ``gw0``, so two runs sharing a flat directory shared their
+    state files too: one run read the other's evidence and believed it. Here
+    the second run is given the first's directory with the first's evidence
+    already in it, and has to leave it alone - because its owner is a process
+    that is still running.
+    """
+    import json
+    import os
+
+    runner.pytester.makepyfile(test_suite=SUITE)
+    evidence = runner.pytester.path / "artifacts"
+    other = evidence / "run-somebody-else"
+    other.mkdir(parents=True)
+    (other / "owner.json").write_text(
+        json.dumps({"pid": os.getpid(), "run_id": "run-somebody-else"}), encoding="utf-8"
+    )
+    (other / "gw0.state").write_text('{"nodeid": "someone_elses_test"}', encoding="utf-8")
+
+    runner.run("-n", "2", "-o", "failure_directory=artifacts", "test_suite.py", timeout=180)
+
+    # Untouched, because its owner is alive.
+    assert json.loads((other / "gw0.state").read_text())["nodeid"] == "someone_elses_test"
+    # And this run wrote its own gw0 somewhere else entirely.
+    ours = [path for path in evidence.iterdir() if path.is_dir() and path != other]
+    assert len(ours) == 1
+    assert (ours[0] / "gw0.state").exists()

@@ -647,18 +647,20 @@ running which test.
 
 ### Finding the server
 
-A drawn port is written to `callstack-<pid>.json` in the evidence directory, one
-file per serving session, and removed when that session ends. Files left by a
+A drawn port is written to `callstack-<pid>.json` in **this run's** evidence
+directory (see the layout below), one file per serving session, and removed when
+that session ends. Files left by a
 session that was killed are swept by whoever publishes next — by checking the pid
 in the filename, so a live session's address is never deleted.
 
 ```python
-for address in Path(".pytest-failures").glob("callstack-*.json"):
+for address in Path(".pytest-failures").glob("*/callstack-*.json"):
+    run = address.parent                      # one directory per run
     server = json.loads(address.read_text())["url"]
-    for state in Path(".pytest-failures").glob("*.state"):
+    for state in run.glob("*.state"):
         record = json.loads(state.read_bytes().rstrip(b"\x00").strip())
         stack = requests.get(f"{server}/stack?pid={record['pid']}").json()
-        print(record["nodeid"], record["phase"], stack["threads"][0]["frames"][0])
+        print(run.name, record["nodeid"], record["phase"], stack["threads"][0]["frames"][0])
 ```
 
 ```
@@ -719,6 +721,53 @@ read another running as the same user at the same integrity level, so the
 descendant rule above simply does not apply. Reading an *elevated* process from
 an unelevated one needs `SeDebugPrivilege`.
 
+## One directory per run
+
+```
+.pytest-failures/
+  run-70a514cc7a93/    <- this pytest process's own name for itself
+    owner.json         <- the controller's pid, and the only thing that makes
+    gw0.state             this directory ours to delete
+    gw0.events         <- every line carries the *reported* run id
+    gw1.state
+    callstack-4213.json
+```
+
+Runs used to share a flat directory and name their files after the worker,
+which works exactly until two runs happen at once — and on a laptop or a
+bare-metal runner that is the ordinary case. Every worker is `gw0`, so the
+second run's `gw0.state` *is* the first run's `gw0.state`: one run reads the
+other's evidence, believes it, and attributes a stall to a test a different run
+is running. The old start-of-run cleanup made it worse rather than better,
+because it deleted the files of a run still using them.
+
+A directory per run removes the class of bug rather than a symptom. Nothing
+inside is named for the run, because the directory already is, so every path a
+reader builds is unchanged.
+
+**Why the directory is not named after the run id you see on incidents.** The
+obvious name is xdist's own run id, and it cannot be used: it does not exist
+until xdist has built its node manager, and there is no hook order that
+reliably puts that first. `trylast` does not do it, because xdist's own session
+start is *also* `trylast` — so which of the two runs first comes down to which
+plugin registered first, and that differs between installing from the entry
+point and installing from a framework's `pytest_configure`. The directory is
+therefore named by something this process fixes for itself and nothing can
+reorder. The reported run id still prefers xdist's, so incidents still line up
+with xdist's logs, and every `.events` line inside carries it — which is how a
+directory is matched back to a run.
+
+`PYTEST_RUN_ID` names the directory if you set it, which is also the way to
+make two runs deliberately share one.
+
+**What gets cleaned up.** Whole directories of runs that are *over* — not old.
+The controller's pid is in `owner.json`, so a run still going is recognisable
+as such however long it has been going, which matters precisely because several
+run at once. A directory without that marker is not ours and is left alone
+whatever it looks like, which includes the flat files an older version of this
+plugin left behind: they cannot be mistaken for a current run's evidence,
+because a current run does not look there for any.
+
 ## Cost
 
 A passing test must cost as close to nothing as possible, because that is the
@@ -753,7 +802,7 @@ overwhelming majority of what runs.
 | Setting | Default | Purpose |
 |---|---|---|
 | `failure_packages` | — | Your top-level packages, for attribution |
-| `failure_directory` | `.pytest-failures` | Where evidence is written |
+| `failure_directory` | `.pytest-failures` | Where evidence is written; each run gets a subdirectory under it |
 | `failure_watchdog` | `true` | Memory and liveness sampling |
 | `failure_heartbeat_interval` | `5.0` | Seconds between liveness beats (floor 1.0) |
 | `failure_tracemalloc_depth` | `0` | 1 names the allocating line for OOM attribution |

@@ -103,7 +103,7 @@ def test_the_controller_and_its_workers_agree_on_the_run_id(runner):
 
     stamped = {
         json.loads(line).get("run_id")
-        for path in (runner.pytester.path / ".pytest-failures").glob("*.events")
+        for path in (runner.pytester.path / ".pytest-failures").glob("*/*.events")
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
