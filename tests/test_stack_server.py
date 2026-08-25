@@ -455,7 +455,9 @@ def test_a_wildcard_bind_is_advertised_on_an_address_that_can_be_connected_to():
     """0.0.0.0 is a thing to listen on, not a thing to connect to - Windows
     refuses it outright."""
     assert stack_server.reachable("0.0.0.0") == stack_server.LOOPBACK
-    assert stack_server.reachable("::") == stack_server.LOOPBACK
+    # Not the IPv4 loopback: a socket bound to :: without dual-stack does not
+    # answer on an IPv4 address at all.
+    assert stack_server.reachable("::") == stack_server.LOOPBACK6
     assert stack_server.reachable("10.1.2.3") == "10.1.2.3"
 
 
@@ -540,3 +542,91 @@ def test_naming_a_port_on_the_command_line_is_enough_to_start_it(pytester):
         "-p", "failure_instrumentation", "--callstack-port", str(port)
     )
     result.assert_outcomes(passed=1)
+
+
+# -- IPv6 -----------------------------------------------------------------
+
+
+def _has_ipv6() -> bool:
+    """Whether this machine has IPv6 at all. Plenty of containers do not, and
+    a skip that says so beats a failure that looks like our bug."""
+    try:
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    with probe:
+        try:
+            probe.bind(("::1", 0))
+        except OSError:
+            return False
+    return True
+
+
+needs_ipv6 = pytest.mark.skipif(not _has_ipv6(), reason="no IPv6 on this machine")
+
+
+def test_an_ipv6_host_gets_an_ipv6_socket():
+    """http.server is AF_INET and notices nothing otherwise, so a server asked
+    for ``::1`` opened an IPv4 socket and could not bind it - while the
+    settings called ``::1`` a supported loopback and warned about nothing."""
+    assert stack_server.address_family("::1") == socket.AF_INET6
+    assert stack_server.address_family("::") == socket.AF_INET6
+    assert stack_server.address_family("127.0.0.1") == socket.AF_INET
+    assert stack_server.address_family("0.0.0.0") == socket.AF_INET
+    # A name is left to IPv4, which is what every other default here assumes.
+    assert stack_server.address_family("localhost") == socket.AF_INET
+
+
+def test_an_ipv6_literal_is_bracketed_in_a_url():
+    """``http://::1:8080/`` is not a URL anybody can parse, and every client
+    rejects it."""
+    assert stack_server.authority("::1", 8080) == "[::1]:8080"
+    assert stack_server.authority("::", 8080) == "[::1]:8080"
+    assert stack_server.authority("127.0.0.1", 8080) == "127.0.0.1:8080"
+    assert stack_server.authority("0.0.0.0", 8080) == "127.0.0.1:8080"
+
+
+@needs_ipv6
+def test_a_server_on_ipv6_binds_and_answers(serving):
+    service = serving(0, host="::1")
+    assert wait_for(lambda: service.serving), service.status
+    assert service.url.startswith("http://[::1]:")
+    assert stack_server.identify(service.bound_port, "::1") is not None
+
+
+def test_the_claim_is_settled_between_real_processes(serving, tmp_path):
+    """Every other election test runs both sides in one interpreter, where the
+    kernel is the only thing actually being tested. This is the arrangement the
+    named mode is *for*: a separate pytest session already holding the port,
+    identified over HTTP because there is no other way to ask it."""
+    port = free_port()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time\n"
+            "from pytest_failure_instrumentation import stack_server\n"
+            f"service = stack_server.StackService({port})\n"
+            "service.start()\n"
+            "time.sleep(120)\n",
+        ]
+    )
+    try:
+        assert wait_for(lambda: stack_server.identify(port) is not None), "holder never served"
+        held_by = stack_server.identify(port)
+        assert held_by["pid"] == holder.pid  # a different process, really
+
+        waiting = serving(port, reclaim_seconds=0.2)
+        assert wait_for(lambda: "another session is serving" in waiting.status), waiting.status
+        assert not waiting.serving
+        assert str(holder.pid) in waiting.status
+
+        # And the port is handed over when that process goes away.
+        holder.kill()
+        holder.wait(timeout=10)
+        assert wait_for(lambda: waiting.serving), waiting.status
+        assert stack_server.identify(port)["pid"] == os.getpid()
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=10)

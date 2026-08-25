@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -76,8 +77,12 @@ SERVICE = "pytest-failure-instrumentation-stacks"
 #: down for a UI is never the wildcard.
 LOOPBACK = "127.0.0.1"
 
+#: Its IPv6 spelling, for a server that was asked to bind the IPv6 wildcard.
+LOOPBACK6 = "::1"
+
 #: What the wildcard binds mean, so an advertised URL can avoid them.
-WILDCARDS = frozenset({"0.0.0.0", "::", ""})
+IPV6_WILDCARD = "::"
+WILDCARDS = frozenset({"0.0.0.0", IPV6_WILDCARD, ""})
 
 #: Files a UI reads to find the servers running on this machine, one per
 #: serving session, named for the pid that wrote it so that two sessions in one
@@ -105,6 +110,34 @@ MAX_CONCURRENT_READS = 8
 _readers = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
 
 
+def address_family(host: str) -> int:
+    """IPv4 unless the host is written as an IPv6 address.
+
+    ``HTTPServer`` is AF_INET and nothing about it notices otherwise, so a
+    server asked for ``::1`` opened an IPv4 socket and failed to bind it -
+    while the settings said ``::1`` was a supported loopback and warned about
+    nothing. Resolved from the literal rather than guessed: a name is left to
+    IPv4, which is what the stack of every other default here assumes.
+    """
+    try:
+        socket.inet_pton(socket.AF_INET6, host)
+    except (OSError, ValueError, AttributeError):
+        return socket.AF_INET
+    return socket.AF_INET6
+
+
+def authority(host: str, port: Optional[int]) -> str:
+    """``host:port`` for a URL, with an IPv6 literal bracketed.
+
+    ``http://::1:8080/`` is not a URL anybody can parse - the colons are
+    ambiguous - and every client rejects it. RFC 3986 wants brackets.
+    """
+    reached = reachable(host)
+    if address_family(reached) == socket.AF_INET6:
+        return f"[{reached}]:{port}"
+    return f"{reached}:{port}"
+
+
 class _Server(ThreadingHTTPServer):
     """Threaded, because reading a stack can take seconds.
 
@@ -114,6 +147,13 @@ class _Server(ThreadingHTTPServer):
     """
 
     daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], handler: Any) -> None:
+        # Set before the base class opens the socket, which reads it off the
+        # instance. A class attribute cannot answer this: the family depends
+        # on what this particular server was asked to bind.
+        self.address_family = address_family(address[0])
+        super().__init__(address, handler)
 
     #: **Not** the inherited default on Windows, where SO_REUSEADDR means
     #: something else entirely: there it permits binding an address another
@@ -231,6 +271,10 @@ def reachable(host: str) -> str:
     wildcard-bound server from the same machine, and a client on another
     machine was never going to be told the address by this process anyway.
     """
+    if host == IPV6_WILDCARD:
+        # A socket bound to :: without dual-stack does not answer on an IPv4
+        # address at all, so the IPv4 loopback would be a wrong answer here.
+        return LOOPBACK6
     return LOOPBACK if host in WILDCARDS else host
 
 
@@ -247,7 +291,7 @@ def identify(
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(
-            f"http://{reachable(host)}:{port}/identity", timeout=timeout
+            f"http://{authority(host, port)}/identity", timeout=timeout
         ) as response:
             payload = json.loads(response.read(4096))
     except (urllib.error.URLError, OSError, ValueError, TimeoutError):
@@ -304,7 +348,7 @@ class StackService:
 
     @property
     def url(self) -> str:
-        return f"http://{reachable(self.host)}:{self.bound_port or self.port}"
+        return f"http://{authority(self.host, self.bound_port or self.port)}"
 
     def start(self) -> None:
         self._thread = threading.Thread(
