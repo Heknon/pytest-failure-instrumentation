@@ -166,3 +166,51 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+  wheel:
+    # The one thing no other job here can see. Every one of them installs the
+    # source tree, so a test that reads a file from beside the package - or a
+    # file the wheel does not ship at all - passes on a checkout and fails
+    # only once a release is already running. That is what happened to v0.2.0:
+    # it built, failed every verify cell, and never published.
+    #
+    # This is release.yml's verify job on a single cell, moved to push time.
+    # Keep the two in step: what is worth checking at the tag is worth knowing
+    # before the tag exists.
+    name: ubuntu / built wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Install the wheel, not the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install "$(ls dist/*.whl)" pytest-xdist
+
+      - name: Confirm it is the wheel under test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'CHECK'
+          import pytest_failure_instrumentation as package
+
+          located = package.__file__.replace("\\", "/")
+          assert "site-packages" in located, f"tested the checkout, not the wheel: {located}"
+          print("installed from:", located)
+          CHECK
+
+      - name: Test
+        run: pytest -q

@@ -135,10 +135,18 @@ def test_the_two_places_the_version_is_written_agree():
     Read with a regex rather than tomllib, which is 3.11+, and against the
     source rather than the installed metadata, which is written at install
     time and goes stale the moment pyproject is edited.
+
+    pyproject is found from this file rather than from the package, because
+    the package is not always in the tree that declares it: the release
+    workflow runs this same suite against the built wheel, where it sits in
+    site-packages with no pyproject.toml anywhere above it. The tests only
+    ever ship with the source, so their own location is the one that finds
+    it - and against an installed wheel the comparison gets stronger, since
+    the version being read out is the one that was packaged.
     """
     import pytest_failure_instrumentation
 
-    root = Path(pytest_failure_instrumentation.__file__).parent.parent.parent
+    root = Path(__file__).resolve().parent.parent
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
     declared = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
     assert declared, "no version in pyproject.toml"
