@@ -623,45 +623,69 @@ opening listening sockets on everybody who upgrades it:
 failure_stack_server = true
 ```
 
-**One server per host, not per run.** The port has to be fixed: a port picked
-at random is one no firewall has been told about and no UI can guess. A fixed
-port cannot be bound twice, and several pytest sessions on one machine is the
-ordinary case — a laptop, or a CI runner with parallel jobs. So the first
-session to start claims it and serves; the rest find it claimed and leave it
-alone. Any of them can answer about any pid, because the answer comes from
-reading the target process, which needs no relationship to the reader.
-
-**Claimed by whom is decided by asking, not by looking.** The intuitive check —
-does the process holding the port look like ours — cannot work: the process is
-a Python interpreter, so its name is `python` on every platform and its command
-line is whatever pytest was invoked as. What identifies a server is that it
-answers `/identity` with a name only this package uses. Anything else on the
-port — a dev server, a proxy, Jenkins — is a stranger, and the run continues
-without live stacks rather than fighting for the port:
-
-```
-port 8080 is held by something that is not a stack server (Address already in
-use); set failure_stack_server_port to an unused port, or turn
-failure_stack_server off
+```console
+$ pytest --callstack-port 8080          # also switches it on
+$ pytest --callstack-host 0.0.0.0       # so does this
 ```
 
-**Handover.** The session holding the port is rarely the last one running, so a
-session that lost the claim keeps trying and takes over within seconds of the
-holder exiting. Sessions never coordinate beyond the port itself, which is the
-only thing all of them can see.
+### Two modes, and the port number picks between them
 
-**Reading another process needs py-spy** (`pip install
-pytest-failure-instrumentation[stacks]`). There is no way to walk another
-process's frames from Python, so a request naming any pid but the server's own
-is answered by an external reader. That is also what makes it work on a worker
-whose GIL is held by native code: py-spy reads the target's memory rather than
-asking it to run anything, and it stops the target before reading, so it never
-walks a frame that is being torn down. The server's *own* pid is answered from
-`sys._current_frames()` — no subprocess, no ptrace, no permission.
+**Drawn** — the default, when no port is named. The session binds whatever the
+kernel hands it and writes the address into the evidence directory. Nothing is
+shared, so nothing is contended and nothing can be lost to another session.
 
-Without py-spy the endpoint still answers, with the reason instead of a stack.
-A UI that is told *why* it has no stack can tell a dead process from a missing
-permission; one that gets an empty response cannot:
+**Named** — `--callstack-port 8080`, or the ini equivalent. The session claims
+that exact port and shares it with every other session on the machine, since a
+fixed port cannot be bound twice. First to start serves; the rest wait, and take
+over within five seconds of the holder exiting.
+
+Name a port when something outside has to be told the address once and for all —
+a firewall rule, a UI with it compiled in, a published container port. Otherwise
+let one be drawn: a UI that can read the evidence directory needs no agreement
+about numbers, and it has to read that directory anyway to know which pid is
+running which test.
+
+### Finding the server
+
+A drawn port is written to `callstack-<pid>.json` in the evidence directory, one
+file per serving session, and removed when that session ends. Files left by a
+session that was killed are swept by whoever publishes next — by checking the pid
+in the filename, so a live session's address is never deleted.
+
+```python
+for address in Path(".pytest-failures").glob("callstack-*.json"):
+    server = json.loads(address.read_text())["url"]
+    for state in Path(".pytest-failures").glob("*.state"):
+        record = json.loads(state.read_bytes().rstrip(b"\x00").strip())
+        stack = requests.get(f"{server}/stack?pid={record['pid']}").json()
+        print(record["nodeid"], record["phase"], stack["threads"][0]["frames"][0])
+```
+
+```
+test_pool.py::test_concurrent_writes call {'function': '_wait_for_lease', ...}
+```
+
+### Containers
+
+`--callstack-host 0.0.0.0` is what a container needs: its UI is outside, and
+127.0.0.1 inside a container is unreachable from there. Binding anything but
+loopback warns, once, because **the server has no authentication** — it answers
+with the stack of any process it can read, to anyone who asks.
+
+Two things about containers make this easier than it looks:
+
+- **Each container has its own network namespace**, so `8080` inside one pod is
+  not `8080` inside another. The port contention that the named mode exists to
+  resolve does not arise between pods at all — it is a bare-metal and laptop
+  problem. Name a port in a container, publish it, and every pod can use the
+  same number.
+- **Each container has its own PID namespace**, so a server in one pod could not
+  read another pod's workers even with every permission granted. Sharing is
+  neither possible nor needed there.
+
+Reading a process needs ptrace, which modern Docker permits under its default
+seccomp profile. Where it is refused, the endpoint says so and names the fix
+rather than returning nothing:
 
 ```json
 {"pid": 48213, "source": "py-spy", "error": "Operation not permitted (os error 1)
@@ -670,25 +694,30 @@ permission; one that gets an empty response cannot:
  are), and add --cap-add=SYS_PTRACE if this is a container"}
 ```
 
-**Finding the pids.** The server answers about a pid, and the evidence
-directory already says which pid is running which test — that is what the
-per-worker `.state` file is, one fixed-size record overwritten in place. So a
-UI enumerates workers from disk and asks about each:
+`ptrace_scope` is a host-wide sysctl and is **not namespaced**, so a container
+inherits the node's value and cannot change it. At `ptrace_scope=1` a process
+may only read its own descendants — which its own xdist workers are, so a drawn
+port works; a *named* port shared across sessions reads only the workers of the
+session hosting it.
 
-```python
-for state in Path(".pytest-failures").glob("*.state"):
-    record = json.loads(state.read_bytes().rstrip(b"\x00").strip())
-    stack = requests.get(f"http://127.0.0.1:8080/stack?pid={record['pid']}").json()
-    print(record["nodeid"], record["phase"], stack["threads"][0]["frames"][0])
-```
+### Reading another process needs py-spy
 
-```
-test_pool.py::test_concurrent_writes call {'function': '_wait_for_lease', ...}
-```
+`pip install pytest-failure-instrumentation[stacks]`. There is no way to walk
+another process's frames from Python, so any pid but the server's own is read
+externally. That is also what makes it work on a worker whose GIL is held by
+native code: py-spy reads the target's memory rather than asking it to run
+anything, and stops the target before reading, so it never walks a frame that is
+being torn down. The server's *own* pid is answered from `sys._current_frames()`
+— no subprocess, no ptrace, no permission.
 
-**It listens on 127.0.0.1 only, and that is not configurable.** It reports what
-local processes are executing, which is precisely the kind of thing that must
-not be reachable from off the machine.
+Without py-spy the endpoint still answers, with the reason instead of a stack. A
+UI that is told *why* it has no stack can tell a dead process from a missing
+permission; one that gets an empty response cannot.
+
+On Windows there is no ptrace and no equivalent restriction: any process can
+read another running as the same user at the same integrity level, so the
+descendant rule above simply does not apply. Reading an *elevated* process from
+an unelevated one needs `SeDebugPrivilege`.
 
 ## Cost
 
@@ -734,8 +763,9 @@ overwhelming majority of what runs.
 | `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
-| `failure_stack_server` | `false` | Serve live stacks over HTTP, one server per host |
-| `failure_stack_server_port` | `8080` | Where that server listens (loopback only) |
+| `failure_stack_server` | `false` | Serve live stacks over HTTP |
+| `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
+| `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
 
 `failure_slow_test_seconds` and `failure_stall_seconds` are not independent.
 The stack a stalled worker is reported with is whatever the watchdog last

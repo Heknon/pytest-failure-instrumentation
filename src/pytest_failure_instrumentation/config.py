@@ -24,10 +24,27 @@ import pytest
 
 DEFAULT_DIRECTORY = ".pytest-failures"
 
-#: Where the live-stack server listens when it is switched on. Named here
-#: rather than in the server module so that the default and the ini help
-#: cannot drift apart.
-DEFAULT_STACK_SERVER_PORT = 8080
+#: "Pick one for me" - the value the kernel itself reads as *any free port*,
+#: so the lottery costs no branch at the bind. It is the default because a
+#: session that has not been told which port to use has no reason to fight the
+#: other sessions on the host for one: it serves its own workers on a port
+#: nobody else wants, and writes down where. A port is only worth fixing when
+#: something outside has to be told about it once - a firewall rule, a UI with
+#: the address compiled in - and that is what naming one means.
+PORT_LOTTERY = 0
+
+#: The conventional fixed port, used when one is asked for by name rather than
+#: by number. Not a default: 8080 is the most contended port on a developer's
+#: machine, and taking it uninvited is how this feature turns itself off.
+CONVENTIONAL_STACK_SERVER_PORT = 8080
+
+#: Loopback. Overridable, because a container's UI is not inside the container
+#: - see ``failure_stack_server_host``.
+DEFAULT_STACK_SERVER_HOST = "127.0.0.1"
+
+#: Addresses that reach this machine and nowhere else. ``localhost`` is in the
+#: list because people type it, and it resolves to one of the other two.
+LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 
 #: Below this the heartbeat thread costs more than it measures. Clamped on the
 #: object rather than where a setting is read, because the controller decides
@@ -79,10 +96,16 @@ class Settings:
     #: is not something a plugin installed for crash reporting should start
     #: doing to everybody who upgrades it.
     stack_server: bool = False
-    #: Fixed on purpose. A port chosen at random is one no firewall has been
-    #: told about and no UI can guess; the cost of fixing it is that the
-    #: sessions sharing a host have to share the server, which they do.
-    stack_server_port: int = DEFAULT_STACK_SERVER_PORT
+    #: 0 draws a free port and writes it down; any other number is claimed,
+    #: shared with the other sessions on the host, and waited for if somebody
+    #: else has it first. See :mod:`.stack_server` for why those are different
+    #: modes rather than one with a different number in it.
+    stack_server_port: int = PORT_LOTTERY
+    #: What the server binds. Loopback keeps it off the network, which is
+    #: right on a laptop and wrong in a container, where the UI is outside and
+    #: 127.0.0.1 is unreachable from there. Anything else is a deliberate
+    #: exposure and says so.
+    stack_server_host: str = DEFAULT_STACK_SERVER_HOST
     #: How many workers share the machine. Per worker, never sent between
     #: processes - the controller's copy would be wrong on every worker.
     worker_count: int = 1
@@ -98,7 +121,10 @@ class Settings:
             "heartbeat_interval",
             max(MIN_HEARTBEAT_INTERVAL, float(self.heartbeat_interval)),
         )
+        object.__setattr__(self, "stack_server_host", str(self.stack_server_host))
+        object.__setattr__(self, "stack_server_port", int(self.stack_server_port))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
+        self._warn_if_the_stack_server_is_reachable_from_off_the_machine()
 
     def _warn_if_a_stall_is_judged_before_it_has_evidence(self) -> None:
         """The watchdog has to have fired before the stall is assessed.
@@ -120,6 +146,30 @@ class Settings:
             f"failure_stall_seconds ({self.stall_seconds:g}), so a stalled worker "
             "is assessed before its watchdog has written a stack and will be "
             "reported without one",
+            FailureInstrumentationWarning,
+            stacklevel=4,
+        )
+
+    def _warn_if_the_stack_server_is_reachable_from_off_the_machine(self) -> None:
+        """Binding anything but loopback is a decision, and it is worth saying
+        out loud that it was made.
+
+        The server answers with the stack of any local process it can read, and
+        it asks nobody who they are. On loopback that is bounded by who can get
+        a socket on the machine; on 0.0.0.0 it is bounded by the network, which
+        inside a cluster is every other pod. That is the right setting for a
+        container whose UI is outside it and the wrong one everywhere else, and
+        only the person who typed it can tell which case this is.
+        """
+        if not self.stack_server or self.stack_server_host in LOOPBACK:
+            return
+        warnings.warn(
+            f"the live stack server is bound to {self.stack_server_host}, not "
+            "loopback, so anything that can reach this host on port "
+            f"{self.stack_server_port or '<drawn at random>'} can read the stack "
+            "of any process it serves - there is no authentication. This is what "
+            "a container whose UI is outside it needs; it is not what a shared "
+            "machine wants",
             FailureInstrumentationWarning,
             stacklevel=4,
         )
@@ -178,6 +228,7 @@ _FIELD_NAMES = {field.name for field in fields(Settings)}
 
 
 def add_options(parser: pytest.Parser) -> None:
+    _add_command_line_options(parser)
     parser.addini("failure_directory", help="Where evidence is written.", default=DEFAULT_DIRECTORY)
     parser.addini(
         "failure_packages",
@@ -229,10 +280,19 @@ def add_options(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "failure_stack_server_port",
-        help=f"Port for that server. Fixed rather than chosen at random, so a "
-        f"UI and a firewall can both be told about it once. Default "
-        f"{DEFAULT_STACK_SERVER_PORT}.",
-        default=str(DEFAULT_STACK_SERVER_PORT),
+        help="Port for that server. 0 (the default) draws a free one and writes "
+        "it to the evidence directory for a UI to read; any other number is "
+        "claimed and shared with every other session on the host. Overridden by "
+        "--callstack-port.",
+        default=str(PORT_LOTTERY),
+    )
+    parser.addini(
+        "failure_stack_server_host",
+        help="What that server binds. Loopback by default, which keeps it off "
+        "the network; 0.0.0.0 is what a container needs, since its UI is "
+        "outside and cannot reach 127.0.0.1 in there. Overridden by "
+        "--callstack-host.",
+        default=DEFAULT_STACK_SERVER_HOST,
     )
     parser.addini(
         "failure_stack_probe",
@@ -240,6 +300,55 @@ def add_options(parser: pytest.Parser) -> None:
         "(POSIX only). Can nudge a C extension blocked in a syscall.",
         default="true",
     )
+
+
+def _add_command_line_options(parser: pytest.Parser) -> None:
+    """The two settings worth having on the command line.
+
+    Everything else about this plugin is a property of the project and belongs
+    in ini. These two are properties of *where this run happens* - which port
+    is free on this machine, which interface a container needs bound - and that
+    is not something a repository can know on behalf of everybody running it.
+
+    Naming either one switches the server on. An option that is accepted,
+    parsed, and then silently ignored because a separate ini flag was left at
+    its default is the worst of the available behaviours.
+    """
+    group = parser.getgroup("failure-instrumentation")
+    group.addoption(
+        "--callstack-port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="Serve live stacks on this port, shared with any other session on "
+        "the host that names the same one. Omit to draw a free port instead.",
+    )
+    group.addoption(
+        "--callstack-host",
+        default=None,
+        metavar="HOST",
+        help="Serve live stacks on this interface (default 127.0.0.1). Use "
+        "0.0.0.0 to reach the server from outside a container.",
+    )
+
+
+def _option(config: pytest.Config, name: str) -> Any:
+    """A command-line value, or None when there is not one to be had.
+
+    Three ways there is not, and all of them are ordinary. The option may not
+    be registered, because ``-p no:failure_instrumentation`` skips
+    ``pytest_addoption`` - and asking pytest for an unregistered option raises
+    rather than answering. The config may not be pytest's at all: a framework
+    installing this by hand passes what it has. Or the option is registered and
+    simply was not given, which is the common case and answers None by itself.
+    """
+    ask = getattr(config, "getoption", None)
+    if ask is None:
+        return None
+    try:
+        return ask(name)
+    except (ValueError, KeyError):
+        return None
 
 
 def _ini(config: pytest.Config, name: str, fallback: Any) -> Any:
@@ -296,6 +405,13 @@ def resolve(config: pytest.Config) -> Settings:
     # the same id and a stale file from an earlier run is recognisable.
     run_id = str(workerinput.get("failure_run_id") or "") or None
 
+    # The command line outranks ini for these two: they answer "where does this
+    # run happen", which the person starting it knows and the repository does
+    # not.
+    chosen_port = _option(config, "callstack_port")
+    chosen_host = _option(config, "callstack_host")
+    named_on_cli = chosen_port is not None or chosen_host is not None
+
     handed_down = workerinput.get("failure_settings")
     if handed_down:
         return Settings.from_payload(
@@ -315,9 +431,16 @@ def resolve(config: pytest.Config) -> Settings:
         slow_test_seconds=_number(config, "failure_slow_test_seconds", 20.0),
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe", True),
-        stack_server=_flag(config, "failure_stack_server", False),
-        stack_server_port=int(
-            _number(config, "failure_stack_server_port", DEFAULT_STACK_SERVER_PORT)
+        stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,
+        stack_server_port=(
+            chosen_port
+            if chosen_port is not None
+            else int(_number(config, "failure_stack_server_port", PORT_LOTTERY))
+        ),
+        stack_server_host=(
+            chosen_host
+            or _ini(config, "failure_stack_server_host", "")
+            or DEFAULT_STACK_SERVER_HOST
         ),
         worker_count=worker_count,
         run_id=run_id,

@@ -258,7 +258,14 @@ class IncidentEngine:
         if self.settings.stack_server:
             from ..stack_server import start as start_stack_server
 
-            self.stacks = start_stack_server(self.settings.stack_server_port)
+            self.stacks = start_stack_server(
+                self.settings.stack_server_port,
+                self.settings.stack_server_host,
+                # The evidence directory, so a drawn port is written down
+                # beside the worker state a UI reads to know which pid is
+                # running which test.
+                self.directory,
+            )
 
         # Only distributed runs can strand a worker. A single process that
         # wedges takes this detector down with it.

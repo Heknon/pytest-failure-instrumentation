@@ -23,11 +23,15 @@ from pytest_failure_instrumentation.config import (
 class FakeConfig:
     """Just enough of pytest.Config to resolve settings against."""
 
-    def __init__(self, **values: object) -> None:
+    def __init__(self, options: dict | None = None, **values: object) -> None:
         self.values = values
+        self.options = options or {}
 
     def getini(self, name: str) -> object:
         return self.values.get(name, DEFAULTS[name])
+
+    def getoption(self, name: str) -> object:
+        return self.options.get(name)
 
 
 DEFAULTS = {
@@ -44,7 +48,8 @@ DEFAULTS = {
     "failure_stall_seconds": "300",
     "failure_stack_probe": "true",
     "failure_stack_server": "false",
-    "failure_stack_server_port": "8080",
+    "failure_stack_server_port": "0",
+    "failure_stack_server_host": "127.0.0.1",
 }
 
 
@@ -92,10 +97,22 @@ def test_every_setting_in_the_readme_table_is_registered():
     registered: list[str] = []
 
     class Parser:
+        """Both halves of what add_options registers. The command-line options
+        go to a group, and a fake that cannot hand one out would make this test
+        pass by never reaching them."""
+
         def addini(self, name, help, type=None, default=None):  # noqa: A002
             registered.append(name)
 
+        def getgroup(self, name):
+            return self
+
+        def addoption(self, name, **kwargs):
+            command_line.append(name)
+
+    command_line: list[str] = []
     settings_module.add_options(Parser())
+    assert sorted(command_line) == ["--callstack-host", "--callstack-port"]
     assert sorted(registered) == sorted(DEFAULTS)
 
 
@@ -145,3 +162,52 @@ def test_the_two_places_the_version_is_written_agree():
     declared = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
     assert declared, "no version in pyproject.toml"
     assert pytest_failure_instrumentation.__version__ == declared.group(1)
+
+
+# -- where this run happens, as against what this project wants -----------
+
+
+def test_no_port_asked_for_means_one_is_drawn():
+    """The default is the lottery, because a session nobody has told which port
+    to use has no reason to fight the other sessions for one."""
+    assert resolve(FakeConfig()).stack_server_port == 0
+    assert resolve(FakeConfig()).stack_server_host == "127.0.0.1"
+
+
+def test_the_command_line_outranks_ini_for_both_of_them():
+    """These two answer "where does this run happen", which the person starting
+    it knows and the repository does not."""
+    with pytest.warns(FailureInstrumentationWarning):  # 0.0.0.0 is an exposure
+        resolved = resolve(
+            FakeConfig(
+                {"callstack_port": 9111, "callstack_host": "0.0.0.0"},
+                failure_stack_server_port="8080",
+                failure_stack_server_host="127.0.0.1",
+                failure_stack_server="true",
+            )
+        )
+    assert resolved.stack_server_port == 9111
+    assert resolved.stack_server_host == "0.0.0.0"
+
+
+def test_naming_either_one_on_the_command_line_switches_the_server_on():
+    """An option that is accepted, parsed and then ignored because a separate
+    ini flag was left at its default is the worst available behaviour."""
+    assert resolve(FakeConfig({"callstack_port": 9111})).stack_server
+    with pytest.warns(FailureInstrumentationWarning):  # 0.0.0.0 is an exposure
+        assert resolve(FakeConfig({"callstack_host": "0.0.0.0"})).stack_server
+    assert not resolve(FakeConfig()).stack_server
+
+
+def test_binding_off_loopback_says_what_it_exposes():
+    """Right for a container whose UI is outside it, wrong on a shared machine,
+    and only the person who typed it can tell which this is."""
+    with pytest.warns(FailureInstrumentationWarning, match="no authentication"):
+        resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+
+
+def test_loopback_by_any_of_its_names_is_not_an_exposure():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FailureInstrumentationWarning)
+        for name in ("127.0.0.1", "::1", "localhost"):
+            resolve(FakeConfig({"callstack_host": name}))
