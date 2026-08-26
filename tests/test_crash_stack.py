@@ -310,6 +310,31 @@ def test_the_dumping_thread_is_not_reported_as_the_stalled_one(tmp_path):
     assert not any("heartbeat.py" in line for line in lines)
 
 
+def _settled(path, quiet: float = 0.3, timeout: float = 10.0) -> str:
+    """The dump's contents, once it has stopped being written to.
+
+    A dump has no marker for where it ends, so a read taken while the C timer
+    is still writing returns part of one - and part of a dump differs from the
+    whole of it, which is indistinguishable from a second dump having been
+    appended. That is what it looked like on a loaded runner: the comparison
+    below failed with frames *added* to a continuing stack rather than with a
+    second "Timeout (" banner, which is the shape a real repeat would have.
+
+    So the file is left to settle first. This weakens nothing: the assertion is
+    that no *further* dump arrives, and it can only be made against a dump that
+    has finished arriving.
+    """
+    deadline = time.monotonic() + timeout
+    last = -1
+    while time.monotonic() < deadline:
+        size = path.stat().st_size
+        if size and size == last:
+            break
+        last = size
+        time.sleep(quiet)
+    return path.read_text(encoding="utf-8")
+
+
 def test_the_fallback_timer_never_fires_while_the_heartbeat_is_beating(tmp_path):
     """This is the whole safety argument, so it is asserted rather than argued.
 
@@ -342,8 +367,11 @@ def test_the_fallback_timer_never_fires_while_the_heartbeat_is_beating(tmp_path)
 
         # And when the beats stop, it fires - once, which is the whole answer
         # for a process that is no longer changing.
+        # Past the deadline, so it has certainly fired - and then read only
+        # once it has stopped being written to, since a partial dump differs
+        # from the whole one in exactly the way a second dump would.
         time.sleep(2.5)
-        first = path.read_text(encoding="utf-8")
+        first = _settled(path)
         assert first.startswith("Timeout (")
         time.sleep(2.0)
         assert path.read_text(encoding="utf-8") == first, "the timer repeated"
