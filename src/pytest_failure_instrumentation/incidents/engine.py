@@ -30,12 +30,14 @@ instrumentation had done more damage than the failure it came to explain.
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -48,28 +50,61 @@ from ..config import Settings
 from . import collection, death, internal_error, stall, summary
 from .base import Capabilities, Incident, frame_from
 
-#: Suffixes this plugin writes, one file per worker. Anything else in the
-#: evidence directory belongs to somebody else.
-#: ``.part`` is a watchdog dump that was being written when the run ended.
-OWNED_SUFFIXES = (".state", ".events", ".crash", ".slow", ".frozen", ".part")
-
-#: The one file that is not per worker. It is a ``.txt``, and deleting every
-#: ``.txt`` to catch it took a coverage report and a build log with it - so it
-#: is matched by the name this plugin gave it instead.
-COLLECTION_PREFIX = "collection-"
+#: Written at the top of each run's own directory, and the only thing that
+#: makes a directory this plugin's to delete. Matching on file suffixes instead
+#: is how a cleanup takes somebody's coverage report with it: ``failure_directory``
+#: is a natural thing to point at an existing artifacts directory.
+OWNER_FILE = "owner.json"
 
 
-def _is_ours(path: Path) -> bool:
-    if path.suffix in OWNED_SUFFIXES:
-        return True
-    return path.name.startswith(COLLECTION_PREFIX) and path.suffix == ".txt"
+def prune_finished_runs(root: Path) -> None:
+    """Delete the directories of runs that are over.
+
+    Over, not old. The controller's pid is in the marker, so a run that is
+    still going is recognisable as such however long it has been going - which
+    matters, because the whole reason each run has a directory is that several
+    of them happen at once.
+
+    A directory without our marker is not ours and is left alone, whatever it
+    looks like.
+    """
+    try:
+        candidates = [path for path in root.iterdir() if path.is_dir()]
+    except OSError:
+        return
+    for path in candidates:
+        owner = _owner_of(path)
+        if owner is None or _is_running(owner):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _owner_of(directory: Path) -> Optional[int]:
+    """The pid that owns this run directory, or None if it is not ours."""
+    try:
+        record = json.loads((directory / OWNER_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    pid = record.get("pid") if isinstance(record, dict) else None
+    return int(pid) if isinstance(pid, int) else None
+
+
+def _is_running(pid: int) -> bool:
+    """Errs towards "yes": an unreadable answer leaves the directory alone
+    rather than deleting a live run's evidence."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, ValueError):
+        return True  # EPERM means it exists and is not ours to signal
+    return True
 
 
 class IncidentEngine:
     def __init__(self, config: pytest.Config, settings: Settings) -> None:
         self.config = config
         self.settings = settings
-        self.directory = settings.directory
         self.attributor = Attributor(settings.packages)
         self.baseline_oom_kills = probes.cgroup_oom_kills()
         self.distributed = bool(
@@ -82,9 +117,16 @@ class IncidentEngine:
         # so it is resolved lazily below, with a fallback fixed now. A
         # timestamp is not enough: two runs starting in the same second are
         # common on CI, and they would share an id.
-        self._run_id_fallback = os.environ.get("PYTEST_RUN_ID") or (
+        #: This process's own name for itself, fixed here and dependent on
+        #: nothing. It names the directory, which is why it cannot be xdist's
+        #: id: see the ``directory`` property.
+        self.session_id = os.environ.get("PYTEST_RUN_ID") or (
             f"run-{uuid.uuid4().hex[:12]}"
         )
+        #: Filled by the first read that finds a real id, and never
+        #: recomputed after that - see the property for why not the first read
+        #: of any kind.
+        self._run_id: str | None = None
         self.collections = CollectionTracker()
         self.reported_mismatch = False
         #: Workers that went down before registering a collection. They are
@@ -107,25 +149,80 @@ class IncidentEngine:
         #: anything - but session start and finish are here, and giving it a
         #: plugin of its own would be two objects with one lifetime.
         self.stacks: Any = None
-        self._prepare_directory()
+
+    # -- where this run's evidence goes ----------------------------------
+
+    @property
+    def directory(self) -> Path:
+        """This run's own directory, under the configured one.
+
+        Runs used to share a directory and name their files after the worker,
+        which works exactly until two runs happen at once - and on a laptop or
+        a bare-metal runner that is the ordinary case, not the exotic one.
+        Every worker is ``gw0``, so the second run's ``gw0.state`` is the first
+        run's ``gw0.state``: one run reads the other's evidence, believes it,
+        and attributes a stall to a test that a different run is running. The
+        old start-of-run cleanup made it worse rather than better, because it
+        deleted the files of a run that was still using them.
+
+        A directory per run removes the class of bug rather than a symptom of
+        it. Nothing inside is named for the run, because the directory already
+        is, and the paths every reader builds are unchanged.
+
+        **Named by this process, not by xdist.** The obvious name is the run id
+        this run reports, and it cannot be used: xdist's id does not exist
+        until xdist has built its node manager, and there is no hook order that
+        reliably puts that before this. ``trylast`` does not do it, because
+        xdist's own session start is *also* ``trylast`` - so which of the two
+        runs first comes down to which plugin registered first, and that
+        differs between installing from the entry point and installing from a
+        framework's ``pytest_configure``. Ordering had already been got wrong
+        here once (see :mod:`..registration`); a name that depends on nothing
+        cannot be got wrong again.
+
+        The reported run id is unaffected and still prefers xdist's, so an
+        incident still lines up with xdist's logs. Every ``.events`` line in
+        here carries it, which is how a directory is matched to a run.
+        """
+        return self.settings.directory / self.session_id
 
     def _prepare_directory(self) -> None:
-        # Only workers write evidence here, so a single-process run has no
-        # reason to leave an empty directory in somebody's repository.
-        if not self.distributed:
+        """Make this run's directory, and clear out the runs that are over.
+
+        Made when something is actually going to write there - workers, or the
+        stack server publishing its address. A single-process run with neither
+        has no reason to leave an empty directory in somebody's repository, and
+        a run that skips the marker would leave a directory nothing ever prunes.
+
+        What is pruned is *whole directories of finished runs*, which is a much
+        safer thing to delete than a list of file suffixes: a directory is only
+        touched if it holds this plugin's own marker naming a process that is
+        no longer running. ``failure_directory`` is a natural thing to point at
+        an existing artifacts directory, and a green run that deletes somebody's
+        coverage report has done more damage than any failure it might have
+        explained.
+        """
+        if not self.distributed and not self.settings.stack_server:
             return
-        # Stale files from an earlier run would be read as this one's evidence.
-        # Only files this plugin writes are removed: failure_directory is a
-        # natural thing to point at an existing artifacts directory, and a
-        # green run that deletes somebody's coverage report has done more
-        # damage than any failure it might have explained.
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            for path in self.directory.iterdir():
-                if path.is_file() and _is_ours(path):
-                    path.unlink()
+            # The run id is deliberately absent: reading it here would settle
+            # it before xdist has one, and the id this run reports would then
+            # be a name nothing else agrees with. The events files inside carry
+            # it, and they are written from the start.
+            (self.directory / OWNER_FILE).write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "session_id": self.session_id,
+                        "started_at": time.time(),
+                    }
+                ),
+                encoding="utf-8",
+            )
         except OSError:
-            pass
+            return  # bookkeeping must never break a run
+        prune_finished_runs(self.settings.directory)
 
     # -- raising ---------------------------------------------------------
 
@@ -236,23 +333,56 @@ class IncidentEngine:
     def run_id(self) -> str:
         """The id every piece of this run's evidence is stamped with.
 
-        xdist's own id is preferred, so an incident lines up with its logs. It
-        is read from the session plugin rather than stored: the node manager
-        that holds it is built inside xdist's own ``pytest_sessionstart``,
-        which may run after this one.
+        Kept once it is *authoritative*, and only then. The distinction is
+        load-bearing: this process's own name for itself is a stand-in that
+        exists from the start, and xdist's real one does not exist until xdist
+        has built its node manager. Caching whichever came first froze the
+        stand-in and every incident in the run then carried a name that
+        appears in nobody's logs.
 
-        A framework that installed this by hand and named an id outranks both
-        - correlating incidents with a build id is a reason to install by hand
-        in the first place, and it is the only id that means anything outside
-        this process.
+        And "whichever came first" is not under this plugin's control at all.
+        pytest's fixture collection walks every attribute of every registered
+        plugin object looking for fixtures, with a plain ``getattr`` - so
+        reading a property is something *pytest* does, at plugin registration
+        time, before any hook here has run. Measured on pytest 7.0.1, where it
+        happens through ``FixtureManager.parsefactories``; newer pytest
+        happened not to, which is the kind of difference that makes an
+        ordering assumption a bug waiting for a version bump.
+
+        So a property on a plugin object must have no lasting side effect, and
+        this one no longer does: an early read answers with the stand-in and
+        keeps nothing, and the first read once the real id exists is the one
+        that sticks.
+
+        A framework that installed this by hand and named an id outranks both -
+        correlating incidents with a build id is a reason to install by hand in
+        the first place, and it is the only id that means anything outside this
+        process. Then xdist's own, so an incident lines up with its logs.
         """
+        if self._run_id is not None:
+            return self._run_id
+        resolved = self._resolve_run_id()
+        if resolved != self.session_id:
+            # An answer rather than a stand-in, so it is safe to keep.
+            self._run_id = resolved
+        return resolved
+
+    def _resolve_run_id(self) -> str:
         if self.settings.run_id:
             return self.settings.run_id
         session = self.config.pluginmanager.getplugin("dsession")
         manager = getattr(session, "nodemanager", None)
-        return getattr(manager, "testrunuid", None) or self._run_id_fallback
+        return getattr(manager, "testrunuid", None) or self.session_id
 
     def pytest_sessionstart(self, session: pytest.Session) -> None:
+        """Deliberately not ordered against xdist's own session start.
+
+        Nothing here reads the run id, so nothing here cares whether xdist has
+        built its node manager yet - see the ``directory`` property for why
+        that independence had to be designed in rather than assumed.
+        """
+        self._prepare_directory()
+
         # Whether or not this is distributed: a single-process run has a stack
         # worth serving too, and it is the one this process can read for free.
         if self.settings.stack_server:
@@ -294,7 +424,12 @@ class IncidentEngine:
         """
         try:
             node.workerinput["failure_run_id"] = self.run_id
-            node.workerinput["failure_settings"] = self.settings.as_payload()
+            # The *resolved* directory, not the configured one. A worker cannot
+            # work out which run it belongs to on its own, and one that guessed
+            # would write its evidence where nothing is going to read it.
+            node.workerinput["failure_settings"] = self.settings.with_overrides(
+                directory=self.directory
+            ).as_payload()
         except Exception:  # noqa: BLE001 - a worker falling back to ini is a
             pass  # worse answer than this one, not a broken run
 

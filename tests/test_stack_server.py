@@ -491,11 +491,11 @@ def test_a_real_run_draws_a_port_and_a_ui_finds_it_on_disk(pytester):
 
         def test_a_ui_can_find_this_server_without_being_told_the_port():
             deadline = time.monotonic() + 20
-            while not glob.glob(".evidence/callstack-*.json"):
+            while not glob.glob(".evidence/*/callstack-*.json"):
                 assert time.monotonic() < deadline, "no address was ever published"
                 time.sleep(0.1)
 
-            published = glob.glob(".evidence/callstack-*.json")
+            published = glob.glob(".evidence/*/callstack-*.json")
             assert len(published) == 1
             address = json.loads(open(published[0]).read())
             assert address["drawn"] is True
@@ -516,7 +516,7 @@ def test_a_real_run_draws_a_port_and_a_ui_finds_it_on_disk(pytester):
     result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
     result.assert_outcomes(passed=1)
     # And the address does not outlive the session that published it.
-    assert not list((pytester.path / ".evidence").glob("callstack-*.json"))
+    assert not list((pytester.path / ".evidence").glob("*/callstack-*.json"))
 
 
 def test_naming_a_port_on_the_command_line_is_enough_to_start_it(pytester):

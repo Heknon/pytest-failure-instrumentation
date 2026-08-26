@@ -76,17 +76,23 @@ def test_a_previous_runs_evidence_is_not_reported_as_this_ones(runner, monkeypat
     runner.pytester.makepyfile(test_suite=SUITE)
     runner.pytester.makepyfile(boom_plugin=BOOM_PLUGIN)
 
+    # Both runs are given the same session id, which is what puts them in one
+    # directory: runs have their own directory now, so sharing one is no longer
+    # something that just happens - it is what naming them the same does. The
+    # run id stamped on each line is then the only thing separating the two.
+    monkeypatch.setenv("PYTEST_RUN_ID", "a-shared-directory")
+    evidence = runner.pytester.path / ".pytest-failures" / "a-shared-directory"
+
     if _has_xdist():
         # Run one: a worker fails, and its record stays on disk.
         monkeypatch.setenv("BOOM_ON", "gw1")
         runner.pytester.runpytest_subprocess(
             "-n", "2", "-p", "boom_plugin", "test_suite.py", timeout=180
         )
-        assert list((runner.pytester.path / ".pytest-failures").glob("*.events"))
+        assert list(evidence.glob("*.events"))
     else:
         # No xdist: forge the leftovers a distributed run would have left.
-        evidence = runner.pytester.path / ".pytest-failures"
-        evidence.mkdir(exist_ok=True)
+        evidence.mkdir(parents=True, exist_ok=True)
         (evidence / "gw1.events").write_text(
             json.dumps(
                 {
