@@ -497,9 +497,13 @@ class StackService:
             httpd.server_close()
             return True
 
+        # Published *before* anything is told the server is up. The socket is
+        # bound and listening from the constructor, so the order costs nothing -
+        # and the other order is a window in which a reader sees a serving
+        # session whose address is not written down yet. macOS found it.
+        self._publish()
         self.serving = True
         self.status = f"serving on {self.url}"
-        self._publish()
         try:
             httpd.serve_forever(poll_interval=0.5)
         except Exception as failure:  # noqa: BLE001

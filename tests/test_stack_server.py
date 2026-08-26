@@ -24,6 +24,8 @@ from pytest_failure_instrumentation import stack_server
 from pytest_failure_instrumentation.probes import pyspy, stacks
 from pytest_failure_instrumentation.probes.platform_flags import IS_WINDOWS
 
+from .conftest import needs_process_liveness
+
 needs_pyspy = pytest.mark.skipif(
     not pyspy.available(), reason="py-spy is not installed in this environment"
 )
@@ -435,6 +437,7 @@ def test_two_sessions_in_one_directory_do_not_overwrite_each_others_address(
     assert len(list(tmp_path.glob("callstack-*.json"))) == 2
 
 
+@needs_process_liveness
 def test_only_dead_sessions_addresses_are_swept(tmp_path):
     """Cleaning up a live session's address is how a cleanup becomes an
     outage, so the pid is checked rather than the age."""
