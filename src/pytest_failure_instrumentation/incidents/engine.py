@@ -128,6 +128,7 @@ class IncidentEngine:
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.watcher: threading.Thread | None = None
+        self.sampler: threading.Thread | None = None
         self.seen: dict[str, int] = {}
         self.raised = 0
         self.suppressed = 0
@@ -392,6 +393,14 @@ class IncidentEngine:
                 self.session_id,
             )
 
+        if self.settings.sample_seconds > 0:
+            self.sampler = threading.Thread(
+                target=self._sample_workers,
+                name="failure-instrumentation-sample",
+                daemon=True,
+            )
+            self.sampler.start()
+
         # Only distributed runs can strand a worker. A single process that
         # wedges takes this detector down with it.
         if self.distributed and self.settings.stall_seconds > 0:
@@ -401,6 +410,44 @@ class IncidentEngine:
                 daemon=True,
             )
             self.watcher.start()
+
+    def _sample_workers(self) -> None:
+        """Push what every worker is doing, on a cadence, until the run ends.
+
+        Its own thread rather than the stall watcher's, though both poll the
+        same files. The watcher's cadence is derived from the stall threshold
+        and is a detection deadline; this one is a reporting rate somebody
+        picked to suit their dashboard, and tying a diagnosis to a display
+        setting is how a stall starts being detected late because a UI wanted
+        fewer rows.
+        """
+        from ..sampling import WorkerSampler
+
+        sampler = WorkerSampler(
+            self.directory,
+            session_id=self.session_id,
+            want_stacks=self.settings.sample_stacks,
+        )
+        while not self.stop.wait(self.settings.sample_seconds):
+            try:
+                sample = sampler.sample()
+            except Exception as failure:  # noqa: BLE001 - never break a run
+                print(
+                    f"[failure-instrumentation] could not sample: {failure!r}",
+                    flush=True,
+                )
+                continue
+            if not sample.workers:
+                # Nothing has started writing yet, or the run is over. An
+                # empty sample is a row that says nothing, every interval.
+                continue
+            try:
+                self.config.hook.pytest_failure_worker_sample(sample=sample)
+            except Exception as failure:  # noqa: BLE001 - never break a run
+                print(
+                    f"[failure-instrumentation] sample hook raised: {failure!r}",
+                    flush=True,
+                )
 
     def _stack_server_ready(self, server: Any) -> None:
         """The live view is up, and only this run knows where.
@@ -587,6 +634,10 @@ class IncidentEngine:
         self.stop.set()
         if self.watcher is not None:
             self.watcher.join(timeout=2.0)
+        if self.sampler is not None:
+            # Bounded like the watcher: a sample hook that will not return
+            # must not be what keeps a finished run from exiting.
+            self.sampler.join(timeout=2.0)
         # A worker that died still owing a collection means the full set never
         # arrives. Report what was seen rather than nothing at all, flagged as
         # incomplete so the worker counts are not read as the whole picture.

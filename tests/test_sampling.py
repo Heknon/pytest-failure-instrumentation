@@ -1,0 +1,304 @@
+"""Periodic worker samples, and the two things that keep them affordable.
+
+Sampling every worker's stack on a cadence is the most expensive thing this
+package can be asked to do. These are the tests for the two decisions that
+make it cheap - read a stack only for a worker the truth table already calls
+stuck, and send a stack only when it is not the one already sent.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+from pytest_failure_instrumentation.sampling import (
+    MAX_STACKS_PER_SAMPLE,
+    WorkerSampler,
+    digest_of,
+)
+
+from .conftest import needs_xdist
+
+FRAMES_A = [{"name": "t", "frames": [{"function": "wait", "file": "a.py", "line": 3}]}]
+FRAMES_B = [{"name": "t", "frames": [{"function": "poll", "file": "b.py", "line": 9}]}]
+
+
+def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid=None):
+    """A run directory shaped like one a real run leaves behind.
+
+    ``workers`` is {name: cpu_seconds_series}, and the series is the knob these
+    tests turn: it is what decides working-vs-blocked.
+
+    The pid is this test process, because it has to be one that exists. A dead
+    pid is reported ``gone``, which outranks every other status by design - so
+    a fixture with invented pids would test nothing but that rule.
+    """
+    moment = time.time() if now is None else now
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "owner.json").write_text(json.dumps({"pid": 1, "started_at": moment - 60}))
+    alive = os.getpid() if pid is None else pid
+    for name, cpus in workers.items():
+        state = {"pid": alive, "nodeid": f"test_x.py::{name}", "phase": "call",
+                 "time": moment, "tests_started": 1, "tests_finished": 0}
+        raw = json.dumps(state).encode()
+        (root / f"{name}.state").write_bytes(raw + b"\x00" * (5120 - len(raw)))
+        lines = [json.dumps({"event": "watchdog_started", "interval": beats_apart,
+                             "run_id": run_id, "time": moment - 60})]
+        for i, cpu in enumerate(cpus):
+            lines.append(json.dumps({
+                "event": "heartbeat", "cpu_seconds": cpu, "rss_mb": 40,
+                "nodeid": f"test_x.py::{name}", "phase": "call", "run_id": run_id,
+                "time": moment - (len(cpus) - 1 - i) * beats_apart,
+            }))
+        (root / f"{name}.events").write_text("\n".join(lines) + "\n")
+    return root
+
+
+def reader(answer):
+    """A stand-in for py-spy, so the dedupe can be driven without it."""
+    def read(pid):
+        value = answer() if callable(answer) else answer
+        return (value, None) if value else (None, "nothing to read")
+    return read
+
+
+# -- what gets a stack at all ---------------------------------------------
+
+
+def test_a_working_worker_is_reported_but_never_read(tmp_path):
+    """The saving that makes this affordable at all. A worker burning CPU is
+    working, the heartbeat already said so, and reading its stack costs a
+    subprocess and a pause to learn nothing."""
+    asked: list[int] = []
+
+    def counting(pid):
+        asked.append(pid)
+        return FRAMES_A, None
+
+    # A rising CPU series is a busy worker.
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0, 5.0, 7.0]})
+    sample = WorkerSampler(root, reader=counting).sample()
+
+    assert [w.status for w in sample.workers] == ["working"]
+    assert asked == [], "a working worker was read"
+    assert sample.workers[0].stack is None
+    # Still reported: the row is the live view, and it is nearly free.
+    assert sample.workers[0].nodeid == "test_x.py::gw0"
+    assert sample.workers[0].cpu_rate is not None
+
+
+def test_a_blocked_worker_is_read(tmp_path):
+    """Flat CPU with a live heartbeat is the case worth a stack."""
+    root = evidence(tmp_path / "run", {"gw0": [5.0, 5.0, 5.0, 5.0]})
+    sample = WorkerSampler(root, reader=reader(FRAMES_A)).sample()
+
+    assert [w.status for w in sample.workers] == ["blocked"]
+    assert sample.workers[0].stack == FRAMES_A
+    assert sample.workers[0].stack_digest == digest_of(FRAMES_A)
+    assert sample.workers[0].stack_repeats == 0
+
+
+def test_stacks_can_be_declined_while_the_statuses_are_kept(tmp_path):
+    """The two halves have very different prices, so they are separable: the
+    rows come from files the run wrote anyway, the frames do not."""
+    root = evidence(tmp_path / "run", {"gw0": [5.0, 5.0, 5.0]})
+    sample = WorkerSampler(root, want_stacks=False, reader=reader(FRAMES_A)).sample()
+
+    assert sample.workers[0].status == "blocked"
+    assert sample.workers[0].stack is None
+    assert sample.workers[0].stack_digest is None
+
+
+# -- not sending the same stack twice --------------------------------------
+
+
+def test_an_unchanged_stack_is_sent_once_and_then_counted(tmp_path):
+    """The whole reason this is affordable for the workers that matter most.
+    A worker wedged for a day has one stack, and storing it 8,640 times is
+    8,640 copies of one fact."""
+    root = evidence(tmp_path / "run", {"gw0": [5.0, 5.0, 5.0]})
+    sampler = WorkerSampler(root, reader=reader(FRAMES_A))
+
+    first = sampler.sample().workers[0]
+    assert first.stack == FRAMES_A and first.stack_repeats == 0
+
+    for expected in (1, 2, 3):
+        later = sampler.sample().workers[0]
+        assert later.stack is None, "the same stack was sent twice"
+        # Still identified, so a suppressed row joins to the one with frames.
+        assert later.stack_digest == digest_of(FRAMES_A)
+        assert later.stack_repeats == expected
+
+
+def test_a_stack_that_moves_is_sent_again(tmp_path):
+    """Suppression must be of repeats, not of stacks. A worker that moved to a
+    different frame has news, and reporting it as a repeat would describe it
+    with the stack it left."""
+    root = evidence(tmp_path / "run", {"gw0": [5.0, 5.0, 5.0]})
+    frames = [FRAMES_A]
+    sampler = WorkerSampler(root, reader=reader(lambda: frames[0]))
+
+    assert sampler.sample().workers[0].stack == FRAMES_A
+    assert sampler.sample().workers[0].stack is None
+    frames[0] = FRAMES_B
+    moved = sampler.sample().workers[0]
+    assert moved.stack == FRAMES_B
+    assert moved.stack_digest == digest_of(FRAMES_B)
+    assert moved.stack_repeats == 0
+
+
+def test_the_same_stack_under_a_new_test_is_sent_again(tmp_path):
+    """The subtle one. A worker that blocks in the same library call on the
+    next test has an identical stack and a different subject - suppressing it
+    files the new test's evidence under the old test's document."""
+    root = tmp_path / "run"
+    evidence(root, {"gw0": [5.0, 5.0, 5.0]})
+    sampler = WorkerSampler(root, reader=reader(FRAMES_A))
+    assert sampler.sample().workers[0].stack == FRAMES_A
+    assert sampler.sample().workers[0].stack is None
+
+    # Same worker, same frames, different test.
+    state = json.loads((root / "gw0.state").read_bytes().rstrip(b"\x00"))
+    state["nodeid"] = "test_x.py::a_different_test"
+    raw = json.dumps(state).encode()
+    (root / "gw0.state").write_bytes(raw + b"\x00" * (5120 - len(raw)))
+
+    again = sampler.sample().workers[0]
+    assert again.nodeid == "test_x.py::a_different_test"
+    assert again.stack == FRAMES_A, "frames were suppressed across a change of test"
+
+
+def test_a_worker_that_recovers_starts_over(tmp_path):
+    """A worker that went back to work and later blocks again is reporting a
+    new stall. Carrying the old digest forward would make its first stack read
+    as a repeat of something hours earlier."""
+    root = tmp_path / "run"
+    evidence(root, {"gw0": [5.0, 5.0, 5.0]})
+    sampler = WorkerSampler(root, reader=reader(FRAMES_A))
+    assert sampler.sample().workers[0].stack == FRAMES_A
+
+    evidence(root, {"gw0": [1.0, 3.0, 5.0, 7.0]})   # busy again
+    assert sampler.sample().workers[0].status == "working"
+
+    evidence(root, {"gw0": [9.0, 9.0, 9.0]})        # blocked again
+    resumed = sampler.sample().workers[0]
+    assert resumed.stack == FRAMES_A
+    assert resumed.stack_repeats == 0
+
+
+# -- not falling over -------------------------------------------------------
+
+
+def test_a_reader_that_fails_says_so_rather_than_reporting_no_frames(tmp_path):
+    """Absence of a stack is a fact about the host - no py-spy, a refused
+    ptrace - and an empty stack field would read as "the worker had none"."""
+    def refuses(pid):
+        return None, "Operation not permitted (os error 1)"
+
+    root = evidence(tmp_path / "run", {"gw0": [5.0, 5.0, 5.0]})
+    entry = WorkerSampler(root, reader=refuses).sample().workers[0]
+    assert entry.stack is None
+    assert entry.stack_digest is None
+    assert "not permitted" in (entry.stack_error or "")
+
+
+def test_a_reader_that_raises_does_not_end_the_sample(tmp_path):
+    def explodes(pid):
+        raise RuntimeError("py-spy went away")
+
+    root = evidence(tmp_path / "run", {"gw0": [5.0, 5.0, 5.0],
+                                       "gw1": [5.0, 5.0, 5.0]})
+    sample = WorkerSampler(root, reader=explodes).sample()
+    assert len(sample.workers) == 2
+    assert all("py-spy went away" in (w.stack_error or "") for w in sample.workers)
+
+
+def test_a_run_where_everything_wedged_at_once_is_bounded_and_says_so(tmp_path):
+    """Each stack is a subprocess that pauses its target. A run that wedged
+    entirely should not turn its own diagnosis into the slowest thing on the
+    host - and what was dropped is named, because a bound nobody is told about
+    reads as full coverage."""
+    stuck = {f"gw{i}": [5.0, 5.0, 5.0] for i in range(MAX_STACKS_PER_SAMPLE + 4)}
+    root = evidence(tmp_path / "run", stuck)
+    sample = WorkerSampler(root, reader=reader(FRAMES_A)).sample()
+
+    with_frames = [w for w in sample.workers if w.stack is not None]
+    assert len(with_frames) == MAX_STACKS_PER_SAMPLE
+    assert len(sample.stacks_not_taken) == 4
+    # Everyone is still reported, whether or not they were read.
+    assert len(sample.workers) == MAX_STACKS_PER_SAMPLE + 4
+    assert all(w.status == "blocked" for w in sample.workers)
+
+
+def test_an_empty_directory_samples_nothing_rather_than_raising(tmp_path):
+    sample = WorkerSampler(tmp_path / "nothing-here").sample()
+    assert sample.workers == []
+
+
+# -- the whole chain, in a real run -----------------------------------------
+
+
+@needs_xdist
+def test_a_real_run_pushes_samples_to_a_product_that_implements_the_hook(pytester):
+    """Everything above drives the sampler directly, so none of it would
+    notice the thread never starting or the hook never being registered."""
+    pytester.makeconftest(
+        """
+        import json
+
+
+        def pytest_failure_worker_sample(sample):
+            with open("samples.jsonl", "a") as handle:
+                handle.write(sample.model_dump_json() + "\\n")
+        """
+    )
+    pytester.makepyfile(
+        """
+        import time
+
+        def test_one():
+            time.sleep(6)
+
+        def test_two():
+            time.sleep(6)
+        """
+    )
+    result = pytester.runpytest_subprocess(
+        "-p", "failure_instrumentation", "-n", "2",
+        "-o", "failure_sample_seconds=1",
+        "-o", "failure_heartbeat_interval=1",
+        "-o", "failure_sample_stacks=false",
+    )
+    result.assert_outcomes(passed=2)
+
+    lines = (pytester.path / "samples.jsonl").read_text().strip().splitlines()
+    assert lines, "the sampler never pushed anything"
+    samples = [json.loads(line) for line in lines]
+    assert all(s["session_id"] for s in samples)
+    # Both workers show up, doing the tests they were given.
+    seen = {w["worker"] for s in samples for w in s["workers"]}
+    assert {"gw0", "gw1"} <= seen
+    nodeids = {w["nodeid"] for s in samples for w in s["workers"] if w["nodeid"]}
+    assert any("test_one" in n or "test_two" in n for n in nodeids)
+    # Statuses come from the truth table, not from a placeholder.
+    assert {w["status"] for s in samples for w in s["workers"]} <= {
+        "working", "blocked", "frozen", "gone", "unmeasured"
+    }
+
+
+def test_sampling_is_off_unless_it_is_asked_for(pytester):
+    """It is the only hook here that fires when nothing is wrong, so it is the
+    only one that must not arrive because somebody upgraded."""
+    pytester.makeconftest(
+        """
+        def pytest_failure_worker_sample(sample):
+            with open("samples.jsonl", "a") as handle:
+                handle.write("called\\n")
+        """
+    )
+    pytester.makepyfile("def test_one():\n    assert True\n")
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
+    result.assert_outcomes(passed=1)
+    assert not (pytester.path / "samples.jsonl").exists()

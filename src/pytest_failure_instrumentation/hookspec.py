@@ -1,10 +1,11 @@
 """The hooks your product implements.
 
-Two, and they answer different questions. ``pytest_failure_incident`` says
+Three, and they answer different questions. ``pytest_failure_incident`` says
 something went wrong, once per incident, and is the reason this package exists.
-``pytest_failure_server_ready`` says the live-stack server is up and where -
-nothing went wrong, and a product that never switches the server on never sees
-it.
+``pytest_failure_worker_sample`` says what every worker is doing right now,
+on a cadence, and is off unless asked for. ``pytest_failure_server_ready`` says
+the live-stack server is up and where - nothing went wrong, and a product that
+never switches the server on never sees it.
 
 Both are named for what they deliver - most of what arrives at the first is not
 a crash - and namespaced to this distribution, the way ``pytest_xdist_*`` hooks
@@ -90,6 +91,7 @@ import pytest
 if TYPE_CHECKING:  # kept out of the runtime import path: a worker never
     from .incidents.base import Incident  # loads pydantic
     from .live_view import LiveStackServer
+    from .sampling import WorkerSample
 
 
 @pytest.hookspec()
@@ -121,4 +123,26 @@ def pytest_failure_server_ready(server: LiveStackServer) -> None:
     as it likes: nothing waits for it, and the run does not.
 
     Never raises into the run, on the same grounds as the hook above.
+    """
+
+
+@pytest.hookspec()
+def pytest_failure_worker_sample(sample: WorkerSample) -> None:
+    """Called on the controller every ``failure_sample_seconds``, while the run
+    is still going, with what each of this run's workers is doing.
+
+    Off unless ``failure_sample_seconds`` is set. This is the only hook here
+    that fires when nothing is wrong, so it is the only one with a running
+    cost - see :mod:`.sampling` for what that cost is and how it is kept down.
+
+    ``sample.workers`` carries every worker's status, node id, phase, resident
+    memory and CPU rate, all read from files the run was writing anyway.
+    Frames are attached only for workers that are ``blocked`` or ``frozen``,
+    and only on the sample that first sees a given stack: after that
+    ``stack`` is ``None`` while ``stack_digest`` and ``stack_repeats`` say
+    which stack it still is and for how long. Store the rows; store the frames
+    when they are there.
+
+    Called from the sampler's own thread, and wrapped like the others - an
+    exception here is never allowed to become an INTERNALERROR in the run.
     """

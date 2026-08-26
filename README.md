@@ -237,9 +237,9 @@ anything it could read itself. `run_id` travels with it, which is what lets a
 build id group a whole run's incidents.
 
 **Turning auto-registration off.** `-p no:failure_instrumentation` skips the
-entry point entirely; `install` puts back the hookspecs so both
-`pytest_failure_incident` and `pytest_failure_server_ready` still reach their
-implementers. Note that it also skips `pytest_addoption`, so
+entry point entirely; `install` puts back the hookspecs so
+`pytest_failure_incident`, `pytest_failure_worker_sample` and
+`pytest_failure_server_ready` all still reach their implementers. Note that it also skips `pytest_addoption`, so
 `failure_*` ini keys become unknown config options — which is the point if your
 framework owns the settings, and a reason to leave the entry point enabled and
 just call `install` if it does not.
@@ -840,6 +840,53 @@ for address in Path(".pytest-failures").glob("*/callstack-*.json"):
 test_pool.py::test_concurrent_writes call {'function': '_wait_for_lease', ...}
 ```
 
+### Pushing samples instead of polling for them
+
+`/workers` and `/stack` are a pull: something outside asks, when it wants to
+know. For a dashboard watching one run that is exactly right. For a fleet it is
+not — a poller has to reach every host, and the answer for almost every worker
+is "still working", which the heartbeat already said.
+
+`failure_sample_seconds` turns the same information around and pushes it:
+
+```python
+def pytest_failure_worker_sample(sample):
+    for worker in sample.workers:
+        rows.insert(session=sample.session_id, at=sample.observed_at,
+                    worker=worker.worker, nodeid=worker.nodeid,
+                    status=worker.status, rss_mb=worker.rss_mb,
+                    cpu_rate=worker.cpu_rate, digest=worker.stack_digest)
+        if worker.stack:                     # only when it is news
+            frames.insert(digest=worker.stack_digest, frames=worker.stack)
+```
+
+Off by default. It is the only hook here that fires when nothing is wrong, so
+it is the only one with a running cost — and two decisions keep that cost off
+the floor:
+
+**Only stuck workers are read.** Every worker's status comes from files the run
+was writing anyway, with nothing asked of the worker itself, so the rows are
+nearly free. Frames are taken only for `blocked` and `frozen`. A worker burning
+CPU is working, and reading its stack costs a subprocess and a pause to learn
+what the heartbeat already reported. `unmeasured` is not sampled either: it is
+what every worker looks like with the watchdog off, so sampling it would quietly
+mean sampling everything.
+
+**An unchanged stack is sent once.** The workers worth watching are the ones
+whose frames are *not* moving, so the same stack is drawn over and over. It goes
+out once; after that `stack` is `None` while `stack_digest` and `stack_repeats`
+say which stack it still is and for how long. A worker wedged for a day costs
+one stack and a counter rather than thousands of copies of one fact.
+
+The difference is not marginal. Reading every worker every ten seconds across a
+few thousand concurrent workers is hundreds of gigabytes a day; the same period
+sampled this way is single-digit gigabytes, and the stack trail for anything
+that actually got stuck is identical.
+
+Set `failure_sample_stacks = false` to keep the rows and decline the frames —
+the two halves have very different prices and are worth being able to buy
+separately.
+
 ### Containers
 
 `--callstack-host 0.0.0.0` is what a container needs: its UI is outside, and
@@ -985,6 +1032,8 @@ overwhelming majority of what runs.
 | `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
+| `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
+| `failure_sample_stacks` | `true` | Whether those samples carry frames for workers that look stuck |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
