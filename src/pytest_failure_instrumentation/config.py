@@ -57,6 +57,10 @@ MIN_HEARTBEAT_INTERVAL = 1.0
 #: cadence below this is a busy loop wearing a setting's clothes.
 MIN_SAMPLE_SECONDS = 1.0
 
+#: Accepted values for ``failure_tracer``; anything else falls back to the
+#: default rather than failing a run over a typo in an ini file.
+TRACER_POLICIES = ("parent", "any", "off")
+
 
 class FailureInstrumentationWarning(UserWarning):
     """Raised for a setting this plugin could not use, and for setup it had to
@@ -96,6 +100,12 @@ class Settings:
     slow_test_seconds: float = 20.0
     stall_seconds: float = 300.0
     stack_probe: bool = True
+    #: Who a worker declares may read its stack on Linux, where Yama restricts
+    #: it. "parent" nominates the controller and covers a session reading its
+    #: own workers, which is the default mode; "any" is what a *shared* server
+    #: needs, since another session's reader is no descendant of this
+    #: controller; "off" declares nothing. Nothing outside Linux consults it.
+    tracer: str = "parent"
     #: How often to push a ``pytest_failure_worker_sample`` while the run is
     #: going. 0 is off, and is the default: this is the only hook here that
     #: fires when nothing is wrong, so it is the only one a run pays for
@@ -140,6 +150,11 @@ class Settings:
             self,
             "sample_seconds",
             0.0 if self.sample_seconds <= 0 else max(MIN_SAMPLE_SECONDS, float(self.sample_seconds)),
+        )
+        object.__setattr__(
+            self,
+            "tracer",
+            self.tracer if self.tracer in TRACER_POLICIES else "parent",
         )
         object.__setattr__(self, "stack_server_host", str(self.stack_server_host))
         object.__setattr__(self, "stack_server_port", int(self.stack_server_port))
@@ -233,6 +248,9 @@ class Settings:
             "slow_test_seconds": self.slow_test_seconds,
             "stall_seconds": self.stall_seconds,
             "stack_probe": self.stack_probe,
+            # Handed down: it is the *worker* that makes the declaration, and
+            # only the controller was told which mode this run is in.
+            "tracer": self.tracer,
             # Sampling is absent for the same reason as the stack server below:
             # it runs on the controller, over every worker at once, and a
             # worker that read these would sample itself and its siblings.
@@ -330,6 +348,12 @@ def add_options(parser: pytest.Parser) -> None:
         help="Whether those samples carry frames for workers that look stuck. "
         "The statuses are nearly free; the frames are not.",
         default="true",
+    )
+    parser.addini(
+        "failure_tracer",
+        help="Who a worker lets read its stack on Linux under Yama: parent "
+        "(the controller, the default), any (needed by a shared server), off.",
+        default="parent",
     )
     parser.addini(
         "failure_stack_probe",
@@ -468,6 +492,7 @@ def resolve(config: pytest.Config) -> Settings:
         slow_test_seconds=_number(config, "failure_slow_test_seconds", 20.0),
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe", True),
+        tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
         sample_stacks=_flag(config, "failure_sample_stacks", True),
         stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,

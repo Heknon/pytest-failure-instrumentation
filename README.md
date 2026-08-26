@@ -933,7 +933,10 @@ an answer beside it rather than only a message.
 
 A *named* port shared across sessions still reads only the workers of the
 session hosting it: another session's workers nominated *their* controller, not
-this one.
+this one. `failure_tracer = any` is what lifts that — it drops the relationship
+requirement entirely, so any reader on the machine that could already ptrace is
+permitted. That is the setting a shared server needs and the one a private run
+does not, which is why it is not the default.
 
 ### Reading another process needs py-spy
 
@@ -1045,6 +1048,7 @@ overwhelming majority of what runs.
 | `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
+| `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off` |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
 | `failure_sample_stacks` | `true` | Whether those samples carry frames for workers that look stuck |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |

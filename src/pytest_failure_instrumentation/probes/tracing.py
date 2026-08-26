@@ -61,6 +61,41 @@ def ptrace_scope() -> Optional[int]:
         return None
 
 
+#: What a worker may declare. "parent" nominates the controller, whose
+#: descendants include the py-spy it spawns - enough for a session to read its
+#: own workers, which is the default mode. "any" drops the relationship
+#: requirement, which is what a *shared* server needs: another session's
+#: py-spy is no descendant of this session's controller. "off" declares
+#: nothing and leaves the kernel's answer as it stands.
+POLICIES = ("parent", "any", "off")
+
+
+def permit_tracing(policy: str = "parent") -> bool:
+    """Declare who may read this process, under the caller's chosen policy.
+
+    Separated from the default because the two modes need different answers
+    and only the person running knows which they are in. A drawn port is read
+    by its own session and "parent" covers it exactly; a named port shared
+    across sessions is read by somebody else's process, which no ancestry
+    covers and only "any" permits.
+    """
+    if policy == "off" or not IS_LINUX:
+        return False
+    if policy == "any":
+        return _declare(PTRACE_ANY)
+    return _declare(os.getppid())
+
+
+def _declare(tracer: int) -> bool:
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        return libc.prctl(PR_SET_PTRACER, ctypes.c_ulong(tracer), 0, 0, 0) == 0
+    except Exception:  # noqa: BLE001 - a missing exception costs a stack, not a run
+        return False
+
+
 def permit_parent_to_trace() -> bool:
     """Nominate this process's parent as a permitted tracer.
 

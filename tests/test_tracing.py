@@ -104,3 +104,30 @@ def test_a_worker_that_grants_nothing_is_refused(tmp_path):
         "machine is not restricting what it reports it restricts"
     )
     assert error and "permitted" in error.lower(), error
+
+
+@pytest.mark.parametrize("policy", tracing.POLICIES)
+def test_every_policy_answers_without_raising(policy):
+    """This runs on a worker's startup path, so the one thing it must never do
+    is raise - a missing exception costs a stack, an exception costs the run."""
+    assert isinstance(tracing.permit_tracing(policy), bool)
+
+
+def test_off_declares_nothing_even_where_the_kernel_would_accept_it():
+    """The escape hatch has to actually be one: somebody who does not want
+    their test processes advertising a tracer must be able to say so."""
+    assert tracing.permit_tracing("off") is False
+
+
+@needs_pyspy
+@needs_restriction
+def test_the_any_policy_is_what_a_shared_reader_needs():
+    """Why "parent" is not simply always right.
+
+    A named port is served by whichever session claimed it, so the reader is a
+    descendant of *that* controller - and a worker that nominated its own
+    controller has said nothing about this one. Only "any" covers a reader
+    that is nobody's descendant, which is exactly the shared case.
+    """
+    threads, error = _read_a_sibling(tracing.PTRACE_ANY)
+    assert threads, f"a worker granting ANY could not be read: {error}"

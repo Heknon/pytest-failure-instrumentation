@@ -95,7 +95,7 @@ class WorkerRecorder:
         # live-stack read of this worker is refused wherever Yama enforces
         # ptrace_scope=1, because the reader is a *sibling* rather than an
         # ancestor - see probes.tracing.
-        traceable = tracing.permit_parent_to_trace()
+        traceable = tracing.permit_tracing(settings.tracer)
 
         self.events.record(
             "worker_start",
@@ -106,6 +106,7 @@ class WorkerRecorder:
             # Recorded because it is the difference between "no stack" and
             # "no stack, and here is the reason", and it is only knowable here.
             traceable_by_parent=traceable,
+            tracer_policy=settings.tracer,
         )
         self.state.update()
 
