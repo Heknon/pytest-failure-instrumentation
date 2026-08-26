@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -425,3 +426,61 @@ def test_the_stack_stays_out_of_the_alert_text():
         worker="gw1", crash_stack=['  File "/app/x.py", line 3 in boom']
     )
     assert "/app/x.py" not in str(death)
+
+
+# -- the kinds, and everything that claims to list them -------------------
+
+
+def _repo_root():
+    import pytest_failure_instrumentation
+
+    return Path(pytest_failure_instrumentation.__file__).parent.parent.parent
+
+
+def _every_kind() -> set[str]:
+    """Every kind the discriminated union can produce.
+
+    Read from the registry rather than written down here: a list in a test is
+    one more copy to forget, which is the failure this whole test exists to
+    catch.
+    """
+    from pytest_failure_instrumentation.incidents.registry import json_schema
+
+    return {
+        value
+        for definition in json_schema().get("$defs", {}).values()
+        for value in [definition.get("properties", {}).get("kind", {}).get("const")]
+        if value
+    }
+
+
+def test_the_registry_produces_the_kinds_the_hookspec_promises():
+    """The hookspec table is the contract a product implements against. A kind
+    missing from it is a payload arriving at a handler written not to expect
+    it."""
+    from pytest_failure_instrumentation import hookspec
+
+    documented = hookspec.__doc__ or ""
+    for kind in _every_kind():
+        # The table elides long names to fit its columns, so the stem is what
+        # can be matched rather than the whole thing.
+        assert kind[:24] in documented, f"{kind} is not in the hookspec table"
+
+
+def test_the_triage_skill_knows_every_kind():
+    """The skill ships in this repository and is what reads an alert when a
+    person or an agent has to triage one. A kind it does not list is a kind it
+    triages by guesswork - and its description is also what makes it trigger on
+    an alert block at all, so an unlisted kind may not even reach it."""
+    skill = _repo_root() / ".claude" / "skills" / "reading-failure-incidents" / "SKILL.md"
+    if not skill.exists():
+        pytest.skip("the skill is not part of this checkout")
+
+    text = skill.read_text(encoding="utf-8")
+    header, _, body = text.partition("---\n")[2].partition("\n---\n")
+    for kind in _every_kind():
+        assert f"[{kind}]" in header or kind in header, (
+            f"{kind} is missing from the skill's description, which is what "
+            "makes it trigger on an alert block"
+        )
+        assert kind in body, f"{kind} has no section in the skill"
