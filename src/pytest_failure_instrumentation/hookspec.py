@@ -9,7 +9,7 @@ arrives is not a crash - and namespaced to this distribution, the way
         alerts.send(str(incident))
 
 ``incident`` is a pydantic model, one class per kind, discriminated on
-``incident.kind``. All five are raised:
+``incident.kind``. All six are raised:
 
 ========================= ==================================================== =============
 ``worker_death``          ``incidents.death.WorkerDeathIncident``               needs xdist
@@ -27,6 +27,13 @@ arrives on the controller as a re-raised string.
 
 ``run_summary`` is emitted once at the end of every run, so its *absence*
 means the controller died too.
+
+``stack_server_unavailable`` is raised only when the live-stack server was
+switched on and could not serve - a port held by something that is not one of
+ours, or an address that could not be bound at all. It is *not* raised when
+another of our own sessions holds the port, which is the shared mode working
+as designed. The run is unaffected either way; what is lost is the live view,
+and without this nothing would ever say so.
 
 A stall is assessed on a watcher thread, so an implementation of this hook can
 be called from a thread other than the one running the session.
