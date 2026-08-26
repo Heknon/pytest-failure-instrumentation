@@ -12,7 +12,7 @@ import platform
 from typing import Any
 
 from . import memory, pyspy, stacks
-from .platform_flags import IS_WINDOWS, optional_psutil
+from .platform_flags import IS_WINDOWS
 
 
 def capabilities() -> dict[str, Any]:
@@ -33,5 +33,8 @@ def capabilities() -> dict[str, Any]:
         # only way to get a stack out of a worker whose GIL is held by
         # native code.
         "external_stack": "py-spy" if pyspy.available() else "unavailable",
-        "psutil": optional_psutil() is not None,
+        # A dependency rather than an upgrade, so this is a constant now.
+        # Kept because a consumer's table has the column, and a field that
+        # disappears is a migration where a field that stops varying is not.
+        "psutil": True,
     }
