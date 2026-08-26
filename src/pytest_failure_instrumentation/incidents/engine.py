@@ -102,6 +102,11 @@ class IncidentEngine:
         self.raised = 0
         self.suppressed = 0
         self.run_ending = 0
+        #: The host's live-stack server, if this session ended up hosting it.
+        #: Not an incident source - it answers questions rather than raising
+        #: anything - but session start and finish are here, and giving it a
+        #: plugin of its own would be two objects with one lifetime.
+        self.stacks: Any = None
         self._prepare_directory()
 
     def _prepare_directory(self) -> None:
@@ -248,6 +253,13 @@ class IncidentEngine:
         return getattr(manager, "testrunuid", None) or self._run_id_fallback
 
     def pytest_sessionstart(self, session: pytest.Session) -> None:
+        # Whether or not this is distributed: a single-process run has a stack
+        # worth serving too, and it is the one this process can read for free.
+        if self.settings.stack_server:
+            from ..stack_server import start as start_stack_server
+
+            self.stacks = start_stack_server(self.settings.stack_server_port)
+
         # Only distributed runs can strand a worker. A single process that
         # wedges takes this detector down with it.
         if self.distributed and self.settings.stall_seconds > 0:
@@ -409,3 +421,8 @@ class IncidentEngine:
                 self.distributed,
             )
         )
+        # Last, so that a UI watching a long teardown keeps its answers for as
+        # long as this session exists. Whoever is waiting for the port takes it
+        # over within a few seconds of this returning.
+        if self.stacks is not None:
+            self.stacks.stop()

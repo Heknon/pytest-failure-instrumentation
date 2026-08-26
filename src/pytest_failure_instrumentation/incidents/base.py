@@ -61,6 +61,11 @@ class Capabilities(BaseModel):
     cgroup_oom_counter: bool = False
     exit_status: str = "unavailable"
     live_stack: bool = False
+    #: Whether a process can be read from *outside* it, which is the only way
+    #: to get a stack out of a worker whose GIL is held by native code.
+    #: Declared rather than left to ``extra="allow"`` so that it reaches the
+    #: JSON schema a consumer migrates their table from.
+    external_stack: str = "unavailable"
     psutil: bool = False
 
 

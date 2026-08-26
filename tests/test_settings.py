@@ -43,6 +43,8 @@ DEFAULTS = {
     "failure_slow_test_seconds": "20",
     "failure_stall_seconds": "300",
     "failure_stack_probe": "true",
+    "failure_stack_server": "false",
+    "failure_stack_server_port": "8080",
 }
 
 

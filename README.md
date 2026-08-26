@@ -600,6 +600,96 @@ reported as nothing at all.
 on disk during the healthy part of the run, because a process that is about to
 be killed gets no warning. The controller reads files, never the corpse.
 
+## Live stacks over HTTP
+
+Everything above is for reading afterwards. This is the other direction: a UI
+watching a run, asking what a test is doing *while it is still doing it*.
+
+```console
+$ curl localhost:8080/stack?pid=48213
+{"pid": 48213, "source": "py-spy", "captured_at": 1756142887.31,
+ "threads": [{"thread_id": 8632442880, "thread_name": "MainThread",
+              "owns_gil": true, "active": true,
+              "frames": [{"function": "_wait_for_lease", "file": "/app/pool.py", "line": 91},
+                         {"function": "checkout", "file": "/app/pool.py", "line": 44},
+                         {"function": "test_concurrent_writes", "file": "/tests/test_pool.py", "line": 210}]}]}
+```
+
+Off by default — a plugin installed for crash reporting should not start
+opening listening sockets on everybody who upgrades it:
+
+```ini
+[pytest]
+failure_stack_server = true
+```
+
+**One server per host, not per run.** The port has to be fixed: a port picked
+at random is one no firewall has been told about and no UI can guess. A fixed
+port cannot be bound twice, and several pytest sessions on one machine is the
+ordinary case — a laptop, or a CI runner with parallel jobs. So the first
+session to start claims it and serves; the rest find it claimed and leave it
+alone. Any of them can answer about any pid, because the answer comes from
+reading the target process, which needs no relationship to the reader.
+
+**Claimed by whom is decided by asking, not by looking.** The intuitive check —
+does the process holding the port look like ours — cannot work: the process is
+a Python interpreter, so its name is `python` on every platform and its command
+line is whatever pytest was invoked as. What identifies a server is that it
+answers `/identity` with a name only this package uses. Anything else on the
+port — a dev server, a proxy, Jenkins — is a stranger, and the run continues
+without live stacks rather than fighting for the port:
+
+```
+port 8080 is held by something that is not a stack server (Address already in
+use); set failure_stack_server_port to an unused port, or turn
+failure_stack_server off
+```
+
+**Handover.** The session holding the port is rarely the last one running, so a
+session that lost the claim keeps trying and takes over within seconds of the
+holder exiting. Sessions never coordinate beyond the port itself, which is the
+only thing all of them can see.
+
+**Reading another process needs py-spy** (`pip install
+pytest-failure-instrumentation[stacks]`). There is no way to walk another
+process's frames from Python, so a request naming any pid but the server's own
+is answered by an external reader. That is also what makes it work on a worker
+whose GIL is held by native code: py-spy reads the target's memory rather than
+asking it to run anything, and it stops the target before reading, so it never
+walks a frame that is being torn down. The server's *own* pid is answered from
+`sys._current_frames()` — no subprocess, no ptrace, no permission.
+
+Without py-spy the endpoint still answers, with the reason instead of a stack.
+A UI that is told *why* it has no stack can tell a dead process from a missing
+permission; one that gets an empty response cannot:
+
+```json
+{"pid": 48213, "source": "py-spy", "error": "Operation not permitted (os error 1)
+ - ptrace is not permitted: check /proc/sys/kernel/yama/ptrace_scope (0 or 1 allows
+ this; 1 requires the target to be a descendant of the reader, which xdist workers
+ are), and add --cap-add=SYS_PTRACE if this is a container"}
+```
+
+**Finding the pids.** The server answers about a pid, and the evidence
+directory already says which pid is running which test — that is what the
+per-worker `.state` file is, one fixed-size record overwritten in place. So a
+UI enumerates workers from disk and asks about each:
+
+```python
+for state in Path(".pytest-failures").glob("*.state"):
+    record = json.loads(state.read_bytes().rstrip(b"\x00").strip())
+    stack = requests.get(f"http://127.0.0.1:8080/stack?pid={record['pid']}").json()
+    print(record["nodeid"], record["phase"], stack["threads"][0]["frames"][0])
+```
+
+```
+test_pool.py::test_concurrent_writes call {'function': '_wait_for_lease', ...}
+```
+
+**It listens on 127.0.0.1 only, and that is not configurable.** It reports what
+local processes are executing, which is precisely the kind of thing that must
+not be reachable from off the machine.
+
 ## Cost
 
 A passing test must cost as close to nothing as possible, because that is the
@@ -619,6 +709,9 @@ overwhelming majority of what runs.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.
+- The live stack server, when switched on: one thread per session, which
+  either serves or retries the claim every five seconds. Nothing is sampled
+  and nothing is written unless something asks.
 - pydantic is imported on the controller, and only when xdist is active. A
   worker never loads it, so nothing about the per-test path changed when the
   payload became typed.
@@ -641,6 +734,8 @@ overwhelming majority of what runs.
 | `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
+| `failure_stack_server` | `false` | Serve live stacks over HTTP, one server per host |
+| `failure_stack_server_port` | `8080` | Where that server listens (loopback only) |
 
 `failure_slow_test_seconds` and `failure_stall_seconds` are not independent.
 The stack a stalled worker is reported with is whatever the watchdog last
@@ -663,6 +758,7 @@ you a hard ceiling per worker, which is why it is opt-in.
 | Current memory | procfs | psutil, else peak only | psapi |
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
+| Live stack of another process (needs py-spy) | yes | root only | yes |
 
 Two Windows differences are worth knowing about, because they change what you
 will see rather than how it is reported.

@@ -24,6 +24,11 @@ import pytest
 
 DEFAULT_DIRECTORY = ".pytest-failures"
 
+#: Where the live-stack server listens when it is switched on. Named here
+#: rather than in the server module so that the default and the ini help
+#: cannot drift apart.
+DEFAULT_STACK_SERVER_PORT = 8080
+
 #: Below this the heartbeat thread costs more than it measures. Clamped on the
 #: object rather than where a setting is read, because the controller decides
 #: what counts as a stale beat from the same number - and two different
@@ -69,6 +74,15 @@ class Settings:
     slow_test_seconds: float = 20.0
     stall_seconds: float = 300.0
     stack_probe: bool = True
+    #: Serve the stack of any local process over HTTP, for a UI watching a run
+    #: - see :mod:`.stack_server`. Off by default: opening a listening socket
+    #: is not something a plugin installed for crash reporting should start
+    #: doing to everybody who upgrades it.
+    stack_server: bool = False
+    #: Fixed on purpose. A port chosen at random is one no firewall has been
+    #: told about and no UI can guess; the cost of fixing it is that the
+    #: sessions sharing a host have to share the server, which they do.
+    stack_server_port: int = DEFAULT_STACK_SERVER_PORT
     #: How many workers share the machine. Per worker, never sent between
     #: processes - the controller's copy would be wrong on every worker.
     worker_count: int = 1
@@ -147,6 +161,10 @@ class Settings:
             "slow_test_seconds": self.slow_test_seconds,
             "stall_seconds": self.stall_seconds,
             "stack_probe": self.stack_probe,
+            # The stack server is deliberately absent. It is the controller's
+            # alone - a worker that read these and started one would have every
+            # worker on the host racing for the same port, which is the exact
+            # collision the server exists to avoid.
         }
 
     @classmethod
@@ -201,6 +219,21 @@ def add_options(parser: pytest.Parser) -> None:
         default="20",
     )
     parser.addini("failure_stall_seconds", help="Silence before a stall is assessed. 0 disables.", default="300")
+    parser.addini(
+        "failure_stack_server",
+        help="Serve the live stack of any local process over HTTP, for a UI "
+        "watching a run. One server per host, shared by every pytest session "
+        "on it; reading a process other than the server's own needs py-spy "
+        "installed. Loopback only.",
+        default="false",
+    )
+    parser.addini(
+        "failure_stack_server_port",
+        help=f"Port for that server. Fixed rather than chosen at random, so a "
+        f"UI and a firewall can both be told about it once. Default "
+        f"{DEFAULT_STACK_SERVER_PORT}.",
+        default=str(DEFAULT_STACK_SERVER_PORT),
+    )
     parser.addini(
         "failure_stack_probe",
         help="Ask an already-diagnosed stalled worker for a fresh stack "
@@ -282,6 +315,10 @@ def resolve(config: pytest.Config) -> Settings:
         slow_test_seconds=_number(config, "failure_slow_test_seconds", 20.0),
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe", True),
+        stack_server=_flag(config, "failure_stack_server", False),
+        stack_server_port=int(
+            _number(config, "failure_stack_server_port", DEFAULT_STACK_SERVER_PORT)
+        ),
         worker_count=worker_count,
         run_id=run_id,
     )
