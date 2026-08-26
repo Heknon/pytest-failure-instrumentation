@@ -5,18 +5,28 @@ run wants the opposite: the stack of a test that is still running, on demand,
 without waiting for it to fail. That is a pull, and a pull needs something
 listening.
 
-**Why one server per host rather than one per run.** The port has to be fixed -
-a port assigned at random is a port a firewall has not been told about and a UI
-cannot guess - and a fixed port cannot be bound twice. Several pytest sessions
-on one machine is the ordinary case (a developer's laptop, a CI runner with
-parallel jobs), so a server per session would mean every session after the
-first failing to start, or worse, silently stealing the port from the one
-already serving.
+**Two modes, and the port number picks between them.**
 
-So the first session to start claims the port and serves; the rest find it
-already claimed and leave it alone. Any of them can be asked about any pid,
-because the answer does not come from the session's own memory - it comes from
-reading the target process, which needs no relationship to the reader.
+*Drawn* (``port = 0``, the default). The session binds whatever the kernel
+hands it, serves its own run, and writes the address into the evidence
+directory it is already writing to. Nothing is shared and nothing is contended,
+so nothing can be lost to another session. This is right whenever the UI can
+read that directory - which it must anyway, since that is where it learns which
+pid is running which test.
+
+*Named* (any other port). The session claims that exact port and shares it with
+every other session on the machine, because a fixed port cannot be bound twice.
+The first to start claims it and serves; the rest find it claimed and wait.
+Naming a port is worth it when something outside has to be told the address
+once and for all - a firewall rule, a UI with it compiled in, a published
+container port.
+
+Both work because the answer does not come from the serving session's memory -
+it comes from reading the target process, which needs no relationship to the
+reader. That is also the one thing a *named* port cannot promise everywhere:
+under Linux's Yama LSM at ``ptrace_scope=1``, a process may only read its own
+descendants, so a shared server reads its own workers and not another session's.
+A drawn port has no such gap, because every session reads only its own.
 
 **How "already claimed" is decided.** By asking, not by looking. The obvious
 check is whether the process holding the port looks like ours, and it cannot
@@ -33,21 +43,25 @@ running. So a session that lost the claim keeps trying, quietly, and takes over
 whenever the holder exits. Sessions do not coordinate beyond the port itself,
 which is the only thing all of them can see.
 
-The listener is loopback-only. It reports what local processes are executing,
-which is exactly the kind of thing that must not be reachable from off the
-machine.
+**What it binds.** Loopback by default, because it reports what local
+processes are executing and asks nobody who they are. A container is the
+exception that makes it configurable: its UI lives outside it, and 127.0.0.1
+inside a container is unreachable from there. Binding anything else warns, once,
+at settings time.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import socket
 import socketserver
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -58,10 +72,24 @@ from .probes.platform_flags import IS_WINDOWS
 #: string being unique to this package, so it is the distribution name.
 SERVICE = "pytest-failure-instrumentation-stacks"
 
-#: Loopback only, and not configurable. See the module docstring.
-HOST = "127.0.0.1"
+#: The default bind, and what a drawn address is advertised as. A server
+#: bound to 0.0.0.0 is *reached* on a routable address, never on 0.0.0.0
+#: itself - Windows refuses to connect to it outright - so what gets written
+#: down for a UI is never the wildcard.
+LOOPBACK = "127.0.0.1"
 
-DEFAULT_PORT = 8080
+#: Its IPv6 spelling, for a server that was asked to bind the IPv6 wildcard.
+LOOPBACK6 = "::1"
+
+#: What the wildcard binds mean, so an advertised URL can avoid them.
+IPV6_WILDCARD = "::"
+WILDCARDS = frozenset({"0.0.0.0", IPV6_WILDCARD, ""})
+
+#: Files a UI reads to find the servers running on this machine, one per
+#: serving session, named for the pid that wrote it so that two sessions in one
+#: evidence directory cannot overwrite each other.
+DISCOVERY_PREFIX = "callstack-"
+DISCOVERY_SUFFIX = ".json"
 
 #: How long to wait for a stranger to identify itself. Long enough for a busy
 #: local server to answer, short enough not to stall session start.
@@ -83,6 +111,34 @@ MAX_CONCURRENT_READS = 8
 _readers = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
 
 
+def address_family(host: str) -> int:
+    """IPv4 unless the host is written as an IPv6 address.
+
+    ``HTTPServer`` is AF_INET and nothing about it notices otherwise, so a
+    server asked for ``::1`` opened an IPv4 socket and failed to bind it -
+    while the settings said ``::1`` was a supported loopback and warned about
+    nothing. Resolved from the literal rather than guessed: a name is left to
+    IPv4, which is what the stack of every other default here assumes.
+    """
+    try:
+        socket.inet_pton(socket.AF_INET6, host)
+    except (OSError, ValueError, AttributeError):
+        return socket.AF_INET
+    return socket.AF_INET6
+
+
+def authority(host: str, port: Optional[int]) -> str:
+    """``host:port`` for a URL, with an IPv6 literal bracketed.
+
+    ``http://::1:8080/`` is not a URL anybody can parse - the colons are
+    ambiguous - and every client rejects it. RFC 3986 wants brackets.
+    """
+    reached = reachable(host)
+    if address_family(reached) == socket.AF_INET6:
+        return f"[{reached}]:{port}"
+    return f"{reached}:{port}"
+
+
 class _Server(ThreadingHTTPServer):
     """Threaded, because reading a stack can take seconds.
 
@@ -93,6 +149,12 @@ class _Server(ThreadingHTTPServer):
 
     daemon_threads = True
 
+    def __init__(self, address: tuple[str, int], handler: Any) -> None:
+        # Set before the base class opens the socket, which reads it off the
+        # instance. A class attribute cannot answer this: the family depends
+        # on what this particular server was asked to bind.
+        self.address_family = address_family(address[0])
+        super().__init__(address, handler)
     def server_bind(self) -> None:
         """Bind without asking DNS who we are.
 
@@ -225,7 +287,25 @@ def read_stack(pid: int) -> tuple[Optional[list[dict[str, Any]]], Optional[str],
     return threads, error, "py-spy"
 
 
-def identify(port: int, timeout: float = IDENTIFY_TIMEOUT) -> Optional[dict[str, Any]]:
+def reachable(host: str) -> str:
+    """An address a client can actually connect to.
+
+    A wildcard bind means "every interface", which is a thing to listen on and
+    not a thing to connect to: Windows refuses ``connect()`` to 0.0.0.0
+    outright, and on POSIX it only works by accident. Loopback always reaches a
+    wildcard-bound server from the same machine, and a client on another
+    machine was never going to be told the address by this process anyway.
+    """
+    if host == IPV6_WILDCARD:
+        # A socket bound to :: without dual-stack does not answer on an IPv4
+        # address at all, so the IPv4 loopback would be a wrong answer here.
+        return LOOPBACK6
+    return LOOPBACK if host in WILDCARDS else host
+
+
+def identify(
+    port: int, host: str = LOOPBACK, timeout: float = IDENTIFY_TIMEOUT
+) -> Optional[dict[str, Any]]:
     """Whoever holds ``port``, if it is one of ours; None for anything else.
 
     Proxies are explicitly disabled. ``urlopen`` honours ``http_proxy`` from
@@ -235,7 +315,9 @@ def identify(port: int, timeout: float = IDENTIFY_TIMEOUT) -> Optional[dict[str,
     """
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(f"http://{HOST}:{port}/identity", timeout=timeout) as response:
+        with opener.open(
+            f"http://{authority(host, port)}/identity", timeout=timeout
+        ) as response:
             payload = json.loads(response.read(4096))
     except (urllib.error.URLError, OSError, ValueError, TimeoutError):
         return None
@@ -245,17 +327,34 @@ def identify(port: int, timeout: float = IDENTIFY_TIMEOUT) -> Optional[dict[str,
 
 
 class StackService:
-    """This session's part in keeping one server alive on the host.
+    """This session's part in serving live stacks.
 
-    Either it is serving, or it is waiting for whoever is. Nothing here ever
-    raises into a run: a session that cannot serve and cannot find a server
-    simply has no live stacks, which is the same position every session was in
-    before this module existed.
+    With a drawn port that is the whole of it: bind, serve, write down where.
+    With a named one it is a claim that may be lost, and then it is either
+    serving or waiting for whoever is.
+
+    Nothing here ever raises into a run: a session that cannot serve and cannot
+    find a server simply has no live stacks, which is the same position every
+    session was in before this module existed.
     """
 
-    def __init__(self, port: int = DEFAULT_PORT, reclaim_seconds: float = RECLAIM_SECONDS) -> None:
+    def __init__(
+        self,
+        port: int = 0,
+        host: str = LOOPBACK,
+        directory: Optional[Path] = None,
+        reclaim_seconds: float = RECLAIM_SECONDS,
+    ) -> None:
+        #: What was asked for. 0 means "draw one", and is not what got bound.
         self.port = port
+        self.host = host
+        #: Where to write the address down, so a UI can find a drawn port. The
+        #: evidence directory, because that is where the same UI already reads
+        #: which pid is running which test.
+        self.directory = directory
         self.reclaim_seconds = reclaim_seconds
+        #: What is actually bound, which is the only number worth publishing.
+        self.bound_port: Optional[int] = None
         #: What happened, in words, for whoever asks why there are no stacks.
         self.status = "not started"
         self.serving = False
@@ -264,8 +363,17 @@ class StackService:
         self._thread: Optional[threading.Thread] = None
 
     @property
+    def drawn(self) -> bool:
+        """Whether this session drew its own port rather than naming one.
+
+        The difference is not cosmetic: a drawn port is nobody else's, so there
+        is no claim to lose, nothing to wait for and nothing to hand over.
+        """
+        return self.port == 0
+
+    @property
     def url(self) -> str:
-        return f"http://{HOST}:{self.port}"
+        return f"http://{authority(self.host, self.bound_port or self.port)}"
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -306,10 +414,18 @@ class StackService:
         is sitting on it.
         """
         try:
-            httpd = _Server((HOST, self.port), _Handler)
+            httpd = _Server((self.host, self.port), _Handler)
         except OSError as failure:
+            if self.drawn:
+                # Nobody is holding "any free port". This is a bad interface, a
+                # sandbox that forbids listening, or a machine with nothing
+                # free - none of which a later attempt would find changed.
+                self.status = f"could not bind {self.host}: {failure.strerror or failure}"
+                return True
             self._note_who_has_it(failure)
             return False
+
+        self.bound_port = int(httpd.server_address[1])
 
         self._httpd = httpd
         # Checked *after* publishing the handle, which is what makes the two
@@ -322,6 +438,11 @@ class StackService:
             httpd.server_close()
             return True
 
+        # Published *before* anything is told the server is up. The socket is
+        # bound and listening from the constructor, so the order costs nothing -
+        # and the other order is a window in which a reader sees a serving
+        # session whose address is not written down yet. macOS found it.
+        self._publish()
         self.serving = True
         self.status = f"serving on {self.url}"
         try:
@@ -331,11 +452,63 @@ class StackService:
         finally:
             self.serving = False
             self._httpd = None
+            self._retract()
+            self.bound_port = None
             try:
                 httpd.server_close()
             except OSError:
                 pass
         return True
+
+    # -- saying where this is -------------------------------------------
+
+    @property
+    def _discovery_path(self) -> Optional[Path]:
+        """Named for the pid, not the run.
+
+        Two sessions in one repository share an evidence directory, and a
+        single well-known filename would mean the second silently overwriting
+        the first's address - leaving a UI reading one server and believing it
+        had found them all.
+        """
+        if self.directory is None:
+            return None
+        return self.directory / f"{DISCOVERY_PREFIX}{os.getpid()}{DISCOVERY_SUFFIX}"
+
+    def _publish(self) -> None:
+        """Write the address down, then sweep away the dead.
+
+        Written whole and renamed into place, because a UI reading a file that
+        is being written gets half an address and no way to know it.
+        """
+        path = self._discovery_path
+        if path is None:
+            return
+        payload = dict(
+            identity(),
+            host=self.host,
+            port=self.bound_port,
+            url=self.url,
+            drawn=self.drawn,
+            started_at=round(time.time(), 3),
+        )
+        temporary = path.with_name(path.name + ".part")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError:
+            return  # bookkeeping must never break a run
+        sweep_dead_servers(self.directory)
+
+    def _retract(self) -> None:
+        path = self._discovery_path
+        if path is None:
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass  # a stale file is swept by whoever publishes next
 
     def _note_who_has_it(self, failure: OSError) -> None:
         """Say which of the two reasons this is, since only one is a problem.
@@ -344,7 +517,7 @@ class StackService:
         something else is a collision somebody has to resolve, and it is worth
         saying so in terms that name the fix.
         """
-        holder = identify(self.port)
+        holder = identify(self.port, self.host)
         if holder is not None:
             self.status = (
                 f"another session is serving {self.url} (pid {holder.get('pid')}); "
@@ -353,12 +526,53 @@ class StackService:
             return
         self.status = (
             f"port {self.port} is held by something that is not a stack server "
-            f"({failure.strerror or failure}); set failure_stack_server_port to "
-            "an unused port, or turn failure_stack_server off"
+            f"({failure.strerror or failure}); pass --callstack-port with an "
+            "unused port, or leave it off entirely and let one be drawn"
         )
 
 
-def start(port: int = DEFAULT_PORT) -> Optional[StackService]:
+def sweep_dead_servers(directory: Optional[Path]) -> None:
+    """Remove the address files of sessions that are no longer running.
+
+    A session killed hard never retracts its own, and a UI that trusts a stale
+    file spends its timeout on a port nobody is listening to. The pid is in the
+    filename precisely so this costs no read: a signal 0 answers whether that
+    process still exists.
+
+    Only *dead* ones. Every other file here belongs to a session that is very
+    much alive, and deleting those is how a cleanup becomes an outage.
+    """
+    if directory is None:
+        return
+    try:
+        candidates = list(directory.glob(f"{DISCOVERY_PREFIX}*{DISCOVERY_SUFFIX}"))
+    except OSError:
+        return
+    for path in candidates:
+        pid = path.stem[len(DISCOVERY_PREFIX):]
+        if not pid.isdigit() or _is_running(int(pid)):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _is_running(pid: int) -> bool:
+    """Whether a pid exists. Errs towards "yes", so an unreadable answer
+    leaves the file alone rather than deleting a live session's address."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, ValueError):
+        return True  # EPERM means it exists and is not ours to signal
+    return True
+
+
+def start(
+    port: int = 0, host: str = LOOPBACK, directory: Optional[Path] = None
+) -> Optional[StackService]:
     """Begin serving, or begin waiting to. None if it could not even start.
 
     Never raises. This is called from session start, and a run that fails to
@@ -366,7 +580,7 @@ def start(port: int = DEFAULT_PORT) -> Optional[StackService]:
     the thing that came to make it better.
     """
     try:
-        service = StackService(port)
+        service = StackService(port, host, directory)
         service.start()
         return service
     except Exception:  # noqa: BLE001 - see the docstring
