@@ -237,8 +237,9 @@ anything it could read itself. `run_id` travels with it, which is what lets a
 build id group a whole run's incidents.
 
 **Turning auto-registration off.** `-p no:failure_instrumentation` skips the
-entry point entirely; `install` puts back the hookspec so `pytest_failure_incident`
-still reaches its implementers. Note that it also skips `pytest_addoption`, so
+entry point entirely; `install` puts back the hookspecs so both
+`pytest_failure_incident` and `pytest_failure_server_ready` still reach their
+implementers. Note that it also skips `pytest_addoption`, so
 `failure_*` ini keys become unknown config options — which is the point if your
 framework owns the settings, and a reason to leave the entry point enabled and
 just call `install` if it does not.
@@ -787,9 +788,41 @@ expires with the run — that is the whole of its lifetime management.
 
 ### Finding the server
 
-A drawn port is written to `callstack-<pid>.json` in **this run's** evidence
-directory (see the layout below), one file per serving session, and removed when
-that session ends. Files left by a
+The run tells you, on a hook, the moment it is serving:
+
+```python
+def pytest_failure_server_ready(server):
+    registry.upsert(
+        session=server.session_id,       # names this run's evidence directory
+        url=server.url,                  # already bracketed if the host is IPv6
+        port=server.port,                # what got bound, never the 0 you asked for
+        token=server.token,              # dies with the process that minted it
+        pid=server.pid,                  # the controller, not any worker
+    )
+```
+
+That is the whole address, and for a drawn port it is the only way to learn it
+before the run is over — nobody can configure a number that did not exist a
+moment ago. `server` is a `LiveStackServer`; `server.headers()` gives you the
+`Authorization` header the endpoints want and `server.endpoint("/workers")`
+joins the URL, so neither the scheme nor the slash is yours to get right.
+
+The hook fires on a thread of its own once the server is already accepting, so
+it is free to call straight back into the server it was just handed. It does not
+fire at all when the server was never switched on, nor when this session stood
+down because another of ours already holds a named port — that session announced
+itself, and one server should not be stored twice.
+
+**No run id in the payload.** At the moment the server binds, xdist has usually
+not built its node manager, so this run's real id does not exist yet; stamping
+the placeholder onto a row you will join against later is a key that silently
+matches nothing. `session_id` is stable from the first moment, and `/workers`
+reports the run id per directory as soon as a worker beats.
+
+If you would rather poll the filesystem than implement a hook, the address is
+also on disk. A drawn port is written to `callstack-<pid>.json` in **this run's**
+evidence directory (see the layout below), one file per serving session, and
+removed when that session ends. Files left by a
 session that was killed are swept by whoever publishes next — by checking the pid
 in the filename, so a live session's address is never deleted.
 

@@ -388,6 +388,8 @@ class IncidentEngine:
                 # running which test.
                 self.directory,
                 self._stack_server_gave_up,
+                self._stack_server_ready,
+                self.session_id,
             )
 
         # Only distributed runs can strand a worker. A single process that
@@ -399,6 +401,27 @@ class IncidentEngine:
                 daemon=True,
             )
             self.watcher.start()
+
+    def _stack_server_ready(self, server: Any) -> None:
+        """The live view is up, and only this run knows where.
+
+        A drawn port is the case that makes this necessary rather than
+        convenient: nobody can configure an address that did not exist until a
+        moment ago, so without this a product's only route to it is to read
+        this package's discovery file and parse it - which makes a private file
+        into a public interface, and one that cannot then be changed.
+
+        Called from the server's own announcing thread. The hook is wrapped
+        exactly as the incident hook is: a product's reporting is never allowed
+        to become an INTERNALERROR in somebody's test run.
+        """
+        try:
+            self.config.hook.pytest_failure_server_ready(server=server)
+        except Exception as failure:  # noqa: BLE001 - never break a run
+            print(
+                f"[failure-instrumentation] server-ready hook raised: {failure!r}",
+                flush=True,
+            )
 
     def _stack_server_gave_up(self, verdict: str, detail: str) -> None:
         """Somebody switched the live view on and it is not there.

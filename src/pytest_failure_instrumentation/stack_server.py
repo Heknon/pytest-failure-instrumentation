@@ -473,6 +473,8 @@ class StackService:
         directory: Optional[Path] = None,
         reclaim_seconds: float = RECLAIM_SECONDS,
         on_giving_up: Optional[Any] = None,
+        on_ready: Optional[Any] = None,
+        session_id: str = "",
     ) -> None:
         #: What was asked for. 0 means "draw one", and is not what got bound.
         self.port = port
@@ -488,6 +490,14 @@ class StackService:
         #: probe would teach a reader to filter the whole kind out.
         self.on_giving_up = on_giving_up
         self._reported = False
+        #: Called with a :class:`~.live_view.LiveStackServer` once this session
+        #: is actually serving. At most once per session by construction: the
+        #: supervisor stops looping the moment a claim succeeds.
+        self.on_ready = on_ready
+        #: Names the evidence directory, and goes in the announcement because
+        #: the run id does not exist yet - see :mod:`.live_view`.
+        self.session_id = session_id
+        self._announcer: Optional[threading.Thread] = None
         #: What is actually bound, which is the only number worth publishing.
         self.bound_port: Optional[int] = None
         #: Minted per process. A token that leaks expires with the run that
@@ -532,6 +542,12 @@ class StackService:
             # Bounded, and the thread is a daemon: a server that will not come
             # down must not be what keeps a finished run from exiting.
             thread.join(timeout=5.0)
+        announcer = self._announcer
+        if announcer is not None:
+            # Briefly, and for a different reason: a product writing the
+            # address down should be allowed to finish, but a slow one must
+            # not hold up a run that is over.
+            announcer.join(timeout=2.0)
 
     # -- the claim ------------------------------------------------------
 
@@ -589,6 +605,7 @@ class StackService:
         self._publish()
         self.serving = True
         self.status = f"serving on {self.url}"
+        self._announce()
         try:
             httpd.serve_forever(poll_interval=0.5)
         except Exception as failure:  # noqa: BLE001
@@ -684,6 +701,69 @@ class StackService:
         )
         self._give_up("PORT_TAKEN")
 
+    def _announce(self) -> None:
+        """Tell whoever asked that this is up, from a thread of its own.
+
+        The thread is the point. This is called from the thread that is about
+        to enter the accept loop, and the first thing an implementation
+        naturally does is call the server it has just been told about - which
+        against this thread would be a request waiting for a loop that has not
+        started, waiting for the hook that is making the request. Worse than
+        slow: the address is already published by now, so a hook that never
+        returned would leave a written-down address that nothing ever answers,
+        with the run none the wiser.
+
+        Dispatching instead costs one short-lived thread and makes the
+        obvious implementation the correct one.
+        """
+        callback = self.on_ready
+        if callback is None:
+            return
+        try:
+            payload = self.describe()
+        except Exception:  # noqa: BLE001 - announcing must never break a run
+            return
+        self._announcer = threading.Thread(
+            target=self._call_on_ready,
+            args=(callback, payload),
+            name="failure-instrumentation-stacks-ready",
+            daemon=True,
+        )
+        try:
+            self._announcer.start()
+        except RuntimeError:
+            # An interpreter already shutting down refuses new threads, and a
+            # run that is ending has nothing to do with this announcement.
+            self._announcer = None
+
+    def _call_on_ready(self, callback: Any, payload: Any) -> None:
+        try:
+            callback(payload)
+        except Exception:  # noqa: BLE001 - reporting must never break a run
+            pass
+
+    def describe(self) -> Any:
+        """What this server is, as the payload a product is handed.
+
+        Built here rather than by the caller because the only correct source
+        for the port is what got *bound* - a drawn port is requested as 0, and
+        a caller assembling this from its own settings would publish that 0.
+        """
+        from . import __version__
+        from .live_view import LiveStackServer
+
+        return LiveStackServer(
+            service=SERVICE,
+            version=__version__,
+            url=self.url,
+            host=self.host,
+            port=int(self.bound_port or self.port),
+            token=self.token,
+            pid=os.getpid(),
+            directory=str(self.directory) if self.directory is not None else None,
+            session_id=self.session_id,
+        )
+
     def _give_up(self, verdict: str) -> None:
         """Say so once, to whoever asked to be told.
 
@@ -732,6 +812,8 @@ def start(
     host: str = LOOPBACK,
     directory: Optional[Path] = None,
     on_giving_up: Optional[Any] = None,
+    on_ready: Optional[Any] = None,
+    session_id: str = "",
 ) -> Optional[StackService]:
     """Begin serving, or begin waiting to. None if it could not even start.
 
@@ -740,7 +822,14 @@ def start(
     the thing that came to make it better.
     """
     try:
-        service = StackService(port, host, directory, on_giving_up=on_giving_up)
+        service = StackService(
+            port,
+            host,
+            directory,
+            on_giving_up=on_giving_up,
+            on_ready=on_ready,
+            session_id=session_id,
+        )
         service.start()
         return service
     except Exception:  # noqa: BLE001 - see the docstring

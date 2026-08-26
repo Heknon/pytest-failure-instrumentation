@@ -11,6 +11,9 @@ the directory it was pointed at.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 from .conftest import needs_xdist
 
 SUITE = """
@@ -191,3 +194,37 @@ def test_two_runs_sharing_a_directory_keep_their_evidence_apart(runner):
     ours = [path for path in evidence.iterdir() if path.is_dir() and path != other]
     assert len(ours) == 1
     assert (ours[0] / "gw0.state").exists()
+
+
+def test_the_worker_import_path_never_loads_pydantic():
+    """A promise in the package docstring, and one nothing else checks.
+
+    The incident models are pydantic and are built on the controller, once
+    something has already gone wrong. The modules a *worker* imports on its
+    per-test path must not drag pydantic in behind them, or every worker in
+    every run pays import cost for models it will never build.
+
+    It is one line that breaks this - hoisting a lazy import to module scope -
+    and the breakage is invisible, because everything still works. The live
+    view added a second pydantic module reachable from a worker-imported one,
+    which is what makes this worth pinning rather than trusting.
+    """
+    source = (
+        "import sys\n"
+        "import pytest_failure_instrumentation\n"
+        "import pytest_failure_instrumentation.plugin\n"
+        "import pytest_failure_instrumentation.config\n"
+        "import pytest_failure_instrumentation.registration\n"
+        "import pytest_failure_instrumentation.hookspec\n"
+        "import pytest_failure_instrumentation.stack_server\n"
+        "import pytest_failure_instrumentation.capture.crash_stack\n"
+        "import pytest_failure_instrumentation.capture.heartbeat\n"
+        "import pytest_failure_instrumentation.capture.recorder\n"
+        "import pytest_failure_instrumentation.probes\n"
+        "assert 'pydantic' not in sys.modules, 'pydantic reached the worker path'\n"
+    )
+    # A subprocess because this test session has pydantic loaded already.
+    finished = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True, timeout=120
+    )
+    assert finished.returncode == 0, finished.stderr

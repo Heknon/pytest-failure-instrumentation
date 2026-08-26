@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Optional
 
 import pytest
@@ -1039,3 +1040,155 @@ def test_the_hints_say_something_different_on_each_platform():
     assert len(set(pyspy.PERMISSION_HINTS.values())) == len(pyspy.PERMISSION_HINTS)
     assert "ptrace_scope" in pyspy.PERMISSION_HINTS["linux"]
     assert "root" in pyspy.PERMISSION_HINTS["darwin"]
+
+
+# -- announcing that it is up ---------------------------------------------
+
+
+def test_a_serving_session_hands_out_everything_needed_to_reach_it(serving, tmp_path):
+    """The payload is the whole interface for a drawn port. Anything missing
+    from it sends a product back to parsing the discovery file, which is a
+    private file that then cannot be changed."""
+    announced: list[Any] = []
+    service = serving(
+        0,
+        directory=tmp_path,
+        on_ready=announced.append,
+        session_id="run-under-test",
+    )
+    assert wait_for(lambda: announced), service.status
+    server = announced[0]
+
+    assert server.service == stack_server.SERVICE
+    assert server.version
+    assert server.pid == os.getpid()
+    assert server.session_id == "run-under-test"
+    assert server.directory == str(tmp_path)
+    # The bound port, never the requested one: this asked for 0.
+    assert server.port == service.bound_port
+    assert server.port > 0
+    assert str(server.port) in server.url
+    assert server.token == service.token
+
+    # And it actually opens the door it describes.
+    status, payload = get(server.port, "/workers", token=server.token)
+    assert status == 200, payload
+
+
+def test_the_announcement_is_made_once_the_server_is_already_answering(serving, tmp_path):
+    """The reason it is dispatched rather than called inline. An
+    implementation that calls straight back into the server - the first thing
+    most of them do - must not be waiting on the accept loop that is waiting
+    on it."""
+    answered: list[tuple[int, Any]] = []
+
+    def call_it_back(server: Any) -> None:
+        answered.append(get(server.port, "/identity", timeout=10.0))
+
+    serving(0, directory=tmp_path, on_ready=call_it_back)
+    assert wait_for(lambda: answered, timeout=20.0), "the hook never got an answer"
+    status, payload = answered[0]
+    assert status == 200
+    assert payload["service"] == stack_server.SERVICE
+
+
+def test_a_session_that_never_serves_announces_nothing(serving, tmp_path):
+    """Two sessions, one named port. The one that stands down has no address
+    to give anybody - and announcing anyway would have a product storing the
+    holder's address twice, under two sessions."""
+    port = free_port()
+    holder = serving(port, directory=tmp_path)
+    assert wait_for(lambda: holder.serving), holder.status
+
+    announced: list[Any] = []
+    stood_down = serving(port, directory=tmp_path, on_ready=announced.append)
+    # Long enough for a claim to have been attempted and refused.
+    time.sleep(2.0)
+    assert not stood_down.serving
+    assert not announced
+
+
+def test_an_announcement_that_raises_does_not_stop_the_server(serving, tmp_path):
+    """A product's reporting is never allowed to cost the run its live view."""
+
+    def unhelpful(server: Any) -> None:
+        raise RuntimeError("the product's database was down")
+
+    service = serving(0, directory=tmp_path, on_ready=unhelpful)
+    assert wait_for(lambda: service.serving), service.status
+    status, _ = get(service.bound_port, "/identity")
+    assert status == 200
+
+
+def test_the_headers_on_the_payload_are_the_ones_the_server_accepts(serving, tmp_path):
+    """The scheme is this package's to change, so a product that uses what it
+    was handed keeps working across a change that a hard-coded "Bearer" would
+    not survive."""
+    announced: list[Any] = []
+    service = serving(0, directory=tmp_path, on_ready=announced.append)
+    assert wait_for(lambda: announced), service.status
+    server = announced[0]
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(server.endpoint("/workers"), headers=server.headers())
+    with opener.open(request, timeout=30.0) as response:
+        assert response.status == 200
+
+
+def test_a_real_run_hands_the_address_to_a_product_that_implements_the_hook(pytester):
+    """The whole chain, in one real pytest: a drawn port, the plugin's own
+    wiring, pluggy's dispatch, and a conftest that is exactly what a product
+    would write. The unit tests above all call the callback directly, so
+    nothing else here would notice the hook never being registered."""
+    pytester.makeconftest(
+        """
+        import json
+
+
+        def pytest_failure_server_ready(server):
+            with open("server.json", "w") as handle:
+                handle.write(server.model_dump_json())
+        """
+    )
+    pytester.makepyfile(
+        """
+        def test_one():
+            assert True
+        """
+    )
+    # Zero: the drawn port, which is the case a product cannot configure ahead
+    # of the run and therefore the case this hook exists for.
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation", "--callstack-port", "0")
+    result.assert_outcomes(passed=1)
+
+    announced = json.loads((pytester.path / "server.json").read_text())
+    assert announced["service"] == stack_server.SERVICE
+    assert announced["port"] > 0
+    assert announced["token"]
+    assert announced["session_id"]
+    assert str(announced["port"]) in announced["url"]
+    # The directory it names is the one the run was writing evidence into.
+    assert announced["directory"] and Path(announced["directory"]).name == announced["session_id"]
+
+
+def test_implementing_the_hook_costs_nothing_when_the_server_is_off(pytester):
+    """A product ships the hook once; the people running its tests decide per
+    run whether to switch the server on. The run where they did not must be an
+    ordinary run - not an "unknown hook" at check_pending, and not a hook
+    called with nothing to report."""
+    pytester.makeconftest(
+        """
+        def pytest_failure_server_ready(server):
+            with open("server.json", "w") as handle:
+                handle.write("called")
+        """
+    )
+    pytester.makepyfile(
+        """
+        def test_one():
+            assert True
+        """
+    )
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
+    result.assert_outcomes(passed=1)
+    assert not (pytester.path / "server.json").exists()
