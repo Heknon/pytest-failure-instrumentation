@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from ..config import Settings
+from ..probes import tracing
 from . import crash_stack
 from . import memory as memory_capture
 from .events import EventLog
@@ -90,12 +91,21 @@ class WorkerRecorder:
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
 
+        # Before anything can be asked to read this process. Without it a
+        # live-stack read of this worker is refused wherever Yama enforces
+        # ptrace_scope=1, because the reader is a *sibling* rather than an
+        # ancestor - see probes.tracing.
+        traceable = tracing.permit_parent_to_trace()
+
         self.events.record(
             "worker_start",
             pid=os.getpid(),
             python=sys.version.split()[0],
             platform=platform.platform(),
             executable=sys.executable,
+            # Recorded because it is the difference between "no stack" and
+            # "no stack, and here is the reason", and it is only knowable here.
+            traceable_by_parent=traceable,
         )
         self.state.update()
 

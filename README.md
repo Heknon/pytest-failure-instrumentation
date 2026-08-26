@@ -917,10 +917,23 @@ rather than returning nothing:
 ```
 
 `ptrace_scope` is a host-wide sysctl and is **not namespaced**, so a container
-inherits the node's value and cannot change it. At `ptrace_scope=1` a process
-may only read its own descendants — which its own xdist workers are, so a drawn
-port works; a *named* port shared across sessions reads only the workers of the
-session hosting it.
+inherits the node's value and cannot change it. At `ptrace_scope=1` the
+*tracer* must be an ancestor of what it reads — and the tracer is not the
+controller but py-spy, which the controller spawns. py-spy and a worker are
+both children of the controller, so they are siblings, and a sibling is not an
+ancestor.
+
+Every worker therefore nominates its parent as a permitted tracer at startup,
+via `prctl(PR_SET_PTRACER, <controller pid>)` — the exception Yama provides for
+exactly this. That covers whatever the controller spawns to do the reading and
+nothing else on the machine; `PR_SET_PTRACER_ANY` would also work and is not
+used, because it opens the process to every uid that could already ptrace.
+`worker_start` records whether the exception was granted, so a refused read has
+an answer beside it rather than only a message.
+
+A *named* port shared across sessions still reads only the workers of the
+session hosting it: another session's workers nominated *their* controller, not
+this one.
 
 ### Reading another process needs py-spy
 

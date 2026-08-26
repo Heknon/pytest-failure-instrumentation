@@ -238,3 +238,29 @@ def test_a_permission_error_means_the_process_exists(monkeypatch):
 
     monkeypatch.setattr(process_probe.os, "kill", denied)
     assert process_probe.is_running(4321) is True
+
+
+# -- letting the reader read us -------------------------------------------
+
+
+def test_asking_to_be_traceable_never_raises_and_answers_a_bool():
+    """The call is a no-op wherever it is not needed - a kernel without Yama
+    answers EINVAL, and every non-Linux platform never makes it. What must not
+    happen is an exception on a worker's startup path, which would cost the run
+    rather than a stack."""
+    from pytest_failure_instrumentation.probes import tracing
+
+    granted = tracing.permit_parent_to_trace()
+    assert isinstance(granted, bool)
+    if sys.platform != "linux":
+        assert granted is False, "nothing outside Linux has a tracer exception to grant"
+
+
+def test_the_prctl_option_is_yamas_own_number():
+    """0x59616d61 spells "Yama". Written down rather than imported because
+    Python exposes no constant for it, and a wrong number here would fail
+    silently - prctl returns EINVAL and the worker simply stays unreadable."""
+    from pytest_failure_instrumentation.probes import tracing
+
+    assert tracing.PR_SET_PTRACER == 0x59616D61
+    assert bytes.fromhex(f"{tracing.PR_SET_PTRACER:x}") == b"Yama"

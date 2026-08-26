@@ -24,8 +24,10 @@ container port.
 Both work because the answer does not come from the serving session's memory -
 it comes from reading the target process, which needs no relationship to the
 reader. That is also the one thing a *named* port cannot promise everywhere:
-under Linux's Yama LSM at ``ptrace_scope=1``, a process may only read its own
-descendants, so a shared server reads its own workers and not another session's.
+under Linux's Yama LSM at ``ptrace_scope=1`` a tracer must be an ancestor of
+its target, and workers nominate their own controller (see
+:mod:`.probes.tracing`) - so a shared server reads its own workers and not
+another session's, which nominated a different controller.
 A drawn port has no such gap, because every session reads only its own.
 
 **How "already claimed" is decided.** By asking, not by looking. The obvious
