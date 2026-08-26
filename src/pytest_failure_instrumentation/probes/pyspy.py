@@ -122,17 +122,55 @@ def dump(pid: int, timeout: float = DEFAULT_TIMEOUT) -> tuple[Optional[list[dict
     return [_thread(entry) for entry in payload], None
 
 
+#: Where py-spy stops describing the target and starts describing itself. It
+#: reports a message, then a "Caused by" section carrying the real errno, then
+#: a Rust backtrace of its own frames - and that backtrace says nothing about
+#: the process being read. Taking the *last* line of stderr, which is the
+#: obvious thing to do, therefore reported "10: main" as the reason a pid could
+#: not be read. Measured, from the shape py-spy actually writes.
+BACKTRACE_MARKERS = ("stack backtrace:", "backtrace:")
+
+
+def _is_backtrace(line: str) -> bool:
+    """Only the banner, never the numbered lines under it.
+
+    The frames are numbered ``0:``, ``1:`` - and so are the entries in the
+    "Caused by" section above them, which is where the errno lives. Treating a
+    numbered line as the start of the backtrace therefore threw away the one
+    fact that says *which* failure this is: "Operation not permitted (os error
+    1)" and "No such file or directory (os error 2)" are the difference between
+    a permission hint and a dead process, and both were being dropped.
+    """
+    return line.strip().lower() in BACKTRACE_MARKERS
+
+
 def _explained(stderr: bytes, pid: int) -> str:
-    """py-spy's own words, plus what to do about them where that is knowable."""
-    said = (stderr or b"").decode("utf-8", "replace").strip()
-    said = said.splitlines()[-1] if said else "py-spy failed with no output"
+    """py-spy's own words, plus what to do about them where that is knowable.
+
+    Everything up to the backtrace, joined: the first line is the message and
+    the "Caused by" lines under it carry the errno that says which failure this
+    actually is. Both matter and neither is the last line.
+    """
+    lines = (stderr or b"").decode("utf-8", "replace").splitlines()
+    message = []
+    for line in lines:
+        if _is_backtrace(line):
+            break
+        stripped = line.strip()
+        if stripped and stripped.lower() != "caused by:":
+            message.append(stripped)
+    said = " - ".join(message)[:400] or "py-spy failed with no output"
 
     lowered = said.lower()
     if "permission" in lowered or "denied" in lowered or "operation not permitted" in lowered:
         platform_key = "linux" if IS_LINUX else ("darwin" if IS_MACOS else "win32")
         return f"{said} - {PERMISSION_HINTS[platform_key]}"
-    if "no such process" in lowered or "not found" in lowered:
-        return f"process {pid} is not running"
+    if (
+        "no such process" in lowered
+        or "check that the process is running" in lowered
+        or "not found" in lowered
+    ):
+        return f"process {pid} is not running ({said})"
     return said
 
 
