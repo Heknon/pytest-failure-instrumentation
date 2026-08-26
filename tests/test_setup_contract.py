@@ -11,7 +11,7 @@ the directory it was pointed at.
 
 from __future__ import annotations
 
-from .conftest import needs_process_liveness, needs_xdist
+from .conftest import needs_xdist
 
 SUITE = """
 def test_one():
@@ -112,7 +112,6 @@ def test_a_worker_death_is_still_reported_from_a_relocated_directory(runner):
 # -- one directory per run ------------------------------------------------
 
 
-@needs_process_liveness
 def test_a_finished_runs_directory_is_pruned_and_a_live_one_is_not(tmp_path):
     """Over, not old. Several runs happen at once - that is the whole reason
     each has a directory - so age says nothing about whether one is finished.

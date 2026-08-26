@@ -994,13 +994,14 @@ deliberate `os._exit(3)` gives. What separates a crash from a clean exit there
 is whether a dump was written, not the exit status, which is why the crash
 stack is evidence in its own right rather than a decoration on the verdict.
 
-`psutil` is a dependency, not an upgrade. It is the only cross-platform way to
-ask whether a process is still there, and the POSIX way is actively dangerous
-on Windows: `os.kill(pid, 0)` sends a console event only for `CTRL_C_EVENT` and
-`CTRL_BREAK_EVENT`, and calls `TerminateProcess` for every other value —
-including zero. A liveness check written the obvious way would kill each worker
-it inspected, and the live view inspects every worker on every request. psutil
-also carries the memory figures on macOS and Windows, which procfs cannot.
+`psutil` is a dependency, imported like any other. It is the only
+cross-platform way to ask whether a process is still there, and the POSIX way
+is actively dangerous on Windows: `os.kill(pid, 0)` sends a console event only
+for `CTRL_C_EVENT` and `CTRL_BREAK_EVENT`, and calls `TerminateProcess` for
+every other value — including zero. A liveness check written the obvious way
+would kill each worker it inspected, and the live view inspects every worker on
+every request. psutil also carries the memory figures on macOS and Windows,
+which procfs cannot.
 
 ## Tests
 
@@ -1024,11 +1025,6 @@ cgroup counters — and none of the Windows or macOS paths can be exercised on a
 Linux runner, which is the whole reason the matrix exists. Two axes matter as
 much as the operating system, so each gets its own job:
 
-- **without `psutil`**, which is a dependency and can still be missing: a
-  wheel that will not build, an environment that stripped it. Every probe has
-  to degrade to a declared "unavailable" rather than to a wrong number, and the
-  liveness check has to keep erring towards "still there" rather than start
-  reporting working workers as dead.
 - **without `pytest-xdist`**, where `pytest_testnodedown` has no hookspec at
   all and an unspecced hookimpl is a registration error — the failure mode that
   once made a plain `pytest` run report nothing.

@@ -9,45 +9,14 @@ round-trip on every scenario rather than in one test of its own.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from pytest_failure_instrumentation.incidents.base import Incident
 from pytest_failure_instrumentation.incidents.registry import parse
-from pytest_failure_instrumentation.probes import is_running
-from pytest_failure_instrumentation.probes.platform_flags import optional_psutil
 
 pytest_plugins = ["pytester"]
-
-#: A pid nothing is using, for asking whether this environment can recognise a
-#: process that is not there.
-DEAD_PID = 999999
-
-#: Whether a dead process can be told from a live one *here*. It needs procfs
-#: or psutil, and an environment with neither - psutil is a dependency, so that
-#: means one where it would not install - has ``is_running`` erring towards
-#: "still there" by design, because a wrong "it died" deletes evidence and
-#: reports a working worker as gone. Correct, and it means the tests that turn
-#: on recognising a dead process are asserting a capability that is absent
-#: rather than a behaviour that is wrong.
-needs_process_liveness = pytest.mark.skipif(
-    is_running(DEAD_PID),
-    reason="no way to tell a dead process here: no procfs and no psutil",
-)
-
-#: Recognising a *zombie* is a strictly harder question than recognising a pid
-#: that was never there. POSIX answers the second with signal 0 whatever else
-#: is installed; the first needs procfs or psutil, because the kernel keeps
-#: accepting signals for a process that has died and not yet been reaped. So
-#: macOS without psutil can tell a nonexistent pid from a live one and cannot
-#: tell a zombie from a live one - which is a real, documented gap and not a
-#: wrong answer: the heartbeat carries that finding instead, a beat later.
-needs_zombie_detection = pytest.mark.skipif(
-    optional_psutil() is None and not Path("/proc/self/stat").exists(),
-    reason="zombies need procfs or psutil; the heartbeat carries it here instead",
-)
 
 INCIDENT_FILE = "incidents.jsonl"
 

@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .platform_flags import IS_LINUX, IS_MACOS, IS_WINDOWS, optional_psutil
+import psutil
+
+from .platform_flags import IS_LINUX, IS_MACOS, IS_WINDOWS
 
 
 def resident_megabytes() -> tuple[int | None, str]:
@@ -24,7 +26,6 @@ def resident_megabytes() -> tuple[int | None, str]:
         except (OSError, IndexError, ValueError):
             pass
 
-    psutil = optional_psutil()
     if psutil is not None:
         try:
             return round(psutil.Process().memory_info().rss / 1048576), "psutil"
@@ -116,7 +117,6 @@ def system_available_megabytes() -> tuple[int | None, str]:
         except (OSError, IndexError, ValueError):
             pass
 
-    psutil = optional_psutil()
     if psutil is not None:
         try:
             return round(psutil.virtual_memory().available / 1048576), "psutil"
@@ -236,7 +236,6 @@ def memory_limit() -> dict[str, Any]:
         except OSError:
             pass
 
-    psutil = optional_psutil()
     if psutil is not None:
         try:
             return {

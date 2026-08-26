@@ -87,42 +87,6 @@ jobs:
       - name: Test
         run: pytest -q
 
-  without-psutil:
-    # psutil is a dependency now, so every other job has it and the matrix no
-    # longer proves anything about its absence. This one uninstalls it: the
-    # guards that degrade rather than raise are still there, because a broken
-    # or unbuildable psutil must cost a run its memory figures rather than
-    # cost it the run. What it must never do is silently start reporting live
-    # workers as dead - the liveness check errs towards "still there".
-    name: ${{ matrix.os }} / without psutil
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install, then take psutil away again
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
-          pip uninstall -y psutil
-
-      - name: Show what this machine can measure
-        run: |
-          python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
-
-      - name: Test
-        run: pytest -q
-
   oldest-supported:
     # pyproject declares pytest>=7.0 and python>=3.9. Everything else in this
     # workflow installs whatever is newest, so the floor is a claim nothing

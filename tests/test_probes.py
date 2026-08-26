@@ -164,7 +164,7 @@ def test_windows_liveness_never_goes_through_os_kill(monkeypatch):
             return True
 
     monkeypatch.setattr(process_probe, "IS_WINDOWS", True)
-    monkeypatch.setattr(process_probe, "optional_psutil", lambda: FakePsutil)
+    monkeypatch.setattr(process_probe, "psutil", FakePsutil)
     monkeypatch.setattr(process_probe.os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
     process_probe.is_running(os.getpid())
@@ -185,26 +185,24 @@ def test_windows_liveness_asks_psutil(monkeypatch):
             asked.append(pid)
             return False
 
-    monkeypatch.setattr(process_probe, "optional_psutil", lambda: FakePsutil)
+    monkeypatch.setattr(process_probe, "psutil", FakePsutil)
     assert process_probe.is_running(4321) is False
     assert asked == [4321]
 
 
 def test_liveness_errs_towards_alive_when_it_cannot_tell(monkeypatch):
     """A wrong "it died" deletes evidence and reports a working worker as
-    gone. A wrong "still there" costs a stale row."""
+    gone. A wrong "still there" costs a stale row, so that is the way to be
+    wrong when psutil itself refuses to answer."""
     from pytest_failure_instrumentation.probes import process as process_probe
-
-    monkeypatch.setattr(process_probe, "IS_WINDOWS", True)
-    monkeypatch.setattr(process_probe, "optional_psutil", lambda: None)
-    assert process_probe.is_running(4321) is True
 
     class Broken:
         @staticmethod
         def pid_exists(pid):
             raise RuntimeError("psutil is unhappy")
 
-    monkeypatch.setattr(process_probe, "optional_psutil", lambda: Broken)
+    monkeypatch.setattr(process_probe, "IS_WINDOWS", True)
+    monkeypatch.setattr(process_probe, "psutil", Broken)
     assert process_probe.is_running(4321) is True
 
 

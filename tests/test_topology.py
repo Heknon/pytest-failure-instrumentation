@@ -22,8 +22,6 @@ from pytest_failure_instrumentation import topology
 from pytest_failure_instrumentation.capture.events import TAIL_BYTES, tail_events
 from pytest_failure_instrumentation.probes import is_running
 
-from .conftest import needs_process_liveness, needs_zombie_detection
-
 LIVE = os.getpid()
 #: A pid nothing is using. Not reused within the life of one test run.
 DEAD = 999999
@@ -123,7 +121,6 @@ def test_a_worker_that_stopped_beating_is_frozen(evidence):
     assert "ask again to confirm" in described["why"]
 
 
-@needs_process_liveness
 def test_a_worker_whose_process_is_gone_says_what_it_was_doing(evidence):
     """The crash case. A replacement worker gets a new id rather than reusing
     this one, so the record of what died survives its death."""
@@ -137,7 +134,6 @@ def test_a_worker_whose_process_is_gone_says_what_it_was_doing(evidence):
     assert "test_pool.py::test_reads" in described["why"]
 
 
-@needs_process_liveness
 def test_a_dead_process_outranks_a_stale_heartbeat(evidence):
     """Both are true of a killed worker - its beats stopped when it did - and
     "gone" is the one a reader can act on."""
@@ -223,7 +219,6 @@ def test_a_run_reports_the_id_it_stamps_rather_than_its_directory_name(evidence)
     assert described["controller"]["alive"] is True
 
 
-@needs_process_liveness
 def test_a_run_whose_controller_died_says_so(evidence):
     """Workers still beating under a controller that is gone is a run nobody is
     collecting the results of."""
@@ -257,7 +252,6 @@ def test_a_worker_between_tests_reports_no_node_id(evidence):
 # -- liveness -------------------------------------------------------------
 
 
-@needs_zombie_detection
 def test_a_killed_but_unreaped_process_is_not_running():
     """Signal 0 alone gets this wrong in the one case that matters most: a
     killed worker stays in the process table until its parent waits on it, and

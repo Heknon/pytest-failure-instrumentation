@@ -12,7 +12,9 @@ import os
 import time
 from typing import Any, Optional
 
-from .platform_flags import IS_WINDOWS, optional_psutil
+import psutil
+
+from .platform_flags import IS_WINDOWS
 
 
 def is_running(pid: int) -> bool:
@@ -38,6 +40,7 @@ def is_running(pid: int) -> bool:
     """
     if IS_WINDOWS:
         return _windows_is_running(pid)
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -50,15 +53,13 @@ def is_running(pid: int) -> bool:
 def _windows_is_running(pid: int) -> bool:
     """psutil's answer, which is a different mechanism from the POSIX one.
 
-    psutil is a dependency, so this is the ordinary path rather than a
-    fallback. If it is somehow not importable the answer is "yes", which costs
-    a stale entry in the live view and a run directory that outlives its run -
-    and never costs a worker reported dead while it is working, or evidence
-    deleted out from under a run that is still writing it.
+    Signal 0 is not available here in any form - ``os.kill`` on Windows is an
+    action rather than a question - so this is not a fallback but the only
+    path there is.
+
+    Errs towards "yes" if psutil itself raises, for the same reason as
+    everywhere else here: a wrong "it died" deletes a live run's evidence.
     """
-    psutil = optional_psutil()
-    if psutil is None:
-        return True
     try:
         return bool(psutil.pid_exists(pid))
     except Exception:  # noqa: BLE001 - a liveness check must never raise
@@ -77,16 +78,11 @@ def _is_zombie(pid: int) -> bool:
 
     Linux answers from procfs, which this package already reads for memory and
     which is cheaper than building a psutil object per worker per request.
-    Everywhere else psutil answers. Where neither can, the answer is "not a
-    zombie" and the heartbeat carries the finding instead - its beats stop
-    either way, which is the slower signal but never the wrong one.
+    Everywhere else psutil answers.
     """
     state = _procfs_state(pid)
     if state is not None:
         return state == b"Z"
-    psutil = optional_psutil()
-    if psutil is None:
-        return False
     try:
         return bool(psutil.Process(pid).status() == psutil.STATUS_ZOMBIE)
     except Exception:  # noqa: BLE001 - never let a liveness check raise
@@ -183,16 +179,14 @@ def _waitid_status(pid: int, timeout: float) -> tuple[int, str | None, str] | No
 
 
 def _windows_exit_status(pid: int) -> tuple[int, str | None, str] | None:
-    psutil = optional_psutil()
-    if psutil is not None:
-        try:
-            return (
-                unsigned_on_windows(int(psutil.Process(pid).wait(timeout=5))),
-                "exited",
-                "psutil",
-            )
-        except Exception:
-            pass
+    try:
+        return (
+            unsigned_on_windows(int(psutil.Process(pid).wait(timeout=5))),
+            "exited",
+            "psutil",
+        )
+    except Exception:
+        pass
     try:
         import ctypes
         from ctypes import wintypes
