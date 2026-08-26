@@ -81,13 +81,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
 
-      # Linux only, and deliberately. py-spy is what reads a process other than
-      # the one serving, so without it the test that covers the live view's
-      # whole reason to exist skips - which is the same as not having it. It is
-      # not added to macOS, where reading another process needs root and the
-      # cell would go red for a permission this project cannot grant itself.
+      # py-spy is what reads a process other than the one serving, so without
+      # it the test covering the live view's whole reason to exist skips -
+      # which is the same as not having it. Installed everywhere the platform
+      # table claims that read works, so the table is checked rather than
+      # asserted: Linux and Windows say yes, macOS says root only and is left
+      # out, since granting that would mean running the whole suite as root.
       - name: Install the external stack reader
-        if: runner.os == 'Linux'
+        if: runner.os != 'macOS'
         run: pip install -e ".[stacks]"
 
       - name: Show what this machine can measure
