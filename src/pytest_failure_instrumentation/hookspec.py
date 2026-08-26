@@ -1,8 +1,14 @@
-"""The hook your product implements.
+"""The hooks your product implements.
 
-One hook for every kind of incident. Named for what it delivers - most of what
-arrives is not a crash - and namespaced to this distribution, the way
-``pytest_xdist_*`` hooks are, so it cannot collide with anyone else's.
+Two, and they answer different questions. ``pytest_failure_incident`` says
+something went wrong, once per incident, and is the reason this package exists.
+``pytest_failure_server_ready`` says the live-stack server is up and where -
+nothing went wrong, and a product that never switches the server on never sees
+it.
+
+Both are named for what they deliver - most of what arrives at the first is not
+a crash - and namespaced to this distribution, the way ``pytest_xdist_*`` hooks
+are, so neither can collide with anyone else's.
 
     def pytest_failure_incident(incident):
         database.save(incident.model_dump())
@@ -83,6 +89,7 @@ import pytest
 
 if TYPE_CHECKING:  # kept out of the runtime import path: a worker never
     from .incidents.base import Incident  # loads pydantic
+    from .live_view import LiveStackServer
 
 
 @pytest.hookspec()
@@ -91,4 +98,27 @@ def pytest_failure_incident(incident: Incident) -> None:
 
     Never raises into the run: the caller wraps this, because an exception in
     a reporting hook becomes an INTERNALERROR that ends the customer's run.
+    """
+
+
+@pytest.hookspec()
+def pytest_failure_server_ready(server: LiveStackServer) -> None:
+    """Called once, on the controller, when the live-stack server is serving.
+
+    ``server`` is a :class:`.live_view.LiveStackServer` carrying the address,
+    the token and the evidence directory - everything a UI needs to start
+    polling ``/workers`` and ``/stack``, and the only way to learn a drawn
+    port without reading the discovery file yourself.
+
+    Not called at all when the server was never switched on, and not called
+    when this session stood down because another of ours already holds a named
+    port - that session announced itself, and two announcements for one server
+    would have a product storing the same address twice.
+
+    Called from a thread of its own, once the server is already accepting, so
+    an implementation may call straight back into the server it has just been
+    handed - which is the first thing most of them do. It may also take as long
+    as it likes: nothing waits for it, and the run does not.
+
+    Never raises into the run, on the same grounds as the hook above.
     """
