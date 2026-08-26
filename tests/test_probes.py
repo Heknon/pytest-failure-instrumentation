@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,11 +97,30 @@ def test_waitid_reports_a_kill_as_a_negative_status():
 def test_getexitcodeprocess_answers_from_a_handle(monkeypatch):
     """Windows lets any handle you can open answer, which is what makes the
     status readable without being the parent. psutil answers first in normal
-    use, so it is removed here to reach the call underneath."""
-    monkeypatch.setattr(process, "optional_psutil", lambda: None)
+    use, so it is made to decline here to reach the call underneath."""
+
+    def declines(pid):
+        raise OSError("psutil is not answering for this test")
+
+    monkeypatch.setattr(process, "psutil", SimpleNamespace(Process=declines))
     popen = child("import sys", "sys.exit(7)")
     popen.wait(timeout=10)
     assert process._windows_exit_status(popen.pid) == (7, "exited", "GetExitCodeProcess")
+
+
+def test_the_windows_path_survives_psutil_declining_to_answer(monkeypatch):
+    """Runs everywhere, on purpose. The test above only proves the fallback
+    on Windows, so a rename of the psutil import went unnoticed here until a
+    Windows runner reached it. This one pins the same patch point on every
+    platform: off Windows the ctypes call cannot load, and the contract is
+    that it yields nothing rather than raising or claiming psutil answered."""
+
+    def declines(pid):
+        raise OSError("psutil is not answering for this test")
+
+    monkeypatch.setattr(process, "psutil", SimpleNamespace(Process=declines))
+    status = process._windows_exit_status(os.getpid())
+    assert status is None or status[2] == "GetExitCodeProcess"
 
 
 def test_a_process_that_was_never_ours_yields_no_status_rather_than_a_guess():
