@@ -52,7 +52,7 @@ def test_the_probe_stack_is_not_reported_as_the_crash_stack(tmp_path):
     writer = threading.Thread(target=finish_dying)
     writer.start()
     try:
-        dump = death._crash_dump(crash, -SIGSEGV, "killed")
+        dump = death._crash_dump(crash, -SIGSEGV)
     finally:
         writer.join(timeout=5)
 
@@ -68,20 +68,20 @@ def test_a_dump_already_on_disk_is_not_waited_for(tmp_path):
     crash.write_text(PROBE_DUMP + FATAL_DUMP, encoding="utf-8")
 
     started = time.monotonic()
-    dump = death._crash_dump(crash, -SIGSEGV, "killed")
+    dump = death._crash_dump(crash, -SIGSEGV)
     assert dump[0].startswith("Fatal Python error")
     assert time.monotonic() - started < 0.2, "waited for a dump that was already there"
 
 
 @pytest.mark.parametrize(
-    ("status", "kind"),
+    "status",
     [
-        (-int(getattr(signal, "SIGKILL", 9)), "killed"),  # uncatchable: never writes one
-        (137, "exited"),
-        (None, None),
+        -int(getattr(signal, "SIGKILL", 9)),  # uncatchable: never writes one
+        137,  # a plain exit code, and a Windows NTSTATUS is unsigned like this
+        None,
     ],
 )
-def test_a_death_that_writes_no_dump_is_never_waited_for(tmp_path, status, kind):
+def test_a_death_that_writes_no_dump_is_never_waited_for(tmp_path, status):
     """A worker the OOM killer took wrote nothing and never will. Waiting for
     each of them would put a second on every incident in the worst run a user
     ever has - the one where the whole matrix is being killed."""
@@ -89,7 +89,7 @@ def test_a_death_that_writes_no_dump_is_never_waited_for(tmp_path, status, kind)
     crash.write_text(PROBE_DUMP, encoding="utf-8")
 
     started = time.monotonic()
-    dump = death._crash_dump(crash, status, kind)
+    dump = death._crash_dump(crash, status)
     assert time.monotonic() - started < 0.2, "waited for a dump that was not coming"
     # The probe stack is still returned: it is evidence, and is_fatal() is what
     # says it is not the death stack.
@@ -102,7 +102,7 @@ def test_a_dump_that_never_arrives_still_yields_the_probe_stack(tmp_path):
     crash.write_text(PROBE_DUMP, encoding="utf-8")
 
     started = time.monotonic()
-    dump = death._crash_dump(crash, -SIGSEGV, "killed")
+    dump = death._crash_dump(crash, -SIGSEGV)
     waited = time.monotonic() - started
 
     assert dump, "gave up the only stack it had"
@@ -122,3 +122,44 @@ def test_signals_that_leave_a_dump_are_the_ones_faulthandler_handles(tmp_path):
     kill = getattr(signal, "SIGKILL", None)
     if kill is not None:
         assert int(kill) not in death.DUMPING_SIGNALS, "SIGKILL cannot be caught"
+
+
+def test_every_way_a_signal_death_is_reported_is_waited_for():
+    """The hole this predicate had, and the reason it no longer reads the kind.
+
+    waitid answers "killed" normally and "killed-core-dumped" when core dumps
+    are enabled - which is the ordinary case for a real SIGSEGV, so a check for
+    "killed" alone skipped the wait for precisely the deaths it was written
+    for. The path consulted *before* either of them, popen.returncode, reports
+    no kind at all. All three agree on one thing: a negative status.
+    """
+    segv = -SIGSEGV
+    assert death._expects_a_dump(segv), "a signal death must be waited for"
+
+    # Windows normalises its statuses to unsigned, so nothing there matches -
+    # which is correct: these are POSIX signal numbers, not NTSTATUS values.
+    assert not death._expects_a_dump(0xC0000005)
+    assert not death._expects_a_dump(3)
+    assert not death._expects_a_dump(None)
+    assert not death._expects_a_dump(-int(getattr(signal, "SIGKILL", 9)))
+
+
+def test_a_core_dumped_segfault_is_waited_for(tmp_path):
+    """The kind waitid actually reports on a machine with core dumps enabled,
+    driven end to end rather than asserted about the predicate."""
+    crash = tmp_path / "gw0.crash"
+    crash.write_text(PROBE_DUMP, encoding="utf-8")
+
+    def finish_dying():
+        time.sleep(0.15)
+        with crash.open("a", encoding="utf-8") as handle:
+            handle.write(FATAL_DUMP)
+
+    writer = threading.Thread(target=finish_dying)
+    writer.start()
+    try:
+        # Exactly what _waitid_status returns for a SIGSEGV that dumped core.
+        dump = death._crash_dump(crash, -SIGSEGV)
+    finally:
+        writer.join(timeout=5)
+    assert dump[0].startswith("Fatal Python error")

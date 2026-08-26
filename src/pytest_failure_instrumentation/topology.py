@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .analysis import stall as stall_analysis
-from .capture.events import tail_events
+from .capture.events import head_events, tail_events
 from .capture.heartbeat import DEFAULT_INTERVAL
 from .capture.state import ELIDED, read_state
 from .probes import is_running
@@ -183,7 +183,9 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
     rate = stall_analysis.cpu_rate(beats[-RATE_WINDOW:]) if len(beats) >= 2 else None
-    status, why = _status(exists, beats, beat_age, rate, _interval(events), record)
+    status, why = _status(
+        exists, beats, beat_age, rate, _interval(events, state_path), record
+    )
 
     nodeid = record.get("nodeid")
     return {
@@ -260,16 +262,34 @@ def _status(
     )
 
 
-def _interval(events: list[dict[str, Any]]) -> float:
+def _interval(events: list[dict[str, Any]], state_path: Optional[Path] = None) -> float:
     """The heartbeat cadence this worker was actually started with.
 
     Read rather than assumed: it is what "stale" is measured in, and a run
     configured with a slower beat would otherwise have every worker declared
     frozen between beats.
+
+    Which is what happened. ``watchdog_started`` is written once, before the
+    first beat, and the events are read as a bounded *tail* - so on a run long
+    enough to push that record out of the window, the cadence fell back to the
+    default and every healthy worker on a slower beat read as frozen. At a
+    thirty-second beat the window holds about two and a half hours, so a long
+    test is not an edge case here, it is the case. Worse, the sampler acts on
+    that verdict: every worker looking frozen is every worker read with py-spy,
+    on every pass.
+
+    So the tail is asked first - it is already in hand and holds the answer for
+    any run short enough - and the head of the file is read only when the tail
+    has scrolled past it.
     """
     for event in reversed(events):
         if event.get("event") == "watchdog_started" and event.get("interval"):
             return float(event["interval"])
+    if state_path is not None:
+        head = head_events(state_path.with_name(f"{state_path.stem}.events"))
+        for event in head:
+            if event.get("event") == "watchdog_started" and event.get("interval"):
+                return float(event["interval"])
     return DEFAULT_INTERVAL
 
 

@@ -187,7 +187,9 @@ class Settings:
             f"the live stack server is bound to {self.stack_server_host}, not "
             "loopback, so anything that can reach this host on port "
             f"{self.stack_server_port or '<drawn at random>'} can read the stack "
-            "of any process it serves - there is no authentication. This is what "
+            "of any process it serves, and off loopback the boundary is the network "
+            "rather than who can open a socket here - the token guards the "
+            "endpoints, but anyone who can reach the address can try. This is what "
             "a container whose UI is outside it needs; it is not what a shared "
             "machine wants",
             FailureInstrumentationWarning,

@@ -69,6 +69,7 @@ the token is what makes that survivable rather than reckless.
 
 from __future__ import annotations
 
+import errno
 import hmac
 import json
 import os
@@ -140,6 +141,17 @@ RECLAIM_SECONDS = 5.0
 MAX_CONCURRENT_READS = 8
 
 _readers = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
+
+
+def _is_contention(failure: OSError) -> bool:
+    """Whether this bind failed because somebody already has the address.
+
+    The only error worth waiting on. Everything else says the address itself
+    is unusable here, which no amount of retrying changes - and telling those
+    apart is what decides between "stand down and take over later" and "say so
+    and stop".
+    """
+    return failure.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE))
 
 
 def address_family(host: str) -> int:
@@ -577,11 +589,23 @@ class StackService:
                 self.token,
             )
         except OSError as failure:
+            if not _is_contention(failure):
+                # Not "somebody has this port" but "this address cannot be
+                # bound": a host that is not an interface here, a sandbox that
+                # forbids listening, a privileged port. Waiting changes none of
+                # them, and it was previously decided by whether the port was
+                # *drawn* - so a named port on a bad host was reported as held
+                # by a stranger, advised to try another port, and then retried
+                # the impossible bind every few seconds for the whole run.
+                self.status = f"could not bind {authority(self.host, self.port)}: " + (
+                    failure.strerror or str(failure)
+                )
+                self._give_up("BIND_REFUSED")
+                return True
             if self.drawn:
-                # Nobody is holding "any free port". This is a bad interface, a
-                # sandbox that forbids listening, or a machine with nothing
-                # free - none of which a later attempt would find changed.
-                self.status = f"could not bind {self.host}: {failure.strerror or failure}"
+                # Nobody can be holding "any free port", so contention here
+                # means the machine has nothing free at all.
+                self.status = f"could not draw a port on {self.host}: {failure.strerror or failure}"
                 self._give_up("BIND_REFUSED")
                 return True
             self._note_who_has_it(failure)

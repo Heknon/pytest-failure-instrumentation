@@ -23,6 +23,7 @@ from typing import Any, Optional
 import pytest
 
 from pytest_failure_instrumentation import stack_server
+from pytest_failure_instrumentation.incidents import stack_server as stack_server_incident
 from pytest_failure_instrumentation.probes import pyspy, stacks
 from pytest_failure_instrumentation.probes.platform_flags import (
     IS_LINUX,
@@ -1216,3 +1217,30 @@ def test_implementing_the_hook_costs_nothing_when_the_server_is_off(pytester):
     result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
     result.assert_outcomes(passed=1)
     assert not (pytester.path / "server.json").exists()
+
+
+def test_a_named_port_on_an_unbindable_host_says_so_and_stops(tmp_path):
+    """The remedy has to match the fault. An address that is not an interface
+    here cannot be fixed by choosing another port, and retrying it every few
+    seconds for the length of the run fixes it even less - which is what
+    deciding this by whether the port was *drawn* used to do."""
+    reported: list[tuple[str, str]] = []
+    # A documentation-range address, which is never a local interface.
+    service = stack_server.StackService(
+        18080, host="203.0.113.1", directory=tmp_path,
+        on_giving_up=lambda verdict, detail: reported.append((verdict, detail)),
+    )
+    service.start()
+    try:
+        assert wait_for(lambda: reported), service.status
+    finally:
+        service.stop()
+
+    verdict, detail = reported[0]
+    assert verdict == stack_server_incident.BIND_REFUSED, (
+        f"a bad host was reported as {verdict}, whose remedy is a different port"
+    )
+    assert "--callstack-port" not in detail, "advised a remedy that cannot help"
+    assert "203.0.113.1" in detail
+    # And it stopped rather than settling into a retry loop.
+    assert not service.serving

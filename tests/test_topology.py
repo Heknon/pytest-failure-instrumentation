@@ -19,6 +19,7 @@ import time
 import pytest
 
 from pytest_failure_instrumentation import topology
+from pytest_failure_instrumentation.capture import events as events_module
 from pytest_failure_instrumentation.capture.events import TAIL_BYTES, tail_events
 from pytest_failure_instrumentation.probes import is_running
 
@@ -368,3 +369,59 @@ def test_a_name_that_looks_like_a_path_reaches_nothing(evidence):
     snapshot = topology.snapshot(evidence.base, only=["../outside", "/etc/passwd"])
     assert [entry for run in snapshot["runs"] for entry in run["workers"]] == []
     assert snapshot["filter"]["unmatched"] == ["../outside", "/etc/passwd"]
+
+
+def test_a_long_run_does_not_report_every_healthy_worker_as_frozen(tmp_path):
+    """The failure a long run walks into, built as the file state it is.
+
+    "Stale" is measured in heartbeat intervals, and the interval is written
+    once - in watchdog_started, before the first beat. The events are read as
+    a bounded tail, so once a run is long enough to push that record out of
+    the window, the cadence falls back to the default and every worker on a
+    slower beat reads as frozen. At a thirty-second beat the window holds
+    roughly two and a half hours; a twelve-hour test is not an edge case.
+
+    The sampler then acts on that verdict, so the cost is not a wrong label -
+    it is py-spy against every worker on every pass.
+    """
+    now = time.time()
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "owner.json").write_text(json.dumps({"pid": os.getpid(), "started_at": now - 40_000}))
+
+    state = {"pid": os.getpid(), "nodeid": "test_slow.py::test_long", "phase": "call",
+             "time": now, "tests_started": 1, "tests_finished": 0}
+    raw = json.dumps(state).encode()
+    (root / "gw0.state").write_bytes(raw + b"\x00" * (5120 - len(raw)))
+
+    interval = 30.0
+    lines = [json.dumps({"event": "watchdog_started", "interval": interval,
+                         "run_id": "r", "time": now - 40_000})]
+    # Enough beats to push that first record well past the tail window, which
+    # is what a long run does on its own.
+    beats = int(events_module.TAIL_BYTES / 180) + 200
+    for i in range(beats):
+        lines.append(json.dumps({
+            "event": "heartbeat", "cpu_seconds": 100.0, "rss_mb": 40,
+            "nodeid": "test_slow.py::test_long", "phase": "call", "run_id": "r",
+            # The most recent beat is a normal fraction of an interval old,
+            # which is what a healthy worker on this cadence looks like at any
+            # given instant - and is over the *default* interval's staleness
+            # bound while being well inside its own.
+            "time": now - 25.0 - (beats - 1 - i) * interval,
+        }))
+    (root / "gw0.events").write_text("\n".join(lines) + "\n")
+
+    tail = events_module.tail_events(root / "gw0.events")
+    assert not any(e.get("event") == "watchdog_started" for e in tail), (
+        "the setup did not actually push the record out of the tail window"
+    )
+
+    described = topology.run(root, now)
+    worker = described["workers"][0]
+    # Beating on time, on its configured cadence, using no CPU: blocked, which
+    # is a stall worth a look - but emphatically not frozen, which claims the
+    # worker's own thread has stopped running.
+    assert worker["status"] != "frozen", (
+        f"a healthy worker on a {interval:g}s beat was reported frozen: {worker['why']}"
+    )

@@ -194,6 +194,7 @@ class IncidentEngine:
         """
         if not self.distributed and not self.settings.stack_server:
             return
+        self._warn_if_a_live_session_already_owns_this_directory()
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             # The run id is deliberately absent: reading it here would settle
@@ -213,6 +214,39 @@ class IncidentEngine:
         except OSError:
             return  # bookkeeping must never break a run
         prune_finished_runs(self.settings.directory)
+
+    def _warn_if_a_live_session_already_owns_this_directory(self) -> None:
+        """Two runs may share a directory on purpose - but not at once.
+
+        Naming a directory with PYTEST_RUN_ID is the documented way to make
+        two runs share one, and for runs that follow one another that is
+        exactly what it does. Concurrently it is something else: every worker
+        is gw0, so the second session's gw0.state overwrites the first's and
+        owner.json names whichever wrote last. The events stay separable
+        because every line carries the run id; the state files do not, and a
+        state file is what says which test a worker is running now.
+
+        A build system that exports one PYTEST_RUN_ID for the whole job and
+        then runs two suites in parallel gets this without choosing it, which
+        is why it is worth saying out loud rather than leaving in the README.
+        """
+        marker = self.directory / OWNER_FILE
+        try:
+            record = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # no marker, or not one of ours: nothing to say
+        other = record.get("pid")
+        if not other or int(other) == os.getpid() or not probes.is_running(int(other)):
+            return  # ours, or a finished run whose directory is free to reuse
+        warnings.warn(
+            f"this run's evidence directory ({self.directory}) is already owned "
+            f"by process {other}, which is still running: two live sessions "
+            "sharing one directory overwrite each other's per-worker state. "
+            "Unset PYTEST_RUN_ID, or give each session its own value, to keep "
+            "them apart",
+            FailureInstrumentationWarning,
+            stacklevel=2,
+        )
 
     # -- raising ---------------------------------------------------------
 

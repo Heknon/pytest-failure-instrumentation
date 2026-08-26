@@ -126,3 +126,36 @@ def tail_events(path: Path, limit: int = TAIL_BYTES) -> list[dict[str, Any]]:
         except ValueError:
             continue
     return events
+
+
+#: Enough to reach the startup records a worker writes before its first beat -
+#: capabilities, limits, the interval - without reading a long run's whole log.
+HEAD_BYTES = 8 * 1024
+
+
+def head_events(path: Path, limit: int = HEAD_BYTES) -> list[dict[str, Any]]:
+    """The first events a worker wrote, which is where its setup is described.
+
+    The tail is what says how a worker is doing *now*; the head is what says
+    how it was configured, and the two are not the same read. A worker writes
+    ``watchdog_started`` once, before anything else, so on a run long enough to
+    fill the tail window that record is only in the head - and a reader that
+    looked for it in the tail would find nothing and assume a default.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(limit)
+    except OSError:
+        return []
+    text = raw.decode("utf-8", "replace")
+    # A read that stopped mid-line leaves a partial last line; it is dropped
+    # rather than parsed, the same way the tail drops its partial first one.
+    if not text.endswith("\n"):
+        text = text.rpartition("\n")[0]
+    events = []
+    for line in text.splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events

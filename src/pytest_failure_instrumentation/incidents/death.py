@@ -44,11 +44,24 @@ FATAL_DUMP_WAIT_SECONDS = 1.0
 FATAL_DUMP_POLL_SECONDS = 0.05
 
 
-def _expects_a_dump(status: Optional[int], kind: Optional[str]) -> bool:
-    return kind == "killed" and status is not None and abs(status) in DUMPING_SIGNALS
+def _expects_a_dump(status: Optional[int]) -> bool:
+    """Whether this death is one that writes a dump on its way out.
+
+    Decided from the status rather than from the kind string, because the kind
+    is not one value. ``waitid`` answers ``killed`` normally and
+    ``killed-core-dumped`` when core dumps are enabled - which is the *usual*
+    case for a real SIGSEGV, so keying on ``killed`` alone skipped the wait for
+    exactly the deaths it exists for. And the path checked before either of
+    them, ``popen.returncode``, reports no kind at all.
+
+    A negative status is the POSIX convention for "killed by signal N" and is
+    the one thing all three paths agree on. Windows statuses are normalised to
+    unsigned, so they never match here and never wait.
+    """
+    return status is not None and status < 0 and abs(status) in DUMPING_SIGNALS
 
 
-def _crash_dump(path: Path, status: Optional[int], kind: Optional[str]) -> list[str]:
+def _crash_dump(path: Path, status: Optional[int]) -> list[str]:
     """The dump that describes the death, waiting for it if it is still landing.
 
     The crash file accumulates, and an on-demand stack taken while the worker
@@ -68,7 +81,7 @@ def _crash_dump(path: Path, status: Optional[int], kind: Optional[str]) -> list[
     reads once and moves on.
     """
     dump = crash_stack.read(path, limit=40)
-    if crash_stack.is_fatal(dump) or not _expects_a_dump(status, kind):
+    if crash_stack.is_fatal(dump) or not _expects_a_dump(status):
         return dump
     deadline = time.monotonic() + FATAL_DUMP_WAIT_SECONDS
     while time.monotonic() < deadline:
@@ -166,7 +179,7 @@ def build(
     popen = getattr(getattr(node.gateway, "_io", None), "popen", None)
     # Read before the dump, because it decides whether a dump is still coming.
     status, status_kind, source = probes.exit_status(pid, popen)
-    dump = _crash_dump(crash_file, status, status_kind)
+    dump = _crash_dump(crash_file, status)
     oom_kills = probes.cgroup_oom_kills()
     beats = event_log.heartbeats(events)
     cgroup = probes.cgroup_memory()

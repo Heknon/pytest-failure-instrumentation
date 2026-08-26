@@ -43,9 +43,11 @@ DEFAULT_TIMEOUT = 15.0
 PERMISSION_HINTS = {
     "linux": (
         "ptrace is not permitted: check /proc/sys/kernel/yama/ptrace_scope "
-        "(0 or 1 allows this; 1 requires the target to be a descendant of the "
-        "reader, which xdist workers are), and add --cap-add=SYS_PTRACE if "
-        "this is a container"
+        "(0 allows this; at 1 the tracer must be an ancestor of the target, "
+        "and py-spy is a sibling of the worker rather than its ancestor - "
+        "workers grant the exception themselves at startup, so a refusal here "
+        "usually means the target is not one of ours), and add "
+        "--cap-add=SYS_PTRACE if this is a container"
     ),
     "darwin": "py-spy needs root on macOS, because SIP blocks reading another process",
     "win32": "the reader needs permission to open the target process",

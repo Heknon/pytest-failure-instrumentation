@@ -24,6 +24,7 @@ are, so neither can collide with anyone else's.
 ``collection_mismatch``   ``incidents.collection.CollectionMismatchIncident``   needs xdist
 ``internal_error``        ``incidents.internal_error.InternalErrorIncident``    any run
 ``run_summary``           ``incidents.summary.RunSummaryIncident``              any run
+``stack_server_unavailable`` ``incidents.stack_server.StackServerIncident``     live view on
 ========================= ==================================================== =============
 
 Three of them reach no pytest hook of their own, which is why they need a

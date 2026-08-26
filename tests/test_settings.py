@@ -211,8 +211,14 @@ def test_naming_either_one_on_the_command_line_switches_the_server_on():
 
 def test_binding_off_loopback_says_what_it_exposes():
     """Right for a container whose UI is outside it, wrong on a shared machine,
-    and only the person who typed it can tell which this is."""
-    with pytest.warns(FailureInstrumentationWarning, match="no authentication"):
+    and only the person who typed it can tell which this is.
+
+    The warning used to say there was no authentication, which stopped being
+    true when the endpoints got a token - and a warning that overstates the
+    exposure is as misleading as one that understates it. What is actually
+    true off loopback is that the boundary becomes the network.
+    """
+    with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
         resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
 
 
