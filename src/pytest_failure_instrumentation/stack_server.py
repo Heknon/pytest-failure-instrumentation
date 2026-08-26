@@ -211,7 +211,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif route.path == "/stack":
             self._stack(parse_qs(route.query))
         elif route.path == "/workers":
-            self._workers()
+            self._workers(parse_qs(route.query))
         else:
             self._reply(404, {"error": "no such endpoint", "endpoints": ENDPOINTS})
 
@@ -240,12 +240,17 @@ class _Handler(BaseHTTPRequestHandler):
             },
         )
 
-    def _workers(self) -> None:
+    def _workers(self, query: dict[str, list[str]]) -> None:
         """Every run on this machine, and what each worker is doing.
 
         One request rather than one per worker, and no ptrace: this is
         assembled from files the run was writing anyway. A UI polls this to
         know *where* to look, and ``/stack`` to look.
+
+        ``?worker=`` narrows it. Both spellings are accepted and both shapes -
+        repeated parameters and one comma-separated list - because a caller
+        will write whichever occurs to them and being strict about it would
+        only ever produce a wrong answer rather than a corrected one.
         """
         from . import topology
 
@@ -259,7 +264,7 @@ class _Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        self._reply(200, topology.snapshot(base, served_by=identity()))
+        self._reply(200, topology.snapshot(base, served_by=identity(), only=_named(query)))
 
     def _reply(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -280,8 +285,27 @@ class _Handler(BaseHTTPRequestHandler):
 ENDPOINTS = {
     "/identity": "who is serving this port",
     "/workers": "every run on this machine, and what each worker is doing",
+    "/workers?worker=gw0,gw3": "only those workers; repeat the parameter or comma-separate",
     "/stack?pid=N": "the current stack of every thread in process N",
 }
+
+
+#: Both spellings of the worker filter. A caller writes whichever occurs to
+#: them, and refusing the other only produces a wrong answer.
+WORKER_PARAMS = ("worker", "workers")
+
+
+def _named(query: dict[str, list[str]]) -> Optional[list[str]]:
+    """The workers a request asked about, or None for all of them.
+
+    Repeated parameters and comma-separated values both work, and mixing them
+    works too. Nothing here becomes a path: these names are compared against a
+    directory listing, never joined onto one.
+    """
+    values = [value for key in WORKER_PARAMS for value in query.get(key, [])]
+    if not values:
+        return None
+    return [name for value in values for name in value.split(",")]
 
 
 def identity() -> dict[str, Any]:

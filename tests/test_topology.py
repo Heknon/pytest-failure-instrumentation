@@ -301,3 +301,70 @@ def test_a_short_events_file_is_read_whole(tmp_path):
 
 def test_a_missing_events_file_is_not_an_error(tmp_path):
     assert tail_events(tmp_path / "nothing.events") == []
+
+
+# -- asking about particular workers --------------------------------------
+
+
+def test_only_the_workers_asked_for_are_described(evidence):
+    """A caller watching one test does not want the other sixty-three read for
+    it, and the filter is applied to the listing rather than to the results."""
+    for name in ("gw0", "gw1", "gw2"):
+        evidence.state(name, nodeid=f"test_{name}.py::test_one")
+        evidence.beats(name, cpu_step=0.5)
+
+    described = topology.run(evidence.run, only=["gw1"])
+    assert [entry["worker"] for entry in described["workers"]] == ["gw1"]
+    assert described["workers"][0]["nodeid"] == "test_gw1.py::test_one"
+
+    described = topology.run(evidence.run, only=["gw0", "gw2"])
+    assert [entry["worker"] for entry in described["workers"]] == ["gw0", "gw2"]
+
+
+def test_a_name_that_matched_nothing_is_reported(evidence):
+    """A caller cannot otherwise tell "not running" from "misspelt"."""
+    evidence.state("gw0")
+    evidence.beats("gw0")
+
+    snapshot = topology.snapshot(evidence.base, only=["gw0", "gw9"])
+    assert snapshot["filter"] == {"workers": ["gw0", "gw9"], "unmatched": ["gw9"]}
+    assert [entry["worker"] for run in snapshot["runs"] for entry in run["workers"]] == ["gw0"]
+
+
+def test_an_empty_filter_is_no_filter(evidence):
+    """``?worker=`` is what a UI sends when its filter box is empty, and an
+    empty list back would be technically defensible and useless."""
+    evidence.state("gw0")
+    evidence.beats("gw0")
+
+    for asked in ([], [""], ["  "], None):
+        snapshot = topology.snapshot(evidence.base, only=asked)
+        assert [entry["worker"] for run in snapshot["runs"] for entry in run["workers"]] == ["gw0"]
+        assert "filter" not in snapshot
+
+
+def test_runs_with_no_matching_worker_drop_out(evidence):
+    """A caller that asked about gw0 is not helped by three runs without one."""
+    other = evidence.base / "run-def456"
+    other.mkdir()
+    (other / "owner.json").write_text(json.dumps({"pid": LIVE}))
+    (other / "gw7.state").write_bytes(json.dumps({"pid": LIVE, "time": time.time()}).encode())
+    evidence.state("gw0")
+
+    snapshot = topology.snapshot(evidence.base, only=["gw0"])
+    assert [run["session"] for run in snapshot["runs"]] == ["run-abc123"]
+    # Unfiltered, both are there.
+    assert len(topology.snapshot(evidence.base)["runs"]) == 2
+
+
+def test_a_name_that_looks_like_a_path_reaches_nothing(evidence):
+    """These names arrive from an HTTP query. They are compared against a
+    directory listing and never joined onto one, so a traversal attempt is
+    just a name that matches nothing."""
+    evidence.state("gw0")
+    outside = evidence.base / "outside.state"
+    outside.write_bytes(json.dumps({"pid": LIVE, "nodeid": "secret"}).encode())
+
+    snapshot = topology.snapshot(evidence.base, only=["../outside", "/etc/passwd"])
+    assert [entry for run in snapshot["runs"] for entry in run["workers"]] == []
+    assert snapshot["filter"]["unmatched"] == ["../outside", "/etc/passwd"]
