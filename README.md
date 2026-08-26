@@ -606,7 +606,7 @@ Everything above is for reading afterwards. This is the other direction: a UI
 watching a run, asking what a test is doing *while it is still doing it*.
 
 ```console
-$ curl localhost:8080/stack?pid=48213
+$ curl -H "Authorization: Bearer $TOKEN" localhost:8080/stack?pid=48213
 {"pid": 48213, "source": "py-spy", "captured_at": 1756142887.31,
  "threads": [{"thread_id": 8632442880, "thread_name": "MainThread",
               "owns_gil": true, "active": true,
@@ -723,6 +723,36 @@ the stall you were measuring.
 `nodeid` and `phase` are `null` between tests, and a very long `nodeid` is
 trimmed from both ends with `nodeid_elided: true` saying so.
 
+### Who may ask
+
+Every endpoint but `/identity` requires a token, minted per server and written
+into the address file beside the port:
+
+```console
+$ TOKEN=$(jq -r .token .pytest-failures/*/callstack-*.json)
+$ curl -H "Authorization: Bearer $TOKEN" localhost:8080/workers
+$ curl "localhost:8080/workers?token=$TOKEN"    # for when you are in a hurry
+```
+
+That file is created readable by its owner alone — opened `0o600` rather than
+written and then narrowed, because narrowing afterwards leaves a window and a
+window is all anybody needs. So the boundary is the filesystem's: whoever can
+read this run's evidence directory can read its stacks, and nobody else can.
+
+**Loopback is not that boundary**, which is why the token is not conditional on
+binding off it. Loopback bounds the reachable set to processes on this machine,
+and *every user* on this machine is inside that set — so on a shared box, "only
+local" and "only you" are very different statements, and only the second is
+worth making about a service that reports what your test processes are
+executing.
+
+`/identity` is deliberately open: it is what one session asks another before
+standing down from a contested port, and the two share no token. It answers
+with a service name, a version and a pid, and never with the token.
+
+A token lives and dies with the process that minted it, so one that leaks
+expires with the run — that is the whole of its lifetime management.
+
 ### Finding the server
 
 A drawn port is written to `callstack-<pid>.json` in **this run's** evidence
@@ -749,8 +779,8 @@ test_pool.py::test_concurrent_writes call {'function': '_wait_for_lease', ...}
 
 `--callstack-host 0.0.0.0` is what a container needs: its UI is outside, and
 127.0.0.1 inside a container is unreachable from there. Binding anything but
-loopback warns, once, because **the server has no authentication** — it answers
-with the stack of any process it can read, to anyone who asks.
+loopback warns, once — but the token below is what makes it survivable rather
+than reckless.
 
 Two things about containers make this easier than it looks:
 

@@ -43,17 +43,34 @@ running. So a session that lost the claim keeps trying, quietly, and takes over
 whenever the holder exits. Sessions do not coordinate beyond the port itself,
 which is the only thing all of them can see.
 
-**What it binds.** Loopback by default, because it reports what local
-processes are executing and asks nobody who they are. A container is the
-exception that makes it configurable: its UI lives outside it, and 127.0.0.1
-inside a container is unreachable from there. Binding anything else warns, once,
-at settings time.
+**Who may ask.** Every request but ``/identity`` carries a token, minted per
+server and written into the address file beside the port. That file is created
+readable by its owner alone, so the boundary is the filesystem's: whoever can
+read this run's evidence directory can read its stacks, and nobody else can.
+
+Loopback is not that boundary, which is why the token is not conditional on
+binding off it. Loopback bounds the reachable set to processes on this machine,
+and *every user* on this machine is inside that set - so on a shared box, "only
+local" and "only you" are very different statements, and only the second is the
+one worth making about a service that reports what your test processes are
+executing.
+
+``/identity`` is deliberately open, because it is what one session asks another
+before standing down from a contested port, and the two share no token. It
+answers with a service name, a version and a pid, and never with the token.
+
+**What it binds.** Loopback by default. A container is the exception that makes
+it configurable: its UI lives outside it, and 127.0.0.1 inside a container is
+unreachable from there. Binding anything else warns, once, at settings time -
+the token is what makes that survivable rather than reckless.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import secrets
 import socket
 import socketserver
 import threading
@@ -84,6 +101,18 @@ LOOPBACK6 = "::1"
 #: What the wildcard binds mean, so an advertised URL can avoid them.
 IPV6_WILDCARD = "::"
 WILDCARDS = frozenset({"0.0.0.0", IPV6_WILDCARD, ""})
+
+#: How the token is presented. A header is the right place for a credential -
+#: query strings reach logs and shell history - and the query parameter exists
+#: anyway because a person debugging with curl will reach for it, and refusing
+#: would only teach them to turn the whole thing off.
+AUTH_HEADER = "Authorization"
+AUTH_SCHEME = "Bearer"
+TOKEN_PARAM = "token"
+
+#: Bytes of randomness behind each server. Minted per process and never
+#: reused, so a token that leaks expires with the run that issued it.
+TOKEN_BYTES = 32
 
 #: Files a UI reads to find the servers running on this machine, one per
 #: serving session, named for the pid that wrote it so that two sessions in one
@@ -150,7 +179,11 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(
-        self, address: tuple[str, int], handler: Any, evidence_root: Optional[Path] = None
+        self,
+        address: tuple[str, int],
+        handler: Any,
+        evidence_root: Optional[Path] = None,
+        token: Optional[str] = None,
     ) -> None:
         # Set before the base class opens the socket, which reads it off the
         # instance. A class attribute cannot answer this: the family depends
@@ -160,6 +193,8 @@ class _Server(ThreadingHTTPServer):
         #: session's own, since /workers describes the machine rather than
         #: whichever run happens to be hosting.
         self.evidence_root = evidence_root
+        #: What a request has to carry. None only where no token was minted.
+        self.token = token
         super().__init__(address, handler)
     def server_bind(self) -> None:
         """Bind without asking DNS who we are.
@@ -206,14 +241,52 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
         route = urlparse(self.path)
+        query = parse_qs(route.query)
+
+        # Open, because it is what one session asks another before standing
+        # down from a contested port, and the two share no token.
         if route.path == "/identity":
             self._reply(200, identity())
-        elif route.path == "/stack":
-            self._stack(parse_qs(route.query))
+            return
+
+        if not self._authorised(query):
+            self._reply(
+                401,
+                {
+                    "error": "this server reports what local processes are "
+                    "executing, so it asks who is asking. Send the token from "
+                    f"{DISCOVERY_PREFIX}<pid>{DISCOVERY_SUFFIX} in the evidence "
+                    f"directory, as '{AUTH_HEADER}: {AUTH_SCHEME} <token>' or "
+                    f"?{TOKEN_PARAM}=<token>"
+                },
+            )
+            return
+
+        if route.path == "/stack":
+            self._stack(query)
         elif route.path == "/workers":
-            self._workers(parse_qs(route.query))
+            self._workers(query)
         else:
             self._reply(404, {"error": "no such endpoint", "endpoints": ENDPOINTS})
+
+    def _authorised(self, query: dict[str, list[str]]) -> bool:
+        """Whether this request carries the server's token.
+
+        Compared in constant time. The comparison is short and local and an
+        attacker's timing signal across it is buried in HTTP jitter, but a
+        credential check that leaks its progress is the kind of thing that is
+        cheap to get right and awkward to explain having got wrong.
+        """
+        expected = getattr(self.server, "token", None)
+        if not expected:
+            return True  # no token was minted, so none can be demanded
+
+        offered = (query.get(TOKEN_PARAM) or [""])[0]
+        header = self.headers.get(AUTH_HEADER, "")
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() == AUTH_SCHEME.lower():
+            offered = offered or value.strip()
+        return bool(offered) and hmac.compare_digest(offered, expected)
 
     def _stack(self, query: dict[str, list[str]]) -> None:
         raw = (query.get("pid") or [""])[0]
@@ -409,6 +482,9 @@ class StackService:
         self.reclaim_seconds = reclaim_seconds
         #: What is actually bound, which is the only number worth publishing.
         self.bound_port: Optional[int] = None
+        #: Minted per process. A token that leaks expires with the run that
+        #: issued it, which is the whole of its lifetime management.
+        self.token = secrets.token_urlsafe(TOKEN_BYTES)
         #: What happened, in words, for whoever asks why there are no stacks.
         self.status = "not started"
         self.serving = False
@@ -472,6 +548,7 @@ class StackService:
                 (self.host, self.port),
                 _Handler,
                 self.directory.parent if self.directory is not None else None,
+                self.token,
             )
         except OSError as failure:
             if self.drawn:
@@ -548,12 +625,21 @@ class StackService:
             port=self.bound_port,
             url=self.url,
             drawn=self.drawn,
+            token=self.token,
             started_at=round(time.time(), 3),
         )
         temporary = path.with_name(path.name + ".part")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            # Created owner-only *before* anything is in it, so the token is
+            # never briefly world-readable. Writing it and then chmod-ing
+            # leaves exactly that window, which on a shared machine is the
+            # only window anybody needs.
+            handle = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
             os.replace(temporary, path)
         except OSError:
             return  # bookkeeping must never break a run
