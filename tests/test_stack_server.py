@@ -634,6 +634,57 @@ def test_the_claim_is_settled_between_real_processes(serving, tmp_path):
         if holder.poll() is None:
             holder.kill()
             holder.wait(timeout=10)
+
+
+def test_the_workers_endpoint_describes_the_run_it_is_serving(serving, tmp_path):
+    """One request for the whole machine, assembled from files the run wrote
+    anyway - so a UI learns *where* to look here, and looks with /stack."""
+    run = tmp_path / "run-abc123"
+    run.mkdir()
+    (run / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+    (run / "gw0.state").write_bytes(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "nodeid": "test_pool.py::test_writes",
+                "phase": "call",
+                "time": time.time(),
+                "tests_started": 3,
+                "tests_finished": 2,
+            }
+        ).encode()
+        + b"\n"
+    )
+
+    # The service is given its own run directory; /workers describes the
+    # machine, so it looks at the parent.
+    service = serving(0, directory=run)
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(service.bound_port, "/workers")
+    assert status == 200
+    assert body["served_by"]["service"] == stack_server.SERVICE
+    described = [entry for entry in body["runs"] if entry["session"] == "run-abc123"]
+    assert len(described) == 1
+    worker = described[0]["workers"][0]
+    assert worker["worker"] == "gw0"
+    assert worker["nodeid"] == "test_pool.py::test_writes"
+    assert worker["process_exists"] is True
+
+
+def test_the_workers_endpoint_is_listed_and_says_when_it_cannot_answer(serving):
+    """A server started without an evidence directory can still serve stacks;
+    it just has nothing to enumerate, and says which of the two it is."""
+    port = free_port()
+    service = serving(port)
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(port, "/workers")
+    assert status == 503
+    assert "evidence directory" in body["error"]
+
+    status, body = get(port, "/nothing")
+    assert "/workers" in body["endpoints"]
 def test_a_pyspy_failure_reports_its_message_and_not_its_backtrace():
     """py-spy writes a message, then a "Caused by" section carrying the errno,
     then a Rust backtrace of its own frames. Taking the last line - the obvious

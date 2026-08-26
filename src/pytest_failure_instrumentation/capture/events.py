@@ -88,3 +88,41 @@ def worker_pid(events: list[dict[str, Any]]) -> int | None:
         if event.get("event") == "worker_start" and event.get("pid"):
             return int(event["pid"])
     return None
+
+
+#: How much of an event log to read when only the recent past matters. Beats
+#: accumulate with wall-clock rather than with the suite - roughly twelve lines
+#: per worker per minute - so a long run's log is large while the part worth
+#: reading stays the same size. 64 KiB is many minutes of beats.
+TAIL_BYTES = 64 * 1024
+
+
+def tail_events(path: Path, limit: int = TAIL_BYTES) -> list[dict[str, Any]]:
+    """The most recent events, at constant cost however long the run has been.
+
+    ``read_events`` parses the whole file, which is right for a report written
+    once and wrong for anything polled: a UI asking every second would pay for
+    the entire history each time, and pay more as the run goes on.
+
+    Seeking into the middle of a file lands mid-line, so the first line is
+    dropped rather than parsed - the same tolerance ``read_events`` has for a
+    truncated last line, at the other end.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            raw = handle.read()
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if size > limit and lines:
+        lines = lines[1:]  # the seek landed inside it
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events

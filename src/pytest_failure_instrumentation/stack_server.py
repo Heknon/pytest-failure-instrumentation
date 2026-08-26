@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-from .probes import pyspy, stacks
+from .probes import process, pyspy, stacks
 from .probes.platform_flags import IS_WINDOWS
 
 #: What ``/identity`` answers with. The whole singleton scheme rests on this
@@ -149,11 +149,17 @@ class _Server(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], handler: Any) -> None:
+    def __init__(
+        self, address: tuple[str, int], handler: Any, evidence_root: Optional[Path] = None
+    ) -> None:
         # Set before the base class opens the socket, which reads it off the
         # instance. A class attribute cannot answer this: the family depends
         # on what this particular server was asked to bind.
         self.address_family = address_family(address[0])
+        #: The base directory every run writes under - the parent of this
+        #: session's own, since /workers describes the machine rather than
+        #: whichever run happens to be hosting.
+        self.evidence_root = evidence_root
         super().__init__(address, handler)
     def server_bind(self) -> None:
         """Bind without asking DNS who we are.
@@ -204,6 +210,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(200, identity())
         elif route.path == "/stack":
             self._stack(parse_qs(route.query))
+        elif route.path == "/workers":
+            self._workers()
         else:
             self._reply(404, {"error": "no such endpoint", "endpoints": ENDPOINTS})
 
@@ -232,6 +240,27 @@ class _Handler(BaseHTTPRequestHandler):
             },
         )
 
+    def _workers(self) -> None:
+        """Every run on this machine, and what each worker is doing.
+
+        One request rather than one per worker, and no ptrace: this is
+        assembled from files the run was writing anyway. A UI polls this to
+        know *where* to look, and ``/stack`` to look.
+        """
+        from . import topology
+
+        base = getattr(self.server, "evidence_root", None)
+        if base is None:
+            self._reply(
+                503,
+                {
+                    "error": "this server was not given an evidence directory, so "
+                    "it cannot say what is running; only /stack is available"
+                },
+            )
+            return
+        self._reply(200, topology.snapshot(base, served_by=identity()))
+
     def _reply(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
         try:
@@ -250,6 +279,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 ENDPOINTS = {
     "/identity": "who is serving this port",
+    "/workers": "every run on this machine, and what each worker is doing",
     "/stack?pid=N": "the current stack of every thread in process N",
 }
 
@@ -414,7 +444,11 @@ class StackService:
         is sitting on it.
         """
         try:
-            httpd = _Server((self.host, self.port), _Handler)
+            httpd = _Server(
+                (self.host, self.port),
+                _Handler,
+                self.directory.parent if self.directory is not None else None,
+            )
         except OSError as failure:
             if self.drawn:
                 # Nobody is holding "any free port". This is a bad interface, a
@@ -550,24 +584,12 @@ def sweep_dead_servers(directory: Optional[Path]) -> None:
         return
     for path in candidates:
         pid = path.stem[len(DISCOVERY_PREFIX):]
-        if not pid.isdigit() or _is_running(int(pid)):
+        if not pid.isdigit() or process.is_running(int(pid)):
             continue
         try:
             path.unlink()
         except OSError:
             pass
-
-
-def _is_running(pid: int) -> bool:
-    """Whether a pid exists. Errs towards "yes", so an unreadable answer
-    leaves the file alone rather than deleting a live session's address."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except (OSError, ValueError):
-        return True  # EPERM means it exists and is not ours to signal
-    return True
 
 
 def start(

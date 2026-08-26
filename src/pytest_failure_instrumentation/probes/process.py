@@ -10,9 +10,82 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import Any, Optional
 
 from .platform_flags import IS_WINDOWS, optional_psutil
+
+
+def is_running(pid: int) -> bool:
+    """Whether a process still exists. Never signals it.
+
+    Signal 0 asks the kernel the question without delivering anything, which
+    matters here: every other way of finding out - a stack probe, an attach -
+    can perturb the process being asked about, and the whole point of this
+    check is to describe a worker without touching it.
+
+    Errs towards "yes". EPERM means the process exists and is not ours to
+    signal, and an unreadable answer must not be turned into "it died": the
+    callers delete evidence and report workers as gone on the strength of this.
+
+    A pid can be reused, so this answers "something with this pid exists"
+    rather than "that worker is alive". It is the weakest of the three
+    liveness signals for exactly that reason - the heartbeat is the one that
+    says whether a worker is *progressing*.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return not _is_zombie(pid)
+
+
+def _is_zombie(pid: int) -> bool:
+    """Whether a process has died but not yet been reaped by its parent.
+
+    Signal 0 alone gets this wrong, and gets it wrong in the one case that
+    matters most here. A killed worker stays in the process table until the
+    controller waits on it, and until then the kernel happily accepts a signal
+    for it - so a worker that was killed a moment ago reads as alive, which is
+    the opposite of what a crash view is for. Measured: a worker sent SIGKILL
+    mid-test reported as running rather than gone.
+
+    Linux answers from procfs, which this package already reads for memory.
+    psutil answers anywhere it happens to be installed. Where neither can, the
+    answer is "not a zombie" and the heartbeat carries the finding instead -
+    its beats stop either way, which is the slower signal but never the wrong
+    one.
+    """
+    state = _procfs_state(pid)
+    if state is not None:
+        return state == b"Z"
+    psutil = optional_psutil()
+    if psutil is None:
+        return False
+    try:
+        return bool(psutil.Process(pid).status() == psutil.STATUS_ZOMBIE)
+    except Exception:  # noqa: BLE001 - never let a liveness check raise
+        return False
+
+
+def _procfs_state(pid: int) -> Optional[bytes]:
+    """The one-letter state from ``/proc/<pid>/stat``, or None off Linux.
+
+    Split from the right: the second field is the executable name in
+    parentheses and may itself contain spaces and parentheses, so anything
+    counting fields from the left reads the wrong one for a process whose
+    name is unhelpful.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    try:
+        return raw.rsplit(b")", 1)[1].split()[0]
+    except IndexError:
+        return None
 
 
 def unsigned_on_windows(status: int) -> int:

@@ -74,7 +74,7 @@ def prune_finished_runs(root: Path) -> None:
         return
     for path in candidates:
         owner = _owner_of(path)
-        if owner is None or _is_running(owner):
+        if owner is None or probes.is_running(owner):
             continue
         shutil.rmtree(path, ignore_errors=True)
 
@@ -87,18 +87,6 @@ def _owner_of(directory: Path) -> Optional[int]:
         return None
     pid = record.get("pid") if isinstance(record, dict) else None
     return int(pid) if isinstance(pid, int) else None
-
-
-def _is_running(pid: int) -> bool:
-    """Errs towards "yes": an unreadable answer leaves the directory alone
-    rather than deleting a live run's evidence."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except (OSError, ValueError):
-        return True  # EPERM means it exists and is not ours to signal
-    return True
 
 
 class IncidentEngine:
