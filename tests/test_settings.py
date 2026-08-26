@@ -221,3 +221,18 @@ def test_loopback_by_any_of_its_names_is_not_an_exposure():
         warnings.simplefilter("error", FailureInstrumentationWarning)
         for name in ("127.0.0.1", "::1", "localhost"):
             resolve(FakeConfig({"callstack_host": name}))
+
+
+def test_the_sampler_cadence_has_a_floor_like_its_sibling():
+    """Each pass walks the run directory, reads every state file, tails every
+    event log and may spawn a py-spy per stuck worker. Below a second that is
+    a busy loop wearing a setting's clothes - and heartbeat_interval, which
+    does far less per tick, has been clamped since it was written."""
+    assert settings_module.Settings(sample_seconds=0.01).sample_seconds == (
+        settings_module.MIN_SAMPLE_SECONDS
+    )
+    # Off stays off: 0 is "do not sample", not "sample as fast as allowed".
+    assert settings_module.Settings(sample_seconds=0).sample_seconds == 0.0
+    assert settings_module.Settings(sample_seconds=-5).sample_seconds == 0.0
+    # And a sane value is left alone.
+    assert settings_module.Settings(sample_seconds=30).sample_seconds == 30.0

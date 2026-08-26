@@ -52,6 +52,11 @@ LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 #: answers to "how often does a worker beat" make a healthy worker look frozen.
 MIN_HEARTBEAT_INTERVAL = 1.0
 
+#: The sampler walks a directory, reads every state file and tails every
+#: event log on each pass, and may spawn a py-spy per stuck worker. A
+#: cadence below this is a busy loop wearing a setting's clothes.
+MIN_SAMPLE_SECONDS = 1.0
+
 
 class FailureInstrumentationWarning(UserWarning):
     """Raised for a setting this plugin could not use, and for setup it had to
@@ -130,6 +135,11 @@ class Settings:
             self,
             "heartbeat_interval",
             max(MIN_HEARTBEAT_INTERVAL, float(self.heartbeat_interval)),
+        )
+        object.__setattr__(
+            self,
+            "sample_seconds",
+            0.0 if self.sample_seconds <= 0 else max(MIN_SAMPLE_SECONDS, float(self.sample_seconds)),
         )
         object.__setattr__(self, "stack_server_host", str(self.stack_server_host))
         object.__setattr__(self, "stack_server_port", int(self.stack_server_port))

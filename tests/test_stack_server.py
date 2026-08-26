@@ -35,6 +35,27 @@ needs_pyspy = pytest.mark.skipif(
 )
 
 
+#: A process parked in a known frame, readable by its parent's descendants.
+VICTIM_THAT_PERMITS_TRACING = """
+import ctypes, sys, time
+
+if sys.platform == "linux":
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            0x59616D61, ctypes.c_ulong(__import__("os").getppid()), 0, 0, 0
+        )
+    except Exception:
+        pass
+
+
+def inner():
+    time.sleep(60)
+
+
+inner()
+"""
+
+
 def free_port() -> int:
     with socket.socket() as probe:
         probe.bind((stack_server.LOOPBACK, 0))
@@ -195,9 +216,12 @@ def test_another_process_is_read_from_outside_it(serving):
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
-    victim = subprocess.Popen(
-        [sys.executable, "-c", "import time\ndef inner():\n time.sleep(60)\ninner()"]
-    )
+    # The victim nominates its parent as a permitted tracer, which is what a
+    # real worker now does at startup - see probes.tracing. Without it this
+    # test is refused wherever Yama enforces ptrace_scope=1, because py-spy is
+    # spawned by *this* process and is therefore the victim's sibling rather
+    # than its ancestor. That is the configuration most Linux boxes ship.
+    victim = subprocess.Popen([sys.executable, "-c", VICTIM_THAT_PERMITS_TRACING])
     try:
         # Waiting for the frame itself, not merely for an answer: an
         # interpreter that has not finished starting reads back a perfectly

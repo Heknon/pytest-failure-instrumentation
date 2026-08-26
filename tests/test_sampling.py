@@ -13,6 +13,9 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
+from pytest_failure_instrumentation.probes import pyspy
 from pytest_failure_instrumentation.sampling import (
     MAX_STACKS_PER_SAMPLE,
     WorkerSampler,
@@ -20,6 +23,10 @@ from pytest_failure_instrumentation.sampling import (
 )
 
 from .conftest import needs_xdist
+
+needs_pyspy = pytest.mark.skipif(
+    not pyspy.available(), reason="py-spy is not installed in this environment"
+)
 
 FRAMES_A = [{"name": "t", "frames": [{"function": "wait", "file": "a.py", "line": 3}]}]
 FRAMES_B = [{"name": "t", "frames": [{"function": "poll", "file": "b.py", "line": 9}]}]
@@ -302,3 +309,85 @@ def test_sampling_is_off_unless_it_is_asked_for(pytester):
     result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
     result.assert_outcomes(passed=1)
     assert not (pytester.path / "samples.jsonl").exists()
+
+
+@needs_xdist
+@needs_pyspy
+def test_a_real_run_samples_real_frames_from_a_blocked_worker(pytester):
+    """The seam every test above stubs: the sampler calling the real reader.
+
+    The dedupe is well covered with a stand-in, and a stand-in cannot fail the
+    way the real thing does - no py-spy, a refused ptrace, a worker that moved
+    on between the status read and the dump. Without this, the expensive half
+    of the feature is verified only in the abstract.
+    """
+    pytester.makeconftest(
+        """
+        import json
+
+
+        def pytest_failure_worker_sample(sample):
+            with open("samples.jsonl", "a") as handle:
+                handle.write(sample.model_dump_json() + "\\n")
+        """
+    )
+    pytester.makepyfile(
+        """
+        import threading
+
+        never_set = threading.Event()
+
+        def test_blocks():
+            never_set.wait(12)
+        """
+    )
+    result = pytester.runpytest_subprocess(
+        "-p", "failure_instrumentation", "-n", "1",
+        "-o", "failure_sample_seconds=1",
+        "-o", "failure_heartbeat_interval=1",
+        "-o", "failure_sample_stacks=true",
+    )
+    result.assert_outcomes(passed=1)
+
+    samples = [
+        json.loads(line)
+        for line in (pytester.path / "samples.jsonl").read_text().strip().splitlines()
+    ]
+    workers = [w for s in samples for w in s["workers"]]
+    assert workers, "the sampler pushed nothing"
+
+    # A worker parked in Event.wait burns no CPU, so the truth table calls it
+    # blocked - which is the status that earns a stack.
+    with_frames = [w for w in workers if w.get("stack")]
+    assert with_frames, (
+        "no sample carried frames; statuses seen: "
+        f"{sorted({w['status'] for w in workers})}, "
+        f"errors: {sorted({w['stack_error'] for w in workers if w.get('stack_error')})}"
+    )
+
+    frames = [f for w in with_frames for t in w["stack"] for f in t["frames"]]
+    assert any(f.get("function") == "test_blocks" for f in frames), (
+        "the frames came back but not the test's own"
+    )
+    # And the dedupe held against the real reader: a worker parked in one place
+    # sends its stack once and counts the rest.
+    repeats = [w for w in workers if w.get("stack_digest") and not w.get("stack")]
+    assert repeats, "every sample re-sent the stack of a worker that never moved"
+
+
+def test_sampling_a_run_with_no_workers_says_so_rather_than_pushing_nothing(pytester):
+    """The recorder is installed on workers only, so a single-process run
+    writes no state at all and the sampler would poll an empty directory for
+    the life of the run. From the outside that is indistinguishable from a
+    product whose hook is simply never called - which is the misreading this
+    package exists to prevent, arriving in its own newest feature."""
+    pytester.makepyfile("def test_one():\n    assert True\n")
+    result = pytester.runpytest_subprocess(
+        "-p", "failure_instrumentation", "-o", "failure_sample_seconds=1"
+    )
+    result.assert_outcomes(passed=1)
+    # Raised at session start, which is outside the window pytest folds into
+    # its warnings summary, so it lands on stderr - where a person running the
+    # suite still sees it.
+    combined = result.stdout.str() + result.stderr.str()
+    assert "not distributed" in combined and "no workers to sample" in combined

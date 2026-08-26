@@ -36,6 +36,7 @@ import shutil
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,7 +47,7 @@ from ..analysis import fingerprint as fingerprint_of
 from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
-from ..config import Settings
+from ..config import FailureInstrumentationWarning, Settings
 from . import collection, death, internal_error, stall, summary
 from .base import Capabilities, Incident, frame_from
 
@@ -393,7 +394,20 @@ class IncidentEngine:
                 self.session_id,
             )
 
-        if self.settings.sample_seconds > 0:
+        if self.settings.sample_seconds > 0 and not self.distributed:
+            # Nothing writes a state file in a single-process run: the recorder
+            # is installed on workers only, and there are none. The sampler
+            # would poll an empty directory for the life of the run and push
+            # nothing, which from the outside is indistinguishable from a
+            # product whose hook is never called. Say so instead.
+            warnings.warn(
+                "failure_sample_seconds is set but this run is not distributed, "
+                "so there are no workers to sample and no samples will be "
+                "pushed; run under xdist (-n) or unset it",
+                FailureInstrumentationWarning,
+                stacklevel=2,
+            )
+        elif self.settings.sample_seconds > 0:
             self.sampler = threading.Thread(
                 target=self._sample_workers,
                 name="failure-instrumentation-sample",
