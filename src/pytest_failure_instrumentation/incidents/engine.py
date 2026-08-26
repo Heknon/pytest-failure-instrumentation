@@ -243,7 +243,11 @@ class IncidentEngine:
         blame = self.attributor.blame(lines, reverse=reverse)
         incident.top_frame = frame_from(blame["top_frame"])
         incident.blamed_frame = frame_from(blame["blamed_frame"])
-        incident.owner = blame["owner"]
+        incident.owner = blame["owner"] or "unknown"
+        if incident.owner == "unknown":
+            # A kind that fails before anybody's code runs knows its own owner;
+            # attribution had no frames to find it from.
+            incident.owner = incident.owner_when_unattributable() or "unknown"
 
         nodeid = incident.suspect_nodeid()
         if incident.owner == "unknown" and nodeid:
@@ -383,6 +387,7 @@ class IncidentEngine:
                 # beside the worker state a UI reads to know which pid is
                 # running which test.
                 self.directory,
+                self._stack_server_gave_up,
             )
 
         # Only distributed runs can strand a worker. A single process that
@@ -394,6 +399,28 @@ class IncidentEngine:
                 daemon=True,
             )
             self.watcher.start()
+
+    def _stack_server_gave_up(self, verdict: str, detail: str) -> None:
+        """Somebody switched the live view on and it is not there.
+
+        Without this the run continues perfectly well and their UI shows
+        nothing forever, with no error anywhere - because from the outside "no
+        server" and "no tests running" look identical. Called from the
+        server's own thread, which raise_incident is already safe for.
+        """
+        from . import stack_server as stack_server_incident
+
+        try:
+            self.raise_incident(
+                stack_server_incident.build(
+                    verdict,
+                    self.settings.stack_server_host,
+                    self.settings.stack_server_port,
+                    detail,
+                )
+            )
+        except Exception as failure:  # noqa: BLE001 - never break a run
+            print(f"[failure-instrumentation] could not report: {failure!r}", flush=True)
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_configure_node(self, node: Any) -> None:

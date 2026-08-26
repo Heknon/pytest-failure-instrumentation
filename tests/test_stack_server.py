@@ -871,6 +871,140 @@ def test_a_refusal_keeps_the_errno_that_says_which_refusal_it_is():
 
 
 # -- saying so when there is no live view ---------------------------------
+
+
+def test_a_stranger_on_the_port_is_reported_once(serving):
+    """Somebody switched the live view on. Without an incident the run
+    continues perfectly well and their UI shows nothing forever, with no error
+    anywhere - from the outside "no server" and "no tests running" are
+    identical."""
+    port = free_port()
+    stranger = socket.socket()
+    stranger.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    stranger.bind((stack_server.LOOPBACK, port))
+    stranger.listen(1)
+    reported = []
+    try:
+        service = serving(
+            port, reclaim_seconds=0.1, on_giving_up=lambda *args: reported.append(args)
+        )
+        assert wait_for(lambda: reported), service.status
+        verdict, detail = reported[0]
+        assert verdict == "PORT_TAKEN"
+        assert "--callstack-port" in detail
+
+        # Re-probed every interval for the life of the run; reported once.
+        time.sleep(0.5)
+        assert len(reported) == 1
+    finally:
+        stranger.close()
+
+
+def test_an_address_that_cannot_be_bound_is_reported(serving):
+    """Naming another port does not help here, so it is a separate verdict
+    rather than one message with a different string in it."""
+    reported = []
+    service = serving(
+        0, host="203.0.113.1", reclaim_seconds=0.1,
+        on_giving_up=lambda *args: reported.append(args),
+    )
+    assert wait_for(lambda: reported), service.status
+    assert reported[0][0] == "BIND_REFUSED"
+
+
+def test_our_own_session_holding_the_port_is_not_an_incident(serving):
+    """The named mode working as designed. Reporting it would turn the
+    ordinary case into an alert and teach a reader to filter the kind out."""
+    port = free_port()
+    holder = serving(port)
+    assert wait_for(lambda: holder.serving), holder.status
+
+    reported = []
+    waiting = serving(
+        port, reclaim_seconds=0.1, on_giving_up=lambda *args: reported.append(args)
+    )
+    assert wait_for(lambda: "another session is serving" in waiting.status)
+    time.sleep(0.5)
+    assert reported == []
+
+
+def test_the_incident_is_owned_by_the_runtime_and_stays_quiet():
+    """No test is at fault and the run is unaffected. Left to attribution this
+    would be "unknown", which means "we could not tell" and is scored
+    needs-triage - and here it was known before the incident was built."""
+    from pytest_failure_instrumentation.analysis import severity
+    from pytest_failure_instrumentation.incidents import stack_server as kind
+
+    incident = kind.build("PORT_TAKEN", "127.0.0.1", 8080, "something else is there")
+    assert incident.owner_when_unattributable() == "runtime"
+    assert severity.of(incident.kind, "runtime", incident.verdict, "high", False)[0] == (
+        "informational"
+    )
+    assert "8080" in str(incident)
+    assert "the run itself is unaffected" in str(incident)
+    # The detail is printed once. The alert text is the product, and a fact
+    # printed twice reads as two findings.
+    assert str(incident).count("something else is there") == 1
+    # And no "blamed on" or suspect line: nothing of anybody's ran.
+    assert "blamed on" not in str(incident)
+    assert "suspect" not in str(incident)
+
+
+def test_the_same_address_failing_the_same_way_is_one_incident():
+    from pytest_failure_instrumentation.incidents import stack_server as kind
+
+    first = kind.build("PORT_TAKEN", "127.0.0.1", 8080, "a")
+    again = kind.build("PORT_TAKEN", "127.0.0.1", 8080, "b")
+    elsewhere = kind.build("PORT_TAKEN", "127.0.0.1", 9090, "a")
+
+    assert first.fingerprint_parts() == again.fingerprint_parts()
+    assert first.fingerprint_parts() != elsewhere.fingerprint_parts()
+
+
+def test_the_kind_round_trips_through_the_registry():
+    """A stored row parses back into its own model, like every other kind."""
+    from pytest_failure_instrumentation.incidents import registry
+    from pytest_failure_instrumentation.incidents import stack_server as kind
+
+    incident = kind.build("BIND_REFUSED", "203.0.113.1", 0, "no such interface")
+    parsed = registry.parse(json.loads(incident.model_dump_json()))
+    assert parsed.kind == "stack_server_unavailable"
+    assert parsed.verdict == "BIND_REFUSED"
+    assert parsed.drawn is True
+    assert "stack_server_unavailable" in json.dumps(registry.json_schema())
+
+
+def test_a_real_run_reports_that_it_has_no_live_view(runner):
+    """End to end, through the hook a product actually implements.
+
+    The port is held for the whole inner run by this process, which is the
+    situation a developer hits when 8080 is already something else's.
+    """
+    port = free_port()
+    stranger = socket.socket()
+    stranger.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    stranger.bind((stack_server.LOOPBACK, port))
+    stranger.listen(1)
+    try:
+        runner.pytester.makepyfile(test_suite="def test_one():\n    assert True\n")
+        incidents = runner.run(
+            "-o", "failure_stack_server=true",
+            "-o", f"failure_stack_server_port={port}",
+            "test_suite.py",
+            timeout=180,
+        )
+    finally:
+        stranger.close()
+
+    reported = runner.only(incidents, "stack_server_unavailable")
+    assert reported.verdict == "PORT_TAKEN"
+    assert reported.requested_port == port
+    assert reported.owner == "runtime"
+    assert reported.severity == "informational"
+    assert reported.drawn is False
+    assert "--callstack-port" in reported.detail
+    # The run itself was fine, which the summary alongside it confirms.
+    assert runner.only(incidents, "run_summary").exitstatus == 0
 @pytest.mark.parametrize(
     ("linux", "macos", "expected"),
     [(True, False, "linux"), (False, True, "darwin"), (False, False, "win32")],

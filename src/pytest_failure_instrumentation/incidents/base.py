@@ -112,6 +112,21 @@ class Incident(BaseModel):
         """Whether *this* incident ended the session. Constant for most kinds."""
         return type(self).ends_run
 
+    def owner_when_unattributable(self) -> Optional[str]:
+        """Who owns this when there is no stack to work it out from.
+
+        Attribution reads frames, and a kind with no frames gets "unknown" -
+        which means "we could not tell" and is scored ``needs-triage``. For a
+        kind that fails without ever running anybody's code, that is not
+        uncertainty being reported honestly, it is a certainty being thrown
+        away: nobody's test is at fault and the answer was known before the
+        incident was built.
+
+        Only consulted when attribution came back unknown, so a kind that does
+        have a stack is never overridden by a guess made in its absence.
+        """
+        return None
+
     def raw_stack(self) -> list[str]:
         """Everything captured, as text, whatever kind this is.
 

@@ -471,6 +471,7 @@ class StackService:
         host: str = LOOPBACK,
         directory: Optional[Path] = None,
         reclaim_seconds: float = RECLAIM_SECONDS,
+        on_giving_up: Optional[Any] = None,
     ) -> None:
         #: What was asked for. 0 means "draw one", and is not what got bound.
         self.port = port
@@ -480,6 +481,12 @@ class StackService:
         #: which pid is running which test.
         self.directory = directory
         self.reclaim_seconds = reclaim_seconds
+        #: Called ``(verdict, detail)`` the first time this session concludes
+        #: it cannot serve. Once, not per retry: a named port held by a
+        #: stranger is re-probed for the life of the run, and an alert per
+        #: probe would teach a reader to filter the whole kind out.
+        self.on_giving_up = on_giving_up
+        self._reported = False
         #: What is actually bound, which is the only number worth publishing.
         self.bound_port: Optional[int] = None
         #: Minted per process. A token that leaks expires with the run that
@@ -556,6 +563,7 @@ class StackService:
                 # sandbox that forbids listening, or a machine with nothing
                 # free - none of which a later attempt would find changed.
                 self.status = f"could not bind {self.host}: {failure.strerror or failure}"
+                self._give_up("BIND_REFUSED")
                 return True
             self._note_who_has_it(failure)
             return False
@@ -673,6 +681,22 @@ class StackService:
             f"({failure.strerror or failure}); pass --callstack-port with an "
             "unused port, or leave it off entirely and let one be drawn"
         )
+        self._give_up("PORT_TAKEN")
+
+    def _give_up(self, verdict: str) -> None:
+        """Say so once, to whoever asked to be told.
+
+        Not raised when another of *our* sessions holds the port: that is the
+        named mode working as designed, and reporting it would turn the
+        ordinary case into an alert.
+        """
+        if self._reported or self.on_giving_up is None:
+            return
+        self._reported = True
+        try:
+            self.on_giving_up(verdict, self.status)
+        except Exception:  # noqa: BLE001 - reporting must never break a run
+            pass
 
 
 def sweep_dead_servers(directory: Optional[Path]) -> None:
@@ -703,7 +727,10 @@ def sweep_dead_servers(directory: Optional[Path]) -> None:
 
 
 def start(
-    port: int = 0, host: str = LOOPBACK, directory: Optional[Path] = None
+    port: int = 0,
+    host: str = LOOPBACK,
+    directory: Optional[Path] = None,
+    on_giving_up: Optional[Any] = None,
 ) -> Optional[StackService]:
     """Begin serving, or begin waiting to. None if it could not even start.
 
@@ -712,7 +739,7 @@ def start(
     the thing that came to make it better.
     """
     try:
-        service = StackService(port, host, directory)
+        service = StackService(port, host, directory, on_giving_up=on_giving_up)
         service.start()
         return service
     except Exception:  # noqa: BLE001 - see the docstring

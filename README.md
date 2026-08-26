@@ -723,6 +723,38 @@ the stall you were measuring.
 `nodeid` and `phase` are `null` between tests, and a very long `nodeid` is
 trimmed from both ends with `nodeid_elided: true` saying so.
 
+### When there is no live view
+
+Switching the server on and getting no server raises a
+`stack_server_unavailable` incident through the same hook as everything else.
+Without it the run continues perfectly well and your UI shows nothing forever
+with no error anywhere — because from the outside "no server" and "no tests
+running" look identical, which is the exact misreading this package exists to
+prevent:
+
+```
+[stack_server_unavailable] PORT_TAKEN  severity=informational  owner=runtime
+    no live stacks this run: 127.0.0.1 could not serve on port 8080
+    port 8080 is held by something that is not a stack server (Address already in use);
+    pass --callstack-port with an unused port, or leave it off entirely and let one be drawn
+    · the run itself is unaffected; what is missing is the live view
+```
+
+Two verdicts, because they have different remedies. `PORT_TAKEN` is a stranger
+on the port — name another one. `BIND_REFUSED` is an address that is not an
+interface on this machine, or a sandbox that forbids listening — naming another
+port does not help.
+
+Neither is raised when **another of your own sessions** holds the port: that is
+the shared mode working as designed, and alerting on the ordinary case is how a
+kind gets filtered out entirely. It is reported once per address per run, not
+once per retry, though a named port held by a stranger is re-probed for the
+life of the run.
+
+`owner=runtime`, `severity=informational`: no test is at fault and nothing is
+broken. What is lost is a diagnostic, and somebody has to decide whether to
+reconfigure it.
+
 ### Who may ask
 
 Every endpoint but `/identity` requires a token, minted per server and written
