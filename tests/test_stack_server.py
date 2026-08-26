@@ -23,7 +23,11 @@ import pytest
 
 from pytest_failure_instrumentation import stack_server
 from pytest_failure_instrumentation.probes import pyspy, stacks
-from pytest_failure_instrumentation.probes.platform_flags import IS_WINDOWS
+from pytest_failure_instrumentation.probes.platform_flags import (
+    IS_LINUX,
+    IS_MACOS,
+    IS_WINDOWS,
+)
 
 from .conftest import needs_process_liveness
 
@@ -844,7 +848,13 @@ def test_a_pyspy_failure_reports_its_message_and_not_its_backtrace():
 
 def test_a_refusal_keeps_the_errno_that_says_which_refusal_it_is():
     """"Permission denied" and the errno under it are different facts, and the
-    hint below is chosen from the pair."""
+    hint is chosen from the pair.
+
+    The hint asserted is *this platform's*. An earlier version of this test
+    asserted the Linux one everywhere and went red on macOS, where the right
+    answer is SIP and root rather than ptrace_scope - the code had picked
+    correctly and the test had not.
+    """
     explained = pyspy._explained(
         b"Error: Failed to open process\n\nCaused by:\n"
         b"    0: Operation not permitted (os error 1)\n"
@@ -852,7 +862,15 @@ def test_a_refusal_keeps_the_errno_that_says_which_refusal_it_is():
         4242,
     )
     assert "Operation not permitted" in explained
-    assert "ptrace" in explained or "permission" in explained.lower()
+
+    expected = "linux" if IS_LINUX else ("darwin" if IS_MACOS else "win32")
+    assert pyspy.PERMISSION_HINTS[expected] in explained
+    # And nobody else's hint, so a platform lookup that silently fell through
+    # to a default would still fail here.
+    for platform_key, hint in pyspy.PERMISSION_HINTS.items():
+        if platform_key != expected:
+            assert hint not in explained
+
     assert "main" not in explained
 
 
@@ -991,3 +1009,36 @@ def test_a_real_run_reports_that_it_has_no_live_view(runner):
     assert "--callstack-port" in reported.detail
     # The run itself was fine, which the summary alongside it confirms.
     assert runner.only(incidents, "run_summary").exitstatus == 0
+
+
+@pytest.mark.parametrize(
+    ("linux", "macos", "expected"),
+    [(True, False, "linux"), (False, True, "darwin"), (False, False, "win32")],
+)
+def test_every_platform_gets_its_own_refusal_hint(monkeypatch, linux, macos, expected):
+    """The remedy for a refused read is different on each platform, and only
+    one of the three can be checked by running here.
+
+    The previous test asserts the hint for whichever platform it runs on, which
+    means two of the three branches are only ever exercised by CI - and that is
+    how a test asserting the Linux hint everywhere reached macOS and failed
+    there while the code was right. This one drives all three anywhere.
+    """
+    monkeypatch.setattr(pyspy, "IS_LINUX", linux)
+    monkeypatch.setattr(pyspy, "IS_MACOS", macos)
+
+    explained = pyspy._explained(
+        b"Error: Failed to open process\n\nCaused by:\n"
+        b"    0: Operation not permitted (os error 1)\n",
+        4242,
+    )
+    assert pyspy.PERMISSION_HINTS[expected] in explained
+    assert "Operation not permitted" in explained
+
+
+def test_the_hints_say_something_different_on_each_platform():
+    """Three identical hints would pass the selection test above and help
+    nobody: the whole point is that the remedy differs."""
+    assert len(set(pyspy.PERMISSION_HINTS.values())) == len(pyspy.PERMISSION_HINTS)
+    assert "ptrace_scope" in pyspy.PERMISSION_HINTS["linux"]
+    assert "root" in pyspy.PERMISSION_HINTS["darwin"]
