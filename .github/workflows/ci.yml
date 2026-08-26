@@ -91,6 +91,18 @@ jobs:
         if: runner.os != 'macOS'
         run: pip install -e ".[stacks]"
 
+      # The restrictive setting, on purpose. Ubuntu and Debian ship
+      # ptrace_scope=1, which is what makes a worker unreadable by a reader
+      # that is its sibling rather than its ancestor - so a runner left at 0
+      # would pass the live-view tests without ever exercising the exception
+      # that makes them work on a real user's machine. Set here rather than
+      # assumed, and the tests report the value they observed either way.
+      - name: Restrict ptrace the way a stock Linux box does
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=1
+          cat /proc/sys/kernel/yama/ptrace_scope
+
       - name: Show what this machine can measure
         run: |
           python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"

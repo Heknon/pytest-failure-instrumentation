@@ -11,7 +11,7 @@ import os
 import platform
 from typing import Any
 
-from . import memory, pyspy, stacks
+from . import memory, pyspy, stacks, tracing
 from .platform_flags import IS_WINDOWS
 
 
@@ -37,4 +37,7 @@ def capabilities() -> dict[str, Any]:
         # Kept because a consumer's table has the column, and a field that
         # disappears is a migration where a field that stops varying is not.
         "psutil": True,
+        # What this machine lets one process read of another. Decides whether
+        # the live view can answer for a worker at all - see probes.tracing.
+        "ptrace_scope": tracing.ptrace_scope(),
     }

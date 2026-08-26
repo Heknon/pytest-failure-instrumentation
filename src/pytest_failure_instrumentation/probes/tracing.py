@@ -30,12 +30,35 @@ the remedy attached.
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 from .platform_flags import IS_LINUX
 
 #: prctl's option number for Yama's tracer exception. The value spells "Yama"
 #: in ASCII, which is how it is written in the kernel's own headers.
 PR_SET_PTRACER = 0x59616D61
+
+#: Yama nominates any descendant of this pid as a permitted tracer.
+PTRACE_ANY = -1
+
+#: Where Yama publishes what it enforces. Absent on kernels built without it,
+#: which is the same as "no restriction" for our purposes.
+PTRACE_SCOPE = "/proc/sys/kernel/yama/ptrace_scope"
+
+
+def ptrace_scope() -> Optional[int]:
+    """What this machine enforces, or None where Yama is not present.
+
+    Worth reporting rather than inferring. 0 permits any read a uid could make
+    anyway; 1 - the Ubuntu and Debian default - is the setting that makes the
+    difference between a live view that works and one that is refused for every
+    worker; 2 and 3 are progressively stricter and no exception helps.
+    """
+    try:
+        with open(PTRACE_SCOPE, encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def permit_parent_to_trace() -> bool:
