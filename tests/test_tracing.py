@@ -13,6 +13,8 @@ which is what py-spy is.
 
 from __future__ import annotations
 
+import json
+import pathlib
 import subprocess
 import sys
 import textwrap
@@ -21,6 +23,8 @@ import time
 import pytest
 
 from pytest_failure_instrumentation.probes import pyspy, tracing
+
+SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 
 needs_pyspy = pytest.mark.skipif(
     not pyspy.available(), reason="py-spy is not installed in this environment"
@@ -32,13 +36,20 @@ needs_restriction = pytest.mark.skipif(
 )
 
 VICTIM = """
-import ctypes, os, sys, time
+import json, os, sys, time
 
-GRANT = {grant!r}
-if GRANT is not None:
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    libc.prctl(0x59616D61, ctypes.c_ulong(GRANT if GRANT != "parent" else os.getppid()),
-               0, 0, 0)
+sys.path.insert(0, {src!r})
+from pytest_failure_instrumentation.probes import tracing
+
+# The shipping function, not a copy of it: a test that reimplements the call
+# proves its own reimplementation works.
+granted = tracing.permit_tracing({policy!r})
+print(json.dumps({{
+    "granted": granted,
+    "scope": tracing.ptrace_scope(),
+    "pid": os.getpid(),
+    "ppid": os.getppid(),
+}}), flush=True)
 
 
 def parked():
@@ -49,16 +60,30 @@ parked()
 """
 
 
-def _read_a_sibling(grant):
-    """Spawn a victim, ask py-spy for its stack, return (threads, error).
+def _read_a_sibling(policy):
+    """Spawn a victim under ``policy``, ask py-spy for its stack.
 
-    py-spy is spawned by *this* process and so is the victim, which makes them
-    siblings - the same relationship a worker has to the reader in a real run.
+    Returns ``(threads, error, declared)`` where ``declared`` is what the
+    victim reported about its own declaration - which is the difference
+    between "the kernel ignored a good declaration" and "the declaration never
+    happened", and guessing between those costs a CI cycle each time.
     """
-    source = textwrap.dedent(VICTIM.format(grant=grant))
-    victim = subprocess.Popen([sys.executable, "-c", source])
+    source = textwrap.dedent(
+        VICTIM.format(src=str(SRC), policy=policy)
+    )
+    victim = subprocess.Popen(
+        [sys.executable, "-c", source], stdout=subprocess.PIPE, text=True
+    )
+    declared = {}
     try:
+        line = victim.stdout.readline() if victim.stdout else ""
+        try:
+            declared = json.loads(line)
+        except ValueError:
+            declared = {"unparsed": line.strip()}
+
         deadline = time.monotonic() + 20
+        last_error = None
         while time.monotonic() < deadline:
             threads, error = pyspy.dump(victim.pid, timeout=10.0)
             if threads and any(
@@ -66,11 +91,12 @@ def _read_a_sibling(grant):
                 for thread in threads
                 for frame in thread.get("frames", [])
             ):
-                return threads, None
+                return threads, None, declared
+            last_error = error
             if error and "permitted" in error.lower():
-                return None, error
+                return None, error, declared
             time.sleep(0.2)
-        return None, "the victim never parked where it could be read"
+        return None, last_error or "the victim never parked", declared
     finally:
         victim.kill()
         victim.wait(timeout=10)
@@ -87,8 +113,12 @@ def test_this_machines_ptrace_policy_is_reported_rather_than_assumed():
 @needs_restriction
 def test_a_worker_that_grants_the_exception_can_be_read(tmp_path):
     """The fix, under the policy it exists for."""
-    threads, error = _read_a_sibling("parent")
-    assert threads, f"a granting sibling could not be read: {error}"
+    threads, error, declared = _read_a_sibling("parent")
+    assert declared.get("granted") is True, (
+        f"the declaration itself failed, so nothing downstream is being "
+        f"tested: {declared}"
+    )
+    assert threads, f"a granting sibling could not be read: {error} | {declared}"
 
 
 @needs_pyspy
@@ -98,12 +128,13 @@ def test_a_worker_that_grants_nothing_is_refused(tmp_path):
     free. Without the exception this read *must* fail at ptrace_scope=1 - if it
     succeeds, the machine is not enforcing what the skip condition claims and
     the test above proves nothing."""
-    threads, error = _read_a_sibling(None)
+    threads, error, declared = _read_a_sibling("off")
     assert threads is None, (
         "a sibling with no exception was readable at ptrace_scope=1, so this "
         "machine is not restricting what it reports it restricts"
     )
     assert error and "permitted" in error.lower(), error
+    assert declared.get("granted") is False, declared
 
 
 @pytest.mark.parametrize("policy", tracing.POLICIES)
@@ -129,5 +160,8 @@ def test_the_any_policy_is_what_a_shared_reader_needs():
     controller has said nothing about this one. Only "any" covers a reader
     that is nobody's descendant, which is exactly the shared case.
     """
-    threads, error = _read_a_sibling(tracing.PTRACE_ANY)
-    assert threads, f"a worker granting ANY could not be read: {error}"
+    threads, error, declared = _read_a_sibling("any")
+    assert declared.get("granted") is True, (
+        f"the ANY declaration itself failed: {declared}"
+    )
+    assert threads, f"a worker granting ANY could not be read: {error} | {declared}"
