@@ -71,8 +71,9 @@ def assess(
     if not beats:
         return Assessment(
             state="SILENT",
-            reason="the worker never wrote a heartbeat; the watchdog is "
-            "disabled, so no passive evidence is available",
+            reason="the worker never wrote a heartbeat this run; the watchdog "
+            "is disabled, or nothing it wrote is still on disk, so no passive "
+            "evidence is available",
         )
 
     age = now - last_beat_time(beats)

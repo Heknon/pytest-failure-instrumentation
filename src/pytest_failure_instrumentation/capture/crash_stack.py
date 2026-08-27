@@ -46,6 +46,10 @@ def arm_fatal_handler(stream: TextIO) -> bool:
     faulthandler.enable(file=stream, all_threads=True)
     if not stacks.can_request_stack():
         return False
+    # chain=False deliberately. Chaining re-raises the signal with whatever was
+    # installed before, and what is installed before is almost always SIG_DFL -
+    # whose action for SIGUSR1 is to *terminate*. A probe whose whole purpose is
+    # to ask a wedged worker a question must not be the thing that kills it.
     faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=False)
     return True
 

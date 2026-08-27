@@ -83,6 +83,26 @@ def of_run(events: list[dict[str, Any]], run_id: str | None) -> list[dict[str, A
     return [event for event in events if event.get("run_id") == run_id]
 
 
+def this_run(events: list[dict[str, Any]], run_id: str | None) -> list[dict[str, Any]]:
+    """Events that could be this run's, which is not the same set as ``of_run``.
+
+    ``of_run`` drops an unplaceable event, and is right to: it is looking for
+    one specific event, and reporting an internal error that belonged to a
+    previous run is inventing a failure. This is looking for *all* the evidence
+    there is about a worker, and dropping the unplaceable there has the
+    opposite cost - a worker the controller never reached with a run id wrote a
+    run's worth of unstamped beats, and discarding them reports a healthy
+    worker as one that never beat at all.
+
+    So a record is refused only when it names a *different* run, which is the
+    case that matters: an earlier run's beats read as this one's make a live
+    worker look frozen, with high confidence and the wrong pid attached.
+    """
+    if not run_id:
+        return events
+    return [event for event in events if event.get("run_id") in (None, run_id)]
+
+
 def worker_pid(events: list[dict[str, Any]]) -> int | None:
     for event in events:
         if event.get("event") == "worker_start" and event.get("pid"):

@@ -169,7 +169,10 @@ def build(
     may be somebody else's.
     """
     path = directory / f"{worker}.events"
-    events = event_log.read_events(path)
+    # Only this run's. An earlier run's beats - left where the directory could
+    # not be cleared, which on Windows is any file somebody still had open -
+    # are old by definition, and old beats are exactly what FROZEN is read off.
+    events = event_log.this_run(event_log.read_events(path), run_id)
     beats = event_log.heartbeats(events)
     verdict = assessment.assess(beats, time.time(), silent_for, interval)
 
@@ -177,7 +180,9 @@ def build(
         previous = assessment.last_beat_time(beats)
         if _wait(cancel, interval * 1.2):
             return None  # the run is ending; nobody is left to tell
-        beats = event_log.heartbeats(event_log.read_events(path))
+        beats = event_log.heartbeats(
+            event_log.this_run(event_log.read_events(path), run_id)
+        )
         verdict = assessment.confirm(beats, previous, time.time(), silent_for)
 
     if verdict.state is None:

@@ -189,7 +189,9 @@ def build(
 ) -> WorkerDeathIncident:
     worker = node.gateway.id
     crash_file = directory / f"{worker}.crash"
-    events = event_log.read_events(directory / f"{worker}.events")
+    events = event_log.this_run(
+        event_log.read_events(directory / f"{worker}.events"), run_id
+    )
     # The run id keeps a record an earlier run left behind - one this run could
     # not delete, which on Windows is any file somebody still had open - from
     # being read as this worker's last moments.

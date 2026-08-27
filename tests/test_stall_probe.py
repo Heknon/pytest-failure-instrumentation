@@ -1,10 +1,18 @@
-"""What the stall builder does before it touches a live worker.
+"""What the incident builders check before they trust what they read.
 
-Two of these are about a signal that is never sent. ``SIGUSR1``'s default
-disposition is to *terminate*, and the pid it would be aimed at was read back
-out of a file the worker wrote - so a worker that has since exited and had its
-number handed on leaves this plugin one syscall away from killing a stranger's
-process rather than producing a bad report.
+Two things are being guarded here, and they are the same thing seen from two
+sides: a file is not a process, and a directory is not a run.
+
+``SIGUSR1``'s default disposition is to *terminate*, and the pid the stack
+probe would signal was read back out of a file the worker wrote - so a worker
+that has since exited and had its number handed on leaves this plugin one
+syscall away from killing a stranger's process rather than producing a bad
+report.
+
+And the evidence directory outlives a run. Clearing it is best-effort - on
+Windows a file another process still has open cannot be unlinked at all - so
+everything read out of it is stamped with the run that wrote it, and a record
+naming a different run is refused rather than attributed to this one.
 """
 
 from __future__ import annotations
@@ -25,13 +33,24 @@ needs_signals = pytest.mark.skipif(
 )
 
 
-def write_worker(directory, *, nodeid, pid=4242, beats=2, cpu=0.0, run_id=None):
-    """A worker that is alive, silent, and burning nothing."""
+# The interval these tests pass to build() is far wider than they need, so that
+# a runner slow enough to put seconds between writing the beats and reading them
+# cannot turn a worker that is merely quiet into one whose heartbeat has
+# stopped. What is measured here is what the builder does with the evidence, not
+# how it decides a beat is stale - that is analysis.stall's, and tested there.
+def write_worker(
+    directory, *, nodeid, pid=4242, beats=2, cpu=0.0, run_id=None, beat_age=0.0
+):
+    """A worker that is alive, silent, and burning nothing.
+
+    ``beat_age`` backdates the whole run of beats, for the cases about a
+    heartbeat that has stopped rather than one that is merely quiet.
+    """
     state = WorkerState(directory / "gw0.state", pid, run_id)
     state.update(nodeid=nodeid, phase="call" if nodeid else None)
     if nodeid is None:
         state.update(nodeid=None, phase=None)
-    now = time.time()
+    now = time.time() - beat_age
     with (directory / "gw0.events").open("w", encoding="utf-8") as handle:
         handle.write(
             json.dumps({"event": "worker_start", "pid": pid, "run_id": run_id}) + "\n"
@@ -90,7 +109,7 @@ def test_a_worker_with_no_test_in_flight_is_not_blamed_on_its_last_one(tmp_path)
     - but not at the confidence a wedged test earns."""
     write_worker(tmp_path, nodeid=None)
 
-    incident = stall.build("gw0", tmp_path, silent_for=30.0, interval=2.0, stack_probe=False)
+    incident = stall.build("gw0", tmp_path, silent_for=90.0, interval=30.0, stack_probe=False)
 
     assert incident is not None
     assert incident.state == "BLOCKED"
@@ -103,7 +122,7 @@ def test_a_worker_with_no_test_in_flight_is_not_blamed_on_its_last_one(tmp_path)
 def test_a_wedged_test_still_earns_the_confidence_it_did(tmp_path):
     write_worker(tmp_path, nodeid="t.py::test_wedges")
 
-    incident = stall.build("gw0", tmp_path, silent_for=30.0, interval=2.0, stack_probe=False)
+    incident = stall.build("gw0", tmp_path, silent_for=90.0, interval=30.0, stack_probe=False)
 
     assert incident is not None
     assert incident.test_in_flight == "t.py::test_wedges"
@@ -114,14 +133,16 @@ def test_an_earlier_run_s_record_is_not_read_as_this_worker(tmp_path):
     write_worker(tmp_path, nodeid="t.py::test_a", pid=4242, run_id="run-earlier")
 
     incident = stall.build(
-        "gw0", tmp_path, silent_for=30.0, interval=2.0, stack_probe=False,
+        "gw0", tmp_path, silent_for=90.0, interval=30.0, stack_probe=False,
         run_id="run-now",
     )
 
     assert incident is not None
     assert incident.test_in_flight is None
-    # The events log is stamped too, so the pid it offers is refused with it.
-    assert incident.worker_pid == 4242 or incident.worker_pid is None
+    # The events log carries the same stamp, so the pid it offers - the pid a
+    # stack probe would have signalled - is refused along with the beats.
+    assert incident.worker_pid is None
+    assert incident.state == "SILENT", "an earlier run's beats are not evidence"
 
 
 # -- ending the run --------------------------------------------------------
@@ -133,20 +154,52 @@ def test_an_assessment_gives_up_when_the_run_is_already_over(tmp_path):
     fires after the run summary has already said how many incidents there
     were - or during interpreter shutdown, where it is a traceback rather than
     a report."""
-    write_worker(tmp_path, nodeid="t.py::test_a", beats=1)
-    # One beat, stamped long enough ago that the first pass wants confirming.
-    stale = tmp_path / "gw0.events"
-    lines = stale.read_text(encoding="utf-8").splitlines()
-    record = json.loads(lines[-1])
-    record["time"] = time.time() - 60
-    stale.write_text("\n".join(lines[:-1] + [json.dumps(record)]) + "\n", encoding="utf-8")
+    write_worker(tmp_path, nodeid="t.py::test_a", beats=1, beat_age=3600.0)
 
     cancel = threading.Event()
     cancel.set()
     started = time.monotonic()
+    # An hour-old beat against a 30-second interval: the first pass can only
+    # ask for confirmation, and confirming is what costs an interval.
     incident = stall.build(
         "gw0", tmp_path, silent_for=60.0, interval=30.0, stack_probe=False, cancel=cancel
     )
 
     assert incident is None
     assert time.monotonic() - started < 5.0, "it waited out an interval nobody needs"
+
+
+# -- what a death is allowed to read ---------------------------------------
+
+
+class StubNode:
+    """Just enough of an xdist node for the builder: an id and no popen."""
+
+    class gateway:  # noqa: N801 - it is an attribute path, not a class name
+        id = "gw0"
+
+
+def test_a_death_does_not_read_an_earlier_run_s_evidence(tmp_path):
+    """The same stamp, on the other builder. An earlier run's record supplies a
+    test that was never running here and a pid that is nobody's now."""
+    from pytest_failure_instrumentation.incidents import death
+
+    write_worker(tmp_path, nodeid="t.py::test_a", pid=4242, run_id="run-earlier")
+
+    incident = death.build(StubNode(), "node down", tmp_path, None, "run-now")
+
+    assert incident.test_in_flight is None
+    assert incident.last_test is None
+    assert incident.worker_pid is None
+    assert incident.rss_mb_at_death is None
+
+
+def test_a_death_reads_its_own_run_s_evidence(tmp_path):
+    from pytest_failure_instrumentation.incidents import death
+
+    write_worker(tmp_path, nodeid="t.py::test_a", pid=4242, run_id="run-now")
+
+    incident = death.build(StubNode(), "node down", tmp_path, None, "run-now")
+
+    assert incident.test_in_flight == "t.py::test_a"
+    assert incident.worker_pid == 4242
