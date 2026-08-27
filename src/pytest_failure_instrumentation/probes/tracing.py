@@ -87,31 +87,37 @@ def permit_tracing(policy: str = "parent") -> bool:
 
 
 def _declare(tracer: int) -> bool:
-    try:
-        import ctypes
+    """Make the prctl call, with every argument's type spelled out.
 
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        return libc.prctl(PR_SET_PTRACER, ctypes.c_ulong(tracer), 0, 0, 0) == 0
-    except Exception:  # noqa: BLE001 - a missing exception costs a stack, not a run
-        return False
+    ``prctl`` is variadic - ``int prctl(int option, ...)`` - and the kernel
+    reads all four of its arguments as ``unsigned long``. Left to ctypes'
+    defaults a Python ``0`` goes out as a 32-bit C ``int``, so on a 64-bit
+    platform the upper half of what the kernel reads is whatever was in the
+    register. That is the same hazard this package declares argtypes for
+    everywhere it touches Windows handles, and it is worse here because the
+    failure mode is silent: prctl answers EINVAL, this returns False, and a
+    worker is simply never readable, on the one Linux configuration the whole
+    module exists to handle.
 
-
-def permit_parent_to_trace() -> bool:
-    """Nominate this process's parent as a permitted tracer.
-
-    True when the exception was granted, False when it was not needed or not
-    available - the two are not worth telling apart by the caller, since
-    neither costs the run anything.
+    The parent under xdist is the controller, which is also py-spy's parent.
+    Yama walks the tracer's ancestry to the nominated pid, so naming the
+    controller covers whatever it spawns to do the reading.
     """
-    if not IS_LINUX:
-        return False
     try:
         import ctypes
 
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        # The parent under xdist is the controller, which is also py-spy's
-        # parent. Yama walks the tracer's ancestry to the nominated pid, so
-        # naming the controller covers whatever it spawns to do the reading.
-        return libc.prctl(PR_SET_PTRACER, ctypes.c_ulong(os.getppid()), 0, 0, 0) == 0
+        prctl = libc.prctl
+        prctl.argtypes = (
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        )
+        prctl.restype = ctypes.c_int
+        # PTRACE_ANY is the kernel's ((unsigned long)-1), which is what
+        # c_ulong(-1) produces at either width.
+        return prctl(PR_SET_PTRACER, ctypes.c_ulong(tracer).value, 0, 0, 0) == 0
     except Exception:  # noqa: BLE001 - a missing exception costs a stack, not a run
         return False

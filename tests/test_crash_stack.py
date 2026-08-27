@@ -239,21 +239,37 @@ def test_the_dump_is_dropped_when_the_test_that_left_it_ends(tmp_path):
     assert not list(tmp_path.glob("*.part")), "a half-written dump was left behind"
 
 
-def test_the_cadence_is_per_test_and_not_per_tick(tmp_path):
+def test_the_cadence_is_per_test_and_not_per_tick(tmp_path, monkeypatch):
     """The heartbeat ticks far more often than the timeout, and each tick is a
     dump of every thread in the process. Writing one per tick would turn a
-    twenty-second cadence into a five-second one nobody asked for."""
+    twenty-second cadence into a five-second one nobody asked for.
+
+    Counted rather than timed. This compared the file's ``st_mtime_ns`` before
+    and after, which asks the filesystem a question NTFS answers imprecisely:
+    its last-write time has ~15.6 ms granularity and is updated lazily, so two
+    stats around a single write could differ by a tick of the system clock and
+    the test failed on Windows having found no second dump at all. What it
+    means to assert is that the cadence *decided* not to dump, so that is what
+    is asserted.
+    """
     path = tmp_path / "gw0.slow"
     watchdog = crash_stack.SlowTestWatchdog(path, timeout=0.2)
+
+    dumps = []
+    real_dump = watchdog._dump
+    monkeypatch.setattr(
+        watchdog, "_dump", lambda: (dumps.append(time.monotonic()), real_dump())[1]
+    )
 
     watchdog.start_test()
     time.sleep(0.25)
     watchdog.tick()
-    first = path.stat().st_mtime_ns
+    assert len(dumps) == 1, "the first tick past the timeout wrote nothing"
+    assert path.exists(), "the dump named a file it did not write"
 
     for _ in range(5):
         watchdog.tick()
-    assert path.stat().st_mtime_ns == first, "a tick inside the cadence re-dumped"
+    assert len(dumps) == 1, "a tick inside the cadence re-dumped"
 
 
 def test_a_reader_never_sees_half_a_dump(tmp_path):

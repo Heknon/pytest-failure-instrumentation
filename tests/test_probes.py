@@ -250,7 +250,7 @@ def test_asking_to_be_traceable_never_raises_and_answers_a_bool():
     rather than a stack."""
     from pytest_failure_instrumentation.probes import tracing
 
-    granted = tracing.permit_parent_to_trace()
+    granted = tracing.permit_tracing("parent")
     assert isinstance(granted, bool)
     if sys.platform != "linux":
         assert granted is False, "nothing outside Linux has a tracer exception to grant"
@@ -286,9 +286,14 @@ def test_a_live_child_is_recognised_as_one():
 
 
 def test_a_process_that_is_not_ours_is_not_mistaken_for_a_worker():
-    """pid 1 is real and alive on every platform this runs on, and is
-    emphatically not something this process started."""
-    assert probes.is_own_child(1) is False
+    """This process is alive and is certainly not its own child.
+
+    Not pid 1, which is init on POSIX and *nothing at all* on Windows - there
+    the ids start at 0 for Idle and 4 for System, so a test written around pid
+    1 asks about a process that does not exist and passes for the wrong
+    reason.
+    """
+    assert probes.is_own_child(os.getpid()) is False
 
 
 def test_a_pid_that_cannot_exist_is_not_ours():
@@ -304,12 +309,14 @@ def test_a_child_that_has_gone_is_no_longer_ours():
     assert probes.is_own_child(process_handle.pid) is False
 
 
-def test_the_two_liveness_questions_disagree_about_a_stranger(monkeypatch):
-    """is_running says pid 1 is there and is_own_child says it is not ours.
+def test_the_two_liveness_questions_disagree_about_a_stranger():
+    """is_running says this process is there; is_own_child says it is not ours.
 
     Both are right, and the live view depends on them being different: one
-    decides whether to keep reporting a worker, the other whether it is safe
-    to signal it.
+    decides whether to keep reporting a worker, the other whether it is safe to
+    signal it. Asked about *this* process rather than pid 1, which does not
+    exist on Windows - is_running answered False there and the test failed
+    having proved nothing about either question.
     """
-    assert probes.is_running(1) is True
-    assert probes.is_own_child(1) is False
+    assert probes.is_running(os.getpid()) is True
+    assert probes.is_own_child(os.getpid()) is False
