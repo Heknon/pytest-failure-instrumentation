@@ -804,10 +804,17 @@ $ curl -H "Authorization: Bearer $TOKEN" localhost:8080/workers
 $ curl "localhost:8080/workers?token=$TOKEN"    # for when you are in a hurry
 ```
 
-That file is created readable by its owner alone — opened `0o600` rather than
-written and then narrowed, because narrowing afterwards leaves a window and a
-window is all anybody needs. So the boundary is the filesystem's: whoever can
-read this run's evidence directory can read its stacks, and nobody else can.
+That file is where the boundary actually is: whoever can read it can read this
+run's stacks. What that is worth differs by platform, and it is worth saying
+which half of the claim each one gives you. On POSIX it is opened `0o600`
+*before* anything is written into it — created owner-only rather than created
+and then narrowed, since the second leaves a window and a window is all anybody
+needs. On Windows a mode is not an ACL: `os.open`'s mode there only decides
+whether the read-only attribute is set, so the file inherits the evidence
+directory's ACL and the boundary is whatever that grants — usually the user and
+administrators under a profile, potentially wider on a shared or drive-root
+path. Put `failure_directory` somewhere you would keep a credential, or leave
+the server off on a host you share.
 
 **Loopback is not that boundary**, which is why the token is not conditional on
 binding off it. Loopback bounds the reachable set to processes on this machine,

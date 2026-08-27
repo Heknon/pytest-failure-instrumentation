@@ -920,11 +920,17 @@ def test_the_token_is_accepted_either_way_it_is_sent(serving):
     assert get(port, f"/stack?pid={os.getpid()}", service.token)[0] == 200
 
 
-@pytest.mark.skipif(IS_WINDOWS, reason="POSIX file modes")
-def test_the_address_file_is_readable_by_its_owner_alone(serving, tmp_path):
+@pytest.mark.skipif(IS_WINDOWS, reason="a mode is not an ACL; see the docstring")
+def test_the_address_file_is_owner_only_on_posix(serving, tmp_path):
     """The token is only as private as the file holding it, so that file is
     created owner-only rather than created and then narrowed - the second
-    leaves a window, and a window is all anybody needs."""
+    leaves a window, and a window is all anybody needs.
+
+    Named for the platform it holds on. On Windows ``os.open``'s mode only
+    decides the read-only attribute, so there is no owner-only guarantee for a
+    test to make there and the file inherits the directory's ACL instead -
+    which the module docstring says rather than leaving the skip to imply the
+    check merely could not run."""
     run = tmp_path / "run-abc123"
     service = serving(0, directory=run)
     assert wait_for(lambda: service.serving), service.status

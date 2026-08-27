@@ -46,9 +46,19 @@ whenever the holder exits. Sessions do not coordinate beyond the port itself,
 which is the only thing all of them can see.
 
 **Who may ask.** Every request but ``/identity`` carries a token, minted per
-server and written into the address file beside the port. That file is created
-readable by its owner alone, so the boundary is the filesystem's: whoever can
-read this run's evidence directory can read its stacks, and nobody else can.
+server and written into the address file beside the port. So the boundary is
+the filesystem's: whoever can read that file can read this run's stacks.
+
+*What that is worth differs by platform, and saying otherwise would be the
+useful half of a security claim without the true half.* On POSIX the file is
+opened ``0o600`` before anything is written into it - created owner-only rather
+than created and then narrowed, since the second leaves a window and a window
+is all anybody needs. On Windows a mode is not an ACL: ``os.open``'s mode
+argument there only decides whether the read-only attribute is set, so the file
+inherits the evidence directory's ACL and the boundary is whatever *that*
+grants. Under a user profile that is usually the user and administrators; on a
+shared or drive-root path it can be wider. Put ``failure_directory`` somewhere
+you would keep a credential, or leave the server off on a host you share.
 
 Loopback is not that boundary, which is why the token is not conditional on
 binding off it. Loopback bounds the reachable set to processes on this machine,
