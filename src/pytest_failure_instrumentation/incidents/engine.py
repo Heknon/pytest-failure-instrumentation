@@ -126,8 +126,16 @@ class IncidentEngine:
         #: Workers that went down before registering a collection. They are
         #: never going to, so they are subtracted from what is waited for.
         self.workers_lost: set[str] = set()
-        #: Last time each live worker said anything, and which are wedged
-        #: already - shared with the watcher thread below.
+        #: How long each live worker has been silent, on the *monotonic* clock,
+        #: and which are wedged already - shared with the watcher thread below.
+        #: Monotonic because this is one process measuring an interval against
+        #: itself: a wall clock that steps forward - an NTP correction on a
+        #: freshly booted CI machine is the ordinary way that happens - would
+        #: make every worker look silent for the length of the step at once,
+        #: and report the whole fleet as stalled. The heartbeat ages in
+        #: analysis.stall have to stay on the wall clock, because those are
+        #: two processes comparing notes; the verdict there does not rest on
+        #: them (see ``confirm``, which asks whether the beat *advanced*).
         self.activity: dict[str, float] = {}
         self.stalled: set[str] = set()
         #: The live node behind each worker id, so a pid read out of a file can
@@ -330,7 +338,7 @@ class IncidentEngine:
     def _touch(self, worker: str | None) -> None:
         if worker:
             with self.lock:
-                self.activity[worker] = time.time()
+                self.activity[worker] = time.monotonic()
                 # A worker that speaks again was not wedged, or is no longer.
                 # Left in the set, a worker reported once could never be
                 # reported again however badly it went on to hang.
@@ -344,7 +352,7 @@ class IncidentEngine:
         """
         limit = self.settings.stall_seconds
         while not self.stop.wait(min(limit / 4, 15.0)):
-            now = time.time()
+            now = time.monotonic()
             with self.lock:
                 candidates = [
                     (worker, now - seen)
