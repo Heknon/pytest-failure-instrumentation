@@ -677,6 +677,25 @@ class StackService:
                 return True
             self._note_who_has_it(failure)
             return False
+        except Exception as failure:  # noqa: BLE001 - see below
+            # Not every unbindable address answers with an OSError, and the
+            # ones that do not were escaping onto this thread. A port outside
+            # 0-65535 raises OverflowError from ``bind`` - not an OSError, not
+            # caught above - so ``--callstack-port 99999`` printed a raw
+            # traceback, raised no incident, and left the server silently
+            # never serving. Under a project running ``-W error`` pytest turns
+            # that thread exception into a failure: a suite where every test
+            # passed exited 1 because of a typo in a port number. This plugin
+            # does not get to fail a run over its own settings.
+            #
+            # It is a bind refusal like any other - the address cannot be
+            # bound and no amount of waiting changes that - so it is reported
+            # as one, with the number that was asked for.
+            self.status = (
+                f"could not bind {authority(self.host, self.port)}: {failure}"
+            )
+            self._give_up("BIND_REFUSED")
+            return True
 
         self.bound_port = int(httpd.server_address[1])
 

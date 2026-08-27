@@ -42,15 +42,14 @@ the same, so they are spelled differently.
 
 from __future__ import annotations
 
-import warnings
 from typing import Any, Optional
 
 import pytest
 
 from . import hookspec
 from .config import (
-    FailureInstrumentationWarning,
     Settings,
+    advise,
     pytest_faulthandler_timeout,
     resolve,
 )
@@ -207,4 +206,6 @@ def _difference(existing: Settings, wanted: Settings) -> str:
 
 
 def _warn(message: str) -> None:
-    warnings.warn(message, FailureInstrumentationWarning, stacklevel=3)
+    """Routed through :func:`config.advise` so a project that turns warnings
+    into errors gets the advice rather than an INTERNALERROR - see there."""
+    advise(message)

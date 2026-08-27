@@ -36,7 +36,6 @@ import shutil
 import threading
 import time
 import uuid
-import warnings
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,7 +46,7 @@ from ..analysis import fingerprint as fingerprint_of
 from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
-from ..config import FailureInstrumentationWarning, Settings
+from ..config import Settings, advise
 from . import collection, death, internal_error, stall, summary
 from .base import Capabilities, Incident, frame_from
 
@@ -279,14 +278,12 @@ class IncidentEngine:
         other = record.get("pid")
         if not other or int(other) == os.getpid() or not probes.is_running(int(other)):
             return  # ours, or a finished run whose directory is free to reuse
-        warnings.warn(
+        advise(
             f"this run's evidence directory ({self.directory}) is already owned "
             f"by process {other}, which is still running: two live sessions "
             "sharing one directory overwrite each other's per-worker state. "
             "Unset PYTEST_RUN_ID, or give each session its own value, to keep "
-            "them apart",
-            FailureInstrumentationWarning,
-            stacklevel=2,
+            "them apart"
         )
 
     # -- raising ---------------------------------------------------------
@@ -527,12 +524,10 @@ class IncidentEngine:
             # would poll an empty directory for the life of the run and push
             # nothing, which from the outside is indistinguishable from a
             # product whose hook is never called. Say so instead.
-            warnings.warn(
+            advise(
                 "failure_sample_seconds is set but this run is not distributed, "
                 "so there are no workers to sample and no samples will be "
-                "pushed; run under xdist (-n) or unset it",
-                FailureInstrumentationWarning,
-                stacklevel=2,
+                "pushed; run under xdist (-n) or unset it"
             )
         elif self.settings.sample_seconds > 0:
             self.sampler = threading.Thread(

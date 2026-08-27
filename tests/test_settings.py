@@ -63,9 +63,15 @@ def test_a_setting_that_is_not_a_number_says_so_rather_than_vanishing():
 
 
 def test_a_readable_setting_warns_about_nothing():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", FailureInstrumentationWarning)
+    # Recorded rather than filtered to an error. This plugin's advice is now
+    # deliberately immune to an error filter - a project running
+    # ``filterwarnings = error`` used to get INTERNALERROR out of
+    # pytest_configure instead of the advice - so an error filter no longer
+    # detects an unwanted warning here. Counting them does.
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
         assert resolve(FakeConfig(failure_stall_seconds="45")).stall_seconds == 45.0
+    assert [str(entry.message) for entry in raised] == []
 
 
 def test_the_heartbeat_interval_is_clamped_where_both_sides_can_see_it():
@@ -138,11 +144,12 @@ def test_an_inverted_pair_says_what_it_will_cost():
 
 
 def test_switching_either_one_off_is_not_an_inversion():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", FailureInstrumentationWarning)
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
         resolve(FakeConfig(failure_stall_seconds="0"))       # no stall detection
         resolve(FakeConfig(failure_slow_test_seconds="0"))   # no watchdog
         resolve(FakeConfig(failure_watchdog="false"))
+    assert [str(entry.message) for entry in raised] == []
 
 
 def test_the_two_places_the_version_is_written_agree():
@@ -224,10 +231,43 @@ def test_binding_off_loopback_says_what_it_exposes():
 
 
 def test_loopback_by_any_of_its_names_is_not_an_exposure():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", FailureInstrumentationWarning)
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
         for name in ("127.0.0.1", "::1", "localhost"):
             resolve(FakeConfig({"callstack_host": name}))
+    assert [str(entry.message) for entry in raised] == []
+
+
+def test_advice_about_a_setting_cannot_end_the_run_that_asked_for_it(pytester):
+    """``filterwarnings = error`` is a recommended pytest setting and a common
+    one. Every warning this plugin raises about a setting comes out of
+    ``pytest_configure``, and an exception thrown from a configure hook is an
+    INTERNALERROR: exit status 3, not one test collected.
+
+    Measured on the branch that added it: ``--callstack-host 0.0.0.0`` - the
+    documented way to reach the live view from outside a container, which
+    warns *on purpose* because it is a genuine exposure - ended the session
+    that way on any project with that filter. So did an unreadable
+    ``failure_stall_seconds``. The class docstring has always said these are
+    "never an error"; now they cannot be.
+    """
+    pytester.makeini(
+        """
+        [pytest]
+        filterwarnings =
+            error
+        """
+    )
+    pytester.makepyfile("def test_ok():\n    assert True\n")
+
+    result = pytester.runpytest_subprocess("--callstack-host", "0.0.0.0")
+
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, result.stdout.str()
+    assert "INTERNALERROR" not in result.stdout.str()
+    # Downgraded, not dropped: the exposure is still reported, in the same
+    # place it lands on a project with no filter at all.
+    assert "boundary is the network" in result.stderr.str()
 
 
 def test_the_sampler_cadence_has_a_floor_like_its_sibling():

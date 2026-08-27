@@ -1132,6 +1132,23 @@ def test_an_address_that_cannot_be_bound_is_reported(serving):
     assert reported[0][0] == "BIND_REFUSED"
 
 
+def test_a_port_outside_the_range_is_a_bind_refusal_not_a_thread_traceback(serving):
+    """The bind answers an OverflowError here, not the OSError every other
+    unbindable address gives, and only OSError was being caught - so the
+    supervisor thread died with a raw traceback, no incident was raised, and
+    the server silently never served. Under ``filterwarnings = error`` pytest
+    turned that thread exception into a failure, so a suite where every test
+    passed exited non-zero over a typo in a port number.
+    """
+    reported = []
+    service = serving(
+        99999, reclaim_seconds=0.1, on_giving_up=lambda *args: reported.append(args)
+    )
+    assert wait_for(lambda: reported), service.status
+    assert reported[0][0] == "BIND_REFUSED", reported
+    assert "0-65535" in reported[0][1] or "port must be" in reported[0][1], reported
+
+
 def test_our_own_session_holding_the_port_is_not_an_incident(serving):
     """The named mode working as designed. Reporting it would turn the
     ordinary case into an alert and teach a reader to filter the kind out."""

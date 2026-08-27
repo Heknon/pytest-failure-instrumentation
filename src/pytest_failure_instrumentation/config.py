@@ -67,6 +67,38 @@ class FailureInstrumentationWarning(UserWarning):
     give up on. Never an error: nothing here is worth ending a run over."""
 
 
+def advise(message: str) -> None:
+    """Say the above, without being able to end the run - see that promise.
+
+    Every warning in this module is raised from ``pytest_configure``: either
+    building :class:`Settings` or reading an ini value on the way there. A
+    project running ``filterwarnings = error``, which is a recommended setting
+    and a common one, turns each of them into an exception thrown out of a
+    configure hook, and pytest has one answer for that - INTERNALERROR, exit
+    status 3, not a single test collected. "Never an error" was a promise this
+    module made and could not keep.
+
+    Measured: ``--callstack-host 0.0.0.0`` - the documented way to reach the
+    live view from outside a container, which warns on purpose because it is a
+    real exposure - ended the whole session that way; so did
+    ``failure_stall_seconds = 5m``. A plugin installed to report failures does
+    not get to be the thing that stops the run, least of all over advice about
+    its own configuration.
+
+    The advice is downgraded rather than dropped: re-emitted with the
+    project's filters set aside, which leaves it in the warnings summary where
+    it was always meant to be read. pytest's own recorder is left in place, so
+    it is reported exactly as before on every project that had not turned
+    warnings into errors.
+    """
+    try:
+        warnings.warn(message, FailureInstrumentationWarning, stacklevel=3)
+    except FailureInstrumentationWarning:
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.warn(message, FailureInstrumentationWarning, stacklevel=3)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Everything this plugin reads, and the only thing :func:`.install` takes.
@@ -159,6 +191,7 @@ class Settings:
         object.__setattr__(self, "stack_server_host", str(self.stack_server_host))
         object.__setattr__(self, "stack_server_port", int(self.stack_server_port))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
+        self._warn_if_the_port_is_not_a_port()
         self._warn_if_the_stack_server_is_reachable_from_off_the_machine()
 
     def _warn_if_a_stall_is_judged_before_it_has_evidence(self) -> None:
@@ -176,13 +209,36 @@ class Settings:
             return  # one of the two is switched off, so there is no ordering
         if self.slow_test_seconds < self.stall_seconds:
             return
-        warnings.warn(
+        advise(
             f"failure_slow_test_seconds ({self.slow_test_seconds:g}) is not below "
             f"failure_stall_seconds ({self.stall_seconds:g}), so a stalled worker "
             "is assessed before its watchdog has written a stack and will be "
             "reported without one",
-            FailureInstrumentationWarning,
-            stacklevel=4,
+        )
+
+    def _warn_if_the_port_is_not_a_port(self) -> None:
+        """Said here, where the number was typed, rather than only on the wire.
+
+        A port outside 0-65535 cannot be bound, and the bind says so in an
+        ``OverflowError`` rather than the ``OSError`` every other unbindable
+        address answers with. The server treats it as the bind refusal it is
+        and reports an incident - but an incident goes to a hook, and the
+        person who mistyped a number on the command line is owed the answer in
+        the terminal they typed it in.
+
+        Not clamped, and not quietly replaced with a drawn port. Somebody who
+        names a port has told something outside this run where to look; moving
+        it and saying nothing leaves them watching an address the server was
+        never on, which is the failure this warning exists to prevent rather
+        than a fix for it.
+        """
+        if not self.stack_server or 0 <= self.stack_server_port <= 65535:
+            return
+        advise(
+            f"failure_stack_server_port is {self.stack_server_port}, which is "
+            "not a port - the range is 0-65535, where 0 means draw a free one. "
+            "The live stack server cannot bind this and will report itself "
+            "unavailable; the run is otherwise unaffected",
         )
 
     def _warn_if_the_stack_server_is_reachable_from_off_the_machine(self) -> None:
@@ -201,7 +257,7 @@ class Settings:
         """
         if not self.stack_server or self.stack_server_host in LOOPBACK:
             return
-        warnings.warn(
+        advise(
             f"the live stack server is bound to {self.stack_server_host}, not "
             "loopback, so anything that can reach this host on port "
             f"{self.stack_server_port or '<drawn at random>'} can read the stack "
@@ -210,8 +266,6 @@ class Settings:
             "endpoints, but anyone who can reach the address can try. This is what "
             "a container whose UI is outside it needs; it is not what a shared "
             "machine wants",
-            FailureInstrumentationWarning,
-            stacklevel=4,
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:
@@ -446,10 +500,8 @@ def _number(config: pytest.Config, name: str, fallback: float) -> float:
     try:
         return float(raw or fallback)
     except (ValueError, TypeError):
-        warnings.warn(
+        advise(
             f"{name}={raw!r} is not a number; using {fallback} instead",
-            FailureInstrumentationWarning,
-            stacklevel=2,
         )
         return fallback
 
