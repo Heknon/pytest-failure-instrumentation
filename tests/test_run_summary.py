@@ -108,3 +108,23 @@ def test_the_controller_and_its_workers_agree_on_the_run_id(runner):
         if line.strip()
     }
     assert stamped == {summary.run_id}
+
+
+def test_a_run_that_finished_is_not_told_it_could_not_have(runner):
+    """``run_ending`` is the inference the evidence supported when an incident
+    was raised: a worker silent past the threshold has handed xdist work it
+    will never give back. A summary is the one thing emitted late enough to
+    know whether that came true, and here it did not - the frozen worker came
+    back and the run passed. Saying "N of them ended the session" over an exit
+    status of 0 reports a run that finished as one that could not."""
+    from pytest_failure_instrumentation.incidents import summary
+
+    incident = summary.build(
+        exitstatus=0, seen={"abc": 1}, raised=1, suppressed=0, run_ending=1,
+        distributed=True,
+    )
+
+    rendered = str(incident)
+    assert "raised as run-ending" in rendered
+    assert "still reached session finish" in rendered
+    assert "of them ended the session" not in rendered

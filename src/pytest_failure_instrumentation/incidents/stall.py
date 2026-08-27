@@ -52,7 +52,12 @@ class WorkerStallIncident(Incident):
     model_config = ConfigDict(extra="forbid")
 
     # The run cannot finish while a worker is wedged: xdist waits for work it
-    # handed out and never gets back.
+    # handed out and never gets back. That is an inference from the evidence at
+    # detection time rather than an observation - the alert goes out while the
+    # run is still going, which is the whole point of it - and a worker that
+    # comes back falsifies it. The one thing that can say so is the run summary,
+    # which exists only because the session reached its end; it says "raised as
+    # run-ending" rather than "ended the session" for exactly this reason.
     ends_run: ClassVar[bool] = True
 
     kind: Literal["worker_stall"] = "worker_stall"

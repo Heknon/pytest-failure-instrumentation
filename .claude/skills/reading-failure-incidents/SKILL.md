@@ -68,6 +68,7 @@ wrong conclusion. Check this list before quoting a figure back to anyone.
 | `test_in_flight: null` on a stall | the worker had no work | one of three ordinary things that look identical from outside: between tests, collecting, or idle awaiting work. The silence is still real (the run cannot end while a worker never comes back) but the confidence drops to `low` and nothing is blamed on a test |
 | `no stack: pid … could not be confirmed` | the probe failed | the probe was *never sent*. `SIGUSR1` terminates by default, and the pid came out of a file — an exited worker leaves its number to be reused, so an unconfirmable pid is left alone rather than signalled. Not a finding about the worker |
 | `exitstatus` on a `run_summary` | the run's outcome | sometimes reported before pytest applies `INTERNAL_ERROR`; `run_ending_incidents` is the one to trust when they disagree |
+| `run_ending_incidents` on a `run_summary` | that many incidents ended the run | that many were *raised as* run-ending. A summary exists only because the run reached session finish, so a stall counted here is one that resolved — the worker came back. For an `internal_error` the count is the correction to a `0` exit status; for a `worker_stall` it is a prediction the summary itself disproves |
 
 ## The shared fields
 
@@ -157,6 +158,13 @@ completion, because xdist waits for work it handed out and never gets back — s
 a job that hangs to its timeout is the symptom and the stall is the cause. And
 the incident was raised at the threshold, often an hour before that timeout, so
 the useful advice is usually to act on the incident rather than wait.
+
+That is an inference from the evidence at detection time, not an observation,
+and one thing can falsify it: a `run_summary` arriving afterwards. The summary
+is written at session finish, so its existence proves the run got there — the
+wedged worker came back. Treat a stall followed by a summary as a hang that
+resolved, worth fixing and not worth paging about; a stall with no summary
+beside it is the run-ending one.
 
 `stack` is asked for *after* the verdict is reached, because asking a wedged
 process a question can change its answer. `stack_probed: false` means the
