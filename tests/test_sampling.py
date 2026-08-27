@@ -121,6 +121,26 @@ def test_stacks_can_be_declined_while_the_statuses_are_kept(tmp_path):
 # -- not sending the same stack twice --------------------------------------
 
 
+def test_the_digest_does_not_change_when_only_the_thread_order_does():
+    """The saving rests on two reads of one place agreeing, and neither reader
+    promises an order: py-spy walks the interpreter's thread list, and the
+    in-process reader iterates ``sys._current_frames()``, a dict. Order-
+    sensitive, the digest changed when nothing had moved and the full stack
+    went out again every pass - the eight thousand copies this module exists to
+    avoid."""
+    threads = [
+        {"thread_id": 1, "thread_name": "MainThread", "frames": [{"function": "wait", "file": "t.py", "line": 3}]},
+        {"thread_id": 2, "thread_name": "heartbeat", "frames": [{"function": "_run", "file": "h.py", "line": 9}]},
+    ]
+
+    assert digest_of(threads) == digest_of(list(reversed(threads)))
+    # Still a digest of the frames, so a process that moved still reads as
+    # moved - and two threads in the same place still count twice.
+    moved = [dict(threads[0], frames=[{"function": "wait", "file": "t.py", "line": 4}]), threads[1]]
+    assert digest_of(threads) != digest_of(moved)
+    assert digest_of([threads[0], dict(threads[0])]) != digest_of([threads[0]])
+
+
 def test_an_unchanged_stack_is_sent_once_and_then_counted(tmp_path):
     """The whole reason this is affordable for the workers that matter most.
     A worker wedged for a day has one stack, and storing it 8,640 times is
@@ -237,6 +257,33 @@ def test_a_run_where_everything_wedged_at_once_is_bounded_and_says_so(tmp_path):
     # Everyone is still reported, whether or not they were read.
     assert len(sample.workers) == MAX_STACKS_PER_SAMPLE + 4
     assert all(w.status == "blocked" for w in sample.workers)
+
+
+def test_a_fleet_larger_than_the_cap_is_covered_over_passes_not_never(tmp_path):
+    """The cap bounds cost; it must not decide who is visible.
+
+    Read from the top of the list every pass and the seventeenth stuck worker
+    onwards was never read at all - not late, never - while the first sixteen
+    were re-read and then suppressed as repeats. Measured: twenty-two stuck
+    workers over four passes left six of them unread on every one. On a
+    sixty-four-way run that wedged entirely, which is the case this exists
+    for, that is forty-eight workers a UI never sees a frame of.
+    """
+    names = {f"gw{index:02d}": [5.0, 5.0, 5.0] for index in range(MAX_STACKS_PER_SAMPLE + 6)}
+    root = evidence(tmp_path / "run", names)
+    sampler = WorkerSampler(root, reader=reader(FRAMES_A))
+
+    read_at_least_once: set[str] = set()
+    for _ in range(2):
+        sample = sampler.sample()
+        assert len(sample.stacks_not_taken) == 6, "the cap still bounds each pass"
+        read_at_least_once |= {
+            entry.worker
+            for entry in sample.workers
+            if entry.stack is not None or entry.stack_digest
+        }
+
+    assert read_at_least_once == set(names), "some worker is never read on any pass"
 
 
 def test_an_empty_directory_samples_nothing_rather_than_raising(tmp_path):

@@ -122,10 +122,23 @@ def digest_of(threads: list[dict[str, Any]]) -> str:
     question being asked is "is this the same place as last time", and a thread
     id that changes between reads would answer "no" to a process that has not
     moved at all.
+
+    *And never the order they arrive in*, for exactly the same reason. Neither
+    reader promises one: py-spy walks the interpreter's thread list, and the
+    in-process reader iterates ``sys._current_frames()``, which is a dict. Two
+    reads of a process sitting in one place could therefore disagree, and the
+    whole saving here rests on them agreeing - a digest that changes when
+    nothing has moved re-sends the full stack every pass, which is the eight
+    thousand copies this module exists to avoid. So each thread's frames are
+    canonicalised and then *sorted*: a list rather than a set, so two threads
+    stuck in the same place still count twice.
     """
-    frames = [thread.get("frames", []) for thread in threads]
+    per_thread = sorted(
+        json.dumps(thread.get("frames", []), sort_keys=True, default=str)
+        for thread in threads
+    )
     return hashlib.sha1(
-        json.dumps(frames, sort_keys=True, default=str).encode("utf-8")
+        json.dumps(per_thread, default=str).encode("utf-8")
     ).hexdigest()[:16]
 
 
@@ -153,6 +166,8 @@ class WorkerSampler:
         self.reader = reader or pyspy.dump
         self._seen: dict[str, tuple[Optional[str], str]] = {}
         self._repeats: dict[str, int] = {}
+        #: Where the next pass starts sharing out reads. See _share_out.
+        self._cursor = 0
 
     def sample(self, now: Optional[float] = None) -> WorkerSample:
         moment = time.time() if now is None else now
@@ -160,11 +175,8 @@ class WorkerSampler:
         if described is None:
             return WorkerSample(session_id=self.session_id, observed_at=round(moment, 3))
 
-        workers: list[SampledWorker] = []
-        skipped: list[str] = []
-        taken = 0
-        for record in described.get("workers", []):
-            entry = SampledWorker(
+        workers = [
+            SampledWorker(
                 worker=record.get("worker") or "",
                 pid=record.get("pid"),
                 nodeid=record.get("nodeid"),
@@ -175,18 +187,21 @@ class WorkerSampler:
                 cpu_rate=record.get("cpu_rate"),
                 heartbeat_age_s=record.get("heartbeat_age_s"),
             )
+            for record in described.get("workers", [])
+        ]
+        wanting = []
+        for entry in workers:
             if self._wants_a_stack(entry):
-                if taken >= MAX_STACKS_PER_SAMPLE:
-                    skipped.append(entry.worker)
-                else:
-                    taken += 1
-                    self._attach_stack(entry)
+                wanting.append(entry)
             else:
                 # It moved on. Forgetting it means the next stall reports its
                 # frames in full rather than as a repeat of something a reader
                 # would have to go back hours to find.
                 self._forget(entry.worker)
-            workers.append(entry)
+
+        reading, skipped = self._share_out(wanting)
+        for entry in reading:
+            self._attach_stack(entry)
 
         return WorkerSample(
             session_id=self.session_id,
@@ -195,6 +210,39 @@ class WorkerSampler:
             workers=workers,
             stacks_not_taken=skipped,
         )
+
+    def _share_out(
+        self, wanting: list[SampledWorker]
+    ) -> tuple[list[SampledWorker], list[str]]:
+        """Which stuck workers this pass reads, and which it leaves for later.
+
+        Rotated, because the cap is a bound on cost and was accidentally a
+        blindfold. Read from the top of the list every pass and the
+        seventeenth stuck worker onwards is never read *at all* - not late,
+        never - while the first sixteen are re-read and then suppressed as
+        repeats, so those passes spend sixteen subprocesses to report "same as
+        before" and nothing to report the six that have no stack yet.
+
+        Measured: twenty-two stuck workers over four passes left gw16..gw21
+        unread on every one of them. On a sixty-four-way run that wedged
+        entirely - which is the case this sampler exists for - that is
+        forty-eight workers a UI never sees a frame of.
+
+        Starting where the last pass stopped covers a fleet larger than the
+        cap over consecutive passes instead of never. What is left is still
+        named in ``stacks_not_taken``, so a reader waiting on a particular
+        worker can see it is queued rather than missing.
+        """
+        if len(wanting) <= MAX_STACKS_PER_SAMPLE:
+            return wanting, []
+        start = self._cursor % len(wanting)
+        rotated = wanting[start:] + wanting[:start]
+        reading = rotated[:MAX_STACKS_PER_SAMPLE]
+        self._cursor = start + MAX_STACKS_PER_SAMPLE
+        chosen = {entry.worker for entry in reading}
+        return reading, [
+            entry.worker for entry in wanting if entry.worker not in chosen
+        ]
 
     def _wants_a_stack(self, entry: SampledWorker) -> bool:
         return bool(self.want_stacks and entry.pid and entry.status in WORTH_A_STACK)

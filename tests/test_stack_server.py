@@ -321,6 +321,103 @@ def test_both_readers_describe_a_thread_the_same_way():
     assert set(from_inside["frames"][0]) == set(from_outside["frames"][0])
 
 
+def test_two_reads_of_one_target_do_not_race_into_a_permissions_lecture(monkeypatch):
+    """A process can only be suspended by one reader at a time.
+
+    The loser's errno is EPERM, which is exactly what a permission problem
+    gives - so the collision was reported as "ptrace is not permitted, check
+    /proc/sys/kernel/yama/ptrace_scope", on machines with no Yama at all.
+    Measured: four concurrent reads of one process, three answered and the
+    fourth was sent to change a kernel setting that had nothing to do with it.
+
+    And the collision was usually self-inflicted: the sampler reads every stuck
+    worker on a cadence while the server answers a UI polling /stack for the
+    same one.
+    """
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class Finished:
+        returncode = 0
+        stdout = b"[]"
+        stderr = b""
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        release.wait(10)
+        return Finished()
+
+    monkeypatch.setattr(pyspy, "executable", lambda: "/nonexistent/py-spy")
+    monkeypatch.setattr(pyspy.subprocess, "run", slow)
+
+    holder = threading.Thread(target=lambda: pyspy.dump(4321), daemon=True)
+    holder.start()
+    try:
+        assert started.wait(10), "the first read never began"
+        threads, error = pyspy.dump(4321)
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    assert threads is None
+    assert error and "already in flight" in error
+    assert "ptrace_scope" not in error, "a collision was reported as a policy"
+
+    # A different target is unaffected - the bound is per process, not global.
+    release.set()
+    assert pyspy.dump(9999) == ([], None)
+
+
+def test_the_permission_hint_names_a_tracer_that_is_already_attached():
+    """Somebody else's debugger gives the same errno, and that possibility has
+    to be in the hint or the only advice on offer is to change a kernel
+    setting that was never the problem."""
+    for platform_key in ("linux", "darwin"):
+        assert "already be attached" in pyspy.PERMISSION_HINTS[platform_key]
+
+
+def test_a_reader_answering_an_unexpected_shape_explains_rather_than_raising(
+    monkeypatch,
+):
+    """py-spy is a separate program on a floating version.
+
+    The dependency is ``py-spy>=0.3`` with no ceiling, so a release that
+    wrapped its threads in an object - or answered ``null`` - lands here.
+    Iterating it raised out of a function whose whole contract is that it
+    returns a reason instead of a stack, and the server does not wrap this
+    call: the request got no reply at all rather than a 502 saying why. A
+    dict was quieter and worse, iterating its keys to "zero threads and no
+    error", which reads as a process with no Python in it.
+    """
+
+    class Finished:
+        returncode = 0
+        stderr = b""
+
+        def __init__(self, stdout: bytes) -> None:
+            self.stdout = stdout
+
+    def answering(payload: bytes):
+        monkeypatch.setattr(pyspy, "executable", lambda: "/nonexistent/py-spy")
+        monkeypatch.setattr(pyspy.subprocess, "run", lambda *a, **k: Finished(payload))
+        return pyspy.dump(4321)
+
+    for payload in (b"{}", b'{"threads": []}', b"[1, 2]", b'"a string"', b"null"):
+        threads, error = answering(payload)
+        assert threads is None, f"{payload!r} was read as a stack"
+        assert error and "does not understand" in error
+
+    # The shapes it does understand are untouched.
+    assert answering(b"[]") == ([], None)
+    threads, error = answering(
+        b'[{"thread_id": 1, "frames": [{"name": "f", "filename": "a.py", "line": 2}]}]'
+    )
+    assert error is None
+    assert threads and threads[0]["frames"][0]["function"] == "f"
+
+
 def test_own_threads_reports_the_innermost_frame_first():
     """py-spy's order, and this package's order everywhere else."""
 

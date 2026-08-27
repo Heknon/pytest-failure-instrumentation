@@ -224,6 +224,19 @@ class IncidentEngine:
         if not self.distributed and not self.settings.stack_server:
             return
         self._warn_if_a_live_session_already_owns_this_directory()
+        # Swept *before* this run's marker is written, not after. Written
+        # first, our own directory names a live pid - so a directory left
+        # behind by a finished run that shared this PYTEST_RUN_ID is skipped
+        # by the very sweep that exists to remove it, and this run silently
+        # inherits its worker files.
+        #
+        # Measured: a four-worker run followed by a one-worker run under one
+        # build id left the second reporting four workers, three of them the
+        # first attempt's corpses, out of a directory holding two distinct
+        # xdist run ids. Sequential reuse of a directory is supported on
+        # purpose; inheriting the previous attempt's evidence is not part of
+        # what it was supposed to mean.
+        prune_finished_runs(self.settings.directory)
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             # The run id is deliberately absent: reading it here would settle
@@ -242,7 +255,6 @@ class IncidentEngine:
             )
         except OSError:
             return  # bookkeeping must never break a run
-        prune_finished_runs(self.settings.directory)
 
     def _warn_if_a_live_session_already_owns_this_directory(self) -> None:
         """Two runs may share a directory on purpose - but not at once.

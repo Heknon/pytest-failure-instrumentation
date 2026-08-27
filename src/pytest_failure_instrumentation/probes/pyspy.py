@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,20 +39,51 @@ from .platform_flags import IS_LINUX, IS_MACOS, IS_WINDOWS
 DEFAULT_TIMEOUT = 15.0
 
 #: What to suggest when the attach was refused. The cause is nearly always one
-#: of these three, and a bare "Operation not permitted" sends people looking in
+#: of these, and a bare "Operation not permitted" sends people looking in
 #: the wrong place.
+#:
+#: A tracer that is already attached answers EPERM too, and it is worth naming
+#: first: a target can only be suspended by one reader at a time, so a second
+#: read of the same worker fails with the same errno a permission problem
+#: gives. Measured - four concurrent reads of one process, three answered and
+#: the fourth was told "Failed to suspend process - EPERM" and then advised to
+#: go and change ptrace_scope on a machine with no Yama at all. :func:`dump`
+#: now serialises this plugin's own reads per pid, so what is left here is
+#: somebody else's debugger or profiler.
 PERMISSION_HINTS = {
     "linux": (
-        "ptrace is not permitted: check /proc/sys/kernel/yama/ptrace_scope "
+        "another tracer may already be attached - a process can only be "
+        "suspended by one at a time, so a debugger or profiler on this pid "
+        "gives exactly this error; otherwise ptrace is not permitted: check "
+        "/proc/sys/kernel/yama/ptrace_scope "
         "(0 allows this; at 1 the tracer must be an ancestor of the target, "
         "and py-spy is a sibling of the worker rather than its ancestor - "
         "workers grant the exception themselves at startup, so a refusal here "
         "usually means the target is not one of ours), and add "
         "--cap-add=SYS_PTRACE if this is a container"
     ),
-    "darwin": "py-spy needs root on macOS, because SIP blocks reading another process",
+    "darwin": (
+        "another tracer may already be attached, since a process can only be "
+        "suspended by one at a time; otherwise py-spy needs root on macOS, "
+        "because SIP blocks reading another process"
+    ),
     "win32": "the reader needs permission to open the target process",
 }
+
+#: One reader at a time per target, because two cannot suspend one process and
+#: the loser's errno is indistinguishable from a permission problem. Without
+#: this the sampler - which reads every stuck worker on a cadence - raced the
+#: server answering a UI polling /stack for the same worker, and the collision
+#: was reported as a ptrace policy the user was then invited to go and change.
+#:
+#: One lock per pid ever read, which is bounded by the workers a run has.
+_attach_locks: dict[int, threading.Lock] = {}
+_attach_registry = threading.Lock()
+
+
+def _attach_lock(pid: int) -> threading.Lock:
+    with _attach_registry:
+        return _attach_locks.setdefault(pid, threading.Lock())
 
 
 def executable() -> Optional[str]:
@@ -95,6 +127,24 @@ def dump(pid: int, timeout: float = DEFAULT_TIMEOUT) -> tuple[Optional[list[dict
     if binary is None:
         return None, unavailable_reason()
 
+    # Refused rather than queued, for the same reason the server refuses past
+    # its concurrency bound: a caller polling on a timer wants to be told to
+    # come back, not held until its own deadline passes.
+    lock = _attach_lock(pid)
+    if not lock.acquire(blocking=False):
+        return None, (
+            f"a stack read of process {pid} is already in flight - a target can "
+            "only be suspended by one reader at a time; retry shortly"
+        )
+    try:
+        return _dump(binary, pid, timeout)
+    finally:
+        lock.release()
+
+
+def _dump(
+    binary: str, pid: int, timeout: float
+) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
     command = [binary, "dump", "--pid", str(pid), "--json"]
     try:
         completed = subprocess.run(
@@ -120,6 +170,24 @@ def dump(pid: int, timeout: float = DEFAULT_TIMEOUT) -> tuple[Optional[list[dict
         payload = json.loads(completed.stdout or b"[]")
     except ValueError:
         return None, "py-spy answered with something that is not JSON"
+
+    # Shape-checked, not just parsed. py-spy is a separate program on a
+    # floating version - the dependency is ``py-spy>=0.3`` with no ceiling -
+    # and a release that wrapped its threads in an object, or answered
+    # ``null``, would land straight here. Iterating that raised out of a
+    # function whose whole contract is that it returns a reason instead of a
+    # stack, and the server does not wrap this call: the request got no reply
+    # at all rather than the 502 that would have said why. A dict was quieter
+    # and worse - it iterates its keys, so the answer was zero threads and no
+    # error, which reads as "this process has no Python threads".
+    if not isinstance(payload, list) or not all(
+        isinstance(entry, dict) for entry in payload
+    ):
+        return None, (
+            "py-spy answered with JSON this does not understand - expected a "
+            f"list of threads, got {type(payload).__name__}; the installed "
+            "py-spy may be newer than this plugin knows about"
+        )
 
     return [_thread(entry) for entry in payload], None
 

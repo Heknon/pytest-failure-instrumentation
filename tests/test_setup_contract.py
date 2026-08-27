@@ -137,6 +137,38 @@ def test_a_finished_runs_directory_is_pruned_and_a_live_one_is_not(tmp_path):
     assert not finished.exists()
 
 
+def test_a_run_reusing_a_directory_does_not_inherit_the_last_attempt_s_workers(
+    distributed, monkeypatch
+):
+    """Sequential reuse of PYTEST_RUN_ID is supported; inheriting is not.
+
+    The sweep that removes finished runs used to run *after* this run wrote its
+    own marker - so our own directory named a live pid and was skipped by the
+    very sweep meant to clear it. A four-worker run followed by a one-worker
+    run under one build id left the second reporting four workers, three of
+    them the first attempt's corpses, out of a directory holding two distinct
+    xdist run ids.
+    """
+    import time
+
+    from pytest_failure_instrumentation import topology
+
+    distributed.pytester.makepyfile(
+        test_suite="def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n"
+    )
+    monkeypatch.setenv("PYTEST_RUN_ID", "build-123")
+
+    distributed.run("-n", "4", "test_suite.py", timeout=180)
+    evidence = distributed.pytester.path / ".pytest-failures" / "build-123"
+    assert len(sorted(evidence.glob("*.state"))) == 4, "the first run wrote four"
+
+    distributed.run("-n", "1", "test_suite.py", timeout=180)
+
+    assert [path.stem for path in sorted(evidence.glob("*.state"))] == ["gw0"]
+    described = topology.run(evidence, time.time())
+    assert [entry["worker"] for entry in described["workers"]] == ["gw0"]
+
+
 def test_a_directory_that_is_not_ours_is_never_pruned(tmp_path):
     """The marker is what makes a directory ours to delete. Without it, this is
     somebody's build output that happens to live beside our own."""
