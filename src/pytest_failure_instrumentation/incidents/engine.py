@@ -126,6 +126,11 @@ class IncidentEngine:
         #: Workers that went down before registering a collection. They are
         #: never going to, so they are subtracted from what is waited for.
         self.workers_lost: set[str] = set()
+        #: Workers xdist has reported down, which is final: a replacement gets
+        #: a new gateway id, so an id here will never be live again. Kept
+        #: because a dead worker's *last* report arrives after its death -
+        #: see _touch.
+        self.workers_down: set[str] = set()
         #: How long each live worker has been silent, on the *monotonic* clock,
         #: and which are wedged already - shared with the watcher thread below.
         #: Monotonic because this is one process measuring an interval against
@@ -336,13 +341,28 @@ class IncidentEngine:
     # -- liveness --------------------------------------------------------
 
     def _touch(self, worker: str | None) -> None:
-        if worker:
-            with self.lock:
-                self.activity[worker] = time.monotonic()
-                # A worker that speaks again was not wedged, or is no longer.
-                # Left in the set, a worker reported once could never be
-                # reported again however badly it went on to hang.
-                self.stalled.discard(worker)
+        """Note that a worker is alive, unless it is already known not to be.
+
+        The exception is the whole reason this is a method. When a worker
+        crashes, xdist writes the test it abandoned up as a failure and
+        attributes that report to the dead node - so the last report a worker
+        ever produces arrives *after* ``pytest_testnodedown`` has said it is
+        gone. Re-arming its liveness clock there put a corpse back in the set
+        of workers being watched, where nothing could ever remove it again,
+        and every crashed worker was reported a second time as STALLED_FROZEN
+        one ``failure_stall_seconds`` later - "the process is stopped", which
+        was true, and useless, and counted as a second run-ending incident.
+        """
+        if not worker:
+            return
+        with self.lock:
+            if worker in self.workers_down:
+                return
+            self.activity[worker] = time.monotonic()
+            # A worker that speaks again was not wedged, or is no longer. Left
+            # in the set, a worker reported once could never be reported again
+            # however badly it went on to hang.
+            self.stalled.discard(worker)
 
     def _watch_for_stalls(self) -> None:
         """Poll, because a wedged worker fires no hook at all.
@@ -713,6 +733,9 @@ class IncidentEngine:
         with self.lock:
             self.activity.pop(worker, None)
             self.nodes.pop(worker, None)
+            # Final, and it has to be: the report xdist writes for the test
+            # this worker abandoned is still to come, and it names this node.
+            self.workers_down.add(worker)
             if worker not in self.collections.digest_by_worker:
                 self.workers_lost.add(worker)
         # One fewer collection to wait for, which may be the one that was

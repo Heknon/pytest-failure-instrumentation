@@ -87,3 +87,29 @@ def test_a_worker_that_speaks_again_can_be_reported_again(pytester):
     engine._touch("gw0")
 
     assert "gw0" not in engine.stalled
+
+
+class DownNode:
+    """Just enough of an xdist node for pytest_testnodedown."""
+
+    def __init__(self, worker: str) -> None:
+        self.gateway = type("gateway", (), {"id": worker})()
+
+
+def test_a_worker_reported_down_is_never_watched_again(pytester):
+    """The last report a crashed worker produces arrives after its death.
+
+    xdist writes the test a crashed worker abandoned up as a failure and
+    attributes that report to the dead node. Taken as a sign of life, it put a
+    corpse back among the workers being watched - where nothing could remove it
+    again, since testnodedown had already fired - and every crashed worker was
+    reported a second time as STALLED_FROZEN one failure_stall_seconds later.
+    """
+    engine = engine_for(pytester)
+    engine._touch("gw0")
+    engine.pytest_testnodedown(DownNode("gw0"), None)
+    assert "gw0" not in engine.activity
+
+    engine._touch("gw0")  # xdist's report for the test gw0 never finished
+
+    assert "gw0" not in engine.activity
