@@ -780,6 +780,16 @@ class IncidentEngine:
             # Bounded like the watcher: a sample hook that will not return
             # must not be what keeps a finished run from exiting.
             self.sampler.join(timeout=2.0)
+        # A stack service that never got the port reports that from its own
+        # thread, and establishing it takes an identify round-trip - which on a
+        # short run lands right about here. Winding it down now lets a verdict
+        # already in flight arrive while the summary can still count it; the
+        # guard at the end of this method would otherwise drop it, and the run
+        # would be told nothing at all about why it has no live view. Only when
+        # it is not serving: one that is has no verdict pending and is
+        # deliberately left up for the whole teardown.
+        if self.stacks is not None and not getattr(self.stacks, "serving", False):
+            self.stacks.stop()
         # A worker that died still owing a collection means the full set never
         # arrives. Report what was seen rather than nothing at all, flagged as
         # incomplete so the worker counts are not read as the whole picture.

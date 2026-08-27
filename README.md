@@ -1103,16 +1103,20 @@ allocation fail *inside* the process, so you get a `MemoryError` with a
 traceback and a node id instead of an uncatchable kill with neither. It costs
 you a hard ceiling per worker, which is why it is opt-in.
 
-`failure_directory` should not be shared by two runs going at once. Worker ids
-start at `gw0` in every run, so two concurrent runs pointed at one directory
-write the same file names — and the controller clears the directory of its own
-files at startup, which is the other run's evidence as well. Everything either
-run reads is stamped with the run that wrote it and a record naming a different
-run is refused, so the failure mode is *missing* evidence rather than another
-run's attributed to yours; but missing is still missing. The default is
-relative to the rootdir, which separates two suites run from different
-directories. Point it somewhere per-run — a build id, a matrix cell — if you
-are collecting into a shared artifacts directory.
+`failure_directory` is safe to share between runs going at once, and it has to
+be: worker ids start at `gw0` in every run, so a flat directory would have two
+sessions writing the same file names. Each run gets a subdirectory of its own
+named for its session, holding an owner marker with the pid that made it.
+Cleanup prunes *whole directories whose owner is no longer running* rather than
+a list of file suffixes, so a live run's evidence is never what a starting run
+deletes, and a coverage report that happens to live there is never touched at
+all.
+
+Two things back that up rather than repeating it. Every record carries the run
+that wrote it, and a reader refuses one naming a different run — so even a
+directory that somehow got crossed yields missing evidence rather than another
+run's attributed to yours. And a run that finds a live session already owning
+its directory says so.
 
 ## Platform coverage
 

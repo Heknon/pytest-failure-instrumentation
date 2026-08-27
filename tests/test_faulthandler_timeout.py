@@ -74,9 +74,10 @@ def test_standing_down_is_recorded_rather_than_silent(distributed):
 
     distributed.run("-n", "1", "test_quick.py", timeout=180)
 
+    # One directory per run, named for the session - see "Two runs at once".
     evidence = distributed.pytester.path / ".pytest-failures"
     events = "".join(
-        path.read_text(encoding="utf-8") for path in evidence.glob("*.events")
+        path.read_text(encoding="utf-8") for path in evidence.glob("*/*.events")
     )
     assert "frozen_fallback_stood_down" in events
-    assert not list(evidence.glob("*.frozen"))
+    assert not list(evidence.glob("*/*.frozen"))
