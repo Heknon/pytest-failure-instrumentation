@@ -1125,6 +1125,16 @@ are collecting into a shared artifacts directory.
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
 | Live stack of another process (needs py-spy) | yes | root only | yes |
+| Stack from a worker that stopped running Python | yes | yes | yes |
+
+The last row is the frozen-interpreter fallback, and it is the one capability a
+*setting* takes away on every platform rather than a platform taking away: where
+`faulthandler_timeout` is set, pytest owns the single
+`dump_traceback_later` timer it would arm, and it stands down rather than
+cancel a timeout somebody configured. On Windows that leaves a worker frozen in
+native code with no stack at all, since the on-demand probe is not available
+there either — which is why the worker records `frozen_fallback_stood_down` in
+its event log rather than leaving the absence to be guessed at.
 
 Two Windows differences are worth knowing about, because they change what you
 will see rather than how it is reported.
