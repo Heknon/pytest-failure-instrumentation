@@ -131,6 +131,17 @@ IDENTIFY_TIMEOUT = 2.0
 #: still running picks the port up when the holder exits.
 RECLAIM_SECONDS = 5.0
 
+#: The largest number that could be a process id. No operating system this
+#: runs on issues one outside it: Linux caps ``pid_max`` at 2^22 and Windows
+#: process ids are DWORDs well inside this. The bound is here because the
+#: reader is a *separate program* with its own idea of what an integer is -
+#: handed 10^20 py-spy panics and reports a Rust backtrace, and handed a
+#: negative number it reads it as a flag and reports its own usage. Neither is
+#: an answer about a process, and both cost a subprocess and one of the slots
+#: below to produce. A pid that cannot exist is refused where the reply can say
+#: why instead.
+MAX_PID = 2**31 - 1
+
 #: How many external reads may be in flight at once. Each is a subprocess, and
 #: each takes its full timeout when the target is wedged - which is exactly
 #: what a UI polls hardest. Without a bound, a dashboard refreshing sixteen
@@ -344,6 +355,17 @@ class _Handler(BaseHTTPRequestHandler):
             pid = int(raw)
         except ValueError:
             self._reply(400, {"error": f"pid must be a number, not {raw!r}"})
+            return
+        if not 0 < pid <= MAX_PID:
+            # Refused here rather than by the reader, which answers a pid it
+            # cannot use with its own usage text or a panic - see MAX_PID.
+            self._reply(
+                400,
+                {
+                    "error": f"pid must be between 1 and {MAX_PID}, not {pid}; "
+                    "no process can have the id given"
+                },
+            )
             return
 
         threads, error, source = read_stack(pid)

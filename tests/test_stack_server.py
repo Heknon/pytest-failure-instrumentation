@@ -254,6 +254,31 @@ def test_a_pid_that_is_not_a_number_is_refused_rather_than_guessed(serving):
     assert "notapid" in body["error"]
 
 
+def test_a_pid_no_process_could_have_is_refused_without_spending_a_reader(serving):
+    """The reader is a separate program with its own idea of an integer.
+
+    Handed 10^20 py-spy panics and its Rust backtrace became the API's
+    "error"; handed a negative number it reads it as a flag and prints its own
+    usage. Both cost a subprocess and one of the concurrency slots to produce a
+    reply that says nothing about any process. A pid that cannot exist is
+    refused where the reply can say why.
+    """
+    service = serving(free_port(), directory=None)
+    assert wait_for(lambda: service.serving), "never served"
+    port = service.bound_port
+
+    for impossible in (-1, 0, stack_server.MAX_PID + 1, 99999999999999999999):
+        status, body = get(port, f"/stack?pid={impossible}", service.token)
+        assert status == 400, f"pid={impossible} reached the reader"
+        assert "pid must be between" in body["error"]
+        # Nothing py-spy said about itself leaks out as the explanation.
+        assert "py-spy" not in body["error"] and "panicked" not in body["error"]
+
+    # A pid that could exist still goes to the reader, whatever it finds there.
+    status, _ = get(port, f"/stack?pid={stack_server.MAX_PID}", service.token)
+    assert status == 502
+
+
 def test_an_unreadable_process_answers_with_why(serving):
     """A UI that is told nothing shows an empty pane; one that is told why can
     say whether this is a dead process or a missing permission."""
