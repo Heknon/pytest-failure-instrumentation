@@ -189,12 +189,15 @@ class Settings:
         """Binding anything but loopback is a decision, and it is worth saying
         out loud that it was made.
 
-        The server answers with the stack of any local process it can read, and
-        it asks nobody who they are. On loopback that is bounded by who can get
-        a socket on the machine; on 0.0.0.0 it is bounded by the network, which
-        inside a cluster is every other pod. That is the right setting for a
-        container whose UI is outside it and the wrong one everywhere else, and
-        only the person who typed it can tell which case this is.
+        The server answers with the stack of any local process it can read. It
+        does ask who is asking - every endpoint but ``/identity`` wants the
+        token - but a token is a secret in a file, and what changes off
+        loopback is the set of people who get to try it. On loopback that set
+        is whoever can open a socket on this machine; on 0.0.0.0 it is the
+        network, which inside a cluster is every other pod. That is the right
+        setting for a container whose UI is outside it and the wrong one
+        everywhere else, and only the person who typed it can tell which case
+        this is.
         """
         if not self.stack_server or self.stack_server_host in LOOPBACK:
             return
