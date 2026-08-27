@@ -480,6 +480,21 @@ because both ends carry something the other does not — the head is the module
 attribution reads, and the tail is where a parametrize puts the value saying
 which case this was.
 
+The slot carries *two* node ids, and the difference is why it is read at all.
+`test_in_flight` is the test currently running and is cleared when teardown
+returns; `last_test` is the most recent test whether or not it finished. One
+field cannot be both, and being both is how a worker that died in the gap
+between two tests came to be reported as having died *in* the one that had
+already passed — attributed to whoever owns it, with an owner and a severity on
+it. Where nothing is in flight the incident says so, and the lead it offers
+names itself as the last test rather than the running one.
+
+It carries the run id too. The evidence directory outlives a run and clearing
+it is best-effort — on Windows a file another process still has open cannot be
+unlinked at all — so a record stamped with a different run is refused rather
+than read as this one's. That check is load-bearing beyond the report: the pid
+in a stale record is a pid this run's stack probe would otherwise signal.
+
 **The exit status, taken from the OS.** Where a `Popen` object survives, its
 return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
 `WNOWAIT` reads the status *without consuming it*, so execnet's own reaping
@@ -590,6 +605,28 @@ thread for three intervals would starve the timer's own thread with it. The
 dump goes to `<worker>.frozen`, because it means something the watchdog's does
 not — not "this test is slow" but "this process stopped responding" — and the
 incident says which file its stack came out of in `stack_source`.
+
+**It stands down where pytest is using that timer.** There is exactly one
+`faulthandler.dump_traceback_later` timer per process, and arming it cancels
+whatever was armed before. pytest's own faulthandler plugin arms it at the
+start of every test when `faulthandler_timeout` is set, and this fallback
+re-arms every second — so the fallback always won, and a configured timeout
+silently never fired, `faulthandler_exit_on_timeout` and all. Where that ini is
+set the fallback is not armed at all, and the worker records
+`frozen_fallback_stood_down` in its event log saying why. It costs a stalled
+worker its frozen-fallback stack, which is a worse report; the alternative is a
+run that hangs past a timeout somebody configured, which is a worse run.
+
+**Nothing is signalled that cannot be confirmed.** `SIGUSR1`'s default
+disposition is to *terminate*, and the pid the on-demand probe would signal was
+read back out of a file the worker wrote. A worker that has since exited leaves
+its number to be handed on by the kernel, so signalling it does not produce a
+bad report — it kills an unrelated process. The pid is signalled only once
+something says it is still ours: the controller can see that process running
+under this worker's gateway, or the machine can be asked and answers that it is
+a child of this one. A machine that cannot be asked at all is not taken as a
+yes, and the incident says which of those it was instead of showing a stack it
+never had.
 
 **A heartbeat carrying CPU time.** One line every five seconds per worker,
 bounded by wall-clock rather than by how many tests run. `time.process_time()`

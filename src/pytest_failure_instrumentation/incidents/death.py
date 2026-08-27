@@ -116,6 +116,11 @@ class WorkerDeathIncident(Incident):
     exit_status_meaning: str = "unknown"
 
     test_in_flight: Optional[str] = None
+    #: The most recent test this worker ran, whether or not it finished. A
+    #: worker that died in the gap between two tests died *after* this one,
+    #: not in it - which is why it is not ``test_in_flight``, and why the
+    #: attribution below says which of the two it is working from.
+    last_test: Optional[str] = None
     phase: Optional[str] = None
     tests_started: int = 0
     tests_finished: int = 0
@@ -152,7 +157,15 @@ class WorkerDeathIncident(Incident):
         return self.crash_stack, False  # faulthandler prints deepest first
 
     def suspect_nodeid(self) -> str | None:
-        return self.test_in_flight
+        return self.test_in_flight or self.last_test
+
+    def suspect_basis_for(self, path: str) -> str:
+        if self.test_in_flight:
+            return f"owner of the test in flight ({path})"
+        return (
+            f"owner of the last test this worker finished ({path}); the worker "
+            "died between tests, so no test was running"
+        )
 
     def fingerprint_parts(self) -> list[str]:
         return [self.kind, self.verdict, str(self.exit_status)]
@@ -162,6 +175,8 @@ class WorkerDeathIncident(Incident):
         if self.test_in_flight:
             phase = f"  phase={self.phase}" if self.phase else ""
             return [f"in flight {self.test_in_flight}{phase}  {counted}"]
+        if self.last_test:
+            return [f"no test in flight; last was {self.last_test}  {counted}"]
         return [f"no test in flight  {counted}"]
 
 
@@ -170,11 +185,15 @@ def build(
     error: object,
     directory: Path,
     baseline_oom_kills: int | None,
+    run_id: str | None = None,
 ) -> WorkerDeathIncident:
     worker = node.gateway.id
     crash_file = directory / f"{worker}.crash"
     events = event_log.read_events(directory / f"{worker}.events")
-    state = read_state(directory / f"{worker}.state")
+    # The run id keeps a record an earlier run left behind - one this run could
+    # not delete, which on Windows is any file somebody still had open - from
+    # being read as this worker's last moments.
+    state = read_state(directory / f"{worker}.state", run_id)
     pid = state.get("pid") or event_log.worker_pid(events)
     popen = getattr(getattr(node.gateway, "_io", None), "popen", None)
     # Read before the dump, because it decides whether a dump is still coming.
@@ -193,6 +212,7 @@ def build(
         exit_status_source=source,
         exit_status_meaning=exit_status.describe(status),
         test_in_flight=state.get("nodeid"),
+        last_test=state.get("last_nodeid"),
         phase=state.get("phase"),
         tests_started=state.get("tests_started") or 0,
         tests_finished=state.get("tests_finished") or 0,

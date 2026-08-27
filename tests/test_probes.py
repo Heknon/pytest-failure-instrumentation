@@ -264,3 +264,52 @@ def test_the_prctl_option_is_yamas_own_number():
 
     assert tracing.PR_SET_PTRACER == 0x59616D61
     assert bytes.fromhex(f"{tracing.PR_SET_PTRACER:x}") == b"Yama"
+# -- whose process is that pid ---------------------------------------------
+#
+# is_own_child errs the opposite way from is_running above, and the tests hold
+# that: a wrong "yes" signals a stranger's process, a wrong "no" only costs a
+# stalled worker its stack. psutil is a hard dependency here, so there is no
+# machine that cannot answer and no third value to handle.
+
+
+def test_a_live_child_is_recognised_as_one():
+    """What licenses the stack probe. SIGUSR1's default disposition is to
+    terminate, and the pid it is aimed at was read back out of a file - so the
+    question "is that still our worker" is the difference between a bad report
+    and somebody else's process being killed."""
+    process_handle = child("import time", "time.sleep(30)")
+    try:
+        assert probes.is_own_child(process_handle.pid) is True
+    finally:
+        process_handle.kill()
+        process_handle.wait()
+
+
+def test_a_process_that_is_not_ours_is_not_mistaken_for_a_worker():
+    """pid 1 is real and alive on every platform this runs on, and is
+    emphatically not something this process started."""
+    assert probes.is_own_child(1) is False
+
+
+def test_a_pid_that_cannot_exist_is_not_ours():
+    assert probes.is_own_child(0) is False
+    assert probes.is_own_child(-1) is False
+
+
+def test_a_child_that_has_gone_is_no_longer_ours():
+    """The case the whole check exists for: the pid outlives the process, and
+    the number is handed on to somebody else."""
+    process_handle = child("import sys", "sys.exit(0)")
+    process_handle.wait()  # reaped, so this asks about a pid with no process
+    assert probes.is_own_child(process_handle.pid) is False
+
+
+def test_the_two_liveness_questions_disagree_about_a_stranger(monkeypatch):
+    """is_running says pid 1 is there and is_own_child says it is not ours.
+
+    Both are right, and the live view depends on them being different: one
+    decides whether to keep reporting a worker, the other whether it is safe
+    to signal it.
+    """
+    assert probes.is_running(1) is True
+    assert probes.is_own_child(1) is False

@@ -54,8 +54,13 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         phase = f" ({incident.phase})" if incident.phase else ""
         evidence.append(f"died while running {incident.test_in_flight}{phase}")
     elif incident.tests_finished:
+        # Not "died in" - the last test had already finished, and saying
+        # otherwise puts a passing test's name on a death it had no part in.
+        after = (
+            f", the last of them {incident.last_test}" if incident.last_test else ""
+        )
         evidence.append(
-            f"died between tests, after finishing {incident.tests_finished}"
+            f"died between tests, after finishing {incident.tests_finished}{after}"
         )
     else:
         evidence.append("died before running any test (startup or collection)")

@@ -9,6 +9,7 @@ writes them.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -489,3 +490,107 @@ def test_a_cut_stack_says_it_was_cut(tmp_path):
 
     # And nothing is added when nothing was dropped.
     assert not any("more frames" in line for line in crash_stack.read(path, limit=200))
+
+
+def test_a_dump_that_could_not_be_deleted_is_tried_again(tmp_path, monkeypatch):
+    """Windows refuses to unlink a file another process has open, and the other
+    process is the controller reading this very stack while it assesses a
+    stall. Forgetting the file on a refused unlink stranded it for the rest of
+    the run: no later test tried again, and the next stall read a finished
+    test's frames as the live worker's."""
+    watchdog = crash_stack.SlowTestWatchdog(tmp_path / "gw0.slow", timeout=0.01)
+    watchdog.path.write_text("Timeout (0:00:01)!\n", encoding="utf-8")
+    watchdog._on_disk = True
+
+    refused = []
+    real_unlink = Path.unlink
+
+    def refuse_once(self, *arguments, **keywords):
+        if self == watchdog.path and not refused:
+            refused.append(self)
+            raise PermissionError(32, "The process cannot access the file")
+        return real_unlink(self, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, "unlink", refuse_once)
+
+    watchdog.end_test()
+    assert watchdog.path.exists(), "the unlink was refused, as the test arranged"
+
+    watchdog.start_test()
+    watchdog.end_test()
+    assert not watchdog.path.exists(), "the refused dump was never tried again"
+
+
+def test_a_dump_somebody_else_removed_is_not_retried_forever(tmp_path):
+    watchdog = crash_stack.SlowTestWatchdog(tmp_path / "gw0.slow", timeout=0.01)
+    watchdog._on_disk = True
+
+    watchdog.end_test()
+    assert watchdog._on_disk is False
+
+
+# -- the one timer two plugins share ---------------------------------------
+
+
+def test_the_fallback_stands_down_when_it_is_given_no_stream(tmp_path):
+    """How the worker says "pytest owns the timer". There is one
+    dump_traceback_later per process and arming it cancels what was armed
+    before - so a fallback that re-arms every second silently takes over a
+    configured faulthandler_timeout, exit and all."""
+    fallback = crash_stack.FrozenInterpreterFallback(None, interval=0.05)
+    assert fallback.enabled is False
+
+    import faulthandler
+
+    marker = tmp_path / "someone-else.txt"
+    with marker.open("w", buffering=1, encoding="utf-8") as stream:
+        faulthandler.dump_traceback_later(0.5, repeat=False, file=stream, exit=False)
+        try:
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                fallback.tick()      # must not cancel and re-aim the timer
+                time.sleep(0.05)
+            assert marker.stat().st_size > 0, "the other plugin's timer never fired"
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+    # And stopping a fallback that armed nothing must not disarm whoever did.
+    with marker.open("w", buffering=1, encoding="utf-8") as stream:
+        faulthandler.dump_traceback_later(0.5, repeat=False, file=stream, exit=False)
+        try:
+            fallback.stop()
+            time.sleep(1.5)
+            assert marker.stat().st_size > 0, "the fallback cancelled a timer it never armed"
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+
+def test_a_worker_leaves_pytest_s_own_timeout_alone(tmp_path):
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(
+        tmp_path, "gw0", Settings(heartbeat_interval=1), faulthandler_timeout=30.0
+    )
+    try:
+        assert recorder.frozen.enabled is False
+        assert not (tmp_path / "gw0.frozen").exists()
+    finally:
+        recorder.close()
+
+    events = (tmp_path / "gw0.events").read_text(encoding="utf-8")
+    assert "frozen_fallback_stood_down" in events
+    assert "faulthandler_timeout" in events
+
+
+def test_a_worker_with_no_timeout_configured_still_arms_the_fallback(tmp_path):
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(tmp_path, "gw0", Settings(heartbeat_interval=1))
+    try:
+        assert recorder.frozen.enabled is True
+        assert (tmp_path / "gw0.frozen").exists()
+    finally:
+        recorder.heartbeat.stop()
+        recorder.close()

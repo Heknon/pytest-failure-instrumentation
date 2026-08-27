@@ -108,3 +108,38 @@ def test_the_controller_and_its_workers_agree_on_the_run_id(runner):
         if line.strip()
     }
     assert stamped == {summary.run_id}
+
+
+def test_nothing_is_raised_after_the_summary_has_said_how_many_there_were(pytester):
+    """The stall watcher runs on its own thread and can be inside an
+    assessment when the session ends. It is asked to stop and joined first, so
+    this is the backstop - but without it a late incident arrives after the
+    number of incidents has already been reported, into a consumer that has
+    finished writing, or into interpreter shutdown."""
+    from pytest_failure_instrumentation.config import Settings
+    from pytest_failure_instrumentation.incidents.engine import IncidentEngine
+    from pytest_failure_instrumentation.incidents.stall import WorkerStallIncident
+
+    class Collecting:
+        def __init__(self):
+            self.incidents = []
+
+        def pytest_failure_incident(self, incident):
+            self.incidents.append(incident)
+
+    class Stub:
+        def __init__(self, hook, pluginmanager):
+            self.hook = hook
+            self.pluginmanager = pluginmanager
+
+    config = pytester.parseconfig()
+    engine = IncidentEngine(config, Settings(directory=pytester.path / "evidence"))
+    hook = Collecting()
+    engine.config = Stub(hook, config.pluginmanager)
+
+    engine.raise_incident(WorkerStallIncident(worker="gw0", verdict="STALLED_BLOCKED"))
+    assert len(hook.incidents) == 1
+
+    engine.closed = True
+    engine.raise_incident(WorkerStallIncident(worker="gw1", verdict="STALLED_FROZEN"))
+    assert len(hook.incidents) == 1, "an incident arrived after the run had ended"

@@ -1,9 +1,18 @@
-"""Retrieving the exit status of a worker process.
+"""Retrieving the exit status of a worker process, and confirming its identity.
 
 POSIX hands a child's status to its parent exactly once, so ``waitid`` with
 ``WNOWAIT`` reads it without consuming it and whoever owns the process can
 still reap normally. Windows has no such rule: any handle you can open
 answers. Decoding what the number *means* lives in analysis/exit_status.
+
+:func:`is_own_child` answers a different question, and a sharper one. A pid
+read back from a file is a number, not a process: the worker it named may have
+exited and the kernel handed the number to something else. Nothing here does
+anything to a pid, but :mod:`..probes.stacks` sends it a signal - and SIGUSR1's
+default disposition is to *terminate*. Signalling a recycled pid is not a bad
+report, it is an unrelated process killed. It is the mirror of
+:func:`is_running`: that one errs towards saying a process is there, this one
+towards saying it is not ours.
 """
 
 from __future__ import annotations
@@ -120,6 +129,32 @@ def unsigned_on_windows(status: int) -> int:
     if IS_WINDOWS and status < 0:
         return status + (1 << 32)
     return status
+
+
+def is_own_child(pid: int) -> bool:
+    """Whether ``pid`` is a process this one started.
+
+    **This one errs towards no, and :func:`is_running` above errs towards
+    yes.** They are next to each other and they are not the same question, so
+    the difference is worth saying: a wrong "yes" here sends a signal to a
+    stranger's process, and a wrong "no" costs a stalled worker its stack. Only
+    one of those is recoverable.
+
+    Answers without asking the process anything. psutil is a hard dependency,
+    so there is no machine this cannot be asked on and no third answer to
+    handle - which is what lets the caller treat anything other than True as a
+    refusal.
+
+    A pid whose process has gone is not ours, and neither is one whose parent
+    is somebody else. A zombie child still is: its parent is still this
+    process, and a signal to it is a no-op rather than a stray kill.
+    """
+    if pid <= 0:
+        return False
+    try:
+        return psutil.Process(pid).ppid() == os.getpid()
+    except Exception:  # noqa: BLE001 - gone, or not ours to ask about
+        return False
 
 
 def exit_status(pid: int | None, popen: Any, timeout: float = 5.0) -> tuple[int | None, str | None, str]:

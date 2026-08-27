@@ -48,7 +48,12 @@ from typing import Any, Optional
 import pytest
 
 from . import hookspec
-from .config import FailureInstrumentationWarning, Settings, resolve
+from .config import (
+    FailureInstrumentationWarning,
+    Settings,
+    pytest_faulthandler_timeout,
+    resolve,
+)
 
 #: Where the settings in force are kept, so a later caller can see them and
 #: the entry point can tell "already installed" from "nobody has yet".
@@ -139,8 +144,16 @@ def _build(config: pytest.Config, settings: Settings) -> Any:
         from .capture.recorder import WorkerRecorder
 
         worker_id = config.workerinput["workerid"]
+        # pytest's faulthandler_timeout is read here rather than in the
+        # recorder: it is not a setting of this plugin's and does not travel
+        # in Settings, but it decides whether the frozen-interpreter fallback
+        # may arm the one process-wide timer the two plugins share.
+        timeout = pytest_faulthandler_timeout(config)
         return _built(
-            lambda: WorkerRecorder(settings.directory, worker_id, settings), "worker"
+            lambda: WorkerRecorder(
+                settings.directory, worker_id, settings, faulthandler_timeout=timeout
+            ),
+            "worker",
         )
 
     # Registered whether or not xdist is in the picture. Two of the five kinds

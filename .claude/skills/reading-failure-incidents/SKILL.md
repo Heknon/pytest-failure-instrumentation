@@ -64,6 +64,9 @@ wrong conclusion. Check this list before quoting a figure back to anyone.
 | `started=N finished=M` | throughput | where in the worker's life it died. `started=1 finished=0` is a death on the very first test, not a leak accumulating over a long worker lifetime |
 | `missing` / `extra` | the whole difference | capped at 500 per side. `missing_count` / `extra_count` are the true totals |
 | `test_in_flight` | the node id, verbatim | written to a fixed-size slot, so a very long id is elided from the middle and marked `...` — head and tail are kept, since the module is at the front and a parametrized hash at the end. Match on the parts, not the whole string, and do not report an elided id as the test's real name |
+| `last_test` | the test that failed | the last test the worker *ran*, set whether or not it finished. It is only ever context. When `test_in_flight` is null nothing was running — the worker was between tests, still collecting, or waiting to be handed work — and `last_test` had already finished. Never report it as the test that died or hung |
+| `test_in_flight: null` on a stall | the worker had no work | one of three ordinary things that look identical from outside: between tests, collecting, or idle awaiting work. The silence is still real (the run cannot end while a worker never comes back) but the confidence drops to `low` and nothing is blamed on a test |
+| `no stack: pid … could not be confirmed` | the probe failed | the probe was *never sent*. `SIGUSR1` terminates by default, and the pid came out of a file — an exited worker leaves its number to be reused, so an unconfirmable pid is left alone rather than signalled. Not a finding about the worker |
 | `exitstatus` on a `run_summary` | the run's outcome | sometimes reported before pytest applies `INTERNAL_ERROR`; `run_ending_incidents` is the one to trust when they disagree |
 
 ## The shared fields

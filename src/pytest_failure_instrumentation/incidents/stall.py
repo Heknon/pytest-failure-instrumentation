@@ -14,6 +14,7 @@ already made, because the asking can perturb what it measures.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import ClassVar, Literal, Optional
@@ -67,6 +68,10 @@ class WorkerStallIncident(Incident):
     worker_pid: Optional[int] = None
 
     test_in_flight: Optional[str] = None
+    #: The most recent test this worker ran, whether or not it finished. Only
+    #: ever context: a worker wedged between two tests is not wedged *in* the
+    #: one that already passed, and the two must not share a field.
+    last_test: Optional[str] = None
     phase: Optional[str] = None
 
     stack: list[str] = Field(default_factory=list)
@@ -95,13 +100,25 @@ class WorkerStallIncident(Incident):
         return self.stack, False  # faulthandler prints deepest first
 
     def suspect_nodeid(self) -> Optional[str]:
-        return self.test_in_flight
+        return self.test_in_flight or self.last_test
+
+    def suspect_basis_for(self, path: str) -> str:
+        if self.test_in_flight:
+            return f"owner of the test in flight ({path})"
+        return (
+            f"owner of the last test this worker ran ({path}); nothing was in "
+            "flight when it went silent"
+        )
 
     def fingerprint_parts(self) -> list[str]:
         return [self.kind, self.verdict, self.state]
 
     def details(self) -> list[str]:
-        where = self.test_in_flight or "no test in flight"
+        where = self.test_in_flight or (
+            f"no test in flight (last was {self.last_test})"
+            if self.last_test
+            else "no test in flight"
+        )
         phase = f" ({self.phase})" if self.phase else ""
         line = f"silent for {self.silent_for_seconds:.0f}s in {where}{phase}"
         if self.cpu_rate is not None:
@@ -133,11 +150,23 @@ def build(
     silent_for: float,
     interval: float,
     stack_probe: bool,
+    *,
+    run_id: Optional[str] = None,
+    live_pid: Optional[int] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> Optional[WorkerStallIncident]:
     """Assess a silent worker. Returns None when it is merely slow.
 
-    Runs on the stall watcher's own thread, which is why it may sleep: the
-    second pass is what separates a missed beat from a frozen process.
+    Runs on the stall watcher's own thread, which is why it may wait: the
+    second pass is what separates a missed beat from a frozen process. Every
+    wait here is against ``cancel``, so the session can end without waiting
+    out an assessment that will be thrown away - the alternative is a hook
+    call arriving after the run summary, or during interpreter shutdown.
+
+    ``live_pid`` is the pid the controller can still see running for this
+    worker's gateway. It is what licenses the signal in :func:`_stack`; a pid
+    read back from a file is only a number, and the process that owns it now
+    may be somebody else's.
     """
     path = directory / f"{worker}.events"
     events = event_log.read_events(path)
@@ -146,23 +175,44 @@ def build(
 
     if verdict.needs_confirmation:
         previous = assessment.last_beat_time(beats)
-        time.sleep(interval * 1.2)
+        if _wait(cancel, interval * 1.2):
+            return None  # the run is ending; nobody is left to tell
         beats = event_log.heartbeats(event_log.read_events(path))
         verdict = assessment.confirm(beats, previous, time.time(), silent_for)
 
     if verdict.state is None:
         return None  # burning CPU: slow, not stuck. Say nothing and re-arm.
 
-    state = read_state(directory / f"{worker}.state")
+    state = read_state(directory / f"{worker}.state", run_id)
     pid = state.get("pid") or event_log.worker_pid(events)
-    stack, probed, why, written, source = _stack(directory, worker, pid, stack_probe)
+    in_flight = state.get("nodeid")
+    stack, probed, why, written, source = _stack(
+        directory, worker, pid, stack_probe, live_pid, cancel
+    )
+
+    evidence = [
+        f"no report from {worker} for {silent_for:.0f}s while the run continued",
+        verdict.reason,
+    ]
+    confidence = verdict.confidence or CONFIDENCE.get(verdict.state, "low")
+    if not in_flight and verdict.state != "FROZEN":
+        # Nothing was running. A worker between two tests, still collecting, or
+        # waiting for the scheduler to hand it work looks exactly like this
+        # from outside, and all three are ordinary. The silence is still worth
+        # reporting - the run cannot end while a worker never comes back - but
+        # not at the confidence a wedged test earns, and not blamed on a test.
+        evidence.append(
+            "no test was in flight: the worker was between tests, still "
+            "collecting, or waiting to be given work"
+        )
+        confidence = "low"
 
     return WorkerStallIncident(
         worker=worker,
         verdict=f"STALLED_{verdict.state}",
         # The assessment overrides only when it reached the state on weaker
         # evidence than the state normally implies.
-        confidence=verdict.confidence or CONFIDENCE.get(verdict.state, "low"),
+        confidence=confidence,
         state=verdict.state,
         reason=verdict.reason,
         silent_for_seconds=round(silent_for, 1),
@@ -171,7 +221,8 @@ def build(
             round(verdict.heartbeat_age, 1) if verdict.heartbeat_age is not None else None
         ),
         worker_pid=pid,
-        test_in_flight=state.get("nodeid"),
+        test_in_flight=in_flight,
+        last_test=state.get("last_nodeid"),
         phase=state.get("phase"),
         stack=stack,
         stack_probed=probed,
@@ -180,15 +231,25 @@ def build(
             round(max(0.0, time.time() - written), 1) if written is not None else None
         ),
         stack_source=source,
-        evidence=[
-            f"no report from {worker} for {silent_for:.0f}s while the run continued",
-            verdict.reason,
-        ],
+        evidence=evidence,
     )
 
 
+def _wait(cancel: Optional[threading.Event], seconds: float) -> bool:
+    """Sleep, unless and until the run ends. True when it did."""
+    if cancel is None:
+        time.sleep(seconds)
+        return False
+    return cancel.wait(seconds)
+
+
 def _stack(
-    directory: Path, worker: str, pid: Optional[int], allowed: bool
+    directory: Path,
+    worker: str,
+    pid: Optional[int],
+    allowed: bool,
+    live_pid: Optional[int] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
     """Ask the worker for a stack, and read only what it added.
 
@@ -205,7 +266,7 @@ def _stack(
     except OSError:
         before = 0
 
-    why = _cannot_probe(pid, allowed)
+    why = _cannot_probe(pid, allowed, live_pid)
     if why is not None or pid is None:
         # Whatever the worker wrote on its own is still evidence.
         stack, written, source = _passive_stack(directory, worker)
@@ -222,7 +283,8 @@ def _stack(
 
     deadline = time.time() + STACK_WAIT_SECONDS
     while time.time() < deadline:
-        time.sleep(STACK_POLL_SECONDS)
+        if _wait(cancel, STACK_POLL_SECONDS):
+            break
         try:
             if crash_file.stat().st_size > before:
                 return (
@@ -247,14 +309,37 @@ def _stack(
     )
 
 
-def _cannot_probe(pid: Optional[int], allowed: bool) -> Optional[str]:
-    """Why a live stack cannot be asked for, or None when it can."""
+def _cannot_probe(
+    pid: Optional[int], allowed: bool, live_pid: Optional[int]
+) -> Optional[str]:
+    """Why a live stack cannot be asked for, or None when it can.
+
+    The last clause is the one that is not about capability. SIGUSR1's default
+    disposition is to *terminate*, and the pid here was read back out of a file
+    the worker wrote - so if that worker has since exited and the kernel has
+    handed its number to something else, signalling it does not produce a bad
+    report, it kills a process that has nothing to do with this run. So the pid
+    is signalled only once something says it is still ours: the controller can
+    see that process running under this worker's gateway, or the machine can be
+    asked and answers that it is a child of ours. A machine that cannot be
+    asked at all is not taken as a yes.
+    """
     if not allowed:
         return "failure_stack_probe is off, so the worker was left undisturbed"
     if not probes.can_request_stack():
         return "this platform cannot ask a live process for one"
     if not pid:
         return "the worker's pid was never recorded, so there is nothing to ask"
+    if live_pid is not None and live_pid != pid:
+        return (
+            f"the worker's gateway is running pid {live_pid}, not the {pid} on "
+            "file, so nothing here is the process to ask"
+        )
+    if live_pid is None and probes.is_own_child(pid) is not True:
+        return (
+            f"pid {pid} could not be confirmed as this run's worker, and a "
+            "recycled pid belongs to somebody else's process"
+        )
     return None
 
 

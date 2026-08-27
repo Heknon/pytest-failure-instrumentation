@@ -30,9 +30,20 @@ from .state import WorkerState
 
 
 class WorkerRecorder:
-    def __init__(self, directory: Path, worker_id: str, settings: Settings) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        worker_id: str,
+        settings: Settings,
+        *,
+        faulthandler_timeout: float = 0.0,
+    ) -> None:
         self.worker_id = worker_id
         self.directory = directory
+        #: pytest's own ``faulthandler_timeout``. Not a setting of ours - it
+        #: decides only whether the frozen-interpreter fallback may arm the
+        #: one timer the two plugins share. See config.pytest_faulthandler_timeout.
+        self.faulthandler_timeout = faulthandler_timeout
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
         # Filled as each resource is opened, so close() works on a recorder
@@ -51,7 +62,7 @@ class WorkerRecorder:
         directory.mkdir(parents=True, exist_ok=True)
 
         self.state = self._track(
-            WorkerState(directory / f"{worker_id}.state", os.getpid())
+            WorkerState(directory / f"{worker_id}.state", os.getpid(), settings.run_id)
         )
         self.events = self._track(
             EventLog(directory / f"{worker_id}.events", settings.run_id)
@@ -79,14 +90,24 @@ class WorkerRecorder:
         # own threads cannot run while native code holds the GIL. Never
         # closed, for the same reason as the crash stream - the C timer keeps
         # the descriptor and may write to it long after Python has stopped.
-        self._frozen_stream = (
-            directory / f"{worker_id}.frozen"
-        ).open("w", buffering=1, encoding="utf-8")
-        self._open_resources.append(self._frozen_stream)
-        self.frozen = crash_stack.FrozenInterpreterFallback(
-            self._frozen_stream,
-            settings.heartbeat_interval if settings.watchdog else 0.0,
-        )
+        #
+        # It stands down when pytest is using that timer itself. There is one
+        # per process and arming it cancels what was armed before, so the
+        # fallback - which re-arms every second - would quietly take over a
+        # user's faulthandler_timeout and with it the exit that was meant to
+        # end a hung run. Losing a stack is a worse report; losing somebody's
+        # configured timeout is a worse run.
+        self._frozen_stream = None
+        self.frozen = crash_stack.FrozenInterpreterFallback(None, 0.0)
+        if settings.watchdog and self.faulthandler_timeout <= 0:
+            self._frozen_stream = self._track(
+                (directory / f"{worker_id}.frozen").open(
+                    "w", buffering=1, encoding="utf-8"
+                )
+            )
+            self.frozen = crash_stack.FrozenInterpreterFallback(
+                self._frozen_stream, settings.heartbeat_interval
+            )
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
@@ -108,6 +129,14 @@ class WorkerRecorder:
             traceable_by_parent=traceable,
             tracer_policy=settings.tracer,
         )
+        if settings.watchdog and self.faulthandler_timeout > 0:
+            self.events.record(
+                "frozen_fallback_stood_down",
+                reason="pytest's faulthandler_timeout is set and owns the one "
+                "dump_traceback_later timer this process has; re-arming it "
+                "would cancel that timeout",
+                faulthandler_timeout=self.faulthandler_timeout,
+            )
         self.state.update()
 
     def _track(self, resource: Any) -> Any:
@@ -219,13 +248,22 @@ class WorkerRecorder:
         if phase == "setup":
             self.slow_test.start_test()
         yield
-        if phase == "teardown":
-            self.slow_test.end_test()
-        if phase == "teardown":
-            self.state.tests_finished += 1
         if self.heartbeat is not None:
             self.heartbeat.phase = None
-        self.state.update(phase=None)
+        if phase != "teardown":
+            self.state.update(phase=None)
+            return
+        self.slow_test.end_test()
+        self.state.tests_finished += 1
+        # The node id is cleared with the *test*, not with each phase. A worker
+        # that dies or wedges in the gap between two tests has no test in
+        # flight, and saying it had one names a test that already passed - to
+        # which the incident is then attributed, with an owner and a severity.
+        # What that test was is still worth knowing, so the slot keeps it in
+        # `last_nodeid`, where nothing can mistake it for the present.
+        if self.heartbeat is not None:
+            self.heartbeat.nodeid = None
+        self.state.update(phase=None, nodeid=None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_internalerror(self, excrepr: object) -> None:

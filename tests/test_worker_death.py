@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from .conftest import needs_xdist
+from .conftest import INNER_CONFTEST, needs_xdist
 
 pytestmark = needs_xdist
 
@@ -509,3 +509,58 @@ def test_a_worker_that_dumped_nothing_is_not_given_a_stack_age(distributed):
     death = distributed.only(incidents, "worker_death")
     assert death.crash_stack == []
     assert death.crash_stack_age_seconds is None
+
+
+BETWEEN_TESTS_CONFTEST = INNER_CONFTEST + '''
+import os
+
+
+def pytest_runtest_logfinish(nodeid):
+    """The gap between two tests: teardown has returned and the next test has
+    not started, so nothing is in flight.
+
+    Only in the worker. xdist relays logfinish to the controller as well, and
+    a controller that exits here takes the whole run with it.
+    """
+    if nodeid.endswith("::test_finishes") and os.environ.get("PYTEST_XDIST_WORKER"):
+        import victim
+
+        victim.hard_exit(9)
+'''
+
+
+def test_a_death_between_tests_is_not_blamed_on_the_test_that_passed(distributed):
+    """The state slot used to keep the last node id after teardown, so a worker
+    that died in the gap between two tests was reported as having died *in* the
+    one that had already passed - and the incident was attributed to whoever
+    owns it, with a severity and a name on it."""
+    distributed.pytester.makeconftest(BETWEEN_TESTS_CONFTEST)
+    distributed.pytester.makepyfile(
+        test_gap="""
+        def test_first():
+            assert True
+
+
+        def test_finishes():
+            assert True
+
+
+        def test_never_runs():
+            assert True
+        """
+    )
+    incidents = distributed.run("-n", "1", "test_gap.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.exit_status == 9
+    assert death.test_in_flight is None, "no test was running when it died"
+    assert death.last_test == "test_gap.py::test_finishes"
+    assert death.phase is None
+    assert death.tests_started == death.tests_finished == 2
+    assert any("died between tests" in line for line in death.evidence)
+    assert any("test_gap.py::test_finishes" in line for line in death.evidence)
+    # The lead is still offered - it is the best one there is - but it says
+    # which kind of guess it is rather than claiming the test was running.
+    assert "no test in flight" in str(death)
+    if death.suspect_basis:
+        assert "last test this worker finished" in death.suspect_basis

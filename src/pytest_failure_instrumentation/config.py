@@ -451,6 +451,26 @@ def _number(config: pytest.Config, name: str, fallback: float) -> float:
         return fallback
 
 
+def pytest_faulthandler_timeout(config: pytest.Config) -> float:
+    """pytest's own ``faulthandler_timeout``, or 0 when nobody set one.
+
+    There is exactly one ``faulthandler.dump_traceback_later`` timer per
+    process, and arming it cancels whatever was armed before. pytest's
+    faulthandler plugin arms it at the start of every test when this ini is
+    set; the frozen-interpreter fallback re-arms it every second. Whichever
+    ran last owns it, and the fallback always runs last - so a user who
+    configured a timeout got a plugin that silently threw it away, including
+    the ``faulthandler_exit_on_timeout`` that was supposed to end a hung run.
+
+    Read here rather than in the worker so there is one answer to "is pytest
+    using the timer", and it is read the same way pytest reads it.
+    """
+    try:
+        return float(config.getini("faulthandler_timeout") or 0.0)
+    except (ValueError, KeyError, TypeError):
+        return 0.0
+
+
 def resolve(config: pytest.Config) -> Settings:
     """The settings this process should use, before anyone overrides them.
 

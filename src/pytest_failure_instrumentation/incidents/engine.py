@@ -57,6 +57,11 @@ from .base import Capabilities, Incident, frame_from
 #: is a natural thing to point at an existing artifacts directory.
 OWNER_FILE = "owner.json"
 
+#: How long session finish waits for the stall watcher to notice the run is
+#: over. Every wait inside it is against the stop event, so this is slack for a
+#: loaded runner rather than a real deadline.
+WATCHER_JOIN_SECONDS = 10.0
+
 
 def prune_finished_runs(root: Path) -> None:
     """Delete the directories of runs that are over.
@@ -125,9 +130,20 @@ class IncidentEngine:
         #: already - shared with the watcher thread below.
         self.activity: dict[str, float] = {}
         self.stalled: set[str] = set()
+        #: The live node behind each worker id, so a pid read out of a file can
+        #: be checked against the process the gateway is actually running
+        #: before anybody signals it. See _live_pid.
+        self.nodes: dict[str, Any] = {}
         self.tests_seen = 0
         self.lock = threading.Lock()
         self.stop = threading.Event()
+        #: Set once the run summary has been raised. After that there is
+        #: nobody left to tell: the terminal summary is written, a consumer's
+        #: hook may have closed whatever it was writing to, and an incident
+        #: arriving during interpreter shutdown is a traceback rather than a
+        #: report. The watcher is joined first, so this is the backstop and
+        #: not the mechanism.
+        self.closed = False
         self.watcher: threading.Thread | None = None
         self.sampler: threading.Thread | None = None
         self.seen: dict[str, int] = {}
@@ -259,6 +275,8 @@ class IncidentEngine:
         # The stall watcher raises from its own thread, so the counters and
         # the dedupe table are shared state.
         with self.lock:
+            if self.closed:
+                return
             count = self.seen.get(incident.fingerprint, 0) + 1
             self.seen[incident.fingerprint] = count
             if count == 1:
@@ -313,6 +331,10 @@ class IncidentEngine:
         if worker:
             with self.lock:
                 self.activity[worker] = time.time()
+                # A worker that speaks again was not wedged, or is no longer.
+                # Left in the set, a worker reported once could never be
+                # reported again however badly it went on to hang.
+                self.stalled.discard(worker)
 
     def _watch_for_stalls(self) -> None:
         """Poll, because a wedged worker fires no hook at all.
@@ -346,14 +368,45 @@ class IncidentEngine:
             silent_for,
             self.settings.heartbeat_interval,
             self.settings.stack_probe,
+            run_id=self.run_id,
+            live_pid=self._live_pid(worker),
+            cancel=self.stop,
         )
         if incident is None:
-            # Slow, not stuck. Re-arm rather than asking again immediately.
+            # Slow, not stuck - or the run ended under us. Re-arm rather than
+            # asking again immediately.
             self._touch(worker)
             return
         with self.lock:
             self.stalled.add(worker)
         self.raise_incident(incident)
+
+    def _live_pid(self, worker: str) -> int | None:
+        """The pid this worker's gateway is running, if it still is.
+
+        The pid in the state file is what the worker wrote about itself, and a
+        file is not a process: by the time a stall is assessed that worker may
+        have exited and the kernel handed its number to something unrelated.
+        SIGUSR1's default disposition is to terminate, so a stack probe aimed
+        at a recycled pid kills a stranger's process rather than producing a
+        bad report. This is the controller's own answer to "what is running
+        there", and it is what licenses the signal.
+
+        None is "cannot say", not "no": a gateway that is not a local
+        subprocess - ssh, socket - has no pid here to compare against, and the
+        caller falls back to asking the machine instead.
+        """
+        with self.lock:
+            node = self.nodes.get(worker)
+        popen = getattr(getattr(getattr(node, "gateway", None), "_io", None), "popen", None)
+        if popen is None:
+            return None
+        try:
+            if popen.poll() is not None:
+                return None  # it has already exited; its pid is anybody's now
+            return int(popen.pid)
+        except Exception:  # noqa: BLE001 - nothing here is worth a failed run
+            return None
 
     # -- sources ---------------------------------------------------------
 
@@ -568,7 +621,11 @@ class IncidentEngine:
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_testnodeready(self, node: Any) -> None:
-        self._touch(getattr(getattr(node, "gateway", None), "id", None))
+        worker = getattr(getattr(node, "gateway", None), "id", None)
+        if worker:
+            with self.lock:
+                self.nodes[worker] = node
+        self._touch(worker)
 
     def pytest_runtest_logreport(self, report: Any) -> None:
         node = getattr(report, "node", None)
@@ -647,6 +704,7 @@ class IncidentEngine:
         worker = getattr(getattr(node, "gateway", None), "id", "unknown")
         with self.lock:
             self.activity.pop(worker, None)
+            self.nodes.pop(worker, None)
             if worker not in self.collections.digest_by_worker:
                 self.workers_lost.add(worker)
         # One fewer collection to wait for, which may be the one that was
@@ -656,7 +714,7 @@ class IncidentEngine:
             return  # a clean shutdown is not an incident
         try:
             incident: Incident = death.build(
-                node, error, self.directory, self.baseline_oom_kills
+                node, error, self.directory, self.baseline_oom_kills, self.run_id
             )
         except Exception as failure:  # noqa: BLE001
             incident = death.WorkerDeathIncident.degraded(
@@ -679,9 +737,14 @@ class IncidentEngine:
         self.raise_incident(incident)
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
+        # Every wait the watcher can be inside is against this event, so it
+        # returns within a poll of here rather than waiting out an interval it
+        # would only throw away. The join is generous because what it is
+        # preventing is an incident raised *after* the run summary - into a
+        # consumer that has finished writing, or into interpreter shutdown.
         self.stop.set()
         if self.watcher is not None:
-            self.watcher.join(timeout=2.0)
+            self.watcher.join(timeout=WATCHER_JOIN_SECONDS)
         if self.sampler is not None:
             # Bounded like the watcher: a sample hook that will not return
             # must not be what keeps a finished run from exiting.
@@ -700,6 +763,12 @@ class IncidentEngine:
                 self.distributed,
             )
         )
+        # The summary is the last word by definition - it says how many
+        # incidents this run raised. Anything the watcher or the sampler still
+        # manages to produce after it would contradict a number already
+        # reported.
+        with self.lock:
+            self.closed = True
         # Last, so that a UI watching a long teardown keeps its answers for as
         # long as this session exists. Whoever is waiting for the port takes it
         # over within a few seconds of this returning.
