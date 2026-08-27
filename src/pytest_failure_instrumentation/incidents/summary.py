@@ -78,8 +78,8 @@ def build(
         ]
         + (
             [
-                f"{run_ending} of them were raised as run-ending, and the run "
-                "still reached session finish: either the condition resolved - "
+                f"{run_ending} incident(s) were raised as run-ending, and the "
+                "run still reached session finish: either the condition resolved - "
                 "a wedged worker that came back is the usual one - or the exit "
                 "status above is what pytest reported before it applied "
                 "INTERNAL_ERROR"
