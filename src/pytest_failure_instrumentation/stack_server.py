@@ -245,6 +245,25 @@ class _Server(ThreadingHTTPServer):
     #: not be locked out for a minute because the last one just exited.
     allow_reuse_address = not IS_WINDOWS
 
+    #: The last request that failed, for whoever is debugging this server.
+    last_error: Optional[str] = None
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Never a traceback, for the same reason as ``log_message``.
+
+        ``socketserver`` prints the whole traceback to stderr, which is where a
+        human is reading pytest's output - so one malformed request could bury
+        the report it was meant to leave alone. The failure is still kept, on
+        the server, where something debugging this can find it; what is dropped
+        is only its route to the terminal.
+
+        A handler that raises is a defect here rather than a client's problem,
+        so this is a backstop and not a way of ignoring one.
+        """
+        import traceback
+
+        self.last_error = traceback.format_exc(limit=6)
+
 
 class _Handler(BaseHTTPRequestHandler):
     # HTTP/1.0, so every response closes its connection. Keep-alive would
@@ -291,6 +310,17 @@ class _Handler(BaseHTTPRequestHandler):
         attacker's timing signal across it is buried in HTTP jitter, but a
         credential check that leaks its progress is the kind of thing that is
         cheap to get right and awkward to explain having got wrong.
+
+        **Compared as bytes, because the offered value is attacker-chosen.**
+        ``compare_digest`` refuses two ``str`` unless both are pure ASCII, and
+        raises ``TypeError`` rather than returning False when they are not - so
+        a token with one non-ASCII character in it took this straight out of
+        the handler: no reply at all where a 401 belonged, and a traceback into
+        the stderr a human is reading pytest's output from, which is the thing
+        ``log_message`` below exists to keep clean. Unauthenticated, and one
+        URL-encoded character to trigger. Encoding both sides first makes the
+        check total: every input now gets an answer, and it is still the
+        constant-time one.
         """
         expected = getattr(self.server, "token", None)
         if not expected:
@@ -301,7 +331,12 @@ class _Handler(BaseHTTPRequestHandler):
         scheme, _, value = header.partition(" ")
         if scheme.lower() == AUTH_SCHEME.lower():
             offered = offered or value.strip()
-        return bool(offered) and hmac.compare_digest(offered, expected)
+        if not offered:
+            return False
+        return hmac.compare_digest(
+            offered.encode("utf-8", "surrogatepass"),
+            expected.encode("utf-8", "surrogatepass"),
+        )
 
     def _stack(self, query: dict[str, list[str]]) -> None:
         raw = (query.get("pid") or [""])[0]

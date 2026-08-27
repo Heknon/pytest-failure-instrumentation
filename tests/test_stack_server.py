@@ -792,6 +792,71 @@ def test_every_endpoint_but_identity_wants_the_token(serving, tmp_path):
     assert get(port, "/workers", service.token)[0] == 200
 
 
+def test_a_token_that_is_not_ascii_is_refused_rather_than_crashing(serving, capfd):
+    """``compare_digest`` raises on two non-ASCII ``str`` instead of saying no.
+
+    The offered token is whatever the caller sent, so that TypeError came out
+    of the handler *before* authentication: the request got no reply at all
+    where a 401 belonged, and socketserver printed the traceback to the stderr
+    a human is reading pytest's output from - the one thing ``log_message`` is
+    overridden to prevent. One URL-encoded character, no credentials needed.
+
+    Both ways of offering a token are exercised, because they decode
+    differently: a query parameter arrives as UTF-8 and a header as latin-1.
+    """
+    service = serving(free_port(), directory=None)
+    assert wait_for(lambda: service.serving), "never served"
+    port = service.bound_port
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def status_for(path: str, headers: Optional[dict] = None) -> int:
+        request = urllib.request.Request(
+            f"http://{stack_server.LOOPBACK}:{port}{path}", headers=headers or {}
+        )
+        try:
+            with opener.open(request, timeout=30) as response:
+                return response.status
+        except urllib.error.HTTPError as refusal:
+            return refusal.code
+
+    # In the query string, percent-encoded as any client would send it.
+    assert status_for("/workers?token=caf%C3%A9") == 401
+    assert status_for("/workers?token=%F0%9F%92%A9") == 401
+    # And in the header, where latin-1 is what the wire carries.
+    assert status_for(
+        "/workers", {stack_server.AUTH_HEADER: f"{stack_server.AUTH_SCHEME} caf\xe9"}
+    ) == 401
+    # The real one still works, so the fix did not just refuse everything.
+    assert status_for(
+        "/workers?token=" + service.token
+    ) in (200, 503)  # 503 only because this service was given no directory
+
+    assert "Traceback" not in capfd.readouterr().err
+
+
+def test_a_handler_failure_never_reaches_the_report_as_a_traceback(serving, capfd):
+    """A backstop, not a licence. socketserver's default prints the whole
+    traceback to stderr, so one malformed request could bury the report it was
+    meant to leave alone. The failure is kept on the server for whoever is
+    debugging it; only its route to the terminal is removed."""
+    service = serving(free_port(), directory=None)
+    assert wait_for(lambda: service.serving), "never served"
+
+    httpd = service._httpd
+    assert httpd is not None
+    assert httpd.last_error is None
+
+    try:
+        raise RuntimeError("a handler blew up")
+    except RuntimeError:
+        httpd.handle_error(None, ("127.0.0.1", 0))
+
+    assert httpd.last_error is not None
+    assert "a handler blew up" in httpd.last_error
+    assert "Traceback" not in capfd.readouterr().err
+
+
 def test_identity_stays_open_and_never_carries_the_token(serving):
     """It is what one session asks another before standing down from a
     contested port, and the two share no token."""
