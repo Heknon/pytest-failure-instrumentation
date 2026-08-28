@@ -49,7 +49,6 @@ DEFAULTS = {
     "failure_stack_probe": "true",
     "failure_tracer": "parent",
     "failure_sample_seconds": "0",
-    "failure_sample_stacks": "true",
     "failure_stack_server": "false",
     "failure_stack_server_port": "0",
     "failure_stack_server_host": "127.0.0.1",

@@ -563,11 +563,7 @@ class IncidentEngine:
         """
         from ..sampling import WorkerSampler
 
-        sampler = WorkerSampler(
-            self.directory,
-            session_id=self.session_id,
-            want_stacks=self.settings.sample_stacks,
-        )
+        sampler = WorkerSampler(self.directory, session_id=self.session_id)
         while not self.stop.wait(self.settings.sample_seconds):
             try:
                 sample = sampler.sample()

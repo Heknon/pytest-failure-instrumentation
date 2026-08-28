@@ -60,8 +60,8 @@ TOKEN_ENV = "PYTEST_CALLSTACK_TOKEN"
 MIN_HEARTBEAT_INTERVAL = 1.0
 
 #: The sampler walks a directory, reads every state file and tails every
-#: event log on each pass, and may spawn a py-spy per stuck worker. A
-#: cadence below this is a busy loop wearing a setting's clothes.
+#: event log on each pass. A cadence below this is a busy loop wearing a
+#: setting's clothes.
 MIN_SAMPLE_SECONDS = 1.0
 
 #: Accepted values for ``failure_tracer``; anything else falls back to the
@@ -150,11 +150,6 @@ class Settings:
     #: fires when nothing is wrong, so it is the only one a run pays for
     #: continuously - see :mod:`.sampling`.
     sample_seconds: float = 0.0
-    #: Whether a sample carries frames for the workers that look stuck. The
-    #: statuses are read from files the run wrote anyway and are nearly free;
-    #: a stack is a subprocess that pauses its target and is ~30x the size, so
-    #: it is worth being able to keep the first and decline the second.
-    sample_stacks: bool = True
     #: Serve the stack of any local process over HTTP, for a UI watching a run
     #: - see :mod:`.stack_server`. Off by default: opening a listening socket
     #: is not something a plugin installed for crash reporting should start
@@ -350,7 +345,7 @@ class Settings:
             "tracer": self.tracer,
             # Sampling is absent for the same reason as the stack server below:
             # it runs on the controller, over every worker at once, and a
-            # worker that read these would sample itself and its siblings.
+            # worker that read it would sample itself and its siblings.
             # The stack server is deliberately absent. It is the controller's
             # alone - a worker that read these and started one would have every
             # worker on the host racing for the same port, which is the exact
@@ -439,12 +434,6 @@ def add_options(parser: pytest.Parser) -> None:
         help="Push a worker sample to pytest_failure_worker_sample this often, "
         "while the run is going. 0 disables, and is the default.",
         default="0",
-    )
-    parser.addini(
-        "failure_sample_stacks",
-        help="Whether those samples carry frames for workers that look stuck. "
-        "The statuses are nearly free; the frames are not.",
-        default="true",
     )
     parser.addini(
         "failure_tracer",
@@ -636,7 +625,6 @@ def resolve(config: pytest.Config) -> Settings:
         stack_probe=_flag(config, "failure_stack_probe", True),
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
-        sample_stacks=_flag(config, "failure_sample_stacks", True),
         stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,
         stack_server_port=(
             chosen_port

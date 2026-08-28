@@ -7,9 +7,9 @@ on a cadence, and is off unless asked for. ``pytest_failure_server_ready`` says
 the live-stack server is up and where - nothing went wrong, and a product that
 never switches the server on never sees it.
 
-Both are named for what they deliver - most of what arrives at the first is not
-a crash - and namespaced to this distribution, the way ``pytest_xdist_*`` hooks
-are, so neither can collide with anyone else's.
+All three are named for what they deliver - most of what arrives at the first
+is not a crash - and namespaced to this distribution, the way ``pytest_xdist_*``
+hooks are, so none of them can collide with anyone else's.
 
     def pytest_failure_incident(incident):
         database.save(incident.model_dump())
@@ -134,15 +134,15 @@ def pytest_failure_worker_sample(sample: WorkerSample) -> None:
 
     Off unless ``failure_sample_seconds`` is set. This is the only hook here
     that fires when nothing is wrong, so it is the only one with a running
-    cost - see :mod:`.sampling` for what that cost is and how it is kept down.
+    cost - see :mod:`.sampling` for what that cost is.
 
     ``sample.workers`` carries every worker's status, node id, phase, resident
-    memory and CPU rate, all read from files the run was writing anyway.
-    Frames are attached only for workers that are ``blocked`` or ``frozen``,
-    and only on the sample that first sees a given stack: after that
-    ``stack`` is ``None`` while ``stack_digest`` and ``stack_repeats`` say
-    which stack it still is and for how long. Store the rows; store the frames
-    when they are there.
+    memory and CPU rate, all read from files the run was writing anyway. No
+    frames: a sample asks the workers nothing, which is what lets it run where
+    the live server cannot - a CI job that may not open a port, a run too
+    short-lived for anything to discover and poll. Where something *can* reach
+    the run, ``/workers`` reports the same rows and more of them, and
+    ``/stack?pid=`` answers "what is gw3 in" at the moment a human asks it.
 
     Called from the sampler's own thread, and wrapped like the others - an
     exception here is never allowed to become an INTERNALERROR in the run.
