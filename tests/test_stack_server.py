@@ -62,17 +62,28 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def get(port: int, path: str, timeout: float = 30.0) -> tuple[int, Any]:
+def get(
+    port: int, path: str, token: Optional[str] = None, timeout: float = 30.0
+) -> tuple[int, Any]:
     """A request with proxies off, which is how the plugin itself asks.
 
     CI sets ``http_proxy`` constantly, and a request for 127.0.0.1 that goes
     through a proxy tests the proxy.
 
-    Nothing is carried but the path: the server asks for no credential, and
-    the bind is the whole boundary.
+    ``token`` is only needed against a server this run supplied one to. Most
+    tests below start a server with none, because that is the default and the
+    right one on loopback; omitting it there is not "asking anonymously", it
+    is the whole interface.
     """
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    request = urllib.request.Request(f"http://{stack_server.LOOPBACK}:{port}{path}")
+    headers = (
+        {stack_server.AUTH_HEADER: f"{stack_server.AUTH_SCHEME} {token}"}
+        if token
+        else {}
+    )
+    request = urllib.request.Request(
+        f"http://{stack_server.LOOPBACK}:{port}{path}", headers=headers
+    )
     try:
         with opener.open(request, timeout=timeout) as response:
             return response.status, json.loads(response.read())
@@ -625,7 +636,7 @@ def test_a_wildcard_bind_is_advertised_on_an_address_that_can_be_connected_to():
 def test_a_host_that_cannot_be_bound_gives_up_rather_than_retrying(serving):
     """A drawn port that fails to bind failed for a reason no later attempt
     would find changed - a bad interface, or a sandbox that forbids listening."""
-    service = serving(0, host="203.0.113.1", reclaim_seconds=0.2)
+    service = serving(0, host="203.0.113.1", reclaim_seconds=0.2, token="s3cret")
     assert wait_for(lambda: "could not bind" in service.status), service.status
     assert not service.serving
 
@@ -911,6 +922,139 @@ def test_a_handler_failure_never_reaches_the_report_as_a_traceback(serving, capf
     assert "Traceback" not in capfd.readouterr().err
 
 
+def test_a_run_that_supplied_no_token_asks_for_none(serving):
+    """The default, and the right one on loopback, where the bind already
+    bounds the reachable set to this machine."""
+    port = free_port()
+    service = serving(port)
+    assert wait_for(lambda: service.serving), service.status
+
+    assert get(port, "/workers")[0] in (200, 503)  # 503: no directory, not 401
+    assert get(port, f"/stack?pid={os.getpid()}")[0] == 200
+
+
+def test_a_supplied_token_is_demanded_on_every_endpoint_but_identity(serving):
+    """Supplied, never minted. Whoever started the run picked the value, so
+    both ends already have it and nothing has to be published for them to
+    agree - which is what keeps it off disk entirely."""
+    port = free_port()
+    service = serving(port, token="s3cret")
+    assert wait_for(lambda: service.serving), service.status
+
+    assert get(port, f"/stack?pid={os.getpid()}")[0] == 401
+    assert get(port, "/workers")[0] == 401
+    assert get(port, f"/stack?pid={os.getpid()}", "not-the-token")[0] == 401
+
+    assert get(port, f"/stack?pid={os.getpid()}", "s3cret")[0] == 200
+    # Either way it is sent: a header is the right place for a credential, and
+    # the query parameter is there because a person with curl reaches for it.
+    assert get(port, f"/stack?pid={os.getpid()}&token=s3cret")[0] == 200
+
+    # And still open, because two sessions that minted nothing cannot share a
+    # credential, and this is what one asks the other before standing down.
+    assert get(port, "/identity")[0] == 200
+
+
+def test_the_token_is_never_written_down(serving, tmp_path):
+    """The whole reason it is supplied rather than minted. A published secret
+    makes the address file a credential store, and makes where a run may write
+    its evidence a question about where a secret may live - which POSIX
+    answers with an 0o600 and Windows does not answer at all."""
+    run = tmp_path / "run-abc123"
+    service = serving(0, directory=run, token="s3cret")
+    assert wait_for(lambda: service.serving), service.status
+
+    published = wait_for(lambda: list(run.glob("callstack-*.json")))
+    assert published
+    written = published[0].read_text()
+    assert "s3cret" not in written
+    assert "token" not in json.loads(written)
+
+
+def test_a_token_that_is_not_ascii_is_refused_rather_than_crashing(serving, capfd):
+    """``compare_digest`` raises on two non-ASCII ``str`` instead of saying no.
+
+    The offered token is whatever the caller sent, so that TypeError came out
+    of the handler *before* authentication: the request got no reply at all
+    where a 401 belonged, and socketserver printed the traceback to the stderr
+    a human is reading pytest's output from - the one thing ``log_message`` is
+    overridden to prevent. One URL-encoded character, no credentials needed.
+
+    Both ways of offering a token are exercised, because they decode
+    differently: a query parameter arrives as UTF-8 and a header as latin-1.
+    """
+    service = serving(free_port(), directory=None, token="s3cret")
+    assert wait_for(lambda: service.serving), "never served"
+    port = service.bound_port
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def status_for(path: str, headers: Optional[dict] = None) -> int:
+        request = urllib.request.Request(
+            f"http://{stack_server.LOOPBACK}:{port}{path}", headers=headers or {}
+        )
+        try:
+            with opener.open(request, timeout=30) as response:
+                return response.status
+        except urllib.error.HTTPError as refusal:
+            return refusal.code
+
+    assert status_for("/workers?token=caf%C3%A9") == 401
+    assert status_for("/workers?token=%F0%9F%92%A9") == 401
+    assert status_for(
+        "/workers", {stack_server.AUTH_HEADER: f"{stack_server.AUTH_SCHEME} caf\xe9"}
+    ) == 401
+    # The real one still works, so the fix did not just refuse everything.
+    assert status_for("/workers?token=s3cret") in (200, 503)
+
+    assert "Traceback" not in capfd.readouterr().err
+
+
+def test_the_refusal_says_where_the_token_comes_from(serving):
+    """A 401 that does not say how to satisfy it teaches people to turn the
+    whole thing off - and here the answer is not a file to go and read, which
+    is what a reader who used an earlier version would go looking for."""
+    port = free_port()
+    service = serving(port, token="s3cret")
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(port, "/workers")
+    assert status == 401
+    assert "PYTEST_CALLSTACK_TOKEN" in body["error"]
+    assert "Authorization" in body["error"]
+
+
+def test_binding_off_loopback_without_a_token_is_refused_before_the_socket(serving):
+    """The one combination nobody configures on purpose: every local process's
+    stack, served to whatever can route to this host. A warning is the wrong
+    instrument - by the time it is read the port has been open for the length
+    of the run - so it is refused, and reported the way a taken port is."""
+    reported: list[Any] = []
+    service = serving(
+        0, host="0.0.0.0", on_giving_up=lambda *args: reported.append(args)
+    )
+    assert wait_for(lambda: reported), service.status
+    assert reported[0][0] == "BIND_REFUSED"
+    assert "no token was supplied" in reported[0][1]
+    assert not service.serving
+
+    # And it names the address that was actually asked for. `authority` maps a
+    # wildcard to loopback so a client has something to connect to; in a
+    # refusal that rewrite named 127.0.0.1 - the one address that was not the
+    # problem, and one the reader never typed.
+    assert "0.0.0.0" in service.status
+    assert "127.0.0.1" not in service.status
+
+
+def test_a_token_makes_binding_off_loopback_a_decision_rather_than_a_refusal(serving):
+    """Which is the container case: the UI is outside, 127.0.0.1 in there is
+    unreachable from it, and the exposure is deliberate."""
+    service = serving(0, host="0.0.0.0", token="s3cret")
+    assert wait_for(lambda: service.serving), service.status
+    assert get(service.bound_port, f"/stack?pid={os.getpid()}", "s3cret")[0] == 200
+    assert get(service.bound_port, f"/stack?pid={os.getpid()}")[0] == 401
+
+
 def test_identity_is_what_one_session_asks_another(serving):
     """The election runs on it: a session that lost a contested port asks
     whoever holds it whether they are one of ours before standing down."""
@@ -1034,7 +1178,7 @@ def test_an_address_that_cannot_be_bound_is_reported(serving):
     rather than one message with a different string in it."""
     reported = []
     service = serving(
-        0, host="203.0.113.1", reclaim_seconds=0.1,
+        0, host="203.0.113.1", reclaim_seconds=0.1, token="s3cret",
         on_giving_up=lambda *args: reported.append(args),
     )
     assert wait_for(lambda: reported), service.status
@@ -1292,7 +1436,7 @@ def test_a_real_run_hands_the_address_to_a_product_that_implements_the_hook(pyte
     announced = json.loads((pytester.path / "server.json").read_text())
     assert announced["service"] == stack_server.SERVICE
     assert announced["port"] > 0
-    assert "token" not in announced
+    assert announced["token"] == ""  # this run supplied none
     assert announced["session_id"]
     assert str(announced["port"]) in announced["url"]
     # The directory it names is the one the run was writing evidence into.
@@ -1330,7 +1474,7 @@ def test_a_named_port_on_an_unbindable_host_says_so_and_stops(tmp_path):
     reported: list[tuple[str, str]] = []
     # A documentation-range address, which is never a local interface.
     service = stack_server.StackService(
-        18080, host="203.0.113.1", directory=tmp_path,
+        18080, host="203.0.113.1", directory=tmp_path, token="s3cret",
         on_giving_up=lambda verdict, detail: reported.append((verdict, detail)),
     )
     service.start()

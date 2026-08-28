@@ -663,8 +663,14 @@ failure_stack_server = true
 
 ```console
 $ pytest --callstack-port 8080          # also switches it on
-$ pytest --callstack-host 0.0.0.0       # so does this
+$ pytest --callstack-host 0.0.0.0       # so does this - and needs a token
+$ PYTEST_CALLSTACK_TOKEN=$(openssl rand -hex 16) pytest --callstack-host 0.0.0.0
 ```
+
+A token does *not* switch it on: "authenticate the server I am already
+running" and "start a server" are different requests, and an exported
+`PYTEST_CALLSTACK_TOKEN` in a shell profile must not open a socket on every
+pytest run in that shell.
 
 ### Two modes, and the port number picks between them
 
@@ -795,35 +801,65 @@ reconfigure it.
 
 ### Who may ask
 
-Anybody who can reach the address. There is no credential:
+The bind, and a token if you supplied one. On loopback you usually will not:
 
 ```console
 $ curl localhost:8080/workers
-$ curl "localhost:8080/stack?pid=$(pgrep -f 'execnet.*gw3')"
 ```
 
-**The bind is the whole boundary.** On loopback that is processes on this
-machine; on `0.0.0.0` it is anything that can route to the host. There is
-nothing else, so choose the bind deliberately and leave the server off on a
-host you share with people you would not hand a debugger to.
+With a token, which is what any bind but loopback requires:
 
-That is a trade, and worth saying what it bought. A credential has to live
-somewhere both ends can find it, and for a port drawn at random that somewhere
-is a file next to the port — which makes the address file a secret, and turns
-every question about where a run may write its evidence into a question about
-where a *secret* may live. That guarantee is one POSIX can keep with an `0o600`
-and Windows cannot: a mode there is not an ACL, so the same file inherits the
-evidence directory's and the promise quietly stops holding on a supported
-platform. The cost was paid on every run; what it bought on the machine this
-actually runs on — one laptop, one CI container — was a lock on a door in a
-room only that person is standing in.
+```console
+$ export PYTEST_CALLSTACK_TOKEN=$(openssl rand -hex 16)
+$ pytest -n8 --callstack-host 0.0.0.0 &
+$ curl -H "Authorization: Bearer $PYTEST_CALLSTACK_TOKEN" host:8080/workers
+$ curl "host:8080/workers?token=$PYTEST_CALLSTACK_TOKEN"   # for a hurry
+```
 
-So the address file is ordinary data. It holds a host, a port and a pid: the
-address of a server that anyone who can reach it may query anyway. Put
-`failure_directory` wherever evidence goes, on any platform.
+**The token is supplied, never minted, and never written to disk.** That is the
+whole design, and it comes from the two halves of the problem being opposites.
 
-`/identity` is what one session asks another before standing down from a
-contested port. It answers with a service name, a version and a pid.
+*The port has to be published.* A port drawn at random is unguessable by
+construction — that is the point of drawing it — so the run must write it down
+for anything outside to find it.
+
+*The token does not.* It is the one value both ends can agree on in advance,
+because whoever starts the run picks it. Minting one here made it discoverable
+instead, which meant writing it into the address file — and that turned every
+question about where a run may write its evidence into a question about where a
+*secret* may live. POSIX answers that with an `0o600`. Windows does not answer
+it at all: a mode there is not an ACL, so the file inherits the evidence
+directory's and the promise quietly stops holding on a supported platform.
+
+So the address file is ordinary data — a host, a port and a pid, the address of
+a server anyone who can reach it may query anyway. Put `failure_directory`
+wherever evidence goes, on any platform. And the secret arrives the way secrets
+already reach a container, a CI job and a shell:
+
+| | |
+|---|---|
+| `--callstack-token SECRET` | one run |
+| `PYTEST_CALLSTACK_TOKEN` | a shell, a CI job, `docker run -e` |
+| *(nothing)* | no authentication — the default, and right on loopback |
+
+There is no ini setting, deliberately: ini files live in the repository.
+
+**No token is the default and the right one on loopback**, where the bind
+already bounds the reachable set to processes on this machine. On a box you
+share with people you would not hand a debugger to, supply one or leave the
+server off — "only local" and "only you" are different statements, and without
+a token only the first is being made.
+
+**Off loopback without a token is refused**, before the socket is opened, and
+reported as a `stack_server_unavailable` incident. Serving every local
+process's stack to whatever can route to the host is not something anybody
+configures on purpose, and a warning is the wrong instrument for it: by the
+time one is read the port has been open for the length of the run.
+
+`/identity` stays open even with a token set: it is what one session asks
+another before standing down from a contested port, and two sessions that
+minted nothing have no way to share a credential. It answers with a service
+name, a version and a pid.
 
 ### Finding the server
 
@@ -835,14 +871,17 @@ def pytest_failure_server_ready(server):
         session=server.session_id,       # names this run's evidence directory
         url=server.url,                  # already bracketed if the host is IPv6
         port=server.port,                # what got bound, never the 0 you asked for
+        token=server.token,              # what you supplied, or "" if you did not
         pid=server.pid,                  # the controller, not any worker
     )
 ```
 
 That is the whole address, and for a drawn port it is the only way to learn it
 before the run is over — nobody can configure a number that did not exist a
-moment ago. `server` is a `LiveStackServer`; `server.endpoint("/workers")`
-joins the URL, so the slash is not yours to get right.
+moment ago. `server` is a `LiveStackServer`; `server.headers()` gives you the
+`Authorization` header the endpoints want — `{}` when this run supplied no
+token, so the same client code works either way — and `server.endpoint("/workers")`
+joins the URL, so neither the scheme nor the slash is yours to get right.
 
 The hook fires on a thread of its own once the server is already accepting, so
 it is free to call straight back into the server it was just handed. It does not
@@ -927,10 +966,18 @@ separately.
 ### Containers
 
 `--callstack-host 0.0.0.0` is what a container needs: its UI is outside, and
-127.0.0.1 inside a container is unreachable from there. Binding anything but
-loopback warns, once, because it puts an unauthenticated endpoint on the
-network — see [Who may ask](#who-may-ask). Publish the port deliberately, and
-do not route to it from anywhere you would not route a debugger.
+127.0.0.1 inside a container is unreachable from there. That bind requires a
+token and is refused without one — see [Who may ask](#who-may-ask) — which
+suits a container better than the alternative did:
+
+```console
+$ docker run -e PYTEST_CALLSTACK_TOKEN -p 8080:8080 yourimage \
+      pytest -n8 --callstack-host 0.0.0.0 --callstack-port 8080
+```
+
+The UI outside reads the same value from the same place. Nothing has to be
+mounted out for it to find a secret in a file, which is what a minted token
+would have required.
 
 Two things about containers make this easier than it looks:
 
@@ -1092,6 +1139,11 @@ overwhelming majority of what runs.
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
+
+There is deliberately **no ini setting for the token**. It comes from
+`--callstack-token` or `PYTEST_CALLSTACK_TOKEN` and nowhere else: an ini file
+lives in the repository, and a credential in the repository is the thing this
+design exists to avoid. See [Who may ask](#who-may-ask).
 
 `failure_slow_test_seconds` and `failure_stall_seconds` are not independent.
 The stack a stalled worker is reported with is whatever the watchdog last
