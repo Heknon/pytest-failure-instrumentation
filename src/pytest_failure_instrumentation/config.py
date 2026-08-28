@@ -15,6 +15,7 @@ in ``resolve``, so a hand-built one cannot skip them.
 
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -45,6 +46,12 @@ DEFAULT_STACK_SERVER_HOST = "127.0.0.1"
 #: Addresses that reach this machine and nowhere else. ``localhost`` is in the
 #: list because people type it, and it resolves to one of the other two.
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+#: Where the live server's token comes from when it is not on the command
+#: line. An environment variable because that is how a secret reaches a
+#: container, a CI job and a shell, and because it leaves no file behind - see
+#: :func:`_add_command_line_options` for why there is deliberately no ini.
+TOKEN_ENV = "PYTEST_CALLSTACK_TOKEN"
 
 #: Below this the heartbeat thread costs more than it measures. Clamped on the
 #: object rather than where a setting is read, because the controller decides
@@ -163,6 +170,12 @@ class Settings:
     #: 127.0.0.1 is unreachable from there. Anything else is a deliberate
     #: exposure and says so.
     stack_server_host: str = DEFAULT_STACK_SERVER_HOST
+    #: What every endpoint but ``/identity`` demands, or "" for a server that
+    #: asks nothing. Supplied rather than minted, and never written down by
+    #: this package: the address of a drawn port has to be published, but the
+    #: secret guarding it is the one value both ends can agree on in advance,
+    #: so making it discoverable is a cost with nothing on the other side.
+    stack_server_token: str = ""
     #: How many workers share the machine. Per worker, never sent between
     #: processes - the controller's copy would be wrong on every worker.
     worker_count: int = 1
@@ -189,6 +202,9 @@ class Settings:
             self.tracer if self.tracer in TRACER_POLICIES else "parent",
         )
         object.__setattr__(self, "stack_server_host", str(self.stack_server_host))
+        object.__setattr__(
+            self, "stack_server_token", str(self.stack_server_token or "").strip()
+        )
         object.__setattr__(self, "stack_server_port", int(self.stack_server_port))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
@@ -245,27 +261,51 @@ class Settings:
         """Binding anything but loopback is a decision, and it is worth saying
         out loud that it was made.
 
-        The server answers with the stack of any local process it can read. It
-        does ask who is asking - every endpoint but ``/identity`` wants the
-        token - but a token is a secret in a file, and what changes off
-        loopback is the set of people who get to try it. On loopback that set
-        is whoever can open a socket on this machine; on 0.0.0.0 it is the
-        network, which inside a cluster is every other pod. That is the right
-        setting for a container whose UI is outside it and the wrong one
-        everywhere else, and only the person who typed it can tell which case
-        this is.
+        The server answers with the stack of any local process it can read. On
+        loopback the bind is the whole boundary and bounds the reachable set
+        to this machine; off loopback that boundary becomes the network, which
+        inside a cluster is every other pod.
+
+        With a token that is a decision worth stating rather than a problem:
+        the exposure is deliberate, which is what a container whose UI lives
+        outside it needs. Without one it cannot be deliberate - nobody chooses
+        to serve every process's stack to a cluster - so that combination is
+        refused rather than warned about, and this says nothing about it.
         """
         if not self.stack_server or self.stack_server_host in LOOPBACK:
             return
+        if not self.stack_server_token:
+            return  # refused instead; see refuses_to_bind_unauthenticated
         advise(
             f"the live stack server is bound to {self.stack_server_host}, not "
             "loopback, so anything that can reach this host on port "
-            f"{self.stack_server_port or '<drawn at random>'} can read the stack "
-            "of any process it serves, and off loopback the boundary is the network "
-            "rather than who can open a socket here - the token guards the "
-            "endpoints, but anyone who can reach the address can try. This is what "
-            "a container whose UI is outside it needs; it is not what a shared "
-            "machine wants",
+            f"{self.stack_server_port or '<drawn at random>'} and holds the token "
+            "can read the stack of any process it serves. Off loopback the "
+            "boundary is the network plus that token, rather than this machine. "
+            "This is what a container whose UI is outside it needs; it is not "
+            "what a shared machine or a routable host wants",
+        )
+
+    @property
+    def refuses_to_bind_unauthenticated(self) -> bool:
+        """Whether this configuration asks for an open port on the network.
+
+        Off loopback with no token is the one combination that cannot be
+        anybody's intention: it serves the stack of every process on the host
+        to whoever can route to it, and a stack carries file paths, function
+        names and the shape of your code. A warning is the wrong instrument
+        for something nobody meant to ask for - it scrolls past, and by the
+        time anyone reads it the port has been open for the length of the run.
+
+        So the server declines to bind and reports it, through the same
+        machinery a port held by a stranger uses. The run is unaffected either
+        way; what differs is that it fails towards no live view rather than
+        towards an open one, and the remedy is one environment variable.
+        """
+        return (
+            self.stack_server
+            and self.stack_server_host not in LOOPBACK
+            and not self.stack_server_token
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:
@@ -421,16 +461,26 @@ def add_options(parser: pytest.Parser) -> None:
 
 
 def _add_command_line_options(parser: pytest.Parser) -> None:
-    """The two settings worth having on the command line.
+    """The three settings worth having off the ini file.
 
     Everything else about this plugin is a property of the project and belongs
-    in ini. These two are properties of *where this run happens* - which port
-    is free on this machine, which interface a container needs bound - and that
-    is not something a repository can know on behalf of everybody running it.
+    in ini. These are properties of *where this run happens* - which port is
+    free on this machine, which interface a container needs bound, which secret
+    this deployment uses - and that is not something a repository can know on
+    behalf of everybody running it.
 
-    Naming either one switches the server on. An option that is accepted,
-    parsed, and then silently ignored because a separate ini flag was left at
-    its default is the worst of the available behaviours.
+    Naming the port or the host switches the server on. An option that is
+    accepted, parsed, and then silently ignored because a separate ini flag was
+    left at its default is the worst of the available behaviours. The token
+    does *not*, because "authenticate the server I am already running" and
+    "start a server" are different requests and only one of them was made.
+
+    **The token has no ini, deliberately.** ini files live in the repository,
+    and a credential in the repository is exactly the thing removing the
+    minted token got rid of. It comes from the command line or from
+    ``PYTEST_CALLSTACK_TOKEN``, which is how a secret reaches a container, a
+    CI job and a shell - and neither leaves a file behind for this package to
+    have opinions about the permissions of.
     """
     group = parser.getgroup("failure-instrumentation")
     group.addoption(
@@ -447,6 +497,15 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         metavar="HOST",
         help="Serve live stacks on this interface (default 127.0.0.1). Use "
         "0.0.0.0 to reach the server from outside a container.",
+    )
+    group.addoption(
+        "--callstack-token",
+        default=None,
+        metavar="SECRET",
+        help="Require this bearer token on every live-stack endpoint but "
+        "/identity. Also read from PYTEST_CALLSTACK_TOKEN. Never written to "
+        "disk. Required to bind anything but loopback; omit for no "
+        "authentication, which is the default on loopback.",
     )
 
 
@@ -547,6 +606,14 @@ def resolve(config: pytest.Config) -> Settings:
     chosen_port = _option(config, "callstack_port")
     chosen_host = _option(config, "callstack_host")
     named_on_cli = chosen_port is not None or chosen_host is not None
+    # Command line first, environment second, and no third place to look. A
+    # token does not switch the server on: "authenticate the server I am
+    # already running" and "start a server" are different requests, and an
+    # exported PYTEST_CALLSTACK_TOKEN sitting in a shell profile must not turn
+    # a listening socket on for every pytest run in that shell.
+    chosen_token = _option(config, "callstack_token")
+    if chosen_token is None:
+        chosen_token = os.environ.get(TOKEN_ENV)
 
     handed_down = workerinput.get("failure_settings")
     if handed_down:
@@ -581,6 +648,7 @@ def resolve(config: pytest.Config) -> Settings:
             or _ini(config, "failure_stack_server_host", "")
             or DEFAULT_STACK_SERVER_HOST
         ),
+        stack_server_token=chosen_token or "",
         worker_count=worker_count,
         run_id=run_id,
     )

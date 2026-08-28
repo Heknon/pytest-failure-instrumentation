@@ -48,9 +48,11 @@ class LiveStackServer(BaseModel):
     #: 0 and a caller that stored the request would store a 0.
     port: int = 0
 
-    #: The bearer token for every endpoint except ``/identity``. Minted per
-    #: process and valid for exactly as long as this process lives, so it is
-    #: worth storing beside the address and never worth storing longer.
+    #: What every endpoint but ``/identity`` demands, or "" for a run that
+    #: supplied none. Handed over here so a product that implements the hook
+    #: does not have to read the environment this run was started with - and
+    #: because the scheme is this package's to change, which is what
+    #: :meth:`headers` is for.
     token: str = ""
 
     #: The process serving. Under xdist this is the controller, which is not
@@ -67,14 +69,18 @@ class LiveStackServer(BaseModel):
     session_id: str = ""
 
     def headers(self) -> dict:
-        """The Authorization header this server expects.
+        """The Authorization header this server expects, or none if it wants none.
 
-        Here rather than in a product's own string formatting because the
-        scheme is this package's to change, and a client that hard-codes it is
-        a client that breaks quietly on the upgrade that changes it.
+        Here rather than in a product's own string formatting for two reasons:
+        the scheme is this package's to change, and a client that hard-codes it
+        breaks quietly on the upgrade that changes it; and a run with no token
+        answers ``{}``, so the same client code works either way instead of
+        branching on whether authentication happens to be configured.
         """
         from .stack_server import AUTH_HEADER, AUTH_SCHEME
 
+        if not self.token:
+            return {}
         return {AUTH_HEADER: f"{AUTH_SCHEME} {self.token}"}
 
     def endpoint(self, path: str) -> str:

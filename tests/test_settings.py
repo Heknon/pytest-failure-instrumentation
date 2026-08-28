@@ -121,7 +121,11 @@ def test_every_setting_in_the_readme_table_is_registered():
 
     command_line: list[str] = []
     settings_module.add_options(Parser())
-    assert sorted(command_line) == ["--callstack-host", "--callstack-port"]
+    assert sorted(command_line) == [
+        "--callstack-host",
+        "--callstack-port",
+        "--callstack-token",
+    ]
     assert sorted(registered) == sorted(DEFAULTS)
 
 
@@ -192,13 +196,17 @@ def test_no_port_asked_for_means_one_is_drawn():
     assert resolve(FakeConfig()).stack_server_host == "127.0.0.1"
 
 
-def test_the_command_line_outranks_ini_for_both_of_them():
-    """These two answer "where does this run happen", which the person starting
-    it knows and the repository does not."""
+def test_the_command_line_outranks_ini_for_the_address():
+    """These answer "where does this run happen", which the person starting it
+    knows and the repository does not."""
     with pytest.warns(FailureInstrumentationWarning):  # 0.0.0.0 is an exposure
         resolved = resolve(
             FakeConfig(
-                {"callstack_port": 9111, "callstack_host": "0.0.0.0"},
+                {
+                    "callstack_port": 9111,
+                    "callstack_host": "0.0.0.0",
+                    "callstack_token": "s3cret",
+                },
                 failure_stack_server_port="8080",
                 failure_stack_server_host="127.0.0.1",
                 failure_stack_server="true",
@@ -213,7 +221,9 @@ def test_naming_either_one_on_the_command_line_switches_the_server_on():
     ini flag was left at its default is the worst available behaviour."""
     assert resolve(FakeConfig({"callstack_port": 9111})).stack_server
     with pytest.warns(FailureInstrumentationWarning):  # 0.0.0.0 is an exposure
-        assert resolve(FakeConfig({"callstack_host": "0.0.0.0"})).stack_server
+        assert resolve(
+            FakeConfig({"callstack_host": "0.0.0.0", "callstack_token": "s3cret"})
+        ).stack_server
     assert not resolve(FakeConfig()).stack_server
 
 
@@ -221,13 +231,12 @@ def test_binding_off_loopback_says_what_it_exposes():
     """Right for a container whose UI is outside it, wrong on a shared machine,
     and only the person who typed it can tell which this is.
 
-    The warning used to say there was no authentication, which stopped being
-    true when the endpoints got a token - and a warning that overstates the
-    exposure is as misleading as one that understates it. What is actually
-    true off loopback is that the boundary becomes the network.
+    Only reachable with a token, because without one this configuration is
+    refused rather than warned about - nobody means to serve every local
+    process's stack to a network, so there is no decision there to state.
     """
     with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
-        resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+        resolve(FakeConfig({"callstack_host": "0.0.0.0", "callstack_token": "s3cret"}))
 
 
 def test_loopback_by_any_of_its_names_is_not_an_exposure():
@@ -260,7 +269,9 @@ def test_advice_about_a_setting_cannot_end_the_run_that_asked_for_it(pytester):
     )
     pytester.makepyfile("def test_ok():\n    assert True\n")
 
-    result = pytester.runpytest_subprocess("--callstack-host", "0.0.0.0")
+    result = pytester.runpytest_subprocess(
+        "--callstack-host", "0.0.0.0", "--callstack-token", "s3cret"
+    )
 
     result.assert_outcomes(passed=1)
     assert result.ret == 0, result.stdout.str()
@@ -268,6 +279,69 @@ def test_advice_about_a_setting_cannot_end_the_run_that_asked_for_it(pytester):
     # Downgraded, not dropped: the exposure is still reported, in the same
     # place it lands on a project with no filter at all.
     assert "boundary is the network" in result.stderr.str()
+
+
+def test_the_token_comes_from_the_command_line_or_the_environment(monkeypatch):
+    """Two places, and deliberately not a third. ini files live in the
+    repository, and a credential in the repository is exactly what minting one
+    per server and publishing it beside the port amounted to."""
+    monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
+    assert resolve(FakeConfig({"callstack_port": 8080})).stack_server_token == ""
+
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "from-the-environment")
+    assert (
+        resolve(FakeConfig({"callstack_port": 8080})).stack_server_token
+        == "from-the-environment"
+    )
+
+    # The command line outranks it, which is what lets one run differ from the
+    # shell it was started in.
+    assert (
+        resolve(
+            FakeConfig({"callstack_port": 8080, "callstack_token": "from-the-cli"})
+        ).stack_server_token
+        == "from-the-cli"
+    )
+
+
+def test_a_token_alone_does_not_start_a_server(monkeypatch):
+    """Naming a port or a host says "serve"; naming a secret says "and
+    authenticate it". An exported PYTEST_CALLSTACK_TOKEN sitting in somebody's
+    shell profile must not open a listening socket on every pytest run in that
+    shell."""
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
+    resolved = resolve(FakeConfig())
+    assert resolved.stack_server is False
+    assert resolved.stack_server_token == "s3cret"
+
+
+def test_off_loopback_without_a_token_is_refused_rather_than_warned_about(monkeypatch):
+    """Nobody configures "serve every local process's stack to the network",
+    so it is not a decision to warn about - it is one to decline. With a token
+    it becomes a decision, and gets the warning instead."""
+    monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
+    open_to_the_world = resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+    assert open_to_the_world.refuses_to_bind_unauthenticated
+
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+    # Refused, so there is nothing here to advise about.
+    assert [str(entry.message) for entry in raised] == []
+
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
+    with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
+        guarded = resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+    assert not guarded.refuses_to_bind_unauthenticated
+
+
+def test_loopback_needs_no_token_and_is_not_refused(monkeypatch):
+    """The default, and the case the headache was being paid for."""
+    monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
+    for name in ("127.0.0.1", "::1", "localhost"):
+        resolved = resolve(FakeConfig({"callstack_host": name}))
+        assert not resolved.refuses_to_bind_unauthenticated
+        assert resolved.stack_server_token == ""
 
 
 def test_the_sampler_cadence_has_a_floor_like_its_sibling():

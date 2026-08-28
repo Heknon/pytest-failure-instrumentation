@@ -516,6 +516,10 @@ class IncidentEngine:
                 self._stack_server_gave_up,
                 self._stack_server_ready,
                 self.session_id,
+                # Supplied by whoever started the run, never minted here, and
+                # never written down - see the stack server's module docstring
+                # for why the address is published and the secret is not.
+                self.settings.stack_server_token,
             )
 
         if self.settings.sample_seconds > 0 and not self.distributed:

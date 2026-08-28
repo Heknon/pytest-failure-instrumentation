@@ -108,10 +108,10 @@ def pytest_failure_incident(incident: Incident) -> None:
 def pytest_failure_server_ready(server: LiveStackServer) -> None:
     """Called once, on the controller, when the live-stack server is serving.
 
-    ``server`` is a :class:`.live_view.LiveStackServer` carrying the address,
-    the token and the evidence directory - everything a UI needs to start
-    polling ``/workers`` and ``/stack``, and the only way to learn a drawn
-    port without reading the discovery file yourself.
+    ``server`` is a :class:`.live_view.LiveStackServer` carrying the address
+    and the evidence directory - everything a UI needs to start polling
+    ``/workers`` and ``/stack``, and the only way to learn a drawn port
+    without reading the discovery file yourself.
 
     Not called at all when the server was never switched on, and not called
     when this session stood down because another of ours already holds a named

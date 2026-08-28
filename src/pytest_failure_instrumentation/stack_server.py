@@ -45,36 +45,47 @@ running. So a session that lost the claim keeps trying, quietly, and takes over
 whenever the holder exits. Sessions do not coordinate beyond the port itself,
 which is the only thing all of them can see.
 
-**Who may ask.** Every request but ``/identity`` carries a token, minted per
-server and written into the address file beside the port. So the boundary is
-the filesystem's: whoever can read that file can read this run's stacks.
+**Who may ask.** The bind, and a token if this run was started with one.
 
-*What that is worth differs by platform, and saying otherwise would be the
-useful half of a security claim without the true half.* On POSIX the file is
-opened ``0o600`` before anything is written into it - created owner-only rather
-than created and then narrowed, since the second leaves a window and a window
-is all anybody needs. On Windows a mode is not an ACL: ``os.open``'s mode
-argument there only decides whether the read-only attribute is set, so the file
-inherits the evidence directory's ACL and the boundary is whatever *that*
-grants. Under a user profile that is usually the user and administrators; on a
-shared or drive-root path it can be wider. Put ``failure_directory`` somewhere
-you would keep a credential, or leave the server off on a host you share.
+The token is *supplied*, never minted - ``--callstack-token`` or
+``PYTEST_CALLSTACK_TOKEN`` - and this package never writes it anywhere. That
+distinction is the whole design, and it comes from the two halves of the
+problem being opposites:
 
-Loopback is not that boundary, which is why the token is not conditional on
-binding off it. Loopback bounds the reachable set to processes on this machine,
-and *every user* on this machine is inside that set - so on a shared box, "only
-local" and "only you" are very different statements, and only the second is the
-one worth making about a service that reports what your test processes are
-executing.
+*The port has to be published.* A port drawn at random is unguessable by
+construction, which is the point of drawing it, so the run must write it down
+for anything outside to find it.
 
-``/identity`` is deliberately open, because it is what one session asks another
-before standing down from a contested port, and the two share no token. It
-answers with a service name, a version and a pid, and never with the token.
+*The token does not.* It is the one value both ends can agree on in advance,
+because whoever starts the run picks it. Minting one here made it discoverable
+instead - which meant writing it into the address file, which turned every
+question about where a run may write its evidence into a question about where
+a *secret* may live. That is a guarantee POSIX keeps with an ``0o600`` and
+Windows does not: a mode there is not an ACL, so the file inherits the evidence
+directory's and the promise quietly stops holding on a supported platform.
+
+So the address file is ordinary data - a host, a port and a pid - and goes
+wherever evidence goes, on every platform. The secret arrives the way secrets
+already reach a container, a CI job and a shell, and leaves nothing behind.
+
+**No token is the default, and it is the right one on loopback**, where the
+reachable set is processes on this machine. On a box you share with people you
+would not hand a debugger to, supply one or leave the server off: "only local"
+and "only you" are different statements, and without a token only the first is
+being made.
+
+``/identity`` is open even when a token is set: it is what one session asks
+another before standing down from a contested port, and two sessions that
+minted nothing have no way to share a credential. It answers with a service
+name, a version and a pid.
 
 **What it binds.** Loopback by default. A container is the exception that makes
 it configurable: its UI lives outside it, and 127.0.0.1 inside a container is
-unreachable from there. Binding anything else warns, once, at settings time -
-the token is what makes that survivable rather than reckless.
+unreachable from there. Binding anything else warns - and *without a token is
+refused outright*, before the socket is opened. Serving every local process's
+stack to whatever can route to the host is not a thing anybody configures on
+purpose, and a warning is the wrong instrument for it: by the time one is read
+the port has been open for the length of the run.
 """
 
 from __future__ import annotations
@@ -83,7 +94,6 @@ import errno
 import hmac
 import json
 import os
-import secrets
 import socket
 import socketserver
 import threading
@@ -115,17 +125,19 @@ LOOPBACK6 = "::1"
 IPV6_WILDCARD = "::"
 WILDCARDS = frozenset({"0.0.0.0", IPV6_WILDCARD, ""})
 
-#: How the token is presented. A header is the right place for a credential -
-#: query strings reach logs and shell history - and the query parameter exists
-#: anyway because a person debugging with curl will reach for it, and refusing
-#: would only teach them to turn the whole thing off.
+#: Binds that cannot be reached from another machine. Spelled here as well as
+#: in :mod:`.config` because the check they gate is different: settings decide
+#: what to warn about, and this decides what to refuse to bind.
+LOCAL_ONLY = frozenset({LOOPBACK, LOOPBACK6, "localhost"})
+
+#: How the token is presented, when there is one. A header is the right place
+#: for a credential - query strings reach logs and shell history - and the
+#: query parameter exists anyway because a person debugging with curl will
+#: reach for it, and refusing would only teach them to turn the whole thing
+#: off.
 AUTH_HEADER = "Authorization"
 AUTH_SCHEME = "Bearer"
 TOKEN_PARAM = "token"
-
-#: Bytes of randomness behind each server. Minted per process and never
-#: reused, so a token that leaks expires with the run that issued it.
-TOKEN_BYTES = 32
 
 #: Files a UI reads to find the servers running on this machine, one per
 #: serving session, named for the pid that wrote it so that two sessions in one
@@ -196,11 +208,29 @@ def authority(host: str, port: Optional[int]) -> str:
 
     ``http://::1:8080/`` is not a URL anybody can parse - the colons are
     ambiguous - and every client rejects it. RFC 3986 wants brackets.
+
+    For *reaching* the server, so a wildcard is resolved to something a client
+    can connect to. Never for describing a bind - see :func:`bind_address`.
     """
-    reached = reachable(host)
-    if address_family(reached) == socket.AF_INET6:
-        return f"[{reached}]:{port}"
-    return f"{reached}:{port}"
+    return _bracketed(reachable(host), port)
+
+
+def bind_address(host: str, port: Optional[int]) -> str:
+    """``host:port`` as it was *asked for*, for a message about the bind.
+
+    :func:`authority` answers what to connect to, which rewrites a wildcard to
+    loopback because nobody connects to 0.0.0.0 - Windows refuses outright. In
+    an error message that rewrite is a lie: refusing ``--callstack-host
+    0.0.0.0`` reported "refusing to bind 127.0.0.1:0", naming the one address
+    that was not the problem and that the reader never typed.
+    """
+    return _bracketed(host, port)
+
+
+def _bracketed(host: str, port: Optional[int]) -> str:
+    if address_family(host) == socket.AF_INET6:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
 
 
 class _Server(ThreadingHTTPServer):
@@ -218,7 +248,7 @@ class _Server(ThreadingHTTPServer):
         address: tuple[str, int],
         handler: Any,
         evidence_root: Optional[Path] = None,
-        token: Optional[str] = None,
+        token: str = "",
     ) -> None:
         # Set before the base class opens the socket, which reads it off the
         # instance. A class attribute cannot answer this: the family depends
@@ -228,7 +258,9 @@ class _Server(ThreadingHTTPServer):
         #: session's own, since /workers describes the machine rather than
         #: whichever run happens to be hosting.
         self.evidence_root = evidence_root
-        #: What a request has to carry. None only where no token was minted.
+        #: What a request must carry, or "" for a server that asks nothing.
+        #: Supplied by whoever started the run and never written down - see
+        #: the module docstring.
         self.token = token
         super().__init__(address, handler)
 
@@ -299,7 +331,8 @@ class _Handler(BaseHTTPRequestHandler):
         query = parse_qs(route.query)
 
         # Open, because it is what one session asks another before standing
-        # down from a contested port, and the two share no token.
+        # down from a contested port - and the two have no way to share a
+        # token, since neither minted one.
         if route.path == "/identity":
             self._reply(200, identity())
             return
@@ -309,10 +342,11 @@ class _Handler(BaseHTTPRequestHandler):
                 401,
                 {
                     "error": "this server reports what local processes are "
-                    "executing, so it asks who is asking. Send the token from "
-                    f"{DISCOVERY_PREFIX}<pid>{DISCOVERY_SUFFIX} in the evidence "
-                    f"directory, as '{AUTH_HEADER}: {AUTH_SCHEME} <token>' or "
-                    f"?{TOKEN_PARAM}=<token>"
+                    "executing, and this run was started with a token. Send it "
+                    f"as '{AUTH_HEADER}: {AUTH_SCHEME} <token>' or "
+                    f"?{TOKEN_PARAM}=<token>. It is the value in "
+                    "PYTEST_CALLSTACK_TOKEN or --callstack-token; this server "
+                    "did not mint it and has not written it anywhere"
                 },
             )
             return
@@ -325,7 +359,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(404, {"error": "no such endpoint", "endpoints": ENDPOINTS})
 
     def _authorised(self, query: dict[str, list[str]]) -> bool:
-        """Whether this request carries the server's token.
+        """Whether this request carries the token this run was started with.
+
+        Total by construction when no token was supplied: the server asks
+        nothing, so everything is authorised and the branch below is the whole
+        of it.
 
         Compared in constant time. The comparison is short and local and an
         attacker's timing signal across it is buried in HTTP jitter, but a
@@ -343,9 +381,9 @@ class _Handler(BaseHTTPRequestHandler):
         check total: every input now gets an answer, and it is still the
         constant-time one.
         """
-        expected = getattr(self.server, "token", None)
+        expected = getattr(self.server, "token", "")
         if not expected:
-            return True  # no token was minted, so none can be demanded
+            return True  # this run supplied no token, so none can be demanded
 
         offered = (query.get(TOKEN_PARAM) or [""])[0]
         header = self.headers.get(AUTH_HEADER, "")
@@ -556,6 +594,7 @@ class StackService:
         on_giving_up: Optional[Any] = None,
         on_ready: Optional[Any] = None,
         session_id: str = "",
+        token: str = "",
     ) -> None:
         #: What was asked for. 0 means "draw one", and is not what got bound.
         self.port = port
@@ -578,12 +617,15 @@ class StackService:
         #: Names the evidence directory, and goes in the announcement because
         #: the run id does not exist yet - see :mod:`.live_view`.
         self.session_id = session_id
+        #: Supplied by whoever started the run, or "" for a server that asks
+        #: nothing. Never minted here and never written to disk: the address
+        #: of a drawn port has to be published, but a secret both ends can
+        #: agree on in advance does not, and publishing it is what made the
+        #: address file a credential store.
+        self.token = token
         self._announcer: Optional[threading.Thread] = None
         #: What is actually bound, which is the only number worth publishing.
         self.bound_port: Optional[int] = None
-        #: Minted per process. A token that leaks expires with the run that
-        #: issued it, which is the whole of its lifetime management.
-        self.token = secrets.token_urlsafe(TOKEN_BYTES)
         #: What happened, in words, for whoever asks why there are no stacks.
         self.status = "not started"
         self.serving = False
@@ -648,6 +690,19 @@ class StackService:
         somebody else is serving it, or something that is not a server at all
         is sitting on it.
         """
+        if self.host not in LOCAL_ONLY and not self.token:
+            # Not attempted at all, rather than bound and then regretted.
+            # Serving every local process's stack to whatever can route here
+            # is not something anybody configures on purpose, and a warning is
+            # the wrong instrument for it: by the time one is read the port
+            # has been open for the length of the run.
+            self.status = (
+                f"refusing to bind {bind_address(self.host, self.port)}: that is "
+                "reachable from off this machine and no token was supplied"
+            )
+            self._give_up("BIND_REFUSED")
+            return True
+
         try:
             httpd = _Server(
                 (self.host, self.port),
@@ -664,7 +719,7 @@ class StackService:
                 # *drawn* - so a named port on a bad host was reported as held
                 # by a stranger, advised to try another port, and then retried
                 # the impossible bind every few seconds for the whole run.
-                self.status = f"could not bind {authority(self.host, self.port)}: " + (
+                self.status = f"could not bind {bind_address(self.host, self.port)}: " + (
                     failure.strerror or str(failure)
                 )
                 self._give_up("BIND_REFUSED")
@@ -692,7 +747,7 @@ class StackService:
             # bound and no amount of waiting changes that - so it is reported
             # as one, with the number that was asked for.
             self.status = (
-                f"could not bind {authority(self.host, self.port)}: {failure}"
+                f"could not bind {bind_address(self.host, self.port)}: {failure}"
             )
             self._give_up("BIND_REFUSED")
             return True
@@ -763,21 +818,22 @@ class StackService:
             port=self.bound_port,
             url=self.url,
             drawn=self.drawn,
-            token=self.token,
             started_at=round(time.time(), 3),
         )
         temporary = path.with_name(path.name + ".part")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            # Created owner-only *before* anything is in it, so the token is
-            # never briefly world-readable. Writing it and then chmod-ing
-            # leaves exactly that window, which on a shared machine is the
-            # only window anybody needs.
-            handle = os.open(
-                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-            )
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream)
+            # An ordinary file. It held a credential once, which is what made
+            # its mode load-bearing and turned "where may a run write its
+            # evidence" into a question about where a *secret* may live - a
+            # guarantee POSIX could keep and Windows could not. What is in it
+            # now is a host, a port and a pid: the address of a server that
+            # anyone who can reach it may query anyway.
+            #
+            # Still written through a temporary and renamed. That was never
+            # about the secret: a reader polling this directory must never be
+            # handed half an address.
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(temporary, path)
         except OSError:
             return  # bookkeeping must never break a run
@@ -926,6 +982,7 @@ def start(
     on_giving_up: Optional[Any] = None,
     on_ready: Optional[Any] = None,
     session_id: str = "",
+    token: str = "",
 ) -> Optional[StackService]:
     """Begin serving, or begin waiting to. None if it could not even start.
 
@@ -941,6 +998,7 @@ def start(
             on_giving_up=on_giving_up,
             on_ready=on_ready,
             session_id=session_id,
+            token=token,
         )
         service.start()
         return service
