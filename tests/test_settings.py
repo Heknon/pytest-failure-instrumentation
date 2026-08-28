@@ -195,6 +195,14 @@ def test_the_stack_server_help_describes_the_server_that_ships():
     assert "failure_stack_server_host" in help_text
 
 
+def test_the_token_option_says_that_a_command_line_is_readable():
+    """The help is what ``pytest --help`` shows, so it is where somebody about
+    to type a secret into argv can still be told not to."""
+    help_text = _registered().command_line["--callstack-token"]
+    assert settings_module.TOKEN_ENV in help_text
+    assert "ps -eww" in help_text and "/proc/<pid>/cmdline" in help_text
+
+
 def test_the_shipped_defaults_leave_a_stall_something_to_read():
     """These two settings look independent and are not.
 
@@ -293,16 +301,21 @@ def test_naming_either_one_on_the_command_line_switches_the_server_on():
     assert not resolve(FakeConfig()).stack_server
 
 
-def test_binding_off_loopback_says_what_it_exposes():
+def test_binding_off_loopback_says_what_it_exposes(monkeypatch):
     """Right for a container whose UI is outside it, wrong on a shared machine,
     and only the person who typed it can tell which this is.
 
     Only reachable with a token, because without one this configuration is
     refused rather than warned about - nobody means to serve every local
     process's stack to a network, so there is no decision there to state.
+
+    The token comes from the environment rather than the command line so that
+    the bind is the only thing this run is advised about; argv carries its own
+    warning now, which has nothing to do with what is being asserted here.
     """
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
     with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
-        resolve(FakeConfig({"callstack_host": "0.0.0.0", "callstack_token": "s3cret"}))
+        resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
 
 
 def test_loopback_by_any_of_its_names_is_not_an_exposure():
@@ -361,13 +374,14 @@ def test_the_token_comes_from_the_command_line_or_the_environment(monkeypatch):
     )
 
     # The command line outranks it, which is what lets one run differ from the
-    # shell it was started in.
-    assert (
-        resolve(
+    # shell it was started in - and is advised against on its own account,
+    # because argv is readable by everyone on the machine and an environment
+    # is not. See test_a_token_on_the_command_line_says_who_else_can_read_it.
+    with pytest.warns(FailureInstrumentationWarning, match="command line"):
+        from_the_command_line = resolve(
             FakeConfig({"callstack_port": 8080, "callstack_token": "from-the-cli"})
-        ).stack_server_token
-        == "from-the-cli"
-    )
+        )
+    assert from_the_command_line.stack_server_token == "from-the-cli"
 
 
 def test_a_token_alone_does_not_start_a_server(monkeypatch):
@@ -408,6 +422,61 @@ def test_loopback_needs_no_token_and_is_not_refused(monkeypatch):
         resolved = resolve(FakeConfig({"callstack_host": name}))
         assert not resolved.refuses_to_bind_unauthenticated
         assert resolved.stack_server_token == ""
+
+
+def test_a_token_on_the_command_line_says_who_else_can_read_it(monkeypatch):
+    """``--callstack-token SECRET`` hands the token to every other account on
+    the machine, which is the machine the token exists to protect.
+
+    A process's argv is world-readable - ``/proc/<pid>/cmdline`` on Linux,
+    ``ps -eww`` anywhere - and a controller lives as long as the run, so a
+    local user has the length of the suite to read it out. The environment
+    variable reaches the same field and does not: ``/proc/<pid>/environ`` is
+    0400. The flag is not refused, because runs already use it and it is
+    unobjectionable where there is one user; it just no longer happens
+    silently.
+    """
+    monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
+    with pytest.warns(FailureInstrumentationWarning) as raised:
+        resolved = resolve(FakeConfig({"callstack_port": 8080, "callstack_token": "s3cret"}))
+
+    said = "\n".join(str(entry.message) for entry in raised)
+    assert settings_module.TOKEN_ENV in said, said
+    # Advice about a credential being readable that quotes the credential has
+    # published it a second time, into the warnings summary and the CI log.
+    assert "s3cret" not in said
+    # Nothing is refused: the token asked for is the token in force.
+    assert resolved.stack_server_token == "s3cret"
+
+
+def test_a_token_from_the_environment_is_advised_about_nothing(monkeypatch):
+    """The form that does not leak is the one nobody should be nagged about -
+    advice that fires on the right answer as well as the wrong one is noise,
+    and this fires once per run."""
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        resolve(FakeConfig({"callstack_port": 8080}))
+    assert [str(entry.message) for entry in raised] == []
+
+
+def test_a_worker_does_not_repeat_what_the_controller_already_said(monkeypatch):
+    """A worker parses the same argv as its controller, so the advice would
+    otherwise arrive once per worker - eight copies of it under ``-n8``, which
+    is how a real caveat turns into something people filter out."""
+    monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
+
+    class Worker(FakeConfig):
+        workerinput = {
+            "workerid": "gw1",
+            "workercount": 2,
+            "failure_settings": settings_module.Settings().as_payload(),
+        }
+
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        resolve(Worker({"callstack_port": 8080, "callstack_token": "s3cret"}))
+    assert [str(entry.message) for entry in raised] == []
 
 
 def test_the_sampler_cadence_has_a_floor_like_its_sibling():

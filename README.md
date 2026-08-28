@@ -858,11 +858,21 @@ already reach a container, a CI job and a shell:
 
 | | |
 |---|---|
-| `--callstack-token SECRET` | one run |
-| `PYTEST_CALLSTACK_TOKEN` | a shell, a CI job, `docker run -e` |
+| `PYTEST_CALLSTACK_TOKEN` | a shell, a CI job, `docker run -e` — prefer this |
+| `--callstack-token SECRET` | one run, at the cost below |
 | *(nothing)* | no authentication — the default, and right on loopback |
 
 There is no ini setting, deliberately: ini files live in the repository.
+
+**The two are not equally private.** `--callstack-token` puts the secret in the
+controller's command line, and a command line is public on a shared machine:
+`/proc/<pid>/cmdline` is world-readable on Linux, so any other account can take
+the token out of `ps -eww` for as long as the run lasts — on exactly the
+machine a token is worth having. Shell history and an echoed CI command keep it
+after the run has ended, too. `PYTEST_CALLSTACK_TOKEN` reaches the same setting
+by the same path and has none of that: `/proc/<pid>/environ` is `0400`, the
+owner alone. The flag still works — runs use it, and it is unobjectionable on a
+machine with one user on it — and a run that uses it warns once, saying this.
 
 **No token is the default and the right one on loopback**, where the bind
 already bounds the reachable set to processes on this machine. On a box you
@@ -1160,9 +1170,11 @@ overwhelming majority of what runs.
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
 
 There is deliberately **no ini setting for the token**. It comes from
-`--callstack-token` or `PYTEST_CALLSTACK_TOKEN` and nowhere else: an ini file
+`PYTEST_CALLSTACK_TOKEN` or `--callstack-token` and nowhere else: an ini file
 lives in the repository, and a credential in the repository is the thing this
-design exists to avoid. See [Who may ask](#who-may-ask).
+design exists to avoid. Prefer the environment variable — a token on the
+command line is readable by every other user of the machine. See
+[Who may ask](#who-may-ask).
 
 `failure_slow_test_seconds` and `failure_stall_seconds` are not independent.
 The stack a stalled worker is reported with is whatever the watchdog last
