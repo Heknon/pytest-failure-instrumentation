@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .analysis import stall as stall_analysis
-from .capture.events import head_events, tail_events
+from .capture.events import head_events, tail_events, this_run
 from .capture.heartbeat import DEFAULT_INTERVAL
 from .capture.state import ELIDED, read_state
 from .probes import is_running
@@ -174,9 +174,37 @@ def run(
 
 
 def worker(state_path: Path, now: float) -> dict[str, Any]:
-    """One worker: what it is doing, and whether it is still doing it."""
-    record = read_state(state_path)
+    """One worker: what it is doing, and whether it is still doing it.
+
+    The events are read before the state, and that order is the point. An
+    events file is opened truncated by the worker that owns it and every line
+    in it carries the run that wrote the line, so it says which run the worker
+    behind these two files belongs to. A state file says nothing of the kind
+    on its own: it is a fixed slot opened without O_TRUNC and overwritten in
+    place, so an earlier run's record sits there intact until this run's
+    worker reaches its first phase transition - and two sessions that share a
+    directory, which ``PYTEST_RUN_ID`` exported across a whole build job
+    produces without anyone choosing it, overwrite each other's slot for the
+    whole run, because every worker in every session is called ``gw0``.
+
+    So the run id comes from the events and both readings are made as that
+    run: ``read_state`` refuses a slot stamped with a different one, and
+    ``this_run`` drops beats stamped with a different one. Everything below is
+    reported as this run's - the pid most of all. ``sampling`` takes that pid
+    and hands it to py-spy, which stops the process it attaches to; an
+    unfiltered read there is not a wrong label on a dashboard, it is another
+    session's worker suspended by this one.
+
+    Both filters keep an *unstamped* record rather than dropping it - see
+    ``read_state`` and ``events.this_run``. A worker the controller never
+    reached with a run id wrote a run's worth of real evidence, and discarding
+    that to guard against nothing would report a live worker as one that never
+    started.
+    """
     events = tail_events(state_path.with_name(f"{state_path.stem}.events"))
+    run_id = _worker_run_id(events)
+    events = this_run(events, run_id)
+    record = read_state(state_path, run_id)
     beats = [event for event in events if event.get("event") == "heartbeat"]
 
     pid = record.get("pid")
@@ -209,6 +237,31 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
         # produces exactly the second one.
         "cpu_rate": None if rate is None else round(rate, 3),
     }
+
+
+def _worker_run_id(events: list[dict[str, Any]]) -> Optional[str]:
+    """Which run wrote these events, from the events already in hand.
+
+    The most recent stamped record wins. Freshness is the tie-breaker that
+    matters: the only way one file holds two runs' lines is two sessions
+    writing it at once, and a live view describing what is happening now
+    should follow the writer that wrote last.
+
+    Deliberately not a second read of the file. ``worker`` is called once per
+    worker per request to ``/workers``, and unlike the heartbeat interval -
+    which only ``watchdog_started`` carries, once, at the head, which is why
+    ``_interval`` has to go back for it - the run id is on *every* line
+    ``EventLog`` writes. The tail already in hand answers it whenever the file
+    is stamped at all, so reaching for ``head_events`` here would buy a read
+    per worker per poll and nothing else.
+
+    None when nothing is stamped, which is not the same as "no match": both
+    callers below read that as "cannot tell, so keep what there is".
+    """
+    for event in reversed(events):
+        if event.get("run_id"):
+            return str(event["run_id"])
+    return None
 
 
 def _status(
