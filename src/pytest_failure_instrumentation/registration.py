@@ -139,29 +139,50 @@ def _resolve(
 
 
 def _build(config: pytest.Config, settings: Settings) -> Any:
-    if hasattr(config, "workerinput"):
-        from .capture.recorder import WorkerRecorder
+    """The plugin object for this process, or None if it could not be made.
 
+    Both branches import inside the callable ``_built`` guards rather than at
+    the top of the branch, and that placement is the whole point rather than
+    style. Either import reaches ``probes`` - the recorder through the memory
+    and stack probes, the engine directly - and ``probes`` imports psutil at
+    module scope. psutil is a declared dependency and is normally there, but
+    "normally" is doing real work in that sentence: no wheel for the platform
+    so the sdist build failed, a C extension broken by a libc the wheel was
+    not built against, ``pip install --no-deps``, a mirror that has the pure
+    Python dependencies and not the compiled one. An import left outside the
+    guard turns any of those into an ImportError thrown out of
+    ``pytest_configure``, which pytest answers with INTERNALERROR, exit status
+    3 and nothing collected - on the controller and, worse, on every worker.
+    Inside the guard the same failure is the warning-and-disable path the
+    module docstring promises: no instrumentation, and a run that still runs.
+    """
+    if hasattr(config, "workerinput"):
         worker_id = config.workerinput["workerid"]
         # pytest's faulthandler_timeout is read here rather than in the
         # recorder: it is not a setting of this plugin's and does not travel
         # in Settings, but it decides whether the frozen-interpreter fallback
         # may arm the one process-wide timer the two plugins share.
         timeout = pytest_faulthandler_timeout(config)
-        return _built(
-            lambda: WorkerRecorder(
+
+        def recorder() -> Any:
+            from .capture.recorder import WorkerRecorder
+
+            return WorkerRecorder(
                 settings.directory, worker_id, settings, faulthandler_timeout=timeout
-            ),
-            "worker",
-        )
+            )
+
+        return _built(recorder, "worker")
 
     # Registered whether or not xdist is in the picture. Two of the five kinds
     # are not distributed problems - an internal error ends a single-process
     # run just as finally, and the run summary is what says a run reached its
     # end at all.
-    from .incidents.engine import IncidentEngine
+    def engine() -> Any:
+        from .incidents.engine import IncidentEngine
 
-    return _built(lambda: IncidentEngine(config, settings), "run")
+        return IncidentEngine(config, settings)
+
+    return _built(engine, "run")
 
 
 def _ensure_hookspecs(config: pytest.Config) -> None:
@@ -188,6 +209,10 @@ def _built(build: Any, what: str) -> Any:
     Registration is the one place this plugin touches the filesystem before
     anything has gone wrong, and it is allowed to fail: a read-only image, a
     vanished mount, a name already taken by a file.
+
+    ``build`` also does the importing, so a dependency that is declared but
+    absent lands here too rather than out of ``pytest_configure``. See
+    :func:`_build` for why that is arranged rather than incidental.
     """
     try:
         return build()
