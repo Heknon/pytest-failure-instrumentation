@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -56,10 +57,116 @@ from .base import Capabilities, Incident, frame_from
 #: is a natural thing to point at an existing artifacts directory.
 OWNER_FILE = "owner.json"
 
+#: The environment variable that names this run's evidence directory, and the
+#: only value in this package that a person hands over and the filesystem then
+#: obeys. What it names is one component under ``failure_directory``, and
+#: ``Path.__truediv__`` will not hold it to that on its own: an absolute
+#: right-hand side *replaces* the left entirely, so ``PYTEST_RUN_ID=/tmp/x`` is
+#: not a subdirectory of the configured directory but a different directory,
+#: and this run's ``owner.json``, every worker's ``.state``, ``.events``,
+#: ``.crash`` and ``.frozen``, and the live view's discovery file are all
+#: written there instead. ``../..`` walks upward just as quietly, because the
+#: ``mkdir(parents=True)`` that follows is happy to create whatever it is
+#: handed. Neither says anything at the time: the run looks like it worked, and
+#: its evidence is somewhere nobody looks, or on top of somebody else's.
+RUN_NAME_ENV = "PYTEST_RUN_ID"
+
+#: The shape a value has to have before it is used as that component. Letters,
+#: digits, dot, dash and underscore cover what this variable is documented to
+#: carry - a CI build number, a git SHA, a matrix cell like
+#: ``ubuntu-22.04-py3.11``, a slugified branch name - and exclude every way one
+#: component turns into something else: ``/`` and ``\`` are separators (both of
+#: them, on Windows), ``:`` makes ``C:foo`` a drive-relative path rather than a
+#: name, and a NUL is the one that does not even fail like the others -
+#: ``mkdir`` answers it with ``ValueError``, which is not an ``OSError`` and so
+#: is not caught by the guard that exists around it, turning an environment
+#: variable into an INTERNALERROR out of session start.
+#:
+#: 128 characters is not a filesystem limit; ``NAME_MAX`` is 255 wherever this
+#: runs. It leaves the rest of the budget to the files written *inside* the
+#: directory on the platform with the least of it, Windows still bounding a
+#: whole path at 260 characters unless long paths are switched on. The longest
+#: identifier a build system realistically hands over is a 64-character SHA-256
+#: digest.
+RUN_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+
+#: Names Windows resolves to devices rather than to files, in any directory and
+#: whatever suffix follows them. Refused everywhere rather than only where they
+#: bite, because the failure they cause is the quiet one: on Windows the
+#: ``mkdir`` raises, the guard in :meth:`IncidentEngine._prepare_directory`
+#: swallows it as it must, and the run reports nothing and says nothing about
+#: why. A build id that gives a Linux runner a directory and a Windows
+#: developer silence is worse than refusing a name nobody uses as a build id on
+#: either.
+RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{digit}" for digit in "123456789"]
+    + [f"LPT{digit}" for digit in "123456789"]
+)
+
 #: How long session finish waits for the stall watcher to notice the run is
 #: over. Every wait inside it is against the stop event, so this is slack for a
 #: loaded runner rather than a real deadline.
 WATCHER_JOIN_SECONDS = 10.0
+
+
+def usable_as_a_run_name(value: str) -> bool:
+    """Whether ``value`` is one directory component that means only itself."""
+    if not RUN_NAME.match(value):
+        return False
+    if value.strip(".") == "":
+        # "." is the configured directory itself and ".." is its parent, so
+        # both are a run writing on top of something rather than into a
+        # directory of its own - and "." in particular passes every other check
+        # here while making ``prune_finished_runs`` sweep the directory the run
+        # is at that moment using. Longer runs of dots are legal names on POSIX
+        # and go with them, because nothing that reads back as a build id is
+        # spelled that way.
+        return False
+    # Windows matches a device on the stem, so "NUL.evidence" is the device
+    # too; the suffix does not rescue it.
+    return value.split(".")[0].upper() not in RESERVED_NAMES
+
+
+def name_this_run(fallback: str) -> str:
+    """``PYTEST_RUN_ID`` if it can name a directory, otherwise ``fallback``.
+
+    Read once, here, rather than where the directory is built - because the
+    name is not only a directory name. It is stamped into ``owner.json``, it is
+    what :class:`..stack_server.LiveStackServer` reports as its session, and it
+    is the key a product joins incidents on until xdist has a run id of its
+    own. Sanitising at the point of use would leave those three agreeing on a
+    name that the filesystem never saw, which is the same correlation failure
+    in a place that is harder to notice.
+
+    A value that cannot be used falls back rather than ending the run: this
+    plugin does not get to stop a suite over its own settings, and that promise
+    is older than this check. But it is never dropped in silence. Somebody sets
+    this variable precisely so that a build's incidents carry the build's id;
+    an ignored value leaves that correlation broken with nothing to read that
+    says why, which is exactly the kind of quiet absence the plugin exists to
+    stop people misreading.
+    """
+    raw = os.environ.get(RUN_NAME_ENV, "")
+    # Surrounding space is not part of anybody's build id, and a trailing one
+    # is worse than useless: Windows strips it off a directory name, so two
+    # values that differ would name one directory. Folded rather than reported,
+    # the way ``config.resolve`` folds the space around every other setting a
+    # person types.
+    value = raw.strip()
+    if not value:
+        return fallback  # unset, or exported empty, both of which say nothing
+    if usable_as_a_run_name(value):
+        return value
+    advise(
+        f"{RUN_NAME_ENV}={raw!r} cannot name a directory, so it is ignored and "
+        f"this run's evidence goes to {fallback!r} instead - nothing in it will "
+        f"correlate with that id. A run name is 1-128 characters of letters, "
+        f"digits, '.', '-' and '_', and is neither '.' nor '..'; anything else "
+        f"is a path rather than a name and would write this run's evidence "
+        f"outside failure_directory"
+    )
+    return fallback
 
 
 def prune_finished_runs(root: Path) -> None:
@@ -112,10 +219,10 @@ class IncidentEngine:
         # common on CI, and they would share an id.
         #: This process's own name for itself, fixed here and dependent on
         #: nothing. It names the directory, which is why it cannot be xdist's
-        #: id: see the ``directory`` property.
-        self.session_id = os.environ.get("PYTEST_RUN_ID") or (
-            f"run-{uuid.uuid4().hex[:12]}"
-        )
+        #: id: see the ``directory`` property. An operator may name it instead,
+        #: and :func:`name_this_run` is where that name has to earn the right
+        #: to be a directory component - see there.
+        self.session_id = name_this_run(f"run-{uuid.uuid4().hex[:12]}")
         #: Filled by the first read that finds a real id, and never
         #: recomputed after that - see the property for why not the first read
         #: of any kind.
@@ -201,6 +308,12 @@ class IncidentEngine:
         The reported run id is unaffected and still prefers xdist's, so an
         incident still lines up with xdist's logs. Every ``.events`` line in
         here carries it, which is how a directory is matched to a run.
+
+        The join below is only ever one component deep because
+        :func:`name_this_run` has already refused anything else: a name that
+        reached here as ``/tmp/x`` or ``../..`` would take the whole run's
+        evidence with it, quietly, and the operator who exported it would not
+        find out from anything the run printed.
         """
         return self.settings.directory / self.session_id
 
