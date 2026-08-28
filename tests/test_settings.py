@@ -99,33 +99,80 @@ def test_a_worker_takes_the_run_id_the_controller_pushed_down():
     assert resolve(FakeConfig()).run_id is None
 
 
+class RecordingParser:
+    """Both halves of what add_options registers, with the help kept.
+
+    The command-line options go to a group, and a fake that cannot hand one
+    out would make a test pass by never reaching them. The help text is
+    recorded because it is not decoration: it is the whole of what ``pytest
+    --help`` shows, so a sentence that stopped being true there is a sentence
+    nobody has any other way to catch.
+    """
+
+    def __init__(self) -> None:
+        self.ini: dict[str, str] = {}
+        self.command_line: dict[str, str] = {}
+
+    def addini(self, name, help, type=None, default=None):  # noqa: A002
+        self.ini[name] = help
+
+    def getgroup(self, name):
+        return self
+
+    def addoption(self, name, **kwargs):
+        self.command_line[name] = kwargs.get("help", "")
+
+
+def _registered() -> RecordingParser:
+    """Everything ``add_options`` registers, as pytest would have it."""
+    parser = RecordingParser()
+    settings_module.add_options(parser)
+    return parser
+
+
+def _settings_named_in_the_readme_table() -> set[str]:
+    """The names in the README's settings table, read out of the table.
+
+    Found from this file rather than from the package, the way the incident
+    kinds are checked against the hookspec and the triage skill: the tests
+    only ever ship with the source, while the package is also run out of a
+    built wheel in site-packages with no README above it.
+    """
+    readme = Path(__file__).resolve().parent.parent / "README.md"
+    if not readme.exists():
+        pytest.skip("the README is not part of this checkout")
+
+    # The table, and nothing after it: the prose below it names settings too,
+    # and a setting explained there but missing from the table is exactly the
+    # drift this is looking for.
+    table = readme.read_text(encoding="utf-8").partition("\n## Settings\n")[2]
+    return set(re.findall(r"^\|\s*`(failure_\w+)`", table.partition("\n## ")[0], re.MULTILINE))
+
+
 def test_every_setting_in_the_readme_table_is_registered():
     """The table is how anybody finds these, so a setting that drifts out of it
-    is a setting nobody can turn on."""
-    registered: list[str] = []
+    is a setting nobody can turn on.
 
-    class Parser:
-        """Both halves of what add_options registers. The command-line options
-        go to a group, and a fake that cannot hand one out would make this test
-        pass by never reaching them."""
+    Which means reading the table. This asserted against ``DEFAULTS`` alone -
+    a dict a few lines up in this same file - so what it actually guarded was
+    that two lists in the source agreed with each other, and a setting added
+    to ``config.py`` and to ``DEFAULTS`` and documented nowhere passed it. The
+    README is now read the way ``test_models`` reads the hookspec table and the
+    triage skill, and for the same reason: the copy that goes stale unnoticed
+    is always the one no test opens.
 
-        def addini(self, name, help, type=None, default=None):  # noqa: A002
-            registered.append(name)
-
-        def getgroup(self, name):
-            return self
-
-        def addoption(self, name, **kwargs):
-            command_line.append(name)
-
-    command_line: list[str] = []
-    settings_module.add_options(Parser())
-    assert sorted(command_line) == [
+    ``DEFAULTS`` is still compared, because it is what the fake config in this
+    module answers ``getini`` from - a setting missing from it makes every
+    other test here raise KeyError rather than fail with a reason.
+    """
+    parser = _registered()
+    assert sorted(parser.command_line) == [
         "--callstack-host",
         "--callstack-port",
         "--callstack-token",
     ]
-    assert sorted(registered) == sorted(DEFAULTS)
+    assert sorted(parser.ini) == sorted(DEFAULTS)
+    assert sorted(parser.ini) == sorted(_settings_named_in_the_readme_table())
 
 
 def test_the_shipped_defaults_leave_a_stall_something_to_read():

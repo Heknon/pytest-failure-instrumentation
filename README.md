@@ -1143,6 +1143,7 @@ overwhelming majority of what runs.
 |---|---|---|
 | `failure_packages` | — | Your top-level packages, for attribution |
 | `failure_directory` | `.pytest-failures` | Where evidence is written; each run gets a subdirectory under it |
+| `failure_product_version` | — | Version recorded on every incident, for telling which build a failure came from |
 | `failure_watchdog` | `true` | Memory and liveness sampling |
 | `failure_heartbeat_interval` | `5.0` | Seconds between liveness beats (floor 1.0) |
 | `failure_tracemalloc_depth` | `0` | 1 names the allocating line for OOM attribution |
