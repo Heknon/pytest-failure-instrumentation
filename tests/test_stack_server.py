@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -89,6 +91,53 @@ def get(
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as refusal:
         return refusal.code, json.loads(refusal.read())
+
+
+def raw(port: int, request: bytes, timeout: float = 30.0) -> tuple[int, dict, bytes]:
+    """``(status, body, head)`` for a request written straight onto the socket.
+
+    ``urllib`` cannot send most of what is worth testing here: it will not put
+    a path that is not a URL on the wire, and it fills in the ``Host`` header
+    from the address it connected to. Both are exactly what a hostile caller
+    chooses for itself.
+
+    A status of 0 means the server wrote nothing at all before closing, which
+    is the failure several of the tests below are about - and it is the reason
+    this reads to EOF rather than parsing with a client library, which would
+    raise its own error over the top of the evidence.
+    """
+    with socket.create_connection((stack_server.LOOPBACK, port), timeout=timeout) as client:
+        client.sendall(request)
+        answer = b""
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            answer += chunk
+    head, _, body = answer.partition(b"\r\n\r\n")
+    if not head:
+        return 0, {}, b""
+    return int(head.split()[1]), (json.loads(body) if body else {}), head
+
+
+def a_run_of(tmp_path: Path, **workers: int) -> Path:
+    """A run directory as the recorder leaves one, with ``name=pid`` workers.
+
+    The state files are the only place this machine records which processes
+    belong to a run, so they are what a server reads to decide whose stack it
+    has any business reporting - see ``stack_server.serves_pid``.
+    """
+    run = tmp_path / "run-abc123"
+    run.mkdir(exist_ok=True)
+    (run / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+    for name, pid in workers.items():
+        (run / f"{name}.state").write_bytes(
+            json.dumps(
+                {"pid": pid, "nodeid": f"test_{name}.py::test_one", "time": time.time()}
+            ).encode()
+            + b"\n"
+        )
+    return run
 
 
 def wait_for(condition, timeout: float = 20.0):
@@ -195,6 +244,59 @@ def test_windows_does_not_get_the_address_reuse_flag():
     assert stack_server._Server.allow_reuse_address == (not IS_WINDOWS)
 
 
+def test_stopping_a_session_that_never_reached_its_accept_loop_returns(monkeypatch):
+    """The interleaving that hung a run after it had finished.
+
+    The claim publishes its handle and *then* reads the stop flag. A ``stop``
+    that lands between those two statements takes the handle and calls
+    ``shutdown`` on it, while the claim - now seeing the flag - stands the
+    server down without ever entering ``serve_forever``. ``shutdown`` waits on
+    an event that only that loop's own ``finally`` sets, so the wait never
+    ends, and the bounded join that was supposed to make ``stop`` total sits on
+    the next line, never reached. A pytest process that had run every test it
+    was asked to hung there until somebody killed it.
+
+    Driven by hand rather than by racing two threads and hoping: the state the
+    service is put in here is exactly the state the claim leaves it in between
+    those two statements - bound, published on the service, never served.
+    """
+    monkeypatch.setattr(stack_server, "ACCEPT_LOOP_TIMEOUT", 1.0)
+    service = stack_server.StackService(0)
+    httpd = stack_server._Server((stack_server.LOOPBACK, 0), stack_server._Handler)
+    service._httpd = httpd
+    try:
+        returned = threading.Event()
+
+        def stop_it() -> None:
+            service.stop()
+            returned.set()
+
+        threading.Thread(target=stop_it, daemon=True).start()
+        assert returned.wait(20), (
+            "stop() never returned: it is waiting inside shutdown() for a loop "
+            "that was never entered"
+        )
+    finally:
+        httpd.server_close()
+
+
+def test_a_session_that_is_serving_is_still_actually_shut_down(serving, tmp_path):
+    """The other half of the fix, which is the half that could be lost to it:
+    a server that *did* reach its accept loop must still be brought down by
+    ``stop`` rather than left holding the port for the rest of the session."""
+    port = free_port()
+    service = serving(port, directory=tmp_path / "run")
+    assert wait_for(lambda: service.serving), service.status
+    service.stop()
+
+    assert not service.serving
+    assert stack_server.identify(port, timeout=0.5) is None
+    # And the port is free for the next session, which is what shutting down
+    # is for: the socket is closed rather than merely abandoned.
+    with socket.socket() as probe:
+        probe.bind((stack_server.LOOPBACK, port))
+
+
 # -- answering ------------------------------------------------------------
 
 
@@ -215,12 +317,12 @@ def test_a_request_for_the_serving_process_is_answered_from_its_own_frames(servi
 
 
 @needs_pyspy
-def test_another_process_is_read_from_outside_it(serving):
+def test_another_process_is_read_from_outside_it(serving, tmp_path):
     """The case the whole external reader exists for: a stack out of a process
     that was never asked for one and cannot be made to cooperate."""
-    port = free_port()
-    service = serving(port)
+    service = serving(free_port(), directory=tmp_path / "run-abc123")
     assert wait_for(lambda: service.serving), service.status
+    port = service.bound_port
 
     # The victim nominates its parent as a permitted tracer, which is what a
     # real worker now does at startup - see probes.tracing. Without it this
@@ -229,6 +331,9 @@ def test_another_process_is_read_from_outside_it(serving):
     # than its ancestor. That is the configuration most Linux boxes ship.
     victim = subprocess.Popen([sys.executable, "-c", VICTIM_THAT_PERMITS_TRACING])
     try:
+        # Named as one of this run's workers, because that is what makes it
+        # this server's business at all - see the refusal test below.
+        a_run_of(tmp_path, gw0=victim.pid)
         # Waiting for the frame itself, not merely for an answer: an
         # interpreter that has not finished starting reads back a perfectly
         # valid stack that is still inside the import machinery.
@@ -259,7 +364,7 @@ def test_a_pid_that_is_not_a_number_is_refused_rather_than_guessed(serving):
     assert "notapid" in body["error"]
 
 
-def test_a_pid_no_process_could_have_is_refused_without_spending_a_reader(serving):
+def test_a_pid_no_process_could_have_is_refused_without_spending_a_reader(serving, tmp_path):
     """The reader is a separate program with its own idea of an integer.
 
     Handed 10^20 py-spy panics and its Rust backtrace became the API's
@@ -268,7 +373,8 @@ def test_a_pid_no_process_could_have_is_refused_without_spending_a_reader(servin
     reply that says nothing about any process. A pid that cannot exist is
     refused where the reply can say why.
     """
-    service = serving(free_port(), directory=None)
+    a_run_of(tmp_path, gw0=stack_server.MAX_PID)
+    service = serving(free_port(), directory=tmp_path / "run-abc123")
     assert wait_for(lambda: service.serving), "never served"
     port = service.bound_port
 
@@ -279,21 +385,147 @@ def test_a_pid_no_process_could_have_is_refused_without_spending_a_reader(servin
         # Nothing py-spy said about itself leaks out as the explanation.
         assert "py-spy" not in body["error"] and "panicked" not in body["error"]
 
-    # A pid that could exist still goes to the reader, whatever it finds there.
+    # A pid this run claims still goes to the reader, whatever it finds there.
     status, _ = get(port, f"/stack?pid={stack_server.MAX_PID}")
     assert status == 502
 
 
-def test_an_unreadable_process_answers_with_why(serving):
+def test_an_unreadable_process_answers_with_why(serving, tmp_path):
     """A UI that is told nothing shows an empty pane; one that is told why can
     say whether this is a dead process or a missing permission."""
-    port = free_port()
-    service = serving(port)
+    a_run_of(tmp_path, gw0=999999)
+    service = serving(free_port(), directory=tmp_path / "run-abc123")
     assert wait_for(lambda: service.serving), service.status
 
-    status, body = get(port, "/stack?pid=999999")
+    status, body = get(service.bound_port, "/stack?pid=999999")
     assert status == 502
     assert body["error"]
+
+
+def test_a_target_that_is_not_a_url_is_answered_rather_than_dropped(serving, capfd):
+    """An unclosed bracket in the request target is ``Invalid IPv6 URL``, and
+    ``urlparse`` was the first statement of the request.
+
+    It ran before authentication and outside any guard, so the ValueError went
+    to ``handle_error`` - which keeps tracebacks off the terminal by design -
+    and the connection was then closed with nothing written to it. The caller
+    got a socket that hung up: no status, no body, and no way to tell a broken
+    server from a wrong address.
+
+    Sent down a raw socket because no client library will put this on the wire,
+    and in the absolute form because that is the one that reaches the parse: a
+    request line may carry a whole URL, and ``BaseHTTPRequestHandler`` passes
+    that through untouched while collapsing the leading ``//`` of the shorter
+    spelling.
+    """
+    service = serving(free_port(), directory=None)
+    assert wait_for(lambda: service.serving), "never served"
+
+    status, body, _ = raw(
+        service.bound_port, b"GET http://[oops HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+    )
+    assert status == 400, "the malformed target got no reply at all"
+    assert "not a URL" in body["error"]
+    assert "Traceback" not in capfd.readouterr().err
+
+    # The spelling that is collapsed to one slash before this server sees it
+    # is answered too, as an endpoint that does not exist.
+    assert raw(
+        service.bound_port, b"GET //[oops HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+    )[0] == 404
+
+    # And the server is still answering afterwards, which is the other thing a
+    # dropped connection leaves a caller unsure of.
+    assert get(service.bound_port, "/identity")[0] == 200
+
+
+def test_a_handler_that_raises_answers_500_rather_than_nothing(serving, capfd, monkeypatch):
+    """The backstop behind the parse guard, for the defects nobody has found
+    yet: whatever goes wrong in here, the caller is told that something did.
+
+    What went wrong stays on the server. These replies are assembled out of a
+    run's own state - paths, node ids, the frames of a test - and an exception
+    from the middle of that is not a thing to hand to whoever asked.
+    """
+    service = serving(free_port(), directory=None)
+    assert wait_for(lambda: service.serving), "never served"
+
+    def explode() -> dict:
+        raise RuntimeError("a run's private detail")
+
+    monkeypatch.setattr(stack_server, "identity", explode)
+
+    status, body = get(service.bound_port, "/identity")
+    assert status == 500
+    assert "a run's private detail" not in json.dumps(body)
+    # Still recorded where somebody debugging this server can read it.
+    assert "a run's private detail" in (service._httpd.last_error or "")
+    assert "Traceback" not in capfd.readouterr().err
+
+
+def test_only_the_processes_of_this_run_can_be_asked_about(serving, tmp_path):
+    """The port is opened to watch *this* run, and that is what it answers on.
+
+    The reader behind /stack does not care whose process it is pointed at, and
+    the default supplies no token because loopback is taken to be the bound on
+    who can ask. Between the two, ``/stack?pid=N`` counted from 1 was every
+    Python process on the machine: another session, a service, an interpreter
+    with a credential in a local.
+    """
+    run = a_run_of(tmp_path)
+    service = serving(0, directory=run)
+    assert wait_for(lambda: service.serving), service.status
+    port = service.bound_port
+
+    # The serving process answers for itself. It always has a reason to: this
+    # is the stack of whoever is asking for it.
+    assert get(port, f"/stack?pid={os.getpid()}")[0] == 200
+
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        status, body = get(port, f"/stack?pid={stranger.pid}")
+        assert status == 403
+        assert str(stranger.pid) in body["error"]
+        assert "is not part of any run this server is serving" in body["error"]
+
+        # Until the run says it is one of its workers, which it may do at any
+        # point: the pids are read per request, because xdist replaces a dead
+        # worker mid-run and a set taken when the port was claimed would refuse
+        # exactly the worker somebody is asking about.
+        a_run_of(tmp_path, gw0=stranger.pid)
+        assert get(port, f"/stack?pid={stranger.pid}")[0] != 403
+    finally:
+        stranger.kill()
+        stranger.wait(timeout=10)
+
+
+def test_a_server_with_no_evidence_directory_answers_only_for_itself(serving):
+    """It has nowhere to learn a run's workers from, so it claims none. The
+    same position /workers is in, and it says so the same way."""
+    service = serving(free_port(), directory=None)
+    assert wait_for(lambda: service.serving), "never served"
+    port = service.bound_port
+
+    assert get(port, f"/stack?pid={os.getpid()}")[0] == 200
+
+    status, body = get(port, "/stack?pid=999999")
+    assert status == 403
+    assert "no evidence directory" in body["error"]
+
+
+def test_the_pids_a_server_will_answer_for_come_from_the_run(tmp_path):
+    """The rule itself, without a socket in the way."""
+    run = a_run_of(tmp_path, gw0=4242)
+
+    assert stack_server.serves_pid(os.getpid(), tmp_path)
+    assert stack_server.serves_pid(4242, tmp_path)
+    assert not stack_server.serves_pid(4243, tmp_path)
+
+    # Nothing but its own pid when there is no directory to read, and nothing
+    # at all from a directory that has no runs in it.
+    assert stack_server.serves_pid(os.getpid(), None)
+    assert not stack_server.serves_pid(4242, None)
+    assert not stack_server.serves_pid(4242, run)
 
 
 def test_an_unknown_endpoint_lists_the_ones_that_exist(serving):
@@ -582,6 +814,48 @@ def test_a_drawn_port_is_written_down_where_a_ui_will_look(serving, tmp_path):
 
     # And the address it published is one that actually answers.
     assert stack_server.identify(record["port"], record["host"]) is not None
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="a mode there is not an ACL, and this asserts one")
+def test_the_address_is_written_to_a_file_this_process_created(tmp_path):
+    """The temporary is opened, not assumed.
+
+    ``write_text`` asked for O_CREAT and nothing else, and at a well-known
+    name in a directory other things can write to that settles neither
+    question. A symlink already at ``callstack-<pid>.json.part`` is
+    *followed*, so a name anybody can predict aims this write wherever they
+    point it - and it is renamed into place afterwards, so what a UI then
+    reads is the attacker's file. An ordinary file already at that name keeps
+    the mode it was created with, because O_CREAT does not change the mode of
+    a file that exists, so a 0666 leftover stays 0666 however this asks for it.
+
+    Called directly rather than served, because what is being tested is one
+    write and the state of the directory before it.
+    """
+    run = tmp_path / "run-abc123"
+    run.mkdir()
+    elsewhere = tmp_path / "somebody-elses.json"
+    elsewhere.write_text("untouched")
+
+    service = stack_server.StackService(0, directory=run)
+    service.bound_port = 8080
+    temporary = run / f"callstack-{os.getpid()}.json.part"
+    temporary.symlink_to(elsewhere)
+
+    service._publish()
+
+    assert elsewhere.read_text() == "untouched", "the write followed the symlink"
+    published = run / f"callstack-{os.getpid()}.json"
+    assert not published.is_symlink()
+    assert json.loads(published.read_text())["port"] == 8080
+
+    # And a leftover .part of somebody else's making does not decide the mode
+    # of what gets renamed over the address file.
+    published.unlink()
+    temporary.touch()
+    temporary.chmod(0o666)
+    service._publish()
+    assert stat.S_IMODE(published.stat().st_mode) == 0o600
 
 
 def test_the_address_is_retracted_when_the_session_stops(tmp_path):
@@ -920,6 +1194,66 @@ def test_a_handler_failure_never_reaches_the_report_as_a_traceback(serving, capf
     assert httpd.last_error is not None
     assert "a handler blew up" in httpd.last_error
     assert "Traceback" not in capfd.readouterr().err
+
+
+def test_a_request_naming_a_host_this_server_never_bound_is_refused(serving, tmp_path):
+    """DNS rebinding, which "it only listens on loopback" does not answer.
+
+    A page the developer visits controls a name, serves it with a one-second
+    TTL and then re-resolves it to 127.0.0.1. The browser sees the same scheme,
+    name and port, so as far as the same-origin policy is concerned nothing has
+    changed and the page's own script may read what comes back - which is every
+    node id in the run and every frame in every worker. The policy is not
+    bypassed here, it is satisfied, which is why the answer is not a CORS
+    header but a check on the one field the page cannot choose.
+    """
+    service = serving(0, directory=a_run_of(tmp_path))
+    assert wait_for(lambda: service.serving), service.status
+    port = service.bound_port
+
+    for endpoint in (b"/workers", b"/identity", b"/stack?pid=1"):
+        status, body, _ = raw(
+            port, b"GET " + endpoint + b" HTTP/1.0\r\nHost: rebound.example\r\n\r\n"
+        )
+        assert status == 403, endpoint
+        assert "rebound.example" in body["error"]
+
+    # Every spelling a real client can have connected by is still served. The
+    # port is not part of the comparison: a browser leaves it out when it is
+    # the scheme's default, so comparing it would refuse a correct caller
+    # without refusing a single rebound one, whose name is wrong either way.
+    for host in (b"127.0.0.1", b"127.0.0.1:%d" % port, b"localhost", b"localhost:%d" % port):
+        status, _, _ = raw(port, b"GET /identity HTTP/1.0\r\nHost: " + host + b"\r\n\r\n")
+        assert status == 200, host
+
+    # And so is a request with no Host at all: HTTP/1.0 does not require one,
+    # and a browser - the only thing that can be made to rebind - always sends
+    # it. Refusing here would break curl and stop nothing.
+    assert raw(port, b"GET /identity HTTP/1.0\r\n\r\n")[0] == 200
+
+
+def test_an_ipv6_loopback_host_is_recognised_in_both_spellings():
+    """A Host header brackets an IPv6 literal and a bind does not, so the two
+    are compared with the brackets off - and ``::1`` must not be taken apart by
+    a rightmost-colon split looking for a port."""
+    assert stack_server._hostname("[::1]:8080") == "::1"
+    assert stack_server._hostname("[::1]") == "::1"
+    assert stack_server._hostname("::1") == "::1"
+    assert stack_server._hostname("127.0.0.1:8080") == "127.0.0.1"
+    assert stack_server._hostname(" LocalHost ") == "localhost"
+
+
+def test_a_reply_is_not_left_for_a_browser_to_interpret(serving):
+    """These bodies carry a run's own strings - a node id, a frame, a rejected
+    Host echoed back - and content sniffing is how a body a server called data
+    becomes a document the browser runs."""
+    service = serving(free_port(), directory=None)
+    assert wait_for(lambda: service.serving), "never served"
+
+    _, _, head = raw(
+        service.bound_port, b"GET /identity HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+    )
+    assert b"X-Content-Type-Options: nosniff" in head
 
 
 def test_a_run_that_supplied_no_token_asks_for_none(serving):
