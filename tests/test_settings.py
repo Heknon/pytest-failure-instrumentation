@@ -330,11 +330,9 @@ def test_off_loopback_without_a_token_is_refused_rather_than_warned_about(monkey
     assert [str(entry.message) for entry in raised] == []
 
     monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
-    guarded = resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
-    assert not guarded.refuses_to_bind_unauthenticated
-
     with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
-        resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+        guarded = resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+    assert not guarded.refuses_to_bind_unauthenticated
 
 
 def test_loopback_needs_no_token_and_is_not_refused(monkeypatch):
