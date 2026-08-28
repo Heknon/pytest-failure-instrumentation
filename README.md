@@ -1108,7 +1108,12 @@ with xdist's logs, and every `.events` line inside carries it — which is how a
 directory is matched back to a run.
 
 `PYTEST_RUN_ID` names the directory if you set it, which is also the way to
-make two runs deliberately share one.
+make two runs deliberately share one. The value has to be a *name* rather
+than a path: 1–128 characters of letters, digits, `.`, `-` and `_`, and
+neither `.` nor `..`. Anything else is refused with a warning and the run
+names itself — so a slugified branch works and a raw `feature/x` does not,
+because a separator in there would put this run's evidence somewhere other
+than `failure_directory`.
 
 **What gets cleaned up.** Whole directories of runs that are *over* — not old.
 The controller's pid is in `owner.json`, so a run still going is recognisable

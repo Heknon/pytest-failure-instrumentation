@@ -66,7 +66,15 @@ directory's and the promise quietly stops holding on a supported platform.
 
 So the address file is ordinary data - a host, a port and a pid - and goes
 wherever evidence goes, on every platform. The secret arrives the way secrets
-already reach a container, a CI job and a shell, and leaves nothing behind.
+already reach a container, a CI job and a shell.
+
+In ``PYTEST_CALLSTACK_TOKEN`` it leaves nothing behind, because a process's
+environment is readable only by its owner. ``--callstack-token`` is the same
+value by a worse route and the claim does not extend to it: a command line is
+world-readable for the life of the run, and shell history and CI logs keep it
+afterwards. The flag stays because removing it would break the runs that use
+it, and it says so itself - see ``_add_command_line_options`` in :mod:`.config`,
+which also advises once per run when a token arrives that way.
 
 **No token is the default, and it is the right one on loopback**, where the
 reachable set is processes on this machine. On a box you share with people you
