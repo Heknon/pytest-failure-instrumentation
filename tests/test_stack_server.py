@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any, Optional
 
@@ -58,10 +59,85 @@ inner()
 """
 
 
+#: The band of numbers ``free_port`` hands out, and how much of it one xdist
+#: worker owns. It stops below the lowest ephemeral range any of the three
+#: platforms draws from - Linux takes 32768-60999, macOS and Windows
+#: 49152-65535 - so that nothing on the machine is ever *assigned* one of
+#: these. Something can still bind one by naming it, and in this suite only
+#: this file does.
+PORT_BAND_START = 21000
+PORTS_PER_WORKER = 500
+EPHEMERAL_FLOOR = 32768
+
+
+def _ports_this_worker_owns() -> list[int]:
+    """The numbers this process may hand out, in the order it will.
+
+    xdist's identity is read at import rather than when a test asks for a
+    port, because ``tests/conftest.py`` deletes ``PYTEST_XDIST_WORKER`` and
+    ``PYTEST_XDIST_TESTRUNUID`` for the duration of every test - the inner
+    pytest runs must not inherit the outer run's identity. Collection is when
+    this module is imported, it happens in the worker that will run these
+    tests, and it happens before any fixture.
+
+    The worker id picks the slice, which is what makes it impossible for two
+    workers of one run to be handed the same number. The run id only picks
+    where in that slice this run starts, so that two copies of this suite on
+    one machine do not walk the same numbers in step; that part is a
+    probability rather than a guarantee, because nothing here reserves a band
+    against a process that is not part of this run.
+    """
+    slices = (EPHEMERAL_FLOOR - PORT_BAND_START) // PORTS_PER_WORKER
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    numbered = "".join(character for character in worker if character.isdigit())
+    # Modulo the slices that fit: a run with more workers than the band has
+    # room for shares numbers, rather than allocating up into the ephemeral
+    # range where the kernel would be handing the same ones out behind us.
+    mine = (int(numbered) if numbered else 0) % slices
+    run = os.environ.get("PYTEST_XDIST_TESTRUNUID", "") or str(os.getpid())
+    first = zlib.crc32(run.encode()) % PORTS_PER_WORKER
+    start = PORT_BAND_START + mine * PORTS_PER_WORKER
+    return [start + (first + step) % PORTS_PER_WORKER for step in range(PORTS_PER_WORKER)]
+
+
+_BAND = _ports_this_worker_owns()
+_UNISSUED = iter(_BAND)
+
+
 def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind((stack_server.LOOPBACK, 0))
-        return int(probe.getsockname()[1])
+    """A number nothing else will be handed while a test is using it.
+
+    This drew one from the kernel: bind port 0, read back what it chose, close
+    the socket, return the number. That answers "what was free a moment ago",
+    not "what will still be free when the caller binds it" - and every caller
+    here hands the number on to something that binds it several statements
+    later, one of them to a whole pytest subprocess that has yet to start.
+    Anything drawing an ephemeral port in that window can be given the same
+    number, and since CI runs this suite under ``-n 4`` the likeliest such
+    thing is this very function in the three sibling workers. Losing the race
+    does not even raise: the second binder reports "a stranger is on the port"
+    and the run carries on, so it would arrive as an assertion about a status
+    string rather than as an address already in use.
+
+    So the number is not drawn from the kernel at all. It comes out of the
+    band above, which the kernel never allocates from and no sibling worker
+    shares, walked forwards so that a number is never handed out twice within
+    a worker - where the tests are serial anyway. The bind below only checks
+    that nothing got there first; the guarantee is the band and not the probe,
+    which is the whole difference from what this replaces.
+    """
+    for candidate in _UNISSUED:
+        with socket.socket() as probe:
+            try:
+                probe.bind((stack_server.LOOPBACK, candidate))
+            except OSError:
+                continue
+        return candidate
+    raise RuntimeError(
+        f"this worker has handed out all {PORTS_PER_WORKER} ports of its band "
+        f"from {_BAND[0]}: either something is sitting on them, or this file "
+        "now wants more ports than one band holds"
+    )
 
 
 def get(
