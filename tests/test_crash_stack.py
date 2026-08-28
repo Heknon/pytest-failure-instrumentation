@@ -708,7 +708,15 @@ def test_stopping_the_heartbeat_mid_tick_leaves_no_timer_armed(
     monkeypatch.setattr(heartbeat, "TICK_SECONDS", 0.02)
     path = tmp_path / "gw0.frozen"
     with path.open("w", buffering=1, encoding="utf-8") as stream, _hang_protection(pytestconfig):
-        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.15)
+        # The deadline has to sit well beyond one round of ticks, or this test
+        # fails for a reason that is not the one it is about. A round is the
+        # 0.02s wake plus the gate's hold; at interval=0.15 the deadline was
+        # 0.45s against a 0.32s round, and a runner that lost 130ms anywhere in
+        # there fired the timer while the heartbeat was still healthy - which
+        # this test then reported as the stop ordering. Measured: one round
+        # stretched to 0.5s writes a dump at that deadline and none at this
+        # one. macOS found it; the margin is now about ten rounds.
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=1.0)
         gate = _SlowTicker(hold=0.3)
         beat = heartbeat.Heartbeat(
             lambda *arguments, **keywords: None,
@@ -721,6 +729,16 @@ def test_stopping_the_heartbeat_mid_tick_leaves_no_timer_armed(
         gate.entered.clear()  # start() ticks on this thread; wait for the heartbeat's
         try:
             assert gate.entered.wait(5.0), "the heartbeat thread never ticked"
+            # Nothing may have landed yet: a dump here is the deadline being
+            # crossed by a slow round, not by the ordering under test, and the
+            # two are indistinguishable once the file has bytes in it. Checked
+            # before stop so a failure says which of them happened.
+            assert path.stat().st_size == 0, (
+                "the fallback's deadline was crossed while the heartbeat was "
+                "still beating, so this machine could not hold a tick cadence "
+                f"inside {fallback.timeout}s - the ordering below is untested, "
+                "not disproved"
+            )
         finally:
             beat.stop()
 
