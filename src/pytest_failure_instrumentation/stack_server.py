@@ -79,6 +79,22 @@ another before standing down from a contested port, and two sessions that
 minted nothing have no way to share a credential. It answers with a service
 name, a version and a pid.
 
+**What may be asked about is bounded too**, and separately, because on the
+default nothing bounds who is asking. ``/stack`` answers for the serving
+process and for the workers this run wrote ``.state`` files for, and refuses
+every other pid with a 403 - see :func:`serves_pid`. The reader behind it does
+not care whose process it is pointed at, so without that the endpoint was a way
+to walk the pids of the machine and read the frames of anything on it.
+
+**Which addresses it answers to is the other half of that**, because "bound to
+loopback" is not the same as "only reachable by things on this machine that
+mean to reach it". A page in the developer's browser can have its own name
+re-resolved to 127.0.0.1 and then read this server same-origin - the
+same-origin policy is satisfied rather than bypassed, so no CORS header is
+involved in either the attack or the fix. What the page cannot choose is the
+``Host`` header it sends, so a request that names anything but a loopback
+spelling of this bind is refused - see :meth:`_Handler._addressed_to_this_server`.
+
 **What it binds.** Loopback by default. A container is the exception that makes
 it configurable: its UI lives outside it, and 127.0.0.1 inside a container is
 unreachable from there. Binding anything else warns - and *without a token is
@@ -174,6 +190,24 @@ MAX_PID = 2**31 - 1
 MAX_CONCURRENT_READS = 8
 
 _readers = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
+
+#: What a worker's state file is called, which is the only thing under the
+#: evidence root that says which processes belong to a run - see
+#: :func:`serves_pid`. Spelled here as well as in :mod:`.topology` because the
+#: two read it for different reasons: that module describes workers, and this
+#: one only wants to know whether a pid is one.
+STATE_SUFFIX = ".state"
+
+#: How long :meth:`StackService.stop` waits for a session that has just
+#: claimed the port to reach its accept loop, before giving up on shutting it
+#: down cleanly. Bounded because a run that is over must not be held up by
+#: this; short because the only thing between the claim and the loop is
+#: writing one small file - see :meth:`StackService._reached_the_accept_loop`.
+ACCEPT_LOOP_TIMEOUT = 5.0
+
+#: How often that wait looks at the handle as well as the flag, so that the
+#: interleaving it exists for costs a poll rather than the whole timeout.
+ACCEPT_LOOP_POLL = 0.05
 
 
 def _is_contention(failure: OSError) -> bool:
@@ -326,14 +360,79 @@ class _Handler(BaseHTTPRequestHandler):
 
     server_version = SERVICE
 
+    #: Whether this request has already been answered. Read by the backstop
+    #: in :meth:`do_GET`, which must not put a second status line on a
+    #: connection that already carries one.
+    _replied = False
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
-        route = urlparse(self.path)
-        query = parse_qs(route.query)
+        """Answer every request, including the ones that are not requests.
+
+        Two guards wrap the dispatch, and both are here because a failure on
+        this frame is not a 500 - it is *silence*. ``handle_error`` keeps the
+        traceback off the terminal a human is reading pytest's output from
+        (see :meth:`_Server.handle_error`), the connection is then closed with
+        nothing written to it, and the caller is left holding a socket that
+        hung up with no way to tell a broken server from a wrong address.
+
+        The parse is the first of them because it was the first statement of
+        the request and is reachable by anyone: ``urlparse`` raises
+        ``ValueError: Invalid IPv6 URL`` on a request target with an unclosed
+        bracket in its authority, before authentication and before any route is
+        known. The spelling that reaches it is the absolute form, which a
+        request line is allowed to carry - ``GET http://[oops HTTP/1.0``.
+        (``GET //[oops`` does not, and it is worth saying why, because it is
+        the shorter thing to try and it answers 404: ``BaseHTTPRequestHandler``
+        collapses a leading ``//`` to one slash before this sees it, for
+        reasons of its own. That is one client-facing spelling closed by
+        accident, not the parse being safe.) A target that is not a URL is a
+        malformed request and gets a 400 saying so.
+
+        The blanket ``except`` after it is a backstop, not a licence. A handler
+        that raises is this server's defect rather than a caller's problem, so
+        the failure is still recorded on the server where whoever is debugging
+        it can read it, and the reply says only that it happened: this
+        server's exception text is assembled out of a run's own state, and
+        that is not a thing to hand to whoever asked.
+        """
+        try:
+            route = urlparse(self.path)
+            query = parse_qs(route.query)
+        except ValueError as malformed:
+            self._reply(
+                400,
+                {"error": f"the request path is not a URL that can be parsed: {malformed}"},
+            )
+            return
+
+        try:
+            self._dispatch(route.path, query)
+        except Exception:  # noqa: BLE001 - see the docstring
+            # Recorded the way socketserver would have, since catching it here
+            # is what stops it reaching socketserver at all.
+            self.server.handle_error(self.request, self.client_address)
+            if not self._replied:
+                self._reply(500, {"error": "this server failed to handle the request"})
+
+    def _dispatch(self, path: str, query: dict[str, list[str]]) -> None:
+        if not self._addressed_to_this_server():
+            self._reply(
+                403,
+                {
+                    "error": "the Host header names "
+                    f"{self.headers.get('Host', '')!r}, which is not an address "
+                    "this server is bound to. A caller that reached a loopback "
+                    "server under some other name was told that name resolves "
+                    "here, and the browser that believed it would have read this "
+                    "run's stacks as same-origin"
+                },
+            )
+            return
 
         # Open, because it is what one session asks another before standing
         # down from a contested port - and the two have no way to share a
         # token, since neither minted one.
-        if route.path == "/identity":
+        if path == "/identity":
             self._reply(200, identity())
             return
 
@@ -351,19 +450,64 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
-        if route.path == "/stack":
+        if path == "/stack":
             self._stack(query)
-        elif route.path == "/workers":
+        elif path == "/workers":
             self._workers(query)
         else:
             self._reply(404, {"error": "no such endpoint", "endpoints": ENDPOINTS})
+
+    def _addressed_to_this_server(self) -> bool:
+        """Whether ``Host`` names an address this server actually answers on.
+
+        The attack this refuses is DNS rebinding, and it is worth spelling out
+        because "it only listens on loopback" sounds like the answer to it
+        already. A page the developer visits controls a name; the name is
+        served with a one-second TTL and then re-resolved to 127.0.0.1. As far
+        as the browser is concerned the origin has not changed - same scheme,
+        same name, same port - so the page's own script may read the response
+        it gets back. It is now reading ``/workers`` and ``/stack``: every node
+        id in the run and every frame in every worker, out of a server that
+        demanded nothing because loopback was taken to be the bound on who
+        could ask. The same-origin policy is not bypassed here, it is
+        *satisfied*, which is exactly why a CORS header would be the wrong
+        instrument: CORS grants reads across origins, and this attack arranges
+        for there to be only one origin.
+
+        What the page cannot choose is ``Host``. The browser sends the name in
+        the address bar, which is the attacker's, and never one of ours. So the
+        names this server answers to are the check, and they are the loopback
+        spellings a real client can have connected by.
+
+        **A request with no Host at all is allowed.** HTTP/1.0 does not require
+        one and this server speaks 1.0, so refusing would break a raw client
+        for nothing: the only agent that can be made to rebind is a browser,
+        and a browser always sends it.
+
+        **A bind that is not loopback is not checked**, because there is
+        nothing here to check against. The address a legitimate client uses
+        there is the container's published one or some routable interface, and
+        this process never learns which of its host's names that is. That bind
+        is refused outright without a token (see
+        :meth:`StackService._claim_and_serve`), and the token is what stands in
+        for this check: a rebinding page has no way to come by one.
+        """
+        bound = str(getattr(self.server, "server_name", "") or "")
+        if bound not in LOCAL_ONLY:
+            return True
+        offered = self.headers.get("Host", "")
+        if not offered:
+            return True
+        return _hostname(offered) in LOCAL_ONLY
 
     def _authorised(self, query: dict[str, list[str]]) -> bool:
         """Whether this request carries the token this run was started with.
 
         Total by construction when no token was supplied: the server asks
         nothing, so everything is authorised and the branch below is the whole
-        of it.
+        of it. "Authorised" is only about who may *ask*, and on the default it
+        is nobody in particular - which is why what may be asked *about* is
+        bounded separately, by :func:`serves_pid`, rather than resting on this.
 
         Compared in constant time. The comparison is short and local and an
         attacker's timing signal across it is buried in HTTP jitter, but a
@@ -378,8 +522,14 @@ class _Handler(BaseHTTPRequestHandler):
         the stderr a human is reading pytest's output from, which is the thing
         ``log_message`` below exists to keep clean. Unauthenticated, and one
         URL-encoded character to trigger. Encoding both sides first makes the
-        check total: every input now gets an answer, and it is still the
-        constant-time one.
+        check total: every token gets compared rather than crashed on, and the
+        comparison is still the constant-time one.
+
+        That the *request* gets an answer whatever happens to it is
+        :meth:`do_GET`'s guarantee and not this method's, which is a
+        distinction this docstring used to blur by claiming it for itself. The
+        same silence was reachable one statement earlier, from a path that is
+        not a URL and never got as far as a token.
         """
         expected = getattr(self.server, "token", "")
         if not expected:
@@ -412,6 +562,28 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "error": f"pid must be between 1 and {MAX_PID}, not {pid}; "
                     "no process can have the id given"
+                },
+            )
+            return
+
+        evidence_root = getattr(self.server, "evidence_root", None)
+        if not serves_pid(pid, evidence_root):
+            # 403 rather than 404: the pid may well name a running process,
+            # and saying "no such process" about one that exists would send a
+            # caller looking for the wrong fault.
+            serves = (
+                "the process it is running in, and the workers whose state "
+                "files are under the evidence directory it was given"
+                if evidence_root is not None
+                else "the process it is running in, and nothing else: it was "
+                "given no evidence directory, so it knows of no workers"
+            )
+            self._reply(
+                403,
+                {
+                    "error": f"pid {pid} is not part of any run this server is "
+                    f"serving. It reports on {serves}; every other process on "
+                    "this machine is somebody else's"
                 },
             )
             return
@@ -460,10 +632,18 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(200, topology.snapshot(base, served_by=identity(), only=_named(query)))
 
     def _reply(self, status: int, payload: dict[str, Any]) -> None:
+        self._replied = True
         body = json.dumps(payload, default=str).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            # Every body here is JSON and none of it is ever anything else, so
+            # a browser that decides for itself what a body is can only decide
+            # wrongly. Content sniffing is how a document a server called data
+            # becomes a document the browser runs, and the strings in these
+            # replies - a node id, a frame, a Host header echoed back - come
+            # from outside this process.
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -499,6 +679,79 @@ def _named(query: dict[str, list[str]]) -> Optional[list[str]]:
     if not values:
         return None
     return [name for value in values for name in value.split(",")]
+
+
+def _hostname(header: str) -> str:
+    """The name out of a ``Host`` header, without its port or its brackets.
+
+    All four spellings reach a server that binds both families and is
+    connected to by either name: ``127.0.0.1``, ``127.0.0.1:8080``, ``[::1]``
+    and ``[::1]:8080``. The brackets are what make the last two unambiguous -
+    an IPv6 literal is all colons, so a rightmost-colon split would take
+    ``::1`` apart - and they are stripped here rather than compared, so that
+    the set of names this server answers to is written once, in one spelling.
+    """
+    value = header.strip()
+    if value.startswith("["):
+        return value[1:].partition("]")[0].lower()
+    if value.count(":") == 1:
+        return value.rpartition(":")[0].lower()
+    return value.lower()
+
+
+def serves_pid(pid: int, evidence_root: Optional[Path]) -> bool:
+    """Whether this server has a reason to report on ``pid``.
+
+    Every other process on the machine belongs to somebody else. The reader
+    behind ``/stack`` does not care whose process it is asked about - py-spy
+    reads whatever ptrace will let it read - so on the default, which supplies
+    no token because loopback is the bound, ``/stack?pid=N`` walked from 1
+    upwards was every Python process on the host: a developer's other session,
+    a service, an interpreter holding a credential in a local. The port is
+    opened to watch *this* run, and that is the set it answers about.
+
+    Two things are in it. This process, which answers out of its own frames
+    and needs no permission from anybody. And the workers, which are read out
+    of the ``.state`` files the run is writing anyway - the same files
+    ``/workers`` is assembled from, so a pid a UI can see here is a pid it can
+    ask about, and nothing else is.
+
+    Read on every request rather than once at startup, because the set is not
+    fixed: xdist replaces a crashed worker mid-run, a second session starts
+    under the same evidence root, and a snapshot taken when the port was
+    claimed would refuse exactly the worker somebody is asking about because
+    it is new. It costs one directory listing and one fixed-size read per
+    worker, against a request that is about to spawn a subprocess.
+
+    :mod:`.topology` reads the same files and is deliberately not called here:
+    it answers "what is every worker doing", which is an event tail, a CPU
+    rate and a liveness check per worker, for a question that only needs the
+    one field.
+    """
+    if pid == os.getpid():
+        return True
+    if evidence_root is None:
+        # Nothing to enumerate, so nothing is claimed. A server started
+        # without an evidence directory serves its own stack and says so -
+        # see the 503 from /workers, which is the same position.
+        return False
+
+    from .capture.state import read_state
+
+    try:
+        # One level down: the evidence root is the parent of the run
+        # directories, since /workers describes the machine rather than
+        # whichever run happens to be hosting.
+        states = sorted(evidence_root.glob(f"*/*{STATE_SUFFIX}"))
+    except OSError:
+        return False
+    for state in states:
+        try:
+            if int(read_state(state)["pid"]) == pid:
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue  # a torn or hand-written record says nothing either way
+    return False
 
 
 def identity() -> dict[str, Any]:
@@ -631,6 +884,11 @@ class StackService:
         self.serving = False
         self._httpd: Optional[_Server] = None
         self._stop = threading.Event()
+        #: Set on the serving thread immediately before it enters the accept
+        #: loop, and never cleared. It is what makes :meth:`stop` total: a
+        #: server that has not reached that loop cannot be shut down, only
+        #: closed - see :meth:`_reached_the_accept_loop`.
+        self._accepting = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     @property
@@ -653,9 +911,19 @@ class StackService:
         self._thread.start()
 
     def stop(self) -> None:
+        """Bring the server down, or leave it alone, but always return.
+
+        ``shutdown`` is only asked for once this session is known to be inside
+        the accept loop. Asking unconditionally is what hung a pytest process
+        that had finished its run: ``BaseServer.shutdown`` waits on an event
+        that only ``serve_forever``'s own ``finally`` sets, so a server that
+        never entered the loop is one that never comes out of that wait, and
+        the bounded join below - the thing that was supposed to make this
+        total - was never reached to bound anything.
+        """
         self._stop.set()
         httpd = self._httpd
-        if httpd is not None:
+        if httpd is not None and self._reached_the_accept_loop():
             try:
                 httpd.shutdown()
             except Exception:  # noqa: BLE001 - teardown must not raise
@@ -671,6 +939,33 @@ class StackService:
             # address down should be allowed to finish, but a slow one must
             # not hold up a run that is over.
             announcer.join(timeout=2.0)
+
+    def _reached_the_accept_loop(self) -> bool:
+        """Whether the serving thread is inside ``serve_forever`` yet.
+
+        Bounded twice over, because the two ways of not being in the loop want
+        different answers.
+
+        The handle is the tighter bound and the reason this is a loop rather
+        than one ``wait``. The interleaving this exists for is a ``stop`` that
+        lands between the claim publishing its handle and the claim reading the
+        stop flag: the claim then stands down, closing the server it never
+        served from and clearing ``_httpd`` as it goes, and no flag will ever
+        be set for this wait to see. Watching the handle as well as the flag
+        costs that case one poll interval instead of the whole timeout.
+
+        The clock is the outer bound, for a claim that is merely slow: between
+        publishing the handle and entering the loop it writes one small file
+        and starts one thread, which is milliseconds even on a filesystem
+        having a bad day. Past that, leaving a daemon thread holding a socket
+        the interpreter is about to close is the better of the two failures -
+        this plugin does not get to be why a finished run has not exited.
+        """
+        deadline = time.monotonic() + ACCEPT_LOOP_TIMEOUT
+        while not self._accepting.wait(ACCEPT_LOOP_POLL):
+            if self._httpd is None or time.monotonic() >= deadline:
+                return False
+        return True
 
     # -- the claim ------------------------------------------------------
 
@@ -755,11 +1050,19 @@ class StackService:
         self.bound_port = int(httpd.server_address[1])
 
         self._httpd = httpd
-        # Checked *after* publishing the handle, which is what makes the two
-        # orderings exhaustive: either this sees the flag and closes, or
-        # ``stop`` set the flag afterwards and therefore reads a handle it can
-        # shut down. Checking first instead leaves a window where neither
-        # happens and the port stays held until the interpreter exits.
+        # Checked *after* publishing the handle, so that a ``stop`` arriving
+        # now has something to shut down rather than leaving the port held
+        # until the interpreter exits.
+        #
+        # That ordering is not, as this comment used to claim, exhaustive.
+        # ``stop`` can land between the assignment above and the read below:
+        # it takes the handle, and this branch then stands the server down
+        # without ever having entered ``serve_forever`` - so the ``shutdown``
+        # ``stop`` is about to call waits on an event that only that loop's
+        # ``finally`` sets, forever, and the bounded join after it is never
+        # reached. A pytest process that had finished its run hung there.
+        # ``_accepting`` below is what closes the window: ``stop`` shuts down
+        # only a server it has seen reach the loop.
         if self._stop.is_set():
             self._httpd = None
             httpd.server_close()
@@ -773,6 +1076,12 @@ class StackService:
         self.serving = True
         self.status = f"serving on {self.url}"
         self._announce()
+        # Set on the last statement before the loop, and read by ``stop``.
+        # Nothing may come between the two: the flag's whole meaning is that
+        # ``serve_forever`` is about to be entered and will therefore run its
+        # ``finally``, which is the only thing that ever releases a caller
+        # waiting in ``shutdown``.
+        self._accepting.set()
         try:
             httpd.serve_forever(poll_interval=0.5)
         except Exception as failure:  # noqa: BLE001
@@ -833,7 +1142,39 @@ class StackService:
             # Still written through a temporary and renamed. That was never
             # about the secret: a reader polling this directory must never be
             # handed half an address.
-            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            #
+            # Created by this process or not at all. ``write_text`` opened the
+            # temporary with O_CREAT and nothing else, which settles neither
+            # question that matters at a well-known name in a directory other
+            # things can write to. A symlink already sitting there is
+            # *followed*, so the write lands wherever it points - and this
+            # process is often the one with the interesting permissions. An
+            # ordinary file already sitting there keeps the mode it was
+            # created with, because O_CREAT does not change the mode of a file
+            # that exists, so a 0666 leftover stays 0666 however this asks for
+            # it. O_EXCL refuses both by refusing to open anything that is
+            # already there, O_NOFOLLOW refuses the symlink even if something
+            # wins the race against the unlink, and the mode is then the one
+            # asked for here - 0600 not because there is a secret in it, but
+            # because a file this process is about to rename into place should
+            # not be one that anything else can rewrite in between.
+            #
+            # The stale one is removed first because O_EXCL would otherwise
+            # make a crashed session's leftover ``.part`` permanent, and this
+            # file is rewritten on every publish.
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            # Bytes, so that nothing translates a newline on Windows and
+            # changes the length of what a reader is about to parse.
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(json.dumps(payload).encode("utf-8"))
             os.replace(temporary, path)
         except OSError:
             return  # bookkeeping must never break a run
