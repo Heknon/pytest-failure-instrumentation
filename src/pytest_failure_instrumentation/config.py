@@ -53,6 +53,18 @@ LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 #: :func:`_add_command_line_options` for why there is deliberately no ini.
 TOKEN_ENV = "PYTEST_CALLSTACK_TOKEN"
 
+#: The settings whose *value* is a credential, so anything that prints a
+#: setting prints the name and stops there - see
+#: :func:`.registration._difference`, which is where one of these reached a
+#: warnings summary and a CI log.
+#:
+#: A set rather than the one ``if name == "stack_server_token"`` it would take
+#: today, because the cost of the two spellings is the same and only one of
+#: them keeps holding: a second secret field added later is redacted by
+#: appearing here, rather than by whoever adds it remembering every place a
+#: setting gets formatted.
+SECRET_SETTINGS = frozenset({"stack_server_token"})
+
 #: Below this the heartbeat thread costs more than it measures. Clamped on the
 #: object rather than where a setting is read, because the controller decides
 #: what counts as a stale beat from the same number - and two different

@@ -327,3 +327,48 @@ def test_the_worker_import_path_never_loads_pydantic():
         [sys.executable, "-c", source], capture_output=True, text=True, timeout=120
     )
     assert finished.returncode == 0, finished.stderr
+
+
+#: Two frameworks in one run, disagreeing about the token. The values are
+#: distinctive strings rather than anything realistic, so that finding either
+#: of them anywhere in the inner run's output is unambiguous.
+INSTALLS_TWICE_WITH_TWO_TOKENS = """
+from pytest_failure_instrumentation import install
+
+
+def pytest_configure(config):
+    install(config, stack_server_token="tok-in-force-9d41")
+    install(config, stack_server_token="tok-offered-5b27")
+"""
+
+
+def test_the_token_is_never_printed_by_the_advice_about_two_installs(runner):
+    """The one place this package could have written the secret down.
+
+    ``install`` called twice warns that the second call lost, and lists what
+    the two disagreed about by formatting every differing field with its
+    value. ``stack_server_token`` is a field like any other, so two frameworks
+    that disagreed about the token put both of them into a warning - which
+    pytest reproduces in the warnings summary and CI keeps in the job log for
+    the length of its retention.
+
+    Everything else about the token is careful about this: it is supplied
+    rather than minted so that nothing has to publish it, and the address file
+    was demoted to ordinary data on the strength of that. A warning about a
+    misconfiguration is not the place to give it back.
+
+    The name still has to appear. "Something differs" that will not say what
+    leaves the reader with two installs, one warning and nothing to look at.
+    """
+    runner.pytester.makepyfile(test_suite=SUITE, fw_plugin=INSTALLS_TWICE_WITH_TWO_TOKENS)
+
+    result = runner.pytester.runpytest_subprocess(
+        "-p", "no:xdist", "-p", "fw_plugin", "test_suite.py"
+    )
+
+    result.assert_outcomes(passed=2)
+    said = result.stdout.str() + result.stderr.str()
+    assert "already installed" in said
+    assert "stack_server_token" in said, said
+    for secret in ("tok-in-force-9d41", "tok-offered-5b27"):
+        assert secret not in said, f"{secret} reached the run's output"
