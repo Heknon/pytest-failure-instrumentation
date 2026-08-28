@@ -8,12 +8,15 @@ writes them.
 
 from __future__ import annotations
 
+import contextlib
+import faulthandler
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from pytest_failure_instrumentation.capture import crash_stack
+from pytest_failure_instrumentation.capture import crash_stack, heartbeat
 
 HEARTBEAT_SECTION = """\
 Thread 0x00007fb0d66146c0 (most recent call first):
@@ -610,3 +613,152 @@ def test_a_worker_with_no_timeout_configured_still_arms_the_fallback(tmp_path):
     finally:
         recorder.heartbeat.stop()
         recorder.close()
+
+
+# -- the timer at the end of a run -----------------------------------------
+
+
+@contextlib.contextmanager
+def _hang_protection(config):
+    """Give the outer run back the timer these tests take off it.
+
+    There is one ``dump_traceback_later`` per process, so cancelling it here -
+    which is what disarming the fallback does - also cancels the one pytest's
+    own faulthandler plugin armed for this very test out of the
+    ``faulthandler_timeout`` in pyproject.toml. Nothing re-arms it until the
+    next test starts, and that ini exists because a test below wedges things on
+    purpose: without it back, a hang costs the whole 25-minute CI job instead
+    of a stack and a dead run.
+    """
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        try:
+            timeout = float(config.getini("faulthandler_timeout") or 0)
+        except ValueError:
+            timeout = 0.0  # the plugin is switched off, so there was nothing to restore
+        if timeout > 0:
+            faulthandler.dump_traceback_later(timeout, exit=True)
+
+
+def test_a_rearm_that_lost_the_race_with_stop_arms_nothing(tmp_path, pytestconfig):
+    """Cancelling the timer is not the whole of stopping.
+
+    The heartbeat's thread can be anywhere when the run ends, including one
+    instruction past the wait it would have exited on. That tick calls rearm,
+    and a rearm that still believes it is enabled re-aims the C timer at
+    session teardown - the one stretch of the run with nothing left to push
+    the deadline forward, and Python running flat out for it to land in.
+    """
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream, _hang_protection(pytestconfig):
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.05)
+        fallback.tick()
+        fallback.stop()
+
+        fallback.rearm()  # the tick that was already in flight
+        time.sleep(0.4)  # well past the 0.15s deadline it would have set
+        assert path.stat().st_size == 0, "a rearm after stop left a live timer behind"
+
+
+class _SlowTicker:
+    """A ticker that is guaranteed to still be running when stop is called.
+
+    Holding the heartbeat's thread inside a tick is what makes the interleaving
+    a fact of the test rather than a coincidence of scheduling: stop is entered
+    while a round of ticks is in flight, on every run and on every machine.
+    """
+
+    def __init__(self, hold: float) -> None:
+        self.hold = hold
+        self.entered = threading.Event()
+        self.thread: threading.Thread | None = None
+        #: Whether the thread that ticks was still alive at each call to stop,
+        #: which is the ordering the fallback's deadline rests on. A list
+        #: rather than a flag, so that a stop reached twice cannot answer for
+        #: the one that came too early.
+        self.alive_at_stop: list[bool] = []
+
+    def tick(self) -> None:
+        self.entered.set()
+        time.sleep(self.hold)
+
+    def stop(self) -> None:
+        self.alive_at_stop.append(self.thread is not None and self.thread.is_alive())
+
+
+def test_stopping_the_heartbeat_mid_tick_leaves_no_timer_armed(
+    tmp_path, pytestconfig, monkeypatch
+):
+    """The worker must not leave pytest_sessionfinish with a deadline running.
+
+    Stopping the tickers before the thread that drives them does not disarm
+    anything for long: the thread runs one more round of ticks, the fallback's
+    rearms the C timer just after it was cancelled, and the worker finishes the
+    session with a dump due three heartbeat intervals later - fifteen seconds
+    at the defaults, in the middle of teardown. What lands is either the
+    segfault the fallback's own docstring measured at 10 runs out of 10, or a
+    ``.frozen`` file that incidents/stall.py presents as evidence that this
+    healthy process had stopped running Python.
+
+    The wake is shortened so the thread ticks promptly; nothing else about the
+    interleaving depends on it.
+    """
+    monkeypatch.setattr(heartbeat, "TICK_SECONDS", 0.02)
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream, _hang_protection(pytestconfig):
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.15)
+        gate = _SlowTicker(hold=0.3)
+        beat = heartbeat.Heartbeat(
+            lambda *arguments, **keywords: None,
+            interval=1.0,
+            tickers=[gate, fallback],
+        )
+        gate.thread = beat._thread
+
+        beat.start()
+        gate.entered.clear()  # start() ticks on this thread; wait for the heartbeat's
+        try:
+            assert gate.entered.wait(5.0), "the heartbeat thread never ticked"
+        finally:
+            beat.stop()
+
+        time.sleep(fallback.timeout + 0.5)
+        assert path.stat().st_size == 0, (
+            "the run finished with faulthandler's timer still armed"
+        )
+        assert gate.alive_at_stop == [False], (
+            "the tickers were stood down while the thread that ticks them was still running"
+        )
+
+
+def test_a_stop_after_a_failed_rearm_still_cancels_the_live_timer(
+    tmp_path, pytestconfig, monkeypatch
+):
+    """``enabled`` answers "may this arm the timer again", and stop is asking
+    something else: "is there a timer of ours running".
+
+    A rearm that fails - a stream closed under it, a timeout that came back
+    non-positive - stands the fallback down, because nothing here is worth
+    failing a run over. The deadline armed by the rearm before it is still
+    counting, and reading the stood-down flag as "armed nothing" declined to
+    cancel it. That is the same live timer at teardown, reached by a longer
+    road.
+    """
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream, _hang_protection(pytestconfig):
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.1)
+        fallback.tick()  # armed, and counting
+
+        def refuse(*arguments, **keywords):
+            raise RuntimeError("the stream went away under it")
+
+        monkeypatch.setattr(faulthandler, "dump_traceback_later", refuse)
+        fallback.rearm()
+        assert fallback.enabled is False, "the arrangement failed: the rearm did not"
+        monkeypatch.undo()
+
+        fallback.stop()
+        time.sleep(0.5)  # past the 0.3s deadline the first tick armed
+        assert path.stat().st_size == 0, "stop declined to cancel a timer that was armed"

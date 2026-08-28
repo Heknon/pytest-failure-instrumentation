@@ -253,6 +253,11 @@ class FrozenInterpreterFallback:
         #: pytest's own faulthandler_timeout is using the timer this would
         #: arm, and there is only one of it per process.
         self.enabled = self.timeout > 0 and stream is not None
+        #: Whether this object has ever aimed the process's one timer, which
+        #: is what makes cancelling it ours to do. ``enabled`` cannot answer
+        #: that question: it is cleared when an arm fails and when the run
+        #: ends, either of which can happen with a deadline already counting.
+        self._armed = False
 
     def rearm(self) -> None:
         """Push the deadline out by another window.
@@ -265,6 +270,11 @@ class FrozenInterpreterFallback:
         if not self.enabled or stream is None:
             return
         try:
+            # Recorded before the call and not after it. A stop can land
+            # between the two, and a flag set afterwards would be set after
+            # the cancel that needed to read it - which is the one arrangement
+            # that leaves a live timer behind rather than a spurious one.
+            self._armed = True
             faulthandler.dump_traceback_later(
                 self.timeout, repeat=False, file=stream, exit=False
             )
@@ -281,16 +291,35 @@ class FrozenInterpreterFallback:
         the deadline forward, which is precisely the window the arming above
         exists to stay out of.
 
-        Only what this armed. A disabled fallback armed nothing, and cancelling
-        anyway would take out whatever else in the process is using the timer -
-        which, when this is disabled, is exactly what is using it.
+        **Stood down first, cancelled second.** The cancel alone does not end
+        anything, because the heartbeat's thread can be one instruction past
+        the wait it would have exited on: it runs one more tick, rearms, and
+        the deadline is live again a moment after it was taken away. Clearing
+        the flag first makes that racing tick a no-op whichever way the two
+        threads interleave. :meth:`Heartbeat.stop` joins its thread before it
+        stops its tickers, so no tick should be in flight by the time this is
+        reached at all - but that is one caller's ordering, and what is at
+        stake if it is ever wrong is a C timer left armed over teardown: a
+        dump that lands while the interpreter is executing, which the class
+        docstring above measured killing the worker in 10 runs out of 10.
+
+        **Only what this armed.** A disabled fallback armed nothing, and
+        cancelling anyway would take out whatever else in the process is using
+        the timer - which, when this is disabled, is exactly what is using it.
+        That question is asked of ``_armed`` rather than of ``enabled``,
+        because the two are not the same question and answering the second one
+        was wrong in one case: a rearm that fails clears ``enabled``, and the
+        deadline armed by the rearm before it is still counting. Reading
+        "stood down" as "armed nothing" left that one running.
         """
-        if not self.enabled:
+        self.enabled = False
+        if not self._armed:
             return
         try:
             faulthandler.cancel_dump_traceback_later()
         except (RuntimeError, ValueError):
             pass
+        self._armed = False
 
 
 #: What faulthandler writes before the first thread when the process is dying.

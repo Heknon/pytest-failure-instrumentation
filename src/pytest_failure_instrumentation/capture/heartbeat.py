@@ -61,12 +61,24 @@ class Heartbeat:
         self._thread.start()
 
     def stop(self) -> None:
-        # Tickers first: one of them holds a deadline that must not outlive
-        # the thread that pushes it forward.
-        for ticker in self.tickers:
-            ticker.stop()
+        # The thread first, then the tickers it drives. One of them holds a
+        # deadline that must not outlive the thread pushing it forward, and
+        # stopping the tickers first is how that gets broken rather than kept:
+        # a thread already past its wait runs one more round of ticks, and the
+        # frozen fallback's re-arms faulthandler's C timer immediately after it
+        # was cancelled. The worker then leaves pytest_sessionfinish with a
+        # dump due three intervals later - fifteen seconds at the defaults,
+        # landing in teardown, where the interpreter is executing and a dump
+        # taken without the GIL walks frames that are being torn down. Joining
+        # first means there is no thread left to arm anything by the time the
+        # tickers are told to stand down.
         self._stop.set()
         self._thread.join(timeout=2.0)
+        # Bounded, so a thread that will not die still gets its tickers stood
+        # down underneath it; FrozenInterpreterFallback.stop clears its own
+        # flag before it cancels, so a tick that outlives the join arms nothing.
+        for ticker in self.tickers:
+            ticker.stop()
 
     def _beat(self) -> int | None:
         from .. import probes
