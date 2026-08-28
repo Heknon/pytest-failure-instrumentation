@@ -362,6 +362,36 @@ def test_the_sampler_cadence_has_a_floor_like_its_sibling():
 # -- who may read a worker, and whether anybody asked -----------------------
 
 
+def test_an_unusable_tracer_policy_says_so_rather_than_granting_one():
+    """The one fallback in this file that hands out a permission.
+
+    "none" is what somebody who wants no ptrace declaration reaches for, and
+    it is not one of the three words this setting takes. It used to resolve to
+    "parent" with nothing said anywhere, so a reader who believed they had
+    withheld the permission had granted it - the one direction a permission
+    setting must not fail in quietly. The fallback stands, because a typo in
+    an ini file is still not worth ending a run over; it is now audible, like
+    every other unusable value here.
+    """
+    with pytest.warns(FailureInstrumentationWarning, match="failure_tracer"):
+        assert resolve(FakeConfig(failure_tracer="none")).tracer == "parent"
+
+    # The hand-built path cannot skip it either: a framework computes this
+    # value in Python, which is where a typo is least likely to be read.
+    with pytest.warns(FailureInstrumentationWarning, match="parent, any, off"):
+        assert settings_module.Settings(tracer="nope").tracer == "parent"
+
+
+def test_a_policy_that_differs_only_in_case_is_the_policy_it_looks_like():
+    """Not a typo and not reported as one. ``resolve`` has always folded case
+    for the ini path, so a framework passing "OFF" to install() must mean
+    there what it would have meant in an ini file."""
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        assert settings_module.Settings(tracer=" OFF ").tracer == "off"
+    assert [str(entry.message) for entry in raised] == []
+
+
 def test_a_run_that_reads_no_worker_stacks_declares_no_tracer():
     """Nobody reading means nothing to permit.
 

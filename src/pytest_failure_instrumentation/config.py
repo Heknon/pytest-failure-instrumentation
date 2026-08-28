@@ -64,8 +64,9 @@ MIN_HEARTBEAT_INTERVAL = 1.0
 #: cadence below this is a busy loop wearing a setting's clothes.
 MIN_SAMPLE_SECONDS = 1.0
 
-#: Accepted values for ``failure_tracer``; anything else falls back to the
-#: default rather than failing a run over a typo in an ini file.
+#: Accepted values for ``failure_tracer``. Anything else falls back to the
+#: default rather than failing a run over a typo in an ini file - and says so,
+#: which is the part this had missing: see :meth:`Settings._usable_tracer`.
 TRACER_POLICIES = ("parent", "any", "off")
 
 
@@ -205,11 +206,7 @@ class Settings:
             "sample_seconds",
             0.0 if self.sample_seconds <= 0 else max(MIN_SAMPLE_SECONDS, float(self.sample_seconds)),
         )
-        object.__setattr__(
-            self,
-            "tracer",
-            self.tracer if self.tracer in TRACER_POLICIES else "parent",
-        )
+        object.__setattr__(self, "tracer", self._usable_tracer())
         object.__setattr__(
             self,
             "tracer_handed_down",
@@ -223,6 +220,35 @@ class Settings:
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
         self._warn_if_the_stack_server_is_reachable_from_off_the_machine()
+
+    def _usable_tracer(self) -> str:
+        """The policy as written, or the default with the reason said out loud.
+
+        Still a fallback and not an error: a typo in an ini file is not worth
+        ending a run over, which is the rule the whole module keeps. What it
+        was missing is the sentence. Every other unusable value here goes
+        through :func:`advise`; this one coerced in silence, and it is the one
+        setting where coercing in silence hands out a permission nobody asked
+        for - ``failure_tracer = none`` is what somebody reaches for when they
+        want no ptrace declaration made, it is not one of the three words, and
+        it resolved to "parent". They believed they had withheld the
+        permission and had granted it.
+
+        Case and surrounding space are not typos and are not reported as
+        such - ``resolve`` already folds them for the ini path, and a
+        framework passing "OFF" to :func:`.install` means the same thing it
+        would have meant in an ini file.
+        """
+        policy = str(self.tracer).strip().lower()
+        if policy in TRACER_POLICIES:
+            return policy
+        advise(
+            f"failure_tracer={self.tracer!r} is not one of "
+            f"{', '.join(TRACER_POLICIES)}, so it falls back to 'parent' - which "
+            "grants the permission rather than withholding it. 'off' is how a "
+            "worker is told to declare nothing",
+        )
+        return "parent"
 
     def _warn_if_a_stall_is_judged_before_it_has_evidence(self) -> None:
         """The watchdog has to have fired before the stall is assessed.
