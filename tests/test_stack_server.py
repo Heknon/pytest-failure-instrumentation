@@ -428,11 +428,20 @@ def test_a_target_that_is_not_a_url_is_answered_rather_than_dropped(serving, cap
     assert "not a URL" in body["error"]
     assert "Traceback" not in capfd.readouterr().err
 
-    # The spelling that is collapsed to one slash before this server sees it
-    # is answered too, as an endpoint that does not exist.
+    # The shorter spelling is answered too, and which answer it gets is not
+    # this server's to decide. Collapsing a leading "//" in the request target
+    # arrived in a CPython security release, so whether that reaches the parse
+    # at all varies with the interpreter underneath: where it is collapsed this
+    # is a path like any other and there is no such endpoint; where it is not,
+    # it is the malformed target above. Windows on 3.9 answers 400 here and
+    # Linux on 3.9 answers 404, which is how this assertion was found asserting
+    # a property of CPython rather than one of this handler.
+    #
+    # What is being tested either way is the thing the fix is for: a reply
+    # rather than a socket that hangs up.
     assert raw(
         service.bound_port, b"GET //[oops HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
-    )[0] == 404
+    )[0] in (400, 404)
 
     # And the server is still answering afterwards, which is the other thing a
     # dropped connection leaves a caller unsure of.
