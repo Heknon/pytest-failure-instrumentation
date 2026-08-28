@@ -644,7 +644,7 @@ Everything above is for reading afterwards. This is the other direction: a UI
 watching a run, asking what a test is doing *while it is still doing it*.
 
 ```console
-$ curl -H "Authorization: Bearer $TOKEN" localhost:8080/stack?pid=48213
+$ curl localhost:8080/stack?pid=48213
 {"pid": 48213, "source": "py-spy", "captured_at": 1756142887.31,
  "threads": [{"thread_id": 8632442880, "thread_name": "MainThread",
               "owns_gil": true, "active": true,
@@ -795,40 +795,35 @@ reconfigure it.
 
 ### Who may ask
 
-Every endpoint but `/identity` requires a token, minted per server and written
-into the address file beside the port:
+Anybody who can reach the address. There is no credential:
 
 ```console
-$ TOKEN=$(jq -r .token .pytest-failures/*/callstack-*.json)
-$ curl -H "Authorization: Bearer $TOKEN" localhost:8080/workers
-$ curl "localhost:8080/workers?token=$TOKEN"    # for when you are in a hurry
+$ curl localhost:8080/workers
+$ curl "localhost:8080/stack?pid=$(pgrep -f 'execnet.*gw3')"
 ```
 
-That file is where the boundary actually is: whoever can read it can read this
-run's stacks. What that is worth differs by platform, and it is worth saying
-which half of the claim each one gives you. On POSIX it is opened `0o600`
-*before* anything is written into it — created owner-only rather than created
-and then narrowed, since the second leaves a window and a window is all anybody
-needs. On Windows a mode is not an ACL: `os.open`'s mode there only decides
-whether the read-only attribute is set, so the file inherits the evidence
-directory's ACL and the boundary is whatever that grants — usually the user and
-administrators under a profile, potentially wider on a shared or drive-root
-path. Put `failure_directory` somewhere you would keep a credential, or leave
-the server off on a host you share.
+**The bind is the whole boundary.** On loopback that is processes on this
+machine; on `0.0.0.0` it is anything that can route to the host. There is
+nothing else, so choose the bind deliberately and leave the server off on a
+host you share with people you would not hand a debugger to.
 
-**Loopback is not that boundary**, which is why the token is not conditional on
-binding off it. Loopback bounds the reachable set to processes on this machine,
-and *every user* on this machine is inside that set — so on a shared box, "only
-local" and "only you" are very different statements, and only the second is
-worth making about a service that reports what your test processes are
-executing.
+That is a trade, and worth saying what it bought. A credential has to live
+somewhere both ends can find it, and for a port drawn at random that somewhere
+is a file next to the port — which makes the address file a secret, and turns
+every question about where a run may write its evidence into a question about
+where a *secret* may live. That guarantee is one POSIX can keep with an `0o600`
+and Windows cannot: a mode there is not an ACL, so the same file inherits the
+evidence directory's and the promise quietly stops holding on a supported
+platform. The cost was paid on every run; what it bought on the machine this
+actually runs on — one laptop, one CI container — was a lock on a door in a
+room only that person is standing in.
 
-`/identity` is deliberately open: it is what one session asks another before
-standing down from a contested port, and the two share no token. It answers
-with a service name, a version and a pid, and never with the token.
+So the address file is ordinary data. It holds a host, a port and a pid: the
+address of a server that anyone who can reach it may query anyway. Put
+`failure_directory` wherever evidence goes, on any platform.
 
-A token lives and dies with the process that minted it, so one that leaks
-expires with the run — that is the whole of its lifetime management.
+`/identity` is what one session asks another before standing down from a
+contested port. It answers with a service name, a version and a pid.
 
 ### Finding the server
 
@@ -840,16 +835,14 @@ def pytest_failure_server_ready(server):
         session=server.session_id,       # names this run's evidence directory
         url=server.url,                  # already bracketed if the host is IPv6
         port=server.port,                # what got bound, never the 0 you asked for
-        token=server.token,              # dies with the process that minted it
         pid=server.pid,                  # the controller, not any worker
     )
 ```
 
 That is the whole address, and for a drawn port it is the only way to learn it
 before the run is over — nobody can configure a number that did not exist a
-moment ago. `server` is a `LiveStackServer`; `server.headers()` gives you the
-`Authorization` header the endpoints want and `server.endpoint("/workers")`
-joins the URL, so neither the scheme nor the slash is yours to get right.
+moment ago. `server` is a `LiveStackServer`; `server.endpoint("/workers")`
+joins the URL, so the slash is not yours to get right.
 
 The hook fires on a thread of its own once the server is already accepting, so
 it is free to call straight back into the server it was just handed. It does not
@@ -935,8 +928,9 @@ separately.
 
 `--callstack-host 0.0.0.0` is what a container needs: its UI is outside, and
 127.0.0.1 inside a container is unreachable from there. Binding anything but
-loopback warns, once — but the token below is what makes it survivable rather
-than reckless.
+loopback warns, once, because it puts an unauthenticated endpoint on the
+network — see [Who may ask](#who-may-ask). Publish the port deliberately, and
+do not route to it from anywhere you would not route a debugger.
 
 Two things about containers make this easier than it looks:
 

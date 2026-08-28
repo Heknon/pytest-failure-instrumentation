@@ -245,15 +245,13 @@ class Settings:
         """Binding anything but loopback is a decision, and it is worth saying
         out loud that it was made.
 
-        The server answers with the stack of any local process it can read. It
-        does ask who is asking - every endpoint but ``/identity`` wants the
-        token - but a token is a secret in a file, and what changes off
-        loopback is the set of people who get to try it. On loopback that set
-        is whoever can open a socket on this machine; on 0.0.0.0 it is the
-        network, which inside a cluster is every other pod. That is the right
-        setting for a container whose UI is outside it and the wrong one
-        everywhere else, and only the person who typed it can tell which case
-        this is.
+        The server answers with the stack of any local process it can read,
+        and it does not ask who is asking. On loopback that is bounded to
+        processes on this machine; the bind is the whole boundary, so moving
+        it off loopback moves the boundary to the network - which inside a
+        cluster is every other pod. That is exactly what a container whose UI
+        is outside it needs, and the wrong setting everywhere else, and only
+        the person who typed it can tell which case this is.
         """
         if not self.stack_server or self.stack_server_host in LOOPBACK:
             return
@@ -261,11 +259,10 @@ class Settings:
             f"the live stack server is bound to {self.stack_server_host}, not "
             "loopback, so anything that can reach this host on port "
             f"{self.stack_server_port or '<drawn at random>'} can read the stack "
-            "of any process it serves, and off loopback the boundary is the network "
-            "rather than who can open a socket here - the token guards the "
-            "endpoints, but anyone who can reach the address can try. This is what "
-            "a container whose UI is outside it needs; it is not what a shared "
-            "machine wants",
+            "of any process it serves. There is no token: the bind is the whole "
+            "boundary, and off loopback that boundary is the network rather than "
+            "this machine. This is what a container whose UI is outside it needs; "
+            "it is not what a shared machine or a routable host wants",
         )
 
     def with_overrides(self, **overrides: Any) -> Settings:

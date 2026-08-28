@@ -45,45 +45,43 @@ running. So a session that lost the claim keeps trying, quietly, and takes over
 whenever the holder exits. Sessions do not coordinate beyond the port itself,
 which is the only thing all of them can see.
 
-**Who may ask.** Every request but ``/identity`` carries a token, minted per
-server and written into the address file beside the port. So the boundary is
-the filesystem's: whoever can read that file can read this run's stacks.
+**Who may ask.** Anybody who can reach the address. There is no credential:
+the boundary is whatever the bind is, and nothing else.
 
-*What that is worth differs by platform, and saying otherwise would be the
-useful half of a security claim without the true half.* On POSIX the file is
-opened ``0o600`` before anything is written into it - created owner-only rather
-than created and then narrowed, since the second leaves a window and a window
-is all anybody needs. On Windows a mode is not an ACL: ``os.open``'s mode
-argument there only decides whether the read-only attribute is set, so the file
-inherits the evidence directory's ACL and the boundary is whatever *that*
-grants. Under a user profile that is usually the user and administrators; on a
-shared or drive-root path it can be wider. Put ``failure_directory`` somewhere
-you would keep a credential, or leave the server off on a host you share.
+That is a deliberate trade rather than an oversight. A credential has to live
+somewhere both ends can find it, and for a port drawn at random that somewhere
+is a file next to the port - which makes the address file a secret, and makes
+every question about where a run may write its evidence a question about where
+a *secret* may live. On POSIX that is one ``0o600``; on Windows a mode is not
+an ACL, so the same file inherits the evidence directory's and the guarantee
+quietly stops holding. The cost was a real one paid on every run, and what it
+bought on the machine this actually runs on - one developer's laptop, one CI
+container - was a lock on a door in a room only that person is standing in.
 
-Loopback is not that boundary, which is why the token is not conditional on
-binding off it. Loopback bounds the reachable set to processes on this machine,
-and *every user* on this machine is inside that set - so on a shared box, "only
-local" and "only you" are very different statements, and only the second is the
-one worth making about a service that reports what your test processes are
-executing.
+So the address file is ordinary data now, and ``failure_directory`` can go
+wherever evidence goes. What replaces the token is the bind: on loopback the
+reachable set is processes on this machine, which on a single-user box is the
+same set that could read the file the token used to live in.
 
-``/identity`` is deliberately open, because it is what one session asks another
-before standing down from a contested port, and the two share no token. It
-answers with a service name, a version and a pid, and never with the token.
+*On a machine you share with people you would not hand a debugger to, leave the
+server off.* Loopback bounds the reachable set to this machine, and every user
+on it is inside that set - "only local" and "only you" are different
+statements, and without a token only the first one is being made.
+
+``/identity`` is what one session asks another before standing down from a
+contested port. It answers with a service name, a version and a pid.
 
 **What it binds.** Loopback by default. A container is the exception that makes
 it configurable: its UI lives outside it, and 127.0.0.1 inside a container is
-unreachable from there. Binding anything else warns, once, at settings time -
-the token is what makes that survivable rather than reckless.
+unreachable from there. Binding anything else puts an unauthenticated endpoint
+on the network, and warns, once, at settings time.
 """
 
 from __future__ import annotations
 
 import errno
-import hmac
 import json
 import os
-import secrets
 import socket
 import socketserver
 import threading
@@ -114,18 +112,6 @@ LOOPBACK6 = "::1"
 #: What the wildcard binds mean, so an advertised URL can avoid them.
 IPV6_WILDCARD = "::"
 WILDCARDS = frozenset({"0.0.0.0", IPV6_WILDCARD, ""})
-
-#: How the token is presented. A header is the right place for a credential -
-#: query strings reach logs and shell history - and the query parameter exists
-#: anyway because a person debugging with curl will reach for it, and refusing
-#: would only teach them to turn the whole thing off.
-AUTH_HEADER = "Authorization"
-AUTH_SCHEME = "Bearer"
-TOKEN_PARAM = "token"
-
-#: Bytes of randomness behind each server. Minted per process and never
-#: reused, so a token that leaks expires with the run that issued it.
-TOKEN_BYTES = 32
 
 #: Files a UI reads to find the servers running on this machine, one per
 #: serving session, named for the pid that wrote it so that two sessions in one
@@ -218,7 +204,6 @@ class _Server(ThreadingHTTPServer):
         address: tuple[str, int],
         handler: Any,
         evidence_root: Optional[Path] = None,
-        token: Optional[str] = None,
     ) -> None:
         # Set before the base class opens the socket, which reads it off the
         # instance. A class attribute cannot answer this: the family depends
@@ -228,8 +213,6 @@ class _Server(ThreadingHTTPServer):
         #: session's own, since /workers describes the machine rather than
         #: whichever run happens to be hosting.
         self.evidence_root = evidence_root
-        #: What a request has to carry. None only where no token was minted.
-        self.token = token
         super().__init__(address, handler)
 
     def server_bind(self) -> None:
@@ -298,23 +281,11 @@ class _Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path)
         query = parse_qs(route.query)
 
-        # Open, because it is what one session asks another before standing
-        # down from a contested port, and the two share no token.
+        # What one session asks another before standing down from a contested
+        # port. No endpoint here asks who is asking - see the module
+        # docstring for what stands in for that and what it does not cover.
         if route.path == "/identity":
             self._reply(200, identity())
-            return
-
-        if not self._authorised(query):
-            self._reply(
-                401,
-                {
-                    "error": "this server reports what local processes are "
-                    "executing, so it asks who is asking. Send the token from "
-                    f"{DISCOVERY_PREFIX}<pid>{DISCOVERY_SUFFIX} in the evidence "
-                    f"directory, as '{AUTH_HEADER}: {AUTH_SCHEME} <token>' or "
-                    f"?{TOKEN_PARAM}=<token>"
-                },
-            )
             return
 
         if route.path == "/stack":
@@ -323,41 +294,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._workers(query)
         else:
             self._reply(404, {"error": "no such endpoint", "endpoints": ENDPOINTS})
-
-    def _authorised(self, query: dict[str, list[str]]) -> bool:
-        """Whether this request carries the server's token.
-
-        Compared in constant time. The comparison is short and local and an
-        attacker's timing signal across it is buried in HTTP jitter, but a
-        credential check that leaks its progress is the kind of thing that is
-        cheap to get right and awkward to explain having got wrong.
-
-        **Compared as bytes, because the offered value is attacker-chosen.**
-        ``compare_digest`` refuses two ``str`` unless both are pure ASCII, and
-        raises ``TypeError`` rather than returning False when they are not - so
-        a token with one non-ASCII character in it took this straight out of
-        the handler: no reply at all where a 401 belonged, and a traceback into
-        the stderr a human is reading pytest's output from, which is the thing
-        ``log_message`` below exists to keep clean. Unauthenticated, and one
-        URL-encoded character to trigger. Encoding both sides first makes the
-        check total: every input now gets an answer, and it is still the
-        constant-time one.
-        """
-        expected = getattr(self.server, "token", None)
-        if not expected:
-            return True  # no token was minted, so none can be demanded
-
-        offered = (query.get(TOKEN_PARAM) or [""])[0]
-        header = self.headers.get(AUTH_HEADER, "")
-        scheme, _, value = header.partition(" ")
-        if scheme.lower() == AUTH_SCHEME.lower():
-            offered = offered or value.strip()
-        if not offered:
-            return False
-        return hmac.compare_digest(
-            offered.encode("utf-8", "surrogatepass"),
-            expected.encode("utf-8", "surrogatepass"),
-        )
 
     def _stack(self, query: dict[str, list[str]]) -> None:
         raw = (query.get("pid") or [""])[0]
@@ -581,9 +517,6 @@ class StackService:
         self._announcer: Optional[threading.Thread] = None
         #: What is actually bound, which is the only number worth publishing.
         self.bound_port: Optional[int] = None
-        #: Minted per process. A token that leaks expires with the run that
-        #: issued it, which is the whole of its lifetime management.
-        self.token = secrets.token_urlsafe(TOKEN_BYTES)
         #: What happened, in words, for whoever asks why there are no stacks.
         self.status = "not started"
         self.serving = False
@@ -653,7 +586,6 @@ class StackService:
                 (self.host, self.port),
                 _Handler,
                 self.directory.parent if self.directory is not None else None,
-                self.token,
             )
         except OSError as failure:
             if not _is_contention(failure):
@@ -763,21 +695,22 @@ class StackService:
             port=self.bound_port,
             url=self.url,
             drawn=self.drawn,
-            token=self.token,
             started_at=round(time.time(), 3),
         )
         temporary = path.with_name(path.name + ".part")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            # Created owner-only *before* anything is in it, so the token is
-            # never briefly world-readable. Writing it and then chmod-ing
-            # leaves exactly that window, which on a shared machine is the
-            # only window anybody needs.
-            handle = os.open(
-                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-            )
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream)
+            # An ordinary file. It held a credential once, which is what made
+            # its mode load-bearing and turned "where may a run write its
+            # evidence" into a question about where a *secret* may live - a
+            # guarantee POSIX could keep and Windows could not. What is in it
+            # now is a host, a port and a pid: the address of a server that
+            # anyone who can reach it may query anyway.
+            #
+            # Still written through a temporary and renamed. That was never
+            # about the secret: a reader polling this directory must never be
+            # handed half an address.
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(temporary, path)
         except OSError:
             return  # bookkeeping must never break a run
@@ -870,7 +803,6 @@ class StackService:
             url=self.url,
             host=self.host,
             port=int(self.bound_port or self.port),
-            token=self.token,
             pid=os.getpid(),
             directory=str(self.directory) if self.directory is not None else None,
             session_id=self.session_id,

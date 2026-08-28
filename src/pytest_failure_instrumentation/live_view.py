@@ -48,11 +48,6 @@ class LiveStackServer(BaseModel):
     #: 0 and a caller that stored the request would store a 0.
     port: int = 0
 
-    #: The bearer token for every endpoint except ``/identity``. Minted per
-    #: process and valid for exactly as long as this process lives, so it is
-    #: worth storing beside the address and never worth storing longer.
-    token: str = ""
-
     #: The process serving. Under xdist this is the controller, which is not
     #: any of the pids ``/workers`` reports on.
     pid: int = 0
@@ -65,17 +60,6 @@ class LiveStackServer(BaseModel):
     #: What names that directory. Stable from the first moment of the run,
     #: unlike the run id.
     session_id: str = ""
-
-    def headers(self) -> dict:
-        """The Authorization header this server expects.
-
-        Here rather than in a product's own string formatting because the
-        scheme is this package's to change, and a client that hard-codes it is
-        a client that breaks quietly on the upgrade that changes it.
-        """
-        from .stack_server import AUTH_HEADER, AUTH_SCHEME
-
-        return {AUTH_HEADER: f"{AUTH_SCHEME} {self.token}"}
 
     def endpoint(self, path: str) -> str:
         """``url`` and ``path`` joined without caring who brought the slash."""

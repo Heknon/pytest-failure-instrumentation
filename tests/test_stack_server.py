@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import stat
 import subprocess
 import sys
 import time
@@ -63,22 +62,17 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def get(
-    port: int, path: str, token: Optional[str] = None, timeout: float = 30.0
-) -> tuple[int, Any]:
+def get(port: int, path: str, timeout: float = 30.0) -> tuple[int, Any]:
     """A request with proxies off, which is how the plugin itself asks.
 
     CI sets ``http_proxy`` constantly, and a request for 127.0.0.1 that goes
     through a proxy tests the proxy.
 
-    ``token`` is what every endpoint but ``/identity`` requires. Omitting it is
-    how the tests below ask what an unauthenticated caller gets.
+    Nothing is carried but the path: the server asks for no credential, and
+    the bind is the whole boundary.
     """
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    headers = {stack_server.AUTH_HEADER: f"{stack_server.AUTH_SCHEME} {token}"} if token else {}
-    request = urllib.request.Request(
-        f"http://{stack_server.LOOPBACK}:{port}{path}", headers=headers
-    )
+    request = urllib.request.Request(f"http://{stack_server.LOOPBACK}:{port}{path}")
     try:
         with opener.open(request, timeout=timeout) as response:
             return response.status, json.loads(response.read())
@@ -199,7 +193,7 @@ def test_a_request_for_the_serving_process_is_answered_from_its_own_frames(servi
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
-    status, body = get(port, f"/stack?pid={os.getpid()}", service.token)
+    status, body = get(port, f"/stack?pid={os.getpid()}")
     assert status == 200
     assert body["source"] == "in-process"
     assert body["pid"] == os.getpid()
@@ -228,7 +222,7 @@ def test_another_process_is_read_from_outside_it(serving):
         # interpreter that has not finished starting reads back a perfectly
         # valid stack that is still inside the import machinery.
         found = wait_for(
-            lambda: "inner" in (_named_frames(get(port, f"/stack?pid={victim.pid}", service.token)) or [])
+            lambda: "inner" in (_named_frames(get(port, f"/stack?pid={victim.pid}")) or [])
         )
         assert found, "py-spy never reported the frame the victim is parked in"
     finally:
@@ -249,7 +243,7 @@ def test_a_pid_that_is_not_a_number_is_refused_rather_than_guessed(serving):
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
-    status, body = get(port, "/stack?pid=notapid", service.token)
+    status, body = get(port, "/stack?pid=notapid")
     assert status == 400
     assert "notapid" in body["error"]
 
@@ -268,14 +262,14 @@ def test_a_pid_no_process_could_have_is_refused_without_spending_a_reader(servin
     port = service.bound_port
 
     for impossible in (-1, 0, stack_server.MAX_PID + 1, 99999999999999999999):
-        status, body = get(port, f"/stack?pid={impossible}", service.token)
+        status, body = get(port, f"/stack?pid={impossible}")
         assert status == 400, f"pid={impossible} reached the reader"
         assert "pid must be between" in body["error"]
         # Nothing py-spy said about itself leaks out as the explanation.
         assert "py-spy" not in body["error"] and "panicked" not in body["error"]
 
     # A pid that could exist still goes to the reader, whatever it finds there.
-    status, _ = get(port, f"/stack?pid={stack_server.MAX_PID}", service.token)
+    status, _ = get(port, f"/stack?pid={stack_server.MAX_PID}")
     assert status == 502
 
 
@@ -286,7 +280,7 @@ def test_an_unreadable_process_answers_with_why(serving):
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
-    status, body = get(port, "/stack?pid=999999", service.token)
+    status, body = get(port, "/stack?pid=999999")
     assert status == 502
     assert body["error"]
 
@@ -296,7 +290,7 @@ def test_an_unknown_endpoint_lists_the_ones_that_exist(serving):
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
-    status, body = get(port, "/nothing", service.token)
+    status, body = get(port, "/nothing")
     assert status == 404
     assert "/stack?pid=N" in body["endpoints"]
 
@@ -472,10 +466,9 @@ def test_a_real_pytest_session_serves_its_own_stack(pytester):
         import glob, json, os, time, urllib.request
 
 
-        def ask(path, token=None):
+        def ask(path):
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
-            headers = {{"Authorization": "Bearer " + token}} if token else {{}}
-            request = urllib.request.Request("http://127.0.0.1:{port}" + path, headers=headers)
+            request = urllib.request.Request("http://127.0.0.1:{port}" + path)
             with opener.open(request, timeout=30) as answer:
                 return json.loads(answer.read())
 
@@ -494,10 +487,10 @@ def test_a_real_pytest_session_serves_its_own_stack(pytester):
             assert identity["pid"] == os.getpid()
 
             published = glob.glob(".pytest-failures/*/callstack-*.json")
-            assert published, "the server published no address to take a token from"
-            token = json.loads(open(published[0]).read())["token"]
+            assert published, "the server published no address"
+            assert "token" not in json.loads(open(published[0]).read())
 
-            stack = ask("/stack?pid=%d" % os.getpid(), token)
+            stack = ask("/stack?pid=%d" % os.getpid())
             functions = [
                 frame["function"]
                 for thread in stack["threads"]
@@ -666,13 +659,14 @@ def test_a_real_run_draws_a_port_and_a_ui_finds_it_on_disk(pytester):
             assert address["port"] > 0
             assert address["pid"] == os.getpid()
 
-            # The token rides in the same file as the port, because a UI that
-            # can read one can read the other and nothing else can read either.
-            assert address["token"]
+            # Nothing in here is a secret: it is a host, a port and a pid,
+            # which is the address of a server anyone who can reach it may
+            # query anyway. That is what lets this file live wherever the
+            # rest of a run's evidence lives.
+            assert "token" not in address
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             request = urllib.request.Request(
-                address["url"] + "/stack?pid=%d" % os.getpid(),
-                headers={"Authorization": "Bearer " + address["token"]},
+                address["url"] + "/stack?pid=%d" % os.getpid()
             )
             with opener.open(request, timeout=30) as answer:
                 stack = json.loads(answer.read())
@@ -832,7 +826,7 @@ def test_the_workers_endpoint_describes_the_run_it_is_serving(serving, tmp_path)
     service = serving(0, directory=run)
     assert wait_for(lambda: service.serving), service.status
 
-    status, body = get(service.bound_port, "/workers", service.token)
+    status, body = get(service.bound_port, "/workers")
     assert status == 200
     assert body["served_by"]["service"] == stack_server.SERVICE
     described = [entry for entry in body["runs"] if entry["session"] == "run-abc123"]
@@ -850,11 +844,11 @@ def test_the_workers_endpoint_is_listed_and_says_when_it_cannot_answer(serving):
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
-    status, body = get(port, "/workers", service.token)
+    status, body = get(port, "/workers")
     assert status == 503
     assert "evidence directory" in body["error"]
 
-    status, body = get(port, "/nothing", service.token)
+    status, body = get(port, "/nothing")
     assert "/workers" in body["endpoints"]
 
 
@@ -876,7 +870,7 @@ def test_the_workers_endpoint_takes_a_worker_filter(serving, tmp_path):
     assert wait_for(lambda: service.serving), service.status
 
     def named(query: str) -> list[str]:
-        status, body = get(service.bound_port, "/workers" + query, service.token)
+        status, body = get(service.bound_port, "/workers" + query)
         assert status == 200
         return [entry["worker"] for entry in body["runs"][0]["workers"]]
 
@@ -887,74 +881,12 @@ def test_the_workers_endpoint_takes_a_worker_filter(serving, tmp_path):
     assert named("?workers=gw1") == ["gw1"]
     assert named("?worker=") == ["gw0", "gw1", "gw2"]
 
-    status, body = get(service.bound_port, "/workers?worker=gw9", service.token)
+    status, body = get(service.bound_port, "/workers?worker=gw9")
     assert body["runs"] == []
     assert body["filter"]["unmatched"] == ["gw9"]
 
 
 # -- who may ask ----------------------------------------------------------
-
-
-def test_every_endpoint_but_identity_wants_the_token(serving, tmp_path):
-    """This server reports what local processes are executing, so it asks who
-    is asking. Loopback is not that boundary: it bounds the reachable set to
-    this machine, and every user on this machine is inside it."""
-    run = tmp_path / "run-abc123"
-    run.mkdir()
-    (run / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
-    service = serving(0, directory=run)
-    assert wait_for(lambda: service.serving), service.status
-    port = service.bound_port
-
-    assert get(port, f"/stack?pid={os.getpid()}")[0] == 401
-    assert get(port, "/workers")[0] == 401
-    assert get(port, f"/stack?pid={os.getpid()}", "not-the-token")[0] == 401
-
-    assert get(port, f"/stack?pid={os.getpid()}", service.token)[0] == 200
-    assert get(port, "/workers", service.token)[0] == 200
-
-
-def test_a_token_that_is_not_ascii_is_refused_rather_than_crashing(serving, capfd):
-    """``compare_digest`` raises on two non-ASCII ``str`` instead of saying no.
-
-    The offered token is whatever the caller sent, so that TypeError came out
-    of the handler *before* authentication: the request got no reply at all
-    where a 401 belonged, and socketserver printed the traceback to the stderr
-    a human is reading pytest's output from - the one thing ``log_message`` is
-    overridden to prevent. One URL-encoded character, no credentials needed.
-
-    Both ways of offering a token are exercised, because they decode
-    differently: a query parameter arrives as UTF-8 and a header as latin-1.
-    """
-    service = serving(free_port(), directory=None)
-    assert wait_for(lambda: service.serving), "never served"
-    port = service.bound_port
-
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    def status_for(path: str, headers: Optional[dict] = None) -> int:
-        request = urllib.request.Request(
-            f"http://{stack_server.LOOPBACK}:{port}{path}", headers=headers or {}
-        )
-        try:
-            with opener.open(request, timeout=30) as response:
-                return response.status
-        except urllib.error.HTTPError as refusal:
-            return refusal.code
-
-    # In the query string, percent-encoded as any client would send it.
-    assert status_for("/workers?token=caf%C3%A9") == 401
-    assert status_for("/workers?token=%F0%9F%92%A9") == 401
-    # And in the header, where latin-1 is what the wire carries.
-    assert status_for(
-        "/workers", {stack_server.AUTH_HEADER: f"{stack_server.AUTH_SCHEME} caf\xe9"}
-    ) == 401
-    # The real one still works, so the fix did not just refuse everything.
-    assert status_for(
-        "/workers?token=" + service.token
-    ) in (200, 503)  # 503 only because this service was given no directory
-
-    assert "Traceback" not in capfd.readouterr().err
 
 
 def test_a_handler_failure_never_reaches_the_report_as_a_traceback(serving, capfd):
@@ -979,63 +911,40 @@ def test_a_handler_failure_never_reaches_the_report_as_a_traceback(serving, capf
     assert "Traceback" not in capfd.readouterr().err
 
 
-def test_identity_stays_open_and_never_carries_the_token(serving):
-    """It is what one session asks another before standing down from a
-    contested port, and the two share no token."""
+def test_identity_is_what_one_session_asks_another(serving):
+    """The election runs on it: a session that lost a contested port asks
+    whoever holds it whether they are one of ours before standing down."""
     port = free_port()
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
     status, body = get(port, "/identity")
     assert status == 200
-    assert "token" not in body
-    # Which is also what makes the election work without one.
+    assert body["service"] == stack_server.SERVICE
     assert stack_server.identify(port) is not None
 
 
-def test_the_refusal_says_where_the_token_is(serving):
-    """A 401 that does not say how to satisfy it teaches people to turn the
-    whole thing off."""
-    port = free_port()
-    service = serving(port)
-    assert wait_for(lambda: service.serving), service.status
+def test_the_address_file_carries_no_credential(serving, tmp_path):
+    """It used to, and that is what turned "where may a run write its
+    evidence" into a question about where a *secret* may live - one this
+    package could answer on POSIX with an 0o600 and could not answer on
+    Windows at all, where a mode is not an ACL and the file inherits the
+    directory's.
 
-    status, body = get(port, "/workers")
-    assert status == 401
-    assert "callstack-" in body["error"]
-    assert "Authorization" in body["error"]
-
-
-def test_the_token_is_accepted_either_way_it_is_sent(serving):
-    """A header is the right place for a credential; the query parameter is
-    there because a person debugging with curl will reach for it."""
-    port = free_port()
-    service = serving(port)
-    assert wait_for(lambda: service.serving), service.status
-
-    assert get(port, f"/stack?pid={os.getpid()}&token={service.token}")[0] == 200
-    assert get(port, f"/stack?pid={os.getpid()}", service.token)[0] == 200
-
-
-@pytest.mark.skipif(IS_WINDOWS, reason="a mode is not an ACL; see the docstring")
-def test_the_address_file_is_owner_only_on_posix(serving, tmp_path):
-    """The token is only as private as the file holding it, so that file is
-    created owner-only rather than created and then narrowed - the second
-    leaves a window, and a window is all anybody needs.
-
-    Named for the platform it holds on. On Windows ``os.open``'s mode only
-    decides the read-only attribute, so there is no owner-only guarantee for a
-    test to make there and the file inherits the directory's ACL instead -
-    which the module docstring says rather than leaving the skip to imply the
-    check merely could not run."""
+    What is in it now is a host, a port and a pid: the address of a server
+    anyone who can reach it may query anyway. So it goes wherever the rest of
+    a run's evidence goes, on every platform, and the guarantee that held on
+    only one of them is no longer load-bearing on any."""
     run = tmp_path / "run-abc123"
     service = serving(0, directory=run)
     assert wait_for(lambda: service.serving), service.status
 
     published = wait_for(lambda: list(run.glob("callstack-*.json")))
     assert published
-    assert stat.S_IMODE(published[0].stat().st_mode) == 0o600
-    assert json.loads(published[0].read_text())["token"] == service.token
+    address = json.loads(published[0].read_text())
+    assert "token" not in address
+    assert address["port"] == service.bound_port
+    assert address["pid"] == os.getpid()
 
 
 def test_a_pyspy_failure_reports_its_message_and_not_its_backtrace():
@@ -1303,10 +1212,9 @@ def test_a_serving_session_hands_out_everything_needed_to_reach_it(serving, tmp_
     assert server.port == service.bound_port
     assert server.port > 0
     assert str(server.port) in server.url
-    assert server.token == service.token
 
-    # And it actually opens the door it describes.
-    status, payload = get(server.port, "/workers", token=server.token)
+    # And the address it describes actually answers.
+    status, payload = get(server.port, "/workers")
     assert status == 200, payload
 
 
@@ -1355,21 +1263,6 @@ def test_an_announcement_that_raises_does_not_stop_the_server(serving, tmp_path)
     assert status == 200
 
 
-def test_the_headers_on_the_payload_are_the_ones_the_server_accepts(serving, tmp_path):
-    """The scheme is this package's to change, so a product that uses what it
-    was handed keeps working across a change that a hard-coded "Bearer" would
-    not survive."""
-    announced: list[Any] = []
-    service = serving(0, directory=tmp_path, on_ready=announced.append)
-    assert wait_for(lambda: announced), service.status
-    server = announced[0]
-
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    request = urllib.request.Request(server.endpoint("/workers"), headers=server.headers())
-    with opener.open(request, timeout=30.0) as response:
-        assert response.status == 200
-
-
 def test_a_real_run_hands_the_address_to_a_product_that_implements_the_hook(pytester):
     """The whole chain, in one real pytest: a drawn port, the plugin's own
     wiring, pluggy's dispatch, and a conftest that is exactly what a product
@@ -1399,7 +1292,7 @@ def test_a_real_run_hands_the_address_to_a_product_that_implements_the_hook(pyte
     announced = json.loads((pytester.path / "server.json").read_text())
     assert announced["service"] == stack_server.SERVICE
     assert announced["port"] > 0
-    assert announced["token"]
+    assert "token" not in announced
     assert announced["session_id"]
     assert str(announced["port"]) in announced["url"]
     # The directory it names is the one the run was writing evidence into.
