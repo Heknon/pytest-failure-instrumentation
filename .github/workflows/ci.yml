@@ -107,8 +107,23 @@ jobs:
         run: |
           python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
 
+      # -n 4 on Linux, and only there. Measured on a 4-vCPU Linux box, which is
+      # the shape of this runner: 596s serially against 268s under -n 4, with
+      # the same 406 passed, the same 12 skipped, and the same skip reasons
+      # both ways. 4 rather than auto, because 4 is the number that comparison
+      # was made with. macOS and Windows stay serial - the suite spends nearly
+      # all of its time in subprocesses it starts itself, several of which are
+      # xdist runs of their own with timeouts on them, and how a 4x
+      # oversubscribed runner handles that has not been measured there.
+      #
+      # Running it parallel somewhere is the point: the reason -n was unusable
+      # until now was that inner runs inherited PYTEST_XDIST_WORKER from the
+      # outer one, and nothing in CI would have noticed it come back.
+      # oldest-supported, without-xdist and wheel below all run the suite in
+      # one process, so an ordering bug between two tests still has three
+      # places to show itself.
       - name: Test
-        run: pytest -q
+        run: pytest -q ${{ runner.os == 'Linux' && '-n 4' || '' }}
 
   oldest-supported:
     # pyproject declares pytest>=7.0 and python>=3.9. Everything else in this

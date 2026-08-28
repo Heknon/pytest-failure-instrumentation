@@ -18,7 +18,12 @@ import victim
 
 def pytest_collection_modifyitems(session, config, items):
     target = os.environ.get("BOOM_ON", "")
-    if target and os.environ.get("PYTEST_XDIST_WORKER", "main") == target:
+    # Which process this is, asked the way the plugin itself asks it
+    # (registration.py): workerinput exists on a worker and nowhere else. The
+    # environment answers for whoever exported PYTEST_XDIST_WORKER last, which
+    # when this suite is itself run under -n is the outer worker, not this run.
+    worker = getattr(config, "workerinput", None)
+    if target and (worker["workerid"] if worker else "main") == target:
         victim.break_pytest()
 """
 

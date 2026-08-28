@@ -120,6 +120,33 @@ class Runner:
         return matching[0]
 
 
+# The whole set: xdist's remote.py exports exactly these three as a worker
+# starts, and nothing unsets them for a process that worker then spawns.
+XDIST_WORKER_ENV = (
+    "PYTEST_XDIST_WORKER",
+    "PYTEST_XDIST_WORKER_COUNT",
+    "PYTEST_XDIST_TESTRUNUID",
+)
+
+
+@pytest.fixture(autouse=True)
+def _hide_the_outer_runs_xdist_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep this suite's own -n out of the pytest runs it starts.
+
+    pytester scrubs PYTEST_ADDOPTS and TOX_ENV_DIR before a subprocess run, and
+    nothing xdist sets - so under -n every inner run inherits the outer
+    worker's identity and any conftest that reads it believes it is a worker
+    when it is a controller. That cost three deterministic failures under -n 4:
+    the inner conftest in test_worker_death killed the inner controller, and
+    the "main" branch in test_internal_error never fired at all.
+
+    Autouse rather than a dependency of the runner fixture, so an inner run
+    added later is covered without anyone having to remember this.
+    """
+    for name in XDIST_WORKER_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def runner(pytester: pytest.Pytester) -> Runner:
     pytester.makeconftest(INNER_CONFTEST)

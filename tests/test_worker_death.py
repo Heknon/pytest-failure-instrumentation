@@ -512,7 +512,16 @@ def test_a_worker_that_dumped_nothing_is_not_given_a_stack_age(distributed):
 
 
 BETWEEN_TESTS_CONFTEST = INNER_CONFTEST + '''
-import os
+#: Set from pytest_configure because logfinish is not handed the config. It is
+#: config, not PYTEST_XDIST_WORKER, that answers for *this* run: the variable
+#: is inherited by any child process, so with this suite itself under -n the
+#: controller below read the outer worker's id and exited on it.
+in_a_worker = False
+
+
+def pytest_configure(config):
+    global in_a_worker
+    in_a_worker = hasattr(config, "workerinput")
 
 
 def pytest_runtest_logfinish(nodeid):
@@ -522,7 +531,7 @@ def pytest_runtest_logfinish(nodeid):
     Only in the worker. xdist relays logfinish to the controller as well, and
     a controller that exits here takes the whole run with it.
     """
-    if nodeid.endswith("::test_finishes") and os.environ.get("PYTEST_XDIST_WORKER"):
+    if nodeid.endswith("::test_finishes") and in_a_worker:
         import victim
 
         victim.hard_exit(9)
