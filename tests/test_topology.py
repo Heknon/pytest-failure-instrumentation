@@ -57,11 +57,17 @@ def evidence(tmp_path):
             )
 
         def beats(self, worker: str, *, count: int = 4, cpu_step: float = 0.0,
-                  age: float = 0.0, interval: float = 5.0) -> None:
-            """``count`` heartbeats ending ``age`` seconds ago."""
+                  age: float = 0.0, interval: float = 5.0,
+                  run_id: str = "the-reported-run-id", append: bool = False) -> None:
+            """``count`` heartbeats ending ``age`` seconds ago.
+
+            ``run_id`` is what every line is stamped with, and ``append`` adds
+            them after whatever is already in the file - which is how one
+            events file comes to hold two runs' lines.
+            """
             lines = [
                 json.dumps({"event": "watchdog_started", "interval": interval,
-                            "run_id": "the-reported-run-id"})
+                            "run_id": run_id})
             ]
             last = time.time() - age
             for index in range(count):
@@ -72,10 +78,12 @@ def evidence(tmp_path):
                         "time": when,
                         "cpu_seconds": index * cpu_step * interval,
                         "rss_mb": 412,
-                        "run_id": "the-reported-run-id",
+                        "run_id": run_id,
                     })
                 )
-            (self.run / f"{worker}.events").write_text("\n".join(lines) + "\n")
+            path = self.run / f"{worker}.events"
+            with path.open("a" if append else "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
 
         def worker(self, name: str) -> dict:
             return topology.worker(self.run / f"{name}.state", time.time())
@@ -248,6 +256,79 @@ def test_a_worker_between_tests_reports_no_node_id(evidence):
     described = evidence.worker("gw0")
     assert described["nodeid"] is None
     assert described["phase"] is None
+
+
+# -- evidence another run left in the same directory -----------------------
+
+
+def test_a_state_slot_another_run_left_behind_is_not_reported_as_this_worker(evidence):
+    """The live view was the one reader that skipped the run-id stamp.
+
+    A state file is a fixed slot opened without O_TRUNC and overwritten in
+    place, so an earlier run's record survives in it until this run's worker
+    reaches its first phase transition - and two sessions sharing a directory,
+    which one PYTEST_RUN_ID exported across a build job produces without
+    anyone choosing it, overwrite each other's slot for the whole run, because
+    every worker in every session is called gw0. The events file cannot be
+    confused that way: it is truncated by whoever opens it and every line
+    carries the run that wrote it.
+
+    Reporting the slot anyway is not a wrong label on a dashboard. The pid in
+    it is what ``sampling`` hands to py-spy, and py-spy stops the process it
+    attaches to - so a foreign pid read here is another session's worker
+    suspended by this one, on the strength of a record that says so itself.
+    """
+    evidence.state(
+        "gw0",
+        run_id="a-session-that-shared-this-directory",
+        pid=LIVE,
+        nodeid="test_theirs.py::test_not_ours",
+    )
+    evidence.beats("gw0", cpu_step=0.5, run_id="run-now")
+
+    described = evidence.worker("gw0")
+    assert described["pid"] is None
+    assert described["nodeid"] is None
+    assert described["phase"] is None
+    # And through the run view, which is what /workers and the sampler read.
+    assert topology.run(evidence.run)["workers"][0]["pid"] is None
+
+
+def test_another_run_s_beats_are_not_this_run_s_evidence(evidence):
+    """Which is the reading that produces a verdict, rather than a field.
+
+    A worker that has started and not yet beaten has no passive evidence
+    either way, and "unmeasured" says so. Counting the previous session's
+    beats instead dates the silence from *their* last beat, which is however
+    long ago they finished - so a worker that started a second ago is reported
+    frozen, with a confident age attached, and the sampler py-spys it for a
+    stack of a stall that is not happening.
+    """
+    evidence.state("gw0", run_id="run-now")
+    evidence.beats("gw0", count=4, age=600.0, run_id="a-session-that-finished")
+    # This run's worker: started, and not yet through a beat interval.
+    evidence.beats("gw0", count=0, run_id="run-now", append=True)
+
+    described = evidence.worker("gw0")
+    assert described["status"] == "unmeasured"
+    assert described["heartbeat_age_s"] is None
+    assert described["rss_mb"] is None
+
+
+def test_a_worker_that_was_never_told_the_run_id_keeps_its_evidence(evidence):
+    """The asymmetry both filters are built around, and it is deliberate.
+
+    Only a record naming a *different* run is refused. A worker the controller
+    never reached with a run id wrote a run's worth of real state and real
+    beats with no stamp on any of it, and dropping those to guard against
+    nothing would report a working worker as one that never started.
+    """
+    evidence.state("gw0", run_id=None, pid=LIVE)
+    evidence.beats("gw0", cpu_step=0.98, run_id=None)
+
+    described = evidence.worker("gw0")
+    assert described["pid"] == LIVE
+    assert described["status"] == "working"
 
 
 # -- liveness -------------------------------------------------------------

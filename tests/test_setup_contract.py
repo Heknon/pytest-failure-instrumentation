@@ -57,6 +57,73 @@ def test_a_worker_that_cannot_write_evidence_does_not_end_the_run(runner):
     result.stderr.fnmatch_lines(["*failure instrumentation is off for this worker*"])
 
 
+#: A psutil that is installed and will not import, which is what a platform
+#: with no wheel, a C extension built against another libc, or ``pip install
+#: --no-deps`` actually leaves behind. Shadowing rather than deleting, because
+#: the two are different paths through the importer and only this one is the
+#: failure being reproduced.
+BROKEN_PSUTIL = 'raise ImportError("no psutil wheel for this platform")\n'
+
+
+def _psutil_that_will_not_import(runner, monkeypatch) -> None:
+    """Put ``BROKEN_PSUTIL`` ahead of the real one for the inner run.
+
+    pytester prepends the inner run's own directory to PYTHONPATH and keeps
+    whatever is already there, so this entry still sits ahead of the
+    site-packages psutil - in the controller and in every worker it spawns.
+    """
+    shadow = runner.pytester.path / "no-psutil"
+    shadow.mkdir()
+    (shadow / "psutil.py").write_text(BROKEN_PSUTIL, encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+
+
+def test_a_psutil_that_will_not_import_does_not_end_the_run(runner, monkeypatch):
+    """psutil is a hard dependency, and a hard dependency can still be missing.
+
+    Every probe reads process facts through psutil, so both of the objects
+    registration builds - the worker's recorder and the controller's engine -
+    reach it through their imports. Those imports used to sit outside the
+    try/except that exists for exactly this, one statement above the call it
+    guards, which is close enough to look guarded and is not. An ImportError
+    then left ``pytest_configure`` as an INTERNALERROR: exit status 3, not a
+    test collected, and nothing on the machine any longer running the suite
+    the plugin was installed to report on.
+
+    The dependency being declared is not a defence. No wheel for the platform
+    and a source build that fails, a C extension against the wrong libc, ``pip
+    install --no-deps``, a mirror carrying the pure Python packages and not
+    the compiled one - each of them installs a plugin that cannot import its
+    probes, and none of them is the customer's fault or fixable from here.
+    """
+    runner.pytester.makepyfile(test_suite=SUITE)
+    _psutil_that_will_not_import(runner, monkeypatch)
+
+    result = runner.pytester.runpytest_subprocess("-p", "no:xdist", "test_suite.py")
+    result.assert_outcomes(passed=2)
+    assert "INTERNALERROR" not in result.stdout.str()
+    result.stderr.fnmatch_lines(["*failure instrumentation is off for this run*"])
+
+
+@needs_xdist
+def test_a_worker_whose_psutil_will_not_import_does_not_end_the_run(runner, monkeypatch):
+    """The same import, in the process where it costs the most.
+
+    A worker builds a recorder rather than an engine, through a different
+    import that reaches the same probes. It is also the multiplying case: the
+    controller failing this way loses one run, while every worker failing it
+    loses the run several times over, with the traceback repeated once per
+    process and no test result anywhere.
+    """
+    runner.pytester.makepyfile(test_suite=SUITE)
+    _psutil_that_will_not_import(runner, monkeypatch)
+
+    result = runner.pytester.runpytest_subprocess("-n", "2", "test_suite.py", timeout=180)
+    result.assert_outcomes(passed=2)
+    assert "INTERNALERROR" not in result.stdout.str()
+    result.stderr.fnmatch_lines(["*failure instrumentation is off for this worker*"])
+
+
 @needs_xdist
 def test_nothing_in_the_evidence_directory_that_is_not_ours_is_touched(runner):
     """failure_directory is a natural thing to point at an existing artifacts
