@@ -357,3 +357,56 @@ def test_the_sampler_cadence_has_a_floor_like_its_sibling():
     assert settings_module.Settings(sample_seconds=-5).sample_seconds == 0.0
     # And a sane value is left alone.
     assert settings_module.Settings(sample_seconds=30).sample_seconds == 30.0
+
+
+# -- who may read a worker, and whether anybody asked -----------------------
+
+
+def test_a_run_that_reads_no_worker_stacks_declares_no_tracer():
+    """Nobody reading means nothing to permit.
+
+    ptrace_scope=1 is the Ubuntu and Debian default, so before this every
+    worker of every Linux run declared a tracer at startup whether or not the
+    run had a live view - an upgrade and ``pytest -n8`` widened who may read a
+    test process, for a feature nobody had switched on. And it is a real
+    widening: Yama admits the nominated pid *and its descendants*, which is
+    the whole process tree of the run.
+    """
+    assert settings_module.Settings().tracer_in_force == "off"
+    assert settings_module.Settings(tracer="any").tracer_in_force == "off"
+
+    # The two things that read a worker while it runs, and the only two.
+    assert settings_module.Settings(stack_server=True).tracer_in_force == "parent"
+    assert (
+        settings_module.Settings(tracer="any", stack_server=True).tracer_in_force == "any"
+    )
+    assert settings_module.Settings(sample_seconds=5).tracer_in_force == "parent"
+
+    # "off" is still "off" where a reader is watching: the escape hatch has to
+    # be one for the case it exists for.
+    assert settings_module.Settings(tracer="off", stack_server=True).tracer_in_force == "off"
+
+
+def test_the_worker_is_handed_the_answer_it_has_no_way_to_reach():
+    """Where the decision is made, and why it cannot be made at the other end.
+
+    The payload deliberately carries neither the stack server's settings nor
+    the sampler's - a worker that read them could start its own, which is the
+    collision the design exists to prevent - so the question "is anybody going
+    to read my stack" is one a worker cannot answer. The controller answers it
+    once and sends the answer rather than the evidence for it.
+    """
+    watched = settings_module.Settings(tracer="any", stack_server=True)
+    payload = watched.as_payload()
+    assert payload["tracer_handed_down"] == "any"
+    assert not [name for name in payload if name.startswith(("stack_server", "sample_"))]
+
+    # The worker obeys it, though everything it can see for itself says "off".
+    arrived = settings_module.Settings.from_payload(payload)
+    assert arrived.stack_server is False and arrived.sample_seconds == 0.0
+    assert arrived.tracer_in_force == "any"
+
+    # And an ordinary run hands down the declining answer just as explicitly.
+    quiet = settings_module.Settings(tracer="parent").as_payload()
+    assert quiet["tracer_handed_down"] == "off"
+    assert settings_module.Settings.from_payload(quiet).tracer_in_force == "off"

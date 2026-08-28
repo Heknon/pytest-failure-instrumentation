@@ -24,6 +24,8 @@ import pytest
 
 from pytest_failure_instrumentation.probes import pyspy, tracing
 
+from .conftest import INNER_CONFTEST, needs_xdist
+
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 
 needs_pyspy = pytest.mark.skipif(
@@ -165,3 +167,89 @@ def test_the_any_policy_is_what_a_shared_reader_needs():
         f"the ANY declaration itself failed: {declared}"
     )
     assert threads, f"a worker granting ANY could not be read: {error} | {declared}"
+
+
+# -- what a real run declares, as against what it could -------------------
+
+
+def _declarations(pytester):
+    """Every worker's ``worker_start``, read from the run's own evidence.
+
+    Read from the file rather than from a probe, because the point is what
+    reached ``WorkerRecorder`` in a different process: a test that called
+    ``permit_tracing`` itself would prove only that the function works, which
+    is what every other test in this file already covers.
+    """
+    # One directory per run, named for the session - see "Two runs at once".
+    evidence = pytester.path / ".pytest-failures"
+    started = []
+    for path in sorted(evidence.glob("*/*.events")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("event") == "worker_start":
+                started.append(event)
+    return started
+
+
+@needs_xdist
+def test_a_run_with_nothing_reading_stacks_declares_no_tracer(distributed):
+    """The install-and-do-nothing run, which is nearly all of them.
+
+    Every worker used to declare a tracer here whatever the run was for. On
+    Ubuntu and Debian - ptrace_scope=1 out of the box - that made ``pip
+    install --upgrade`` plus ``pytest -n8`` a widening of who may read a test
+    process, for a live view nobody had switched on.
+    """
+    distributed.pytester.makeini(
+        """
+        [pytest]
+        failure_packages = victim
+        """
+    )
+    distributed.pytester.makeconftest(INNER_CONFTEST)
+    distributed.pytester.makepyfile(test_quick="def test_one():\n    assert True\n")
+
+    distributed.run("-n", "1", "test_quick.py", timeout=180)
+
+    started = _declarations(distributed.pytester)
+    assert started, "the worker recorded no startup at all"
+    for event in started:
+        assert event["tracer_policy"] == "off", event
+        # "off" declares nothing on every platform, so this is the same
+        # assertion on a machine with no Yama as on one that enforces it.
+        assert event["traceable_by_parent"] is False, event
+
+
+@needs_xdist
+def test_the_configured_policy_is_what_the_worker_declares(distributed):
+    """The ini reaching the process that acts on it.
+
+    Nothing else exercises that end to end: "any" and "off" were only ever
+    reached by calling ``permit_tracing`` directly, so the wiring between the
+    setting and the declaration - which crosses a process boundary and drops
+    the settings that decide it on the way - was carried by nobody.
+
+    The sampler is switched on because that is one of the two things whose
+    presence makes a declaration worth making; without it the right answer is
+    "off" whatever the policy says, which is the test above.
+    """
+    distributed.pytester.makeini(
+        """
+        [pytest]
+        failure_packages = victim
+        failure_tracer = any
+        failure_sample_seconds = 1
+        """
+    )
+    distributed.pytester.makeconftest(INNER_CONFTEST)
+    distributed.pytester.makepyfile(test_quick="def test_one():\n    assert True\n")
+
+    distributed.run("-n", "1", "test_quick.py", timeout=180)
+
+    started = _declarations(distributed.pytester)
+    assert started, "the worker recorded no startup at all"
+    for event in started:
+        assert event["tracer_policy"] == "any", event
