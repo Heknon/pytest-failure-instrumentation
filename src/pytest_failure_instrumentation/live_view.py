@@ -62,7 +62,8 @@ class LiveStackServer(BaseModel):
     #: This run's evidence directory, and the join key to use until there is a
     #: run id - see the module docstring. ``None`` when the run was not writing
     #: evidence at all, in which case ``/workers`` has nothing to report and
-    #: only ``/stack`` is useful.
+    #: ``/stack`` answers only for the serving process itself - the worker pids
+    #: it will speak for are the ones read out of that directory.
     directory: Optional[str] = None
     #: What names that directory. Stable from the first moment of the run,
     #: unlike the run id.

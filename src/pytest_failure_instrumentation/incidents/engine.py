@@ -262,9 +262,11 @@ class IncidentEngine:
         two runs share one, and for runs that follow one another that is
         exactly what it does. Concurrently it is something else: every worker
         is gw0, so the second session's gw0.state overwrites the first's and
-        owner.json names whichever wrote last. The events stay separable
-        because every line carries the run id; the state files do not, and a
-        state file is what says which test a worker is running now.
+        owner.json names whichever wrote last. Both stay separable, because the events carry the run id on every line and
+        the state slot is stamped with it too - a reader that passes the id it
+        expects gets nothing back rather than the other session's answer. What
+        does not survive is the file itself: the loser's slot is overwritten,
+        so its evidence is gone rather than merely rejected.
 
         A build system that exports one PYTEST_RUN_ID for the whole job and
         then runs two suites in parallel gets this without choosing it, which

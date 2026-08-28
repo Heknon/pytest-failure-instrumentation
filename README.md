@@ -801,7 +801,27 @@ reconfigure it.
 
 ### Who may ask
 
-The bind, and a token if you supplied one. On loopback you usually will not:
+Four things, and the token is only one of them.
+
+**The bind.** Loopback by default, and anything else refuses to open without a
+token — see below.
+
+**The `Host` header.** A request naming a host this server never bound is
+refused with 403. That is not about the network, which the bind already
+settles; it is about a browser. A page you visit can re-resolve its own
+hostname to `127.0.0.1`, at which point its origin *is* this server's and the
+same-origin policy stops protecting you. Checking `Host` costs nothing and
+closes that. A bind that is not loopback is exempt, because the address a
+legitimate client outside a container uses is one this process never learns —
+there the token is what stands in for the check.
+
+**Which pids `/stack` will answer for.** This run's: the serving process, plus
+the worker pids read out of the evidence directory. Anything else is 403. The
+server reads any process it has permission to read, so without this a caller
+who got past the bind could walk pids and collect the stack of every process
+you own — and each read pauses its target.
+
+**A token, if you supplied one.** On loopback you usually will not:
 
 ```console
 $ curl localhost:8080/workers
@@ -1132,7 +1152,7 @@ overwhelming majority of what runs.
 | `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
-| `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off` |
+| `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |

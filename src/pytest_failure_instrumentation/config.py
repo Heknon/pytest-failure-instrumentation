@@ -326,9 +326,17 @@ class Settings:
         """The policy this process actually declares, which is usually none.
 
         "off" unless something in this run reads a worker's stack while it is
-        still running, and there are exactly two things that do: the live
-        stack server and the sampler. :attr:`tracer` is consulted only once
-        one of them is on.
+        still running, and there is exactly one thing that does: the live
+        stack server, answering ``/stack?pid=`` when a UI asks. :attr:`tracer`
+        is consulted only once that is on.
+
+        The sampler does not qualify, and it is worth saying why it used to.
+        It pushed frames for every worker it judged stuck, which needed this
+        same declaration - until the judgement turned out to be ``blocked``,
+        the status of any worker under 0.05 cores, so an I/O-bound suite had
+        every healthy worker read on every pass. That half is gone (see
+        :mod:`.sampling`); what is left reads files, asks no worker anything,
+        and needs no permission from the kernel to do it.
 
         Off by default because the declaration is not free and was being made
         by everybody. ``ptrace_scope=1`` is the Ubuntu and Debian default, and
@@ -340,9 +348,9 @@ class Settings:
         process tree, so what was widened is not a formality either - see
         :mod:`.probes.tracing`.
 
-        A worker cannot answer this from what it can see. It is handed neither
-        the server's settings nor the sampler's, deliberately and for reasons
-        of their own (:meth:`as_payload`), so a worker asked to decide would
+        A worker cannot answer this from what it can see. It is handed none of
+        the server's settings, deliberately and for reasons of its own
+        (:meth:`as_payload`), so a worker asked to decide would
         answer "off" for every run with a live view on and the feature would
         be refused by the kernel on the machines it exists for. The controller
         decides once and hands down the answer, and that answer outranks
@@ -350,7 +358,7 @@ class Settings:
         """
         if self.tracer_handed_down is not None:
             return self.tracer_handed_down
-        return self.tracer if self.stack_server or self.sample_seconds > 0 else "off"
+        return self.tracer if self.stack_server else "off"
 
     @property
     def refuses_to_bind_unauthenticated(self) -> bool:

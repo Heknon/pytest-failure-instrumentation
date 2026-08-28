@@ -232,7 +232,7 @@ def test_the_configured_policy_is_what_the_worker_declares(distributed):
     setting and the declaration - which crosses a process boundary and drops
     the settings that decide it on the way - was carried by nobody.
 
-    The sampler is switched on because that is one of the two things whose
+    The stack server is switched on because it is the one thing whose
     presence makes a declaration worth making; without it the right answer is
     "off" whatever the policy says, which is the test above.
     """
@@ -241,7 +241,7 @@ def test_the_configured_policy_is_what_the_worker_declares(distributed):
         [pytest]
         failure_packages = victim
         failure_tracer = any
-        failure_sample_seconds = 1
+        failure_stack_server = true
         """
     )
     distributed.pytester.makeconftest(INNER_CONFTEST)

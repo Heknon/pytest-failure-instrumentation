@@ -290,7 +290,7 @@ def test_a_state_slot_another_run_left_behind_is_not_reported_as_this_worker(evi
     assert described["pid"] is None
     assert described["nodeid"] is None
     assert described["phase"] is None
-    # And through the run view, which is what /workers and the sampler read.
+    # And through the run view, which is what /workers serves.
     assert topology.run(evidence.run)["workers"][0]["pid"] is None
 
 
@@ -301,7 +301,7 @@ def test_another_run_s_beats_are_not_this_run_s_evidence(evidence):
     either way, and "unmeasured" says so. Counting the previous session's
     beats instead dates the silence from *their* last beat, which is however
     long ago they finished - so a worker that started a second ago is reported
-    frozen, with a confident age attached, and the sampler py-spys it for a
+    frozen, with a confident age attached, and a human is sent looking for a
     stack of a stall that is not happening.
     """
     evidence.state("gw0", run_id="run-now")
@@ -462,8 +462,8 @@ def test_a_long_run_does_not_report_every_healthy_worker_as_frozen(tmp_path):
     slower beat reads as frozen. At a thirty-second beat the window holds
     roughly two and a half hours; a twelve-hour test is not an edge case.
 
-    The sampler then acts on that verdict, so the cost is not a wrong label -
-    it is py-spy against every worker on every pass.
+    The cost is a wrong label in the one view that exists to say which
+    worker is in trouble - every healthy worker on a slow beat reported frozen.
     """
     now = time.time()
     root = tmp_path / "run"

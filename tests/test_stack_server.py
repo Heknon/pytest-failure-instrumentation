@@ -567,7 +567,7 @@ def test_two_reads_of_one_target_do_not_race_into_a_permissions_lecture(monkeypa
     Measured: four concurrent reads of one process, three answered and the
     fourth was sent to change a kernel setting that had nothing to do with it.
 
-    And the collision was usually self-inflicted: the sampler reads every stuck
+    And the collision is easy to cause: a UI polling every stuck
     worker on a cadence while the server answers a UI polling /stack for the
     same one.
     """
@@ -850,12 +850,21 @@ def test_the_address_is_written_to_a_file_this_process_created(tmp_path):
     assert json.loads(published.read_text())["port"] == 8080
 
     # And a leftover .part of somebody else's making does not decide the mode
-    # of what gets renamed over the address file.
+    # of what gets renamed over the address file. Asserted as "not the mode
+    # somebody else chose" rather than as one exact number: what this file
+    # holds is a host, a port and a pid, and it is meant to be readable - a UI
+    # runs as another uid often enough that locking it to 0o600 would break
+    # the case a published address exists for. The flags above are about who
+    # may substitute the target, not who may read it.
     published.unlink()
     temporary.touch()
     temporary.chmod(0o666)
     service._publish()
-    assert stat.S_IMODE(published.stat().st_mode) == 0o600
+    mode = stat.S_IMODE(published.stat().st_mode)
+    assert mode != 0o666, "the leftover's mode survived into the address file"
+    assert not mode & stat.S_IWGRP and not mode & stat.S_IWOTH, (
+        f"the address file is writable by somebody else: {mode:#o}"
+    )
 
 
 def test_the_address_is_retracted_when_the_session_stops(tmp_path):

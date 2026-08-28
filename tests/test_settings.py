@@ -404,12 +404,17 @@ def test_a_run_that_reads_no_worker_stacks_declares_no_tracer():
     assert settings_module.Settings().tracer_in_force == "off"
     assert settings_module.Settings(tracer="any").tracer_in_force == "off"
 
-    # The two things that read a worker while it runs, and the only two.
+    # The one thing that reads a worker while it runs, and the only one.
     assert settings_module.Settings(stack_server=True).tracer_in_force == "parent"
     assert (
         settings_module.Settings(tracer="any", stack_server=True).tracer_in_force == "any"
     )
-    assert settings_module.Settings(sample_seconds=5).tracer_in_force == "parent"
+
+    # The sampler is not one of them any more: it pushes statuses read from
+    # files and asks no worker anything, so a run that only samples declares
+    # nothing. This is the assertion that would have to change first if the
+    # frames half ever came back.
+    assert settings_module.Settings(sample_seconds=5).tracer_in_force == "off"
 
     # "off" is still "off" where a reader is watching: the escape hatch has to
     # be one for the case it exists for.
@@ -419,9 +424,9 @@ def test_a_run_that_reads_no_worker_stacks_declares_no_tracer():
 def test_the_worker_is_handed_the_answer_it_has_no_way_to_reach():
     """Where the decision is made, and why it cannot be made at the other end.
 
-    The payload deliberately carries neither the stack server's settings nor
-    the sampler's - a worker that read them could start its own, which is the
-    collision the design exists to prevent - so the question "is anybody going
+    The payload deliberately carries none of the stack server's settings - a
+    worker that read them could start its own, which is the collision the
+    design exists to prevent - so the question "is anybody going
     to read my stack" is one a worker cannot answer. The controller answers it
     once and sends the answer rather than the evidence for it.
     """

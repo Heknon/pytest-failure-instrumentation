@@ -1169,7 +1169,14 @@ class StackService:
             descriptor = os.open(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
+                # Ordinary data, and readable as such. What this file holds is a
+                # host, a port and a pid; the flags above are about who may
+                # *substitute* the target, not who may read it. An 0o600 here
+                # would fix the symlink and quietly break a UI running as
+                # another uid, which is the case a published address exists to
+                # serve - see the module docstring on why the secret was taken
+                # out of this file rather than the file locked down.
+                0o644,
             )
             # Bytes, so that nothing translates a newline on Windows and
             # changes the length of what a reader is about to parse.

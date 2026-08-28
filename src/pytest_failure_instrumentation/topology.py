@@ -327,9 +327,9 @@ def _interval(events: list[dict[str, Any]], state_path: Optional[Path] = None) -
     enough to push that record out of the window, the cadence fell back to the
     default and every healthy worker on a slower beat read as frozen. At a
     thirty-second beat the window holds about two and a half hours, so a long
-    test is not an edge case here, it is the case. Worse, the sampler acts on
-    that verdict: every worker looking frozen is every worker read with py-spy,
-    on every pass.
+    test is not an edge case here, it is the case. And a wrong verdict here is
+    read by a human watching the run: every healthy worker labelled frozen, in
+    the one view that exists to say which worker is in trouble.
 
     So the tail is asked first - it is already in hand and holds the answer for
     any run short enough - and the head of the file is read only when the tail

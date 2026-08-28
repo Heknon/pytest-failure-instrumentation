@@ -72,7 +72,8 @@ PERMISSION_HINTS = {
 
 #: One reader at a time per target, because two cannot suspend one process and
 #: the loser's errno is indistinguishable from a permission problem. Without
-#: this the sampler - which reads every stuck worker on a cadence - raced the
+#: this two UIs polling the same wedged worker, or a UI and the stall probe,
+#: raced the
 #: server answering a UI polling /stack for the same worker, and the collision
 #: was reported as a ptrace policy the user was then invited to go and change.
 #:
