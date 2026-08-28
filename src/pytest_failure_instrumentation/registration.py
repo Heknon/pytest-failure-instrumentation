@@ -48,6 +48,7 @@ import pytest
 
 from . import hookspec
 from .config import (
+    SECRET_SETTINGS,
     Settings,
     advise,
     pytest_faulthandler_timeout,
@@ -222,11 +223,34 @@ def _built(build: Any, what: str) -> Any:
 
 
 def _difference(existing: Settings, wanted: Settings) -> str:
-    changed = [
-        f"{name}={getattr(wanted, name)!r} (in force: {getattr(existing, name)!r})"
-        for name in vars(type(existing)).get("__dataclass_fields__", {})
-        if getattr(existing, name) != getattr(wanted, name)
-    ]
+    """What the second ``install`` asked for that the first did not, in words.
+
+    Every field is printed with both values, because "packages differ" tells
+    the reader nothing they can act on - except the fields in
+    :data:`~.config.SECRET_SETTINGS`, which are reported by name alone.
+
+    The exception is the whole reason this has a docstring.
+    ``stack_server_token`` is a field like any other, so two frameworks that
+    disagreed about the token put both the offered one and the one in force
+    into a ``FailureInstrumentationWarning`` - which pytest reproduces in the
+    warnings summary, and CI keeps in the job log for anyone with read access
+    to the build. Nothing else in this package ever writes that value down:
+    it is supplied rather than minted precisely so that it need not be, and a
+    warning about a misconfiguration is not a reason to make an exception.
+
+    What the reader needs is that the two calls disagree about the token, and
+    they get that. The values would only tell them which of two secrets they
+    already hold is in force, which is not worth publishing either one for.
+    """
+    changed = []
+    for name in vars(type(existing)).get("__dataclass_fields__", {}):
+        in_force, asked_for = getattr(existing, name), getattr(wanted, name)
+        if in_force == asked_for:
+            continue
+        if name in SECRET_SETTINGS:
+            changed.append(f"a different {name} (not shown - it is a credential)")
+        else:
+            changed.append(f"{name}={asked_for!r} (in force: {in_force!r})")
     return ", ".join(changed) or "the same settings"
 
 

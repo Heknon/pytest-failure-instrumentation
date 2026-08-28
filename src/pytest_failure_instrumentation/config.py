@@ -53,6 +53,18 @@ LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 #: :func:`_add_command_line_options` for why there is deliberately no ini.
 TOKEN_ENV = "PYTEST_CALLSTACK_TOKEN"
 
+#: The settings whose *value* is a credential, so anything that prints a
+#: setting prints the name and stops there - see
+#: :func:`.registration._difference`, which is where one of these reached a
+#: warnings summary and a CI log.
+#:
+#: A set rather than the one ``if name == "stack_server_token"`` it would take
+#: today, because the cost of the two spellings is the same and only one of
+#: them keeps holding: a second secret field added later is redacted by
+#: appearing here, rather than by whoever adds it remembering every place a
+#: setting gets formatted.
+SECRET_SETTINGS = frozenset({"stack_server_token"})
+
 #: Below this the heartbeat thread costs more than it measures. Clamped on the
 #: object rather than where a setting is read, because the controller decides
 #: what counts as a stale beat from the same number - and two different
@@ -491,9 +503,12 @@ def add_options(parser: pytest.Parser) -> None:
     parser.addini(
         "failure_stack_server",
         help="Serve the live stack of any local process over HTTP, for a UI "
-        "watching a run. One server per host, shared by every pytest session "
-        "on it; reading a process other than the server's own needs py-spy "
-        "installed. Loopback only.",
+        "watching a run. Each session serves its own on a port drawn for it, "
+        "shared with nobody, unless failure_stack_server_port names one - a "
+        "named port is shared with every other session on the host. Binds "
+        "loopback unless failure_stack_server_host says otherwise, and off "
+        "loopback a token is required. Reading a process other than the "
+        "server's own needs py-spy installed.",
         default="false",
     )
     parser.addini(
@@ -553,6 +568,20 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
     ``PYTEST_CALLSTACK_TOKEN``, which is how a secret reaches a container, a
     CI job and a shell - and neither leaves a file behind for this package to
     have opinions about the permissions of.
+
+    **The two are not equally private, though, and the flag is the weaker
+    one.** A command line is public on a shared machine: ``/proc/<pid>/cmdline``
+    is world-readable on Linux, so any other account can lift the token out of
+    ``ps -eww`` for as long as the run lasts - on exactly the machine a token
+    is worth having. An environment is not: ``/proc/<pid>/environ`` is 0400,
+    readable by the owner alone. Shell history and an echoed CI command keep
+    argv afterwards as well, and keep it after the run is over.
+
+    The flag stays, because runs already use it and a credential that stops
+    being accepted is a broken deployment rather than a fixed one. What it
+    does not do any more is leak quietly: the help above says so, and
+    :func:`resolve` advises once per run when a token actually arrives that
+    way, naming the variable that does not have the problem.
     """
     group = parser.getgroup("failure-instrumentation")
     group.addoption(
@@ -575,9 +604,13 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         default=None,
         metavar="SECRET",
         help="Require this bearer token on every live-stack endpoint but "
-        "/identity. Also read from PYTEST_CALLSTACK_TOKEN. Never written to "
-        "disk. Required to bind anything but loopback; omit for no "
-        "authentication, which is the default on loopback.",
+        "/identity. Never written to disk. Required to bind anything but "
+        "loopback; omit for no authentication, which is the default on "
+        "loopback. Prefer PYTEST_CALLSTACK_TOKEN, which is read the same way: "
+        "a token given here is in this process's command line, which any other "
+        "user of the machine can read (ps -eww, /proc/<pid>/cmdline) for as "
+        "long as the run lasts, and which shell history and CI logs keep "
+        "afterwards. A process's environment is readable only by its owner.",
     )
 
 
@@ -657,6 +690,38 @@ def pytest_faulthandler_timeout(config: pytest.Config) -> float:
         return 0.0
 
 
+def _warn_if_the_token_was_typed_where_others_can_read_it() -> None:
+    """``--callstack-token`` works and leaks; both halves are worth saying.
+
+    A command line is not private. On Linux ``/proc/<pid>/cmdline`` is
+    world-readable, and a controller lives for the length of the run, so any
+    other account on the machine can take the token straight out of ``ps
+    -eww`` - on the shared machine that is the reason to be running with a
+    token at all. ``PYTEST_CALLSTACK_TOKEN`` reaches the same field by the
+    same code path and does not have the problem: ``/proc/<pid>/environ`` is
+    0400 and only the owner may read it. Shell history and an echoed CI
+    command keep argv too, and keep it after the run has ended.
+
+    Said as advice rather than a refusal, because the flag is documented, is
+    in use, and is the right thing on a machine with one user on it. What is
+    wrong is walking into the exposure without being told, so this fires when
+    the token actually arrives that way - once per run, on the controller, and
+    never on the runs that use the environment variable.
+
+    The value is deliberately absent from the message. A warning about a
+    credential being readable that quotes the credential into the warnings
+    summary and the CI log has published it a second time.
+    """
+    advise(
+        "--callstack-token puts the token in this run's command line, which is "
+        "not private: any other user of this machine can read it out of ps -eww "
+        "(or /proc/<pid>/cmdline) for as long as the run lasts, and shell "
+        f"history and CI logs keep it afterwards. {TOKEN_ENV} is read the same "
+        "way and does not leak - a process's environment is readable only by "
+        "its owner. Nothing is refused: the token given is in force",
+    )
+
+
 def resolve(config: pytest.Config) -> Settings:
     """The settings this process should use, before anyone overrides them.
 
@@ -684,6 +749,11 @@ def resolve(config: pytest.Config) -> Settings:
     # exported PYTEST_CALLSTACK_TOKEN sitting in a shell profile must not turn
     # a listening socket on for every pytest run in that shell.
     chosen_token = _option(config, "callstack_token")
+    # Which of the two the token came from has to be settled here, because it
+    # is the last place that knows: a Settings carries the value and not its
+    # provenance, and the two forms are not equally private - see
+    # _warn_if_the_token_was_typed_where_others_can_read_it.
+    from_the_command_line = bool(str(chosen_token or "").strip())
     if chosen_token is None:
         chosen_token = os.environ.get(TOKEN_ENV)
 
@@ -692,6 +762,12 @@ def resolve(config: pytest.Config) -> Settings:
         return Settings.from_payload(
             dict(handed_down), worker_count=worker_count, run_id=run_id
         )
+
+    # After the worker's early return, so this is said once by the controller
+    # rather than once per worker. A worker is handed the settings and never
+    # the token anyway, but it does parse the same argv.
+    if from_the_command_line:
+        _warn_if_the_token_was_typed_where_others_can_read_it()
 
     return Settings(
         directory=Path(_ini(config, "failure_directory", "") or DEFAULT_DIRECTORY),

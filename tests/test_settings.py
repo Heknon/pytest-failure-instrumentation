@@ -99,33 +99,108 @@ def test_a_worker_takes_the_run_id_the_controller_pushed_down():
     assert resolve(FakeConfig()).run_id is None
 
 
+class RecordingParser:
+    """Both halves of what add_options registers, with the help kept.
+
+    The command-line options go to a group, and a fake that cannot hand one
+    out would make a test pass by never reaching them. The help text is
+    recorded because it is not decoration: it is the whole of what ``pytest
+    --help`` shows, so a sentence that stopped being true there is a sentence
+    nobody has any other way to catch.
+    """
+
+    def __init__(self) -> None:
+        self.ini: dict[str, str] = {}
+        self.command_line: dict[str, str] = {}
+
+    def addini(self, name, help, type=None, default=None):  # noqa: A002
+        self.ini[name] = help
+
+    def getgroup(self, name):
+        return self
+
+    def addoption(self, name, **kwargs):
+        self.command_line[name] = kwargs.get("help", "")
+
+
+def _registered() -> RecordingParser:
+    """Everything ``add_options`` registers, as pytest would have it."""
+    parser = RecordingParser()
+    settings_module.add_options(parser)
+    return parser
+
+
+def _settings_named_in_the_readme_table() -> set[str]:
+    """The names in the README's settings table, read out of the table.
+
+    Found from this file rather than from the package, the way the incident
+    kinds are checked against the hookspec and the triage skill: the tests
+    only ever ship with the source, while the package is also run out of a
+    built wheel in site-packages with no README above it.
+    """
+    readme = Path(__file__).resolve().parent.parent / "README.md"
+    if not readme.exists():
+        pytest.skip("the README is not part of this checkout")
+
+    # The table, and nothing after it: the prose below it names settings too,
+    # and a setting explained there but missing from the table is exactly the
+    # drift this is looking for.
+    table = readme.read_text(encoding="utf-8").partition("\n## Settings\n")[2]
+    return set(re.findall(r"^\|\s*`(failure_\w+)`", table.partition("\n## ")[0], re.MULTILINE))
+
+
 def test_every_setting_in_the_readme_table_is_registered():
     """The table is how anybody finds these, so a setting that drifts out of it
-    is a setting nobody can turn on."""
-    registered: list[str] = []
+    is a setting nobody can turn on.
 
-    class Parser:
-        """Both halves of what add_options registers. The command-line options
-        go to a group, and a fake that cannot hand one out would make this test
-        pass by never reaching them."""
+    Which means reading the table. This asserted against ``DEFAULTS`` alone -
+    a dict a few lines up in this same file - so what it actually guarded was
+    that two lists in the source agreed with each other, and a setting added
+    to ``config.py`` and to ``DEFAULTS`` and documented nowhere passed it. The
+    README is now read the way ``test_models`` reads the hookspec table and the
+    triage skill, and for the same reason: the copy that goes stale unnoticed
+    is always the one no test opens.
 
-        def addini(self, name, help, type=None, default=None):  # noqa: A002
-            registered.append(name)
-
-        def getgroup(self, name):
-            return self
-
-        def addoption(self, name, **kwargs):
-            command_line.append(name)
-
-    command_line: list[str] = []
-    settings_module.add_options(Parser())
-    assert sorted(command_line) == [
+    ``DEFAULTS`` is still compared, because it is what the fake config in this
+    module answers ``getini`` from - a setting missing from it makes every
+    other test here raise KeyError rather than fail with a reason.
+    """
+    parser = _registered()
+    assert sorted(parser.command_line) == [
         "--callstack-host",
         "--callstack-port",
         "--callstack-token",
     ]
-    assert sorted(registered) == sorted(DEFAULTS)
+    assert sorted(parser.ini) == sorted(DEFAULTS)
+    assert sorted(parser.ini) == sorted(_settings_named_in_the_readme_table())
+
+
+def test_the_stack_server_help_describes_the_server_that_ships():
+    """``pytest --help`` is where a CI operator reads what this switches on,
+    and what it read there was one design old.
+
+    It promised "one server per host, shared by every pytest session on it"
+    and "loopback only". Neither survived: the default port is *drawn*, so a
+    session serves itself and shares with nobody unless a port is named, and
+    ``failure_stack_server_host`` binds whatever it is given - 0.0.0.0 is the
+    documented container configuration, refused only when no token is
+    supplied. This is the one place in the package that promised a loopback
+    bind, which is exactly the promise an operator would have planned around.
+    """
+    help_text = _registered().ini["failure_stack_server"]
+    assert "loopback only" not in help_text.lower()
+    assert "one server per host" not in help_text.lower()
+    # And says the two true things in their place.
+    assert "drawn for it" in help_text
+    assert "failure_stack_server_host" in help_text
+
+
+def test_the_token_option_says_that_a_command_line_is_readable():
+    """The help is what ``pytest --help`` shows, so it is where somebody about
+    to type a secret into argv can still be told not to."""
+    help_text = _registered().command_line["--callstack-token"]
+    assert settings_module.TOKEN_ENV in help_text
+    assert "ps -eww" in help_text and "/proc/<pid>/cmdline" in help_text
 
 
 def test_the_shipped_defaults_leave_a_stall_something_to_read():
@@ -226,16 +301,21 @@ def test_naming_either_one_on_the_command_line_switches_the_server_on():
     assert not resolve(FakeConfig()).stack_server
 
 
-def test_binding_off_loopback_says_what_it_exposes():
+def test_binding_off_loopback_says_what_it_exposes(monkeypatch):
     """Right for a container whose UI is outside it, wrong on a shared machine,
     and only the person who typed it can tell which this is.
 
     Only reachable with a token, because without one this configuration is
     refused rather than warned about - nobody means to serve every local
     process's stack to a network, so there is no decision there to state.
+
+    The token comes from the environment rather than the command line so that
+    the bind is the only thing this run is advised about; argv carries its own
+    warning now, which has nothing to do with what is being asserted here.
     """
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
     with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
-        resolve(FakeConfig({"callstack_host": "0.0.0.0", "callstack_token": "s3cret"}))
+        resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
 
 
 def test_loopback_by_any_of_its_names_is_not_an_exposure():
@@ -294,13 +374,14 @@ def test_the_token_comes_from_the_command_line_or_the_environment(monkeypatch):
     )
 
     # The command line outranks it, which is what lets one run differ from the
-    # shell it was started in.
-    assert (
-        resolve(
+    # shell it was started in - and is advised against on its own account,
+    # because argv is readable by everyone on the machine and an environment
+    # is not. See test_a_token_on_the_command_line_says_who_else_can_read_it.
+    with pytest.warns(FailureInstrumentationWarning, match="command line"):
+        from_the_command_line = resolve(
             FakeConfig({"callstack_port": 8080, "callstack_token": "from-the-cli"})
-        ).stack_server_token
-        == "from-the-cli"
-    )
+        )
+    assert from_the_command_line.stack_server_token == "from-the-cli"
 
 
 def test_a_token_alone_does_not_start_a_server(monkeypatch):
@@ -341,6 +422,61 @@ def test_loopback_needs_no_token_and_is_not_refused(monkeypatch):
         resolved = resolve(FakeConfig({"callstack_host": name}))
         assert not resolved.refuses_to_bind_unauthenticated
         assert resolved.stack_server_token == ""
+
+
+def test_a_token_on_the_command_line_says_who_else_can_read_it(monkeypatch):
+    """``--callstack-token SECRET`` hands the token to every other account on
+    the machine, which is the machine the token exists to protect.
+
+    A process's argv is world-readable - ``/proc/<pid>/cmdline`` on Linux,
+    ``ps -eww`` anywhere - and a controller lives as long as the run, so a
+    local user has the length of the suite to read it out. The environment
+    variable reaches the same field and does not: ``/proc/<pid>/environ`` is
+    0400. The flag is not refused, because runs already use it and it is
+    unobjectionable where there is one user; it just no longer happens
+    silently.
+    """
+    monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
+    with pytest.warns(FailureInstrumentationWarning) as raised:
+        resolved = resolve(FakeConfig({"callstack_port": 8080, "callstack_token": "s3cret"}))
+
+    said = "\n".join(str(entry.message) for entry in raised)
+    assert settings_module.TOKEN_ENV in said, said
+    # Advice about a credential being readable that quotes the credential has
+    # published it a second time, into the warnings summary and the CI log.
+    assert "s3cret" not in said
+    # Nothing is refused: the token asked for is the token in force.
+    assert resolved.stack_server_token == "s3cret"
+
+
+def test_a_token_from_the_environment_is_advised_about_nothing(monkeypatch):
+    """The form that does not leak is the one nobody should be nagged about -
+    advice that fires on the right answer as well as the wrong one is noise,
+    and this fires once per run."""
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        resolve(FakeConfig({"callstack_port": 8080}))
+    assert [str(entry.message) for entry in raised] == []
+
+
+def test_a_worker_does_not_repeat_what_the_controller_already_said(monkeypatch):
+    """A worker parses the same argv as its controller, so the advice would
+    otherwise arrive once per worker - eight copies of it under ``-n8``, which
+    is how a real caveat turns into something people filter out."""
+    monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
+
+    class Worker(FakeConfig):
+        workerinput = {
+            "workerid": "gw1",
+            "workercount": 2,
+            "failure_settings": settings_module.Settings().as_payload(),
+        }
+
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
+        resolve(Worker({"callstack_port": 8080, "callstack_token": "s3cret"}))
+    assert [str(entry.message) for entry in raised] == []
 
 
 def test_the_sampler_cadence_has_a_floor_like_its_sibling():
