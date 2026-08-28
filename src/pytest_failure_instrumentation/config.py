@@ -64,8 +64,9 @@ MIN_HEARTBEAT_INTERVAL = 1.0
 #: setting's clothes.
 MIN_SAMPLE_SECONDS = 1.0
 
-#: Accepted values for ``failure_tracer``; anything else falls back to the
-#: default rather than failing a run over a typo in an ini file.
+#: Accepted values for ``failure_tracer``. Anything else falls back to the
+#: default rather than failing a run over a typo in an ini file - and says so,
+#: which is the part this had missing: see :meth:`Settings._usable_tracer`.
 TRACER_POLICIES = ("parent", "any", "off")
 
 
@@ -139,12 +140,21 @@ class Settings:
     slow_test_seconds: float = 20.0
     stall_seconds: float = 300.0
     stack_probe: bool = True
-    #: Who a worker declares may read its stack on Linux, where Yama restricts
-    #: it. "parent" nominates the controller and covers a session reading its
-    #: own workers, which is the default mode; "any" is what a *shared* server
-    #: needs, since another session's reader is no descendant of this
-    #: controller; "off" declares nothing. Nothing outside Linux consults it.
+    #: Which declaration a worker makes on Linux, where Yama restricts who may
+    #: read a process. "parent" nominates the controller and covers a session
+    #: reading its own workers, which is how the live view is used by default;
+    #: "any" is what a *shared* server needs, since another session's reader is
+    #: no descendant of this controller; "off" declares nothing. Nothing
+    #: outside Linux consults it.
+    #:
+    #: This says *which* declaration a run would make, not that one is made:
+    #: whether anything is declared at all is :attr:`tracer_in_force`.
     tracer: str = "parent"
+    #: The answer :attr:`tracer_in_force` was given by the controller, or None
+    #: where nothing has been handed down and this process must work it out
+    #: for itself. Only ever set by :meth:`as_payload`, which is the one place
+    #: that knows both halves of the question.
+    tracer_handed_down: Optional[str] = None
     #: How often to push a ``pytest_failure_worker_sample`` while the run is
     #: going. 0 is off, and is the default: this is the only hook here that
     #: fires when nothing is wrong, so it is the only one a run pays for
@@ -191,10 +201,11 @@ class Settings:
             "sample_seconds",
             0.0 if self.sample_seconds <= 0 else max(MIN_SAMPLE_SECONDS, float(self.sample_seconds)),
         )
+        object.__setattr__(self, "tracer", self._usable_tracer())
         object.__setattr__(
             self,
-            "tracer",
-            self.tracer if self.tracer in TRACER_POLICIES else "parent",
+            "tracer_handed_down",
+            self.tracer_handed_down if self.tracer_handed_down in TRACER_POLICIES else None,
         )
         object.__setattr__(self, "stack_server_host", str(self.stack_server_host))
         object.__setattr__(
@@ -204,6 +215,35 @@ class Settings:
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
         self._warn_if_the_stack_server_is_reachable_from_off_the_machine()
+
+    def _usable_tracer(self) -> str:
+        """The policy as written, or the default with the reason said out loud.
+
+        Still a fallback and not an error: a typo in an ini file is not worth
+        ending a run over, which is the rule the whole module keeps. What it
+        was missing is the sentence. Every other unusable value here goes
+        through :func:`advise`; this one coerced in silence, and it is the one
+        setting where coercing in silence hands out a permission nobody asked
+        for - ``failure_tracer = none`` is what somebody reaches for when they
+        want no ptrace declaration made, it is not one of the three words, and
+        it resolved to "parent". They believed they had withheld the
+        permission and had granted it.
+
+        Case and surrounding space are not typos and are not reported as
+        such - ``resolve`` already folds them for the ini path, and a
+        framework passing "OFF" to :func:`.install` means the same thing it
+        would have meant in an ini file.
+        """
+        policy = str(self.tracer).strip().lower()
+        if policy in TRACER_POLICIES:
+            return policy
+        advise(
+            f"failure_tracer={self.tracer!r} is not one of "
+            f"{', '.join(TRACER_POLICIES)}, so it falls back to 'parent' - which "
+            "grants the permission rather than withholding it. 'off' is how a "
+            "worker is told to declare nothing",
+        )
+        return "parent"
 
     def _warn_if_a_stall_is_judged_before_it_has_evidence(self) -> None:
         """The watchdog has to have fired before the stall is assessed.
@@ -282,6 +322,37 @@ class Settings:
         )
 
     @property
+    def tracer_in_force(self) -> str:
+        """The policy this process actually declares, which is usually none.
+
+        "off" unless something in this run reads a worker's stack while it is
+        still running, and there are exactly two things that do: the live
+        stack server and the sampler. :attr:`tracer` is consulted only once
+        one of them is on.
+
+        Off by default because the declaration is not free and was being made
+        by everybody. ``ptrace_scope=1`` is the Ubuntu and Debian default, and
+        every worker of every run on those machines issued
+        ``prctl(PR_SET_PTRACER, <controller pid>)`` at startup - so ``pip
+        install --upgrade`` followed by ``pytest -n8`` widened who may read a
+        test process, for a feature the user had not switched on. Yama admits
+        the nominated pid *and its descendants*, which is the run's whole
+        process tree, so what was widened is not a formality either - see
+        :mod:`.probes.tracing`.
+
+        A worker cannot answer this from what it can see. It is handed neither
+        the server's settings nor the sampler's, deliberately and for reasons
+        of their own (:meth:`as_payload`), so a worker asked to decide would
+        answer "off" for every run with a live view on and the feature would
+        be refused by the kernel on the machines it exists for. The controller
+        decides once and hands down the answer, and that answer outranks
+        anything this process can see for itself.
+        """
+        if self.tracer_handed_down is not None:
+            return self.tracer_handed_down
+        return self.tracer if self.stack_server or self.sample_seconds > 0 else "off"
+
+    @property
     def refuses_to_bind_unauthenticated(self) -> bool:
         """Whether this configuration asks for an open port on the network.
 
@@ -340,9 +411,13 @@ class Settings:
             "slow_test_seconds": self.slow_test_seconds,
             "stall_seconds": self.stall_seconds,
             "stack_probe": self.stack_probe,
-            # Handed down: it is the *worker* that makes the declaration, and
-            # only the controller was told which mode this run is in.
-            "tracer": self.tracer,
+            # The declaration in force, resolved here rather than there. It
+            # is the worker that makes it and the controller that knows
+            # whether anybody is going to read the result - the two settings
+            # that decide it are absent below, so a worker left to judge for
+            # itself would decline for every run with a live view on. What
+            # travels is the answer, not the evidence for it.
+            "tracer_handed_down": self.tracer_in_force,
             # Sampling is absent for the same reason as the stack server below:
             # it runs on the controller, over every worker at once, and a
             # worker that read it would sample itself and its siblings.

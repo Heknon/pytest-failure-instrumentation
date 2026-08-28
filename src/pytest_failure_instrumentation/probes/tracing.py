@@ -14,12 +14,24 @@ common Linux configuration there is, for a run reading nothing but its own
 processes.
 
 ``PR_SET_PTRACER`` is the exception Yama provides for exactly this: a process
-may nominate a pid whose descendants are allowed to trace it. A worker
-nominates its parent - the controller - so the controller's own py-spy is
-permitted and nothing else on the machine gains anything. ``PR_SET_PTRACER_ANY``
-would also work and is what most projects reach for; it is not used here
-because it opens the process to every uid that could already ptrace, which is a
-much larger promise than this feature needs.
+nominates a pid, and that pid *and every descendant of it* may then trace it. A
+worker nominates its parent - the controller - which is what admits the
+controller's own py-spy.
+
+Be exact about what else it admits, because the reader it exists for is not the
+extent of it. The controller's descendants are the entire process tree of the
+run: every other worker, and any subprocess a test spawns while the declaration
+stands, for as long as it runs under a uid that could ptrace at all. That is
+wider than the one read being paid for, and it is why the declaration is made
+only where something is actually going to read a worker's stack rather than on
+every run - see ``Settings.tracer_in_force``, which resolves that on the
+controller and hands each worker the answer.
+
+``PR_SET_PTRACER_ANY`` is wider again: it drops the ancestry requirement
+altogether, so anything the uid could already ptrace may read the process. It
+is what the "any" policy below declares, and it is not the default - a *shared*
+server is the one case that needs it, because that reader is no descendant of
+this run's controller.
 
 The call is a no-op wherever it is not needed. Kernels without Yama answer
 EINVAL, other platforms never call it, and a failure to obtain the exception
@@ -63,10 +75,11 @@ def ptrace_scope() -> Optional[int]:
 
 #: What a worker may declare. "parent" nominates the controller, whose
 #: descendants include the py-spy it spawns - enough for a session to read its
-#: own workers, which is the default mode. "any" drops the relationship
-#: requirement, which is what a *shared* server needs: another session's
-#: py-spy is no descendant of this session's controller. "off" declares
-#: nothing and leaves the kernel's answer as it stands.
+#: own workers, which is how the live view is used by default. "any" drops the
+#: relationship requirement, which is what a *shared* server needs: another
+#: session's py-spy is no descendant of this session's controller. "off"
+#: declares nothing and leaves the kernel's answer as it stands, which is what
+#: a run with nothing reading worker stacks declares - most runs.
 POLICIES = ("parent", "any", "off")
 
 

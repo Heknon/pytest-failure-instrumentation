@@ -116,7 +116,14 @@ class WorkerRecorder:
         # live-stack read of this worker is refused wherever Yama enforces
         # ptrace_scope=1, because the reader is a *sibling* rather than an
         # ancestor - see probes.tracing.
-        traceable = tracing.permit_tracing(settings.tracer)
+        #
+        # The policy in force, which the controller resolved and this process
+        # obeys rather than judges. It is "off" for every run that reads no
+        # worker stacks - which is nearly all of them, and which used to widen
+        # ptrace here anyway, on every Linux machine that installed this. The
+        # worker has not been told enough to reach that answer itself, on
+        # purpose; see Settings.tracer_in_force.
+        traceable = tracing.permit_tracing(settings.tracer_in_force)
 
         self.events.record(
             "worker_start",
@@ -127,7 +134,10 @@ class WorkerRecorder:
             # Recorded because it is the difference between "no stack" and
             # "no stack, and here is the reason", and it is only knowable here.
             traceable_by_parent=traceable,
-            tracer_policy=settings.tracer,
+            # What was declared, not what was configured: on a run with
+            # nothing reading stacks those differ, and the reader of this line
+            # is asking about the process it names.
+            tracer_policy=settings.tracer_in_force,
         )
         if settings.watchdog and self.faulthandler_timeout > 0:
             self.events.record(

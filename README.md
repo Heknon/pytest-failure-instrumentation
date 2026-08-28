@@ -997,13 +997,23 @@ controller but py-spy, which the controller spawns. py-spy and a worker are
 both children of the controller, so they are siblings, and a sibling is not an
 ancestor.
 
-Every worker therefore nominates its parent as a permitted tracer at startup,
-via `prctl(PR_SET_PTRACER, <controller pid>)` — the exception Yama provides for
-exactly this. That covers whatever the controller spawns to do the reading and
-nothing else on the machine; `PR_SET_PTRACER_ANY` would also work and is not
-used, because it opens the process to every uid that could already ptrace.
-`worker_start` records whether the exception was granted, so a refused read has
-an answer beside it rather than only a message.
+A worker therefore nominates its parent as a permitted tracer at startup, via
+`prctl(PR_SET_PTRACER, <controller pid>)` — the exception Yama provides for
+exactly this. `worker_start` records whether it was granted, so a refused read
+has an answer beside it rather than only a message.
+
+Yama admits the nominated pid **and every descendant of it**, so this is wider
+than "the controller's py-spy may read this worker". The controller's
+descendants are the whole process tree of the run: every other worker, and any
+subprocess a test spawns while the declaration stands. The reader it exists for
+is one of them and is not the only one.
+
+**So the declaration is only made where something is going to read a worker's
+stack** — the live stack server, or the sampler (`failure_sample_seconds`) —
+and is `off` on every run where neither is on, which is most runs. The
+controller resolves that, being the only process that can see either, and hands
+each worker the answer; a worker never judges it for itself. `failure_tracer`
+says *which* declaration such a run makes, not that one is made.
 
 A *named* port shared across sessions still reads only the workers of the
 session hosting it: another session's workers nominated *their* controller, not
