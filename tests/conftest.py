@@ -80,17 +80,62 @@ def break_pytest():
 class Runner:
     def __init__(self, pytester: pytest.Pytester) -> None:
         self.pytester = pytester
-        #: What the inner run itself reported, for the cases where the point is
-        #: that the failure stayed inside the process.
-        self.result: Any = None
+        self._result: Any = None
+        #: The arguments and deadline of a run that never came back, or None.
+        #: Kept so that :attr:`result` can say that rather than hand out the
+        #: nothing it has.
+        self._timed_out: Any = None
+
+    @property
+    def result(self) -> Any:
+        """What the inner run itself reported, for the cases where the point is
+        that the failure stayed inside the process.
+
+        A run that outlives its timeout reports nothing, and every test that
+        reads this then died on ``'NoneType' object has no attribute 'stderr'``
+        - which names neither the timeout nor the run that hit it. A macOS
+        cell spent a CI cycle on that. The cases where a wedged worker *is*
+        the point read incidents off disk and never touch this, so arriving
+        here with nothing means a run that was meant to finish did not, and
+        that is worth saying in those words.
+        """
+        if self._result is None and self._timed_out is not None:
+            arguments, timeout = self._timed_out
+            pytest.fail(
+                f"the inner pytest run did not finish within {timeout}s and so "
+                f"reported nothing to assert on.\n  pytest "
+                f"{' '.join(str(argument) for argument in arguments)}"
+                f"{self._what_it_managed_to_say()}"
+            )
+        return self._result
+
+    def _what_it_managed_to_say(self) -> str:
+        """The tail of a timed-out run's own output, if pytester left any.
+
+        Without it a timeout is only a number: the interesting question is
+        always whether the run hung or was merely slow, and the last lines it
+        printed are what separate those.
+        """
+        parts = []
+        for name in ("stdout", "stderr"):
+            path = self.pytester.path / name
+            try:
+                tail = path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+            except OSError:
+                continue
+            if tail:
+                parts.append(f"\n  --- its {name} (last {len(tail)} lines) ---\n    " + "\n    ".join(tail))
+        return "".join(parts)
 
     def run(self, *arguments: str, timeout: float = 300.0) -> list[Incident]:
         try:
-            self.result = self.pytester.runpytest_subprocess(*arguments, timeout=timeout)
+            self._result = self.pytester.runpytest_subprocess(*arguments, timeout=timeout)
         except self.pytester.TimeoutExpired:  # type: ignore[attr-defined]
             # A wedged worker is the point of some of these; the incident is
-            # already on disk by then.
-            pass
+            # already on disk by then, and those tests read incidents rather
+            # than result. Recorded so that a test which does read result says
+            # the run timed out instead of dying on the None left behind.
+            self._timed_out = (arguments, timeout)
         return self.incidents()
 
     def incidents(self) -> list[Incident]:
