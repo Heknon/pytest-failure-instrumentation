@@ -503,9 +503,12 @@ def add_options(parser: pytest.Parser) -> None:
     parser.addini(
         "failure_stack_server",
         help="Serve the live stack of any local process over HTTP, for a UI "
-        "watching a run. One server per host, shared by every pytest session "
-        "on it; reading a process other than the server's own needs py-spy "
-        "installed. Loopback only.",
+        "watching a run. Each session serves its own on a port drawn for it, "
+        "shared with nobody, unless failure_stack_server_port names one - a "
+        "named port is shared with every other session on the host. Binds "
+        "loopback unless failure_stack_server_host says otherwise, and off "
+        "loopback a token is required. Reading a process other than the "
+        "server's own needs py-spy installed.",
         default="false",
     )
     parser.addini(

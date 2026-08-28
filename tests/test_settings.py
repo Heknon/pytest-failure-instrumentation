@@ -175,6 +175,26 @@ def test_every_setting_in_the_readme_table_is_registered():
     assert sorted(parser.ini) == sorted(_settings_named_in_the_readme_table())
 
 
+def test_the_stack_server_help_describes_the_server_that_ships():
+    """``pytest --help`` is where a CI operator reads what this switches on,
+    and what it read there was one design old.
+
+    It promised "one server per host, shared by every pytest session on it"
+    and "loopback only". Neither survived: the default port is *drawn*, so a
+    session serves itself and shares with nobody unless a port is named, and
+    ``failure_stack_server_host`` binds whatever it is given - 0.0.0.0 is the
+    documented container configuration, refused only when no token is
+    supplied. This is the one place in the package that promised a loopback
+    bind, which is exactly the promise an operator would have planned around.
+    """
+    help_text = _registered().ini["failure_stack_server"]
+    assert "loopback only" not in help_text.lower()
+    assert "one server per host" not in help_text.lower()
+    # And says the two true things in their place.
+    assert "drawn for it" in help_text
+    assert "failure_stack_server_host" in help_text
+
+
 def test_the_shipped_defaults_leave_a_stall_something_to_read():
     """These two settings look independent and are not.
 
