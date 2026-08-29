@@ -1,10 +1,18 @@
-"""A worker process that ended when it should not have.
+"""A process that ended when it should not have.
 
-xdist reports this as ``node down: Not properly terminated`` - a placeholder it
-substitutes when the channel closed without the remote sending anything. The
-cause never left the dead process, so everything below is read from what the
-worker wrote before it died, plus the exit status its parent can still be asked
-for.
+Usually a worker, and then xdist reports it as ``node down: Not properly
+terminated`` - a placeholder it substitutes when the channel closed without the
+remote sending anything. The cause never left the dead process, so everything
+below is read from what it wrote before it died, plus the exit status its
+parent can still be asked for.
+
+:func:`recover` builds the same incident for a process nobody was watching:
+the one process of a run with no workers, or a whole run reclaimed with its
+controller. There is no parent left to ask and no hook that fires, so it is
+raised by a later run reading the directory - see :mod:`.leftovers`. What
+differs is one fact and it is stated rather than papered over: no exit status
+was obtainable, so the number that separates an OOM kill from a segfault was
+never anybody's to read.
 """
 
 from __future__ import annotations
@@ -132,6 +140,17 @@ class WorkerDeathIncident(Incident):
     cgroup_oom_kills_since_start: Optional[int] = None
     high_water: Optional[list[dict[str, Any]]] = None
 
+    #: Which run this incident is *about*, when that is not the run raising
+    #: it. Set only for a death recovered from a directory somebody else left
+    #: behind, and the first thing the alert says - a reader who takes this
+    #: for the current run's crash goes looking for a failure that is not
+    #: there. ``run_id`` is the dead run's too; ``raised_at`` is now.
+    recovered_from_run: Optional[str] = None
+    #: When that run was last known to be running, from its final heartbeat.
+    #: The death is somewhere after this and before it was found, and nothing
+    #: on either side can narrow it further.
+    last_seen_at: Optional[float] = None
+
     crash_stack: list[str] = Field(default_factory=list)
     #: How long before this report the dump on file was written. Around zero
     #: for a fatal dump, which is written as the process dies. Large for
@@ -172,6 +191,16 @@ class WorkerDeathIncident(Incident):
 
     def details(self) -> list[str]:
         counted = f"started={self.tests_started} finished={self.tests_finished}"
+        if self.recovered_from_run:
+            # First, and on a line of its own, because everything after it
+            # describes a run that is already over.
+            return [
+                f"recovered from {self.recovered_from_run}, which ended without "
+                "reaching session finish"
+            ] + self._where(counted)
+        return self._where(counted)
+
+    def _where(self, counted: str) -> list[str]:
         if self.test_in_flight:
             phase = f"  phase={self.phase}" if self.phase else ""
             return [f"in flight {self.test_in_flight}{phase}  {counted}"]
@@ -251,3 +280,104 @@ def _delta(current: int | None, baseline: int | None) -> int | None:
     if current is None or baseline is None:
         return None
     return current - baseline
+
+
+def recover(events_path: Path, session: str) -> Optional[WorkerDeathIncident]:
+    """The death of a process nobody was watching, from what it left on disk.
+
+    ``events_path`` is one process's event log inside a run directory that is
+    over and never reached session finish - see :mod:`.leftovers` for how that
+    set is arrived at. Returns None when this file describes no death: a
+    process that wrote ``worker_finish`` ended its session cleanly, and one
+    that never wrote ``worker_start`` never had a session to end.
+
+    The difference from :func:`build` is the exit status, and it is a real
+    loss rather than a formatting one. Only a parent may read a child's
+    status, the parent here was the run that died, and the process is long
+    gone - so ``-9``, ``-11`` and ``os._exit(1)`` cannot be told apart from
+    the outside. What is left still separates most of them: the state slot
+    says which test was in flight and in which phase, the beats say how much
+    memory it was using and whether it was burning CPU, and a fatal dump - if
+    this run kept one - names the frame.
+
+    Nothing about *this* machine is attached to it. The cgroup figures and the
+    OOM counter describe the moment they are read, and reading them now would
+    put this run's memory pressure on a death that happened an hour ago,
+    under a verdict that reads as a finding.
+    """
+    worker = events_path.stem
+    directory = events_path.parent
+    events = event_log.read_events(events_path)
+    if not events:
+        return None
+    # The file is opened truncated by whoever writes it, so it holds one
+    # process's run - but a second session pointed at the same directory by
+    # PYTEST_RUN_ID overwrites it, and the reader has to be the run that wrote
+    # last rather than a mixture of two.
+    run_id = _run_id(events)
+    events = event_log.this_run(events, run_id)
+    if not any(event.get("event") == "worker_start" for event in events):
+        return None  # nothing here ever started a session
+    if any(event.get("event") == "worker_finish" for event in events):
+        return None  # it reached its own session finish; this is not a death
+
+    state = read_state(directory / f"{worker}.state", run_id)
+    beats = event_log.heartbeats(events)
+    dump = crash_stack.read(directory / f"{worker}.crash", limit=40)
+
+    incident = WorkerDeathIncident(
+        worker=worker,
+        worker_pid=state.get("pid") or event_log.worker_pid(events),
+        recovered_from_run=session,
+        run_id=run_id or session,
+        last_seen_at=(beats[-1].get("time") if beats else None),
+        exit_status_source="unavailable",
+        exit_status_meaning="unknown",
+        test_in_flight=state.get("nodeid"),
+        last_test=state.get("last_nodeid"),
+        phase=state.get("phase"),
+        tests_started=state.get("tests_started") or 0,
+        tests_finished=state.get("tests_finished") or 0,
+        rss_mb_at_death=beats[-1].get("rss_mb") if beats else None,
+        system_available_mb=_last_available(events),
+        crash_stack=dump,
+        crash_stack_age_seconds=_age_of(directory / f"{worker}.crash") if dump else None,
+        high_water=event_log.high_water_marks(events)[-1:] or None,
+    )
+    incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
+    incident.evidence.extend(_what_was_kept(events, dump))
+    return incident
+
+
+def _run_id(events: list[dict[str, Any]]) -> Optional[str]:
+    """The id the dead run reported, which is not the directory's name.
+
+    The last stamped line wins, for the same reason the live view takes the
+    last one: the only way a file holds two runs' lines is two sessions
+    writing it, and the later writer is the one the rest of this directory
+    belongs to.
+    """
+    for event in reversed(events):
+        if event.get("run_id"):
+            return str(event["run_id"])
+    return None
+
+
+def _what_was_kept(events: list[dict[str, Any]], dump: list[str]) -> list[str]:
+    """Why there is no stack, when there is none and one was possible.
+
+    An absence with no reason beside it reads as "it crashed without leaving
+    anything", which is a finding. The truth is usually that the dump was
+    written somewhere this file could not keep it, and that is a setting away
+    from being fixed for next time.
+    """
+    if dump:
+        return []
+    armed = [event for event in events if event.get("event") == "faulthandler_armed"]
+    if armed and armed[-1].get("fatal_stack") == "stderr":
+        return [
+            "no stack was kept here: this run had no workers, so its fatal dump "
+            "went to the terminal pytest's faulthandler plugin writes to rather "
+            "than into a file - set failure_crash_stack to keep a copy instead"
+        ]
+    return []

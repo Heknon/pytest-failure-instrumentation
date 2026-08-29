@@ -226,12 +226,11 @@ def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
             # engine is in the room and can simply be asked.
             settings.with_overrides(run_id=running.run_id),
             faulthandler_timeout=timeout,
-            # The one thing a lone run does differently from a worker. There
-            # is a single destination for a fatal dump and pytest has already
-            # pointed it at stderr; taking it here would take the crash out of
-            # a terminal somebody is watching, which a worker's shared stderr
-            # gives up nothing by doing. See crash_stack.arm_fatal_handler.
-            claims_fatal_dumps=False,
+            # The one thing a lone run does differently from a worker, and the
+            # one thing it is asked rather than told: there is a single
+            # destination for a fatal dump and pytest has already pointed it
+            # at a terminal somebody is watching. See failure_crash_stack.
+            claims_fatal_dumps=settings.crash_stack,
         )
 
     # A recorder that cannot be built leaves the engine registered rather than

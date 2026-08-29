@@ -49,8 +49,9 @@ def arm_fatal_handler(stream: TextIO) -> bool:
     That argument does not survive a run with no workers in it, where the
     stderr in question is a terminal somebody is watching. Such a run arms
     :func:`arm_on_demand_handler` alone and leaves the fatal dump where pytest
-    put it, because moving the only account of a crash out of the place it is
-    read from is not an improvement.
+    put it, unless ``failure_crash_stack`` says otherwise - moving the only
+    account of a crash out of the place it is read from is a trade rather than
+    an improvement, and it is the run's to make.
 
     There is no third option to reach for. ``faulthandler`` keeps exactly one
     destination for a fatal signal, and the obvious way to have both -
@@ -68,9 +69,9 @@ def arm_on_demand_handler(stream: TextIO) -> bool:
     """Let ``SIGUSR1`` ask this process for a stack. False where it cannot.
 
     Separate from the fatal handler above because the two are armed together
-    in a worker and apart in a run with no workers, where the fatal dump stays
-    pytest's and this one is still ours to take. Nothing holds SIGUSR1
-    beforehand, so there is nothing to take away.
+    in a worker and, in a run with no workers, may be apart: the fatal dump
+    there stays pytest's unless it was asked for, while this one is always
+    ours. Nothing holds SIGUSR1 beforehand, so there is nothing to take away.
     """
     if not stacks.can_request_stack():
         return False

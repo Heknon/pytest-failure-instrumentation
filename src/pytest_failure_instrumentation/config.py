@@ -160,6 +160,28 @@ class Settings:
     slow_test_seconds: float = 20.0
     stall_seconds: float = 300.0
     stack_probe: bool = True
+    #: Whether a run with **no workers** keeps its own fatal-signal dump.
+    #:
+    #: A worker always keeps one and gives up nothing for it: the stderr the
+    #: dump would otherwise go to is shared with every other worker, so a
+    #: crash written there is interleaved with fifteen streams and read by
+    #: nobody. A run with no workers is the opposite case. Its stderr is a
+    #: terminal, or a CI log somebody keeps, and pytest's own faulthandler
+    #: plugin is already writing the crash there - so claiming it moves the
+    #: only account of the crash that run will produce *while it is happening*
+    #: into a file, to be reported when a later run reads it.
+    #:
+    #: There is no having both: ``faulthandler`` keeps one destination for a
+    #: fatal signal and CPython refuses to register a second. See
+    #: :func:`..capture.crash_stack.arm_fatal_handler`.
+    #:
+    #: So it is off, and what that costs is the stack rather than the report.
+    #: A death recovered from such a run still names the test in flight, its
+    #: phase, the counters and the memory, and still carries a
+    #: ``suspect_owner`` read from the test's own module; what it cannot carry
+    #: is a blamed frame. Turn it on where the incident is the artefact that
+    #: gets read and the terminal is not, which is most of CI.
+    crash_stack: bool = False
     #: Which declaration a worker makes on Linux, where Yama restricts who may
     #: read a process. "parent" nominates the controller and covers a session
     #: reading its own workers, which is how the live view is used by default;
@@ -446,6 +468,11 @@ class Settings:
             # itself would decline for every run with a live view on. What
             # travels is the answer, not the evidence for it.
             "tracer_handed_down": self.tracer_in_force,
+            # crash_stack is absent, and for a reason of its own: it asks
+            # whether a run with no workers should take the fatal dump off its
+            # terminal, and a worker has no terminal and no choice. It always
+            # keeps its own.
+            #
             # Sampling is absent for the same reason as the stack server below:
             # it runs on the controller, over every worker at once, and a
             # worker that read it would sample itself and its siblings.
@@ -508,6 +535,16 @@ def add_options(parser: pytest.Parser) -> None:
         default="20",
     )
     parser.addini("failure_stall_seconds", help="Silence before a stall is assessed. 0 disables.", default="300")
+    parser.addini(
+        "failure_crash_stack",
+        help="Keep the fatal-signal stack of a run that has no workers, "
+        "instead of leaving it on the stderr pytest points it at. There is one "
+        "destination and it cannot be shared, so this trades the dump your "
+        "terminal shows you now for one an incident can carry later. Off by "
+        "default; a worker keeps its own either way, because the stderr it "
+        "would use is shared and nobody reads it.",
+        default="false",
+    )
     parser.addini(
         "failure_stack_server",
         help="Serve the live stack of any local process over HTTP, for a UI "
@@ -790,6 +827,7 @@ def resolve(config: pytest.Config) -> Settings:
         slow_test_seconds=_number(config, "failure_slow_test_seconds", 20.0),
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe", True),
+        crash_stack=_flag(config, "failure_crash_stack", False),
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
         stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,

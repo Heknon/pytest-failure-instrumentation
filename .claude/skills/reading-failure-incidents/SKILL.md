@@ -126,7 +126,7 @@ replaces it:
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP | nothing, unless the run was not meant to be stopped |
 | `SELF_EXIT` | an exit status and no signal — **including 0** | `sys.exit()`, `os._exit()`, or a plugin aborting. A worker that left without being asked to has gone wrong whatever number it exited with, so a clean 0 here is a finding, not an all-clear |
 | `PROBABLY_SIGNALLED` | exit code 128–191 | a wrapper that ate the signal; the true one did not survive |
-| `UNKNOWN` | no status obtainable (remote gateway) | nothing — do not guess one |
+| `UNKNOWN` | no status obtainable — a remote gateway, or a run recovered after the fact | nothing — do not guess one |
 
 `-9` alone never licenses "we ran out of memory"; only the cgroup counter does,
 and only when `capabilities.cgroup_oom_counter` says it was readable. That
@@ -137,6 +137,24 @@ no container limit was discovered, so raising one may change nothing. And no
 `system had N MB free` line means no high-water snapshot ever fired — the
 worker never came near a ceiling — which is evidence against memory in its own
 right.
+
+**`recovered_from_run` means this is about a different run from the one that
+reported it.** A run whose own process was killed has no survivor to report it,
+so the next run over the same evidence directory does. When that field is set:
+the alert's first detail line names the dead run, `run_id` is *that* run's id
+rather than the reporting run's, and `raised_at` is when it was found rather
+than when it happened — `last_seen_at` is the dead run's final heartbeat, and
+the death is somewhere between the two. Nothing here says anything about the
+run that reported it, which is the misreading to head off: it did not crash.
+
+Such an incident has no exit status and cannot have one. Only a parent may read
+it, the parent was the run that died, and the process was gone before anything
+looked — so `UNKNOWN` here is a fact about who was entitled to ask, not a
+capability of the machine, and no setting recovers it. A fatal stack still can
+be kept (`failure_crash_stack`), and where one was, the verdict reaches
+`NATIVE_CRASH` with a blamed frame on the strength of the dump alone. Where one
+was not, the incident says where it went instead of leaving the absence to be
+read as "it left nothing behind".
 
 ### `worker_stall` — alive, but stopped reporting
 
@@ -262,7 +280,7 @@ The incident usually settles it, and saying so is most of the value.
 
 | Kind | Already true when you read it | What it argues for |
 |---|---|---|
-| `worker_death` | xdist started a replacement; the run went on | fix or route by `owner`; a retry is reasonable only when the cause was external (`SIGNAL_*`, a cancellation) |
+| `worker_death` | xdist started a replacement and the run went on — unless `recovered_from_run` is set, in which case the run it describes is long over and this one is unaffected | fix or route by `owner`; a retry is reasonable only when the cause was external (`SIGNAL_*`, a cancellation) |
 | `worker_stall` | the run has no path to completion and is burning runner time until a timeout | kill the job now rather than waiting it out. A `STALLED_BLOCKED` deadlock is deterministic, so a retry hangs the same way — the incident is worth more than the rerun, and it already holds the live stack you cannot get afterwards |
 | `collection_mismatch` | the run aborted, or quietly lost a worker | retrying repeats it — an unstable parametrize re-rolls its values, an environment-dependent collection diverges the same way again. Nothing improves until collection is deterministic |
 | `internal_error` | the session is over | nobody's test is at fault, so no test-level triage will surface it — it needs the framework or plugin owner |

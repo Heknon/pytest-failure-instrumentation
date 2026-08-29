@@ -35,12 +35,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -51,14 +50,9 @@ from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
 from ..config import SOLE_WORKER, Settings, advise
 from ..registration import RECORDER_NAME
-from . import collection, death, internal_error, stall, summary
-from .base import Capabilities, Incident, frame_from
-
-#: Written at the top of each run's own directory, and the only thing that
-#: makes a directory this plugin's to delete. Matching on file suffixes instead
-#: is how a cleanup takes somebody's coverage report with it: ``failure_directory``
-#: is a natural thing to point at an existing artifacts directory.
-OWNER_FILE = "owner.json"
+from . import collection, death, internal_error, leftovers, stall, summary
+from .base import UNSET_RUN_ID, Capabilities, Incident, frame_from
+from .leftovers import OWNER_FILE, prune_finished_runs
 
 #: The environment variable that names this run's evidence directory, and the
 #: only value in this package that a person hands over and the filesystem then
@@ -172,38 +166,6 @@ def name_this_run(fallback: str) -> str:
     return fallback
 
 
-def prune_finished_runs(root: Path) -> None:
-    """Delete the directories of runs that are over.
-
-    Over, not old. The controller's pid is in the marker, so a run that is
-    still going is recognisable as such however long it has been going - which
-    matters, because the whole reason each run has a directory is that several
-    of them happen at once.
-
-    A directory without our marker is not ours and is left alone, whatever it
-    looks like.
-    """
-    try:
-        candidates = [path for path in root.iterdir() if path.is_dir()]
-    except OSError:
-        return
-    for path in candidates:
-        owner = _owner_of(path)
-        if owner is None or probes.is_running(owner):
-            continue
-        shutil.rmtree(path, ignore_errors=True)
-
-
-def _owner_of(directory: Path) -> Optional[int]:
-    """The pid that owns this run directory, or None if it is not ours."""
-    try:
-        record = json.loads((directory / OWNER_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    pid = record.get("pid") if isinstance(record, dict) else None
-    return int(pid) if isinstance(pid, int) else None
-
-
 class IncidentEngine:
     def __init__(self, config: pytest.Config, settings: Settings) -> None:
         self.config = config
@@ -272,6 +234,9 @@ class IncidentEngine:
         self.raised = 0
         self.suppressed = 0
         self.run_ending = 0
+        #: When this process started, stamped into the marker and kept so a
+        #: rewrite of it at session finish does not report a second start.
+        self.started_at = time.time()
         #: Whether this process is the one running the tests, which is so
         #: exactly when the run has no workers. Settled at session start from
         #: :attr:`recorder` and kept, because a report arriving from a worker
@@ -360,6 +325,10 @@ class IncidentEngine:
         if not self.distributed and not self.settings.stack_server and not self.records_here:
             return
         self._warn_if_a_live_session_already_owns_this_directory()
+        # Read before it is swept: the sweep is what removes this evidence,
+        # and the two orders differ by whether a killed run is reported once
+        # or never.
+        self._report_runs_that_never_came_back()
         # Swept *before* this run's marker is written, not after. Written
         # first, our own directory names a live pid - so a directory left
         # behind by a finished run that shared this PYTEST_RUN_ID is skipped
@@ -379,18 +348,51 @@ class IncidentEngine:
             # it before xdist has one, and the id this run reports would then
             # be a name nothing else agrees with. The events files inside carry
             # it, and they are written from the start.
-            (self.directory / OWNER_FILE).write_text(
-                json.dumps(
-                    {
-                        "pid": os.getpid(),
-                        "session_id": self.session_id,
-                        "started_at": time.time(),
-                    }
-                ),
-                encoding="utf-8",
-            )
+            self._write_marker()
         except OSError:
             return  # bookkeeping must never break a run
+
+    def _write_marker(self, finished: bool = False) -> None:
+        """Say that this directory is a run of ours, and whether it ended.
+
+        Rewritten whole at session finish rather than appended to, because it
+        is one small document and the read that matters most happens when
+        nobody is left to have finished writing it. What that reader takes
+        from a marker it cannot parse is "this run did not reach its end",
+        which is the safe way round: a run that did reach it is still here to
+        be asked, and one that did not is the case this exists for.
+        """
+        record: dict[str, Any] = {
+            "pid": os.getpid(),
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+        }
+        if finished:
+            # The absence of this is what makes a directory worth reporting
+            # rather than merely deleting - see :mod:`.leftovers`.
+            record[leftovers.FINISHED_KEY] = time.time()
+        (self.directory / OWNER_FILE).write_text(json.dumps(record), encoding="utf-8")
+
+    def _report_runs_that_never_came_back(self) -> None:
+        """Raise the incidents of runs that were killed before they could.
+
+        Every other source is something a live process notices. This is the
+        one that nothing in the run it describes was alive to notice, so it is
+        found rather than reported - by the next run over the same directory,
+        which was about to delete it.
+
+        Ordered before the sweep on purpose: the sweep is what removes this
+        evidence, and doing it first is the difference between a killed run
+        being reported once and never. Ordered after nothing else, because a
+        run reports what it finds before it has anything of its own to say.
+        """
+        try:
+            found = leftovers.deaths_left_behind(self.settings.directory, self.directory)
+        except Exception as failure:  # noqa: BLE001 - never break a starting run
+            advise(f"the previous runs' evidence could not be read: {failure!r}")
+            return
+        for incident in found:
+            self.raise_incident(incident)
 
     def _warn_if_a_live_session_already_owns_this_directory(self) -> None:
         """Two runs may share a directory on purpose - but not at once.
@@ -481,7 +483,12 @@ class IncidentEngine:
             incident.evidence.append(why)
 
         incident.fingerprint = fingerprint_of.of(incident, incident.blamed_frame)
-        incident.run_id = self.run_id
+        # This run's, unless the incident is about another one. A death
+        # recovered from a directory somebody else left behind carries the id
+        # of the run that died: it is the key a consumer joins on, and the
+        # run that merely found it is not the run it happened in.
+        if incident.run_id == UNSET_RUN_ID:
+            incident.run_id = self.run_id
         incident.raised_at = time.time()
         incident.capabilities = Capabilities(**probes.capabilities())
         incident.product_version = self.settings.product_version
@@ -989,6 +996,13 @@ class IncidentEngine:
                 self.distributed,
             )
         )
+        # Said after the summary rather than before it, and it is the last
+        # thing this run does that a later one can read: from here on, this
+        # directory says it reached its end and has nothing left to report.
+        try:
+            self._write_marker(finished=True)
+        except OSError:
+            pass  # the marker is bookkeeping, and this run is over anyway
         # The summary is the last word by definition - it says how many
         # incidents this run raised. Anything the watcher or the sampler still
         # manages to produce after it would contradict a number already

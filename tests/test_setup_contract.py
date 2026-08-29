@@ -191,7 +191,7 @@ def test_a_finished_runs_directory_is_pruned_and_a_live_one_is_not(tmp_path):
     import json
     import os
 
-    from pytest_failure_instrumentation.incidents.engine import prune_finished_runs
+    from pytest_failure_instrumentation.incidents.leftovers import prune_finished_runs
 
     live = tmp_path / "run-live"
     finished = tmp_path / "run-finished"

@@ -292,3 +292,112 @@ def test_a_lone_run_that_is_merely_slow_is_not_reported(runner):
 
     assert runner.of_kind(incidents, "worker_stall") == []
     assert runner.only(incidents, "run_summary").raised == 0
+
+
+LEAVES_WITHOUT_FINISHING = """
+import victim
+
+
+def test_filler():
+    assert True
+
+
+def test_leaves():
+    victim.hard_exit(1)
+"""
+
+CRASHES = """
+import victim
+
+
+def test_crashes():
+    victim.native_call(1)
+"""
+
+
+def test_a_run_that_never_came_back_is_reported_by_the_next_one(runner):
+    """The case with no survivor.
+
+    A run whose one process is killed has nobody left to report it - no
+    controller watching, no hook to fire, and a summary that never happens. So
+    the next run over the same directory reports it, which is the walk it was
+    already making to clear the evidence away.
+    """
+    runner.pytester.makepyfile(test_gone=LEAVES_WITHOUT_FINISHING)
+    assert runner.run("test_gone.py") == [], "a dead run reports nothing itself"
+    killed = evidence(runner.pytester).name
+
+    runner.pytester.makepyfile(test_after=SUITE)
+    incidents = runner.run("test_after.py")
+
+    death = runner.only(incidents, "worker_death")
+    assert death.worker == "main"
+    assert death.recovered_from_run == killed
+    # The id of the run it happened in, not of the run that found it: that is
+    # the key a consumer joins on, and the finder had no part in it.
+    assert death.run_id == killed
+    assert death.test_in_flight == "test_gone.py::test_leaves"
+    assert death.phase == "call"
+    assert death.tests_started == 2
+    assert death.tests_finished == 1
+    assert death.last_seen_at is not None
+
+    # Nothing was entitled to read the status, and the incident says so rather
+    # than blaming a gateway that was never in the picture.
+    assert death.exit_status is None
+    assert death.verdict == "UNKNOWN"
+    assert any("Only a parent may" in line for line in death.evidence), death.evidence
+    assert "recovered from" in str(death)
+
+    # And the sweep still happened: the recovered directory is gone, so the
+    # run after this one has nothing left to report twice.
+    assert evidence(runner.pytester).name != killed
+
+
+def test_a_run_that_finished_is_never_reported_by_the_next_one(runner):
+    """The guard the whole thing rests on. A run that reached session finish
+    raised its own incidents, and re-raising them a day later against whoever
+    noticed is worse than never raising them."""
+    runner.pytester.makepyfile(test_first=SUITE)
+    runner.run("test_first.py")
+
+    runner.pytester.makepyfile(test_second=SUITE)
+    incidents = runner.run("test_second.py")
+
+    assert runner.of_kind(incidents, "worker_death") == []
+
+
+def test_a_recovered_crash_is_attributed_when_the_run_kept_its_stack(runner):
+    runner.pytester.makeini(ini(failure_crash_stack="true"))
+    runner.pytester.makepyfile(test_boom=CRASHES)
+    runner.run("test_boom.py")
+
+    runner.pytester.makepyfile(test_after=SUITE)
+    incidents = runner.run("test_after.py")
+
+    death = runner.only(incidents, "worker_death")
+    # No exit status was obtainable, so the dump is the whole of the verdict -
+    # which is exactly the position Windows is in even for a watched worker.
+    assert death.verdict == "NATIVE_CRASH"
+    assert death.crash_stack
+    assert death.blamed_frame is not None
+    assert death.blamed_frame.module == "victim"
+    assert death.owner == "product"
+
+
+def test_a_recovered_run_says_where_its_stack_went(runner):
+    """An absence with no reason beside it reads as "it left nothing", which
+    is a finding. The truth is a setting away from being fixed."""
+    runner.pytester.makepyfile(test_boom=CRASHES)
+    runner.run("test_boom.py")
+
+    runner.pytester.makepyfile(test_after=SUITE)
+    incidents = runner.run("test_after.py")
+
+    death = runner.only(incidents, "worker_death")
+    assert death.crash_stack == []
+    assert any("failure_crash_stack" in line for line in death.evidence), death.evidence
+    # Nothing named the frame, so the test that was running is offered as the
+    # lead it is - in the column a reader does not take for a finding.
+    assert death.owner == "unknown"
+    assert death.suspect_owner == "customer-code"

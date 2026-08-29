@@ -70,6 +70,20 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             f"exit status {status} - {status_table.describe(status)} "
             f"(pid {incident.worker_pid}, via {incident.exit_status_source})"
         )
+    elif incident.recovered_from_run:
+        # Two ways to have no status and they have different remedies, so they
+        # are not allowed to read the same. This one is not a gateway that
+        # could not be asked: it is a process whose parent was the run that
+        # died, found afterwards by somebody who was never entitled to its
+        # status. Nothing can recover it, which is worth saying plainly rather
+        # than leaving a reader to look for a configuration that would.
+        evidence.append(
+            f"exit status unavailable (pid {incident.worker_pid}): nothing was "
+            "left to read it. Only a parent may, the parent was the run that "
+            "died, and by the time this evidence was found the process was "
+            "gone - so an OOM kill, a segfault and an os._exit cannot be told "
+            "apart here"
+        )
     else:
         evidence.append(
             f"exit status unavailable (pid {incident.worker_pid}); remote "
@@ -139,5 +153,6 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             "os._exit(), or a plugin aborted"
         ]
 
-    # No status at all - a remote gateway, with no local process to ask.
+    # No status at all - a remote gateway, or a run found after the fact with
+    # nothing left that was entitled to read one.
     return "UNKNOWN", "low", evidence + memory_evidence(incident)

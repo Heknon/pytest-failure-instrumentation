@@ -9,7 +9,8 @@ raises one hook per incident with an owner attached.
 Whichever process runs the tests is the one that records, so a run with no
 workers is covered as deeply as a distributed one: under xdist that process is
 a worker and the controller reads what it left, and without xdist it is the
-session itself.
+session itself. A run killed outright leaves nobody to report it, so the next
+run over the same evidence directory does.
 
 Installing it is a ``pip install``; it registers itself as a ``pytest11`` entry
 point and reads its settings from ini. A framework that wraps pytest and

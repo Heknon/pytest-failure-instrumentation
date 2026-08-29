@@ -82,7 +82,7 @@ when it did not.
 
 ### The failures that reach no hook at all
 
-Worker death at least fires a hook. Three others do not.
+A worker's death at least fires a hook. Four others do not.
 
 **A run that stalls.** `pytest_testnodedown` needs a dead process; a wedged
 one is alive. And the controller hears from a worker only when a phase
@@ -100,6 +100,14 @@ the stack of the thread that is stuck, and says so *while it is still stuck*.
 diff per differing worker into its own log, and aborts. Nothing structured
 reaches a hook. With sixty workers and one odd node that is fifty-nine complete
 diffs, every one of them naming the majority as the deviation.
+
+**A run that never came back.** Every failure above is reported by a process
+that survived to report it. A run that was *itself* killed has no survivor: a
+plain `pytest` that segfaults, a controller reclaimed along with its workers, a
+CI job cancelled mid-suite. Nothing fires, nothing is written, and the only
+trace is a job that stopped. What that run recorded is on disk and complete —
+so it is reported by the next run over the same directory, which was already
+walking it to clear it out.
 
 **An internal error.** pytest sets `ExitCode.INTERNAL_ERROR`, which is not in
 `summary_exit_codes` in `_pytest/terminal.py` — so `pytest_terminal_summary`
@@ -265,15 +273,16 @@ have nothing to say to each other, so they are not fields of the same object:
 
 | `kind` | Model | Raised on |
 |---|---|---|
-| `worker_death` | `WorkerDeathIncident` | needs xdist |
+| `worker_death` | `WorkerDeathIncident` | any run |
 | `worker_stall` | `WorkerStallIncident` | any run |
 | `collection_mismatch` | `CollectionMismatchIncident` | needs xdist |
 | `internal_error` | `InternalErrorIncident` | any run |
 | `run_summary` | `RunSummaryIncident` | any run |
 
-A worker death needs workers. Everything else is raised whether or not you run
-under xdist, because the process that records is whichever one runs the tests —
-under xdist a worker, and without it the session itself.
+Only the two that are *about* workers need workers. Everything else is raised
+whether or not you run under xdist, because the process that records is
+whichever one runs the tests — under xdist a worker, and without it the session
+itself.
 
 They share `verdict`, `confidence`, `severity`, `owner`, `fingerprint`,
 `run_id`, `worker` and `evidence`. `str(incident)` is the alert text — every
@@ -487,12 +496,13 @@ the same state slot, the same heartbeat and the same stacks a worker does,
 under the name `main`, and the live view, the sampler and the stall watcher
 read them the same way.
 
-The one thing it does not take is the fatal dump. `faulthandler` keeps exactly
-one destination for a fatal signal and pytest's own plugin has already pointed
-it at stderr; a worker claims it and loses nothing, because that stderr is
-shared with fifteen others and a dump written into it belongs to nobody. A run
-with no workers would be taking the crash out of a terminal somebody is
-watching, so it leaves it there.
+The one thing it does not take, unless asked, is the fatal dump.
+`faulthandler` keeps exactly one destination for a fatal signal and pytest's
+own plugin has already pointed it at stderr; a worker claims it and loses
+nothing, because that stderr is shared with fifteen others and a dump written
+into it belongs to nobody. A run with no workers would be taking the crash out
+of a terminal somebody is watching, so it leaves it there — see
+`failure_crash_stack`, which is that trade written down.
 
 **A fixed-size state file.** Which test and phase is open right now is written
 to a fixed-size slot with `os.pwrite` — one syscall, no append, no growth, and a
@@ -669,6 +679,50 @@ reported as nothing at all.
 **Evidence written before it is needed.** Every mechanism above puts its output
 on disk during the healthy part of the run, because a process that is about to
 be killed gets no warning. The controller reads files, never the corpse.
+
+**And a run that never came back is read by the next one.** The corpse being a
+whole run rather than one worker changes only who does the reading. A starting
+run already walks the evidence directory to clear out the runs that are over;
+the same walk now asks a second question of the same marker, and two answers
+separate a run to report from a run to delete:
+
+- *Is it over?* The owner's pid is in the marker, so a run still going is
+  recognisable however long it has been going — which matters because several
+  run at once, and deleting a live run's evidence is how a cleanup once broke
+  the very reports it existed to produce.
+- *Did it report for itself?* A run that reaches session finish stamps the
+  marker on the way out. It raised its own incidents; re-raising them a day
+  later against whichever run happened to notice is worse than never raising
+  them.
+
+A run that is over and never stamped that mark is exactly a run that could not
+report for itself, and each process in it that started a session and never
+finished one is a death:
+
+```
+[worker_death] UNKNOWN  severity=needs-triage  owner=unknown
+    no stack; suspect customer-code (owner of the test in flight (test_pool.py))
+    recovered from run-8f21c0b4e5d7, which ended without reaching session finish
+    in flight test_pool.py::test_writes  phase=call  started=12 finished=11
+    · died while running test_pool.py::test_writes (call)
+    · exit status unavailable (pid 21780): nothing was left to read it. Only a parent may, the parent was the run that died, and by the time this evidence was found the process was gone - so an OOM kill, a segfault and an os._exit cannot be told apart here
+    · resident memory 412 MB at last checkpoint
+    · no stack was kept here: this run had no workers, so its fatal dump went to the terminal pytest's faulthandler plugin writes to rather than into a file - set failure_crash_stack to keep a copy instead
+```
+
+`recovered_from_run` leads the block, because a reader who takes this for the
+current run's crash goes looking for a failure that is not there. `run_id` is
+the dead run's — that is the key anything joins on, and the run that merely
+found it had no part in what happened. `raised_at` is now.
+
+The exit status is the one thing genuinely lost. Only a parent may read it, the
+parent was the run that died, and the process is long gone — so `-9`, `-11` and
+`os._exit(1)` cannot be told apart afterwards, and the incident says that
+rather than guessing. Everything else survives: which test was in flight and in
+which phase, how many had run, the resident memory at the last beat, and — if
+the run kept one — the fatal stack, which is enough to reach `NATIVE_CRASH`
+with a blamed frame and no status at all. That is the same position Windows is
+in for a watched worker, and it is why the dump is evidence in its own right.
 
 ## Live stacks over HTTP
 
@@ -1179,7 +1233,9 @@ names itself — so a slugified branch works and a raw `feature/x` does not,
 because a separator in there would put this run's evidence somewhere other
 than `failure_directory`.
 
-**What gets cleaned up.** Whole directories of runs that are *over* — not old.
+**What gets cleaned up, and what is read first.** Whole directories of runs
+that are *over* — not old — and never before they have been asked whether they
+have anything left to report.
 The controller's pid is in `owner.json`, so a run still going is recognisable
 as such however long it has been going, which matters precisely because several
 run at once. A directory without that marker is not ours and is left alone
@@ -1232,6 +1288,7 @@ overwhelming majority of what runs.
 | `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
+| `failure_crash_stack` | `false` | Keep the fatal stack of a run that has *no workers*, instead of leaving it on the stderr pytest points it at. A worker keeps its own either way |
 | `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
@@ -1250,6 +1307,22 @@ The stack a stalled worker is reported with is whatever the watchdog last
 wrote, so the cadence has to have fired before the stall is assessed — a stall
 judged sooner is judged with no stack at all, and on Windows that is every
 stall. Neither is clamped, but an inverted pair warns.
+
+`failure_crash_stack` is a trade rather than a switch, and it is off because of
+which way the trade goes by default. `faulthandler` keeps exactly one
+destination for a fatal signal, and pytest's own plugin has already pointed it
+at stderr. A worker takes it and loses nothing — that stderr is shared with
+fifteen other workers and a dump written into it belongs to nobody. A run with
+no workers would be taking the crash out of a terminal somebody is watching, in
+exchange for one that cannot be reported until a later run reads the file.
+There is no having both: `faulthandler.register(SIGSEGV, chain=True)` is
+refused by CPython itself.
+
+What is lost by leaving it off is the *stack*, not the report — see the
+recovered incident above, which still names the test, the phase, the counters
+and the memory, and still offers a `suspect_owner`. What it cannot carry is a
+blamed frame. Turn it on where the incident is the artefact that gets read and
+the terminal is not, which is most of CI.
 
 `failure_memory_limit_mb` is worth a note: an `RLIMIT_AS` cap makes the
 allocation fail *inside* the process, so you get a `MemoryError` with a
@@ -1424,10 +1497,10 @@ PyPI rejects a distribution carrying both.
 ## Status
 
 All five kinds and every verdict in the tables above are covered, on all three
-platforms, with and without xdist — a run with no workers records, serves and
-watches itself through the same code paths a distributed one uses, and the
-tests drive it the same way: a real run, wedged for real, read back through the
-hook.
+platforms, with and without xdist — a run with no workers records, serves,
+watches and is recovered through the same code paths a distributed one uses,
+and the tests drive it the same way: a real run, wedged or killed for real,
+read back through the hook.
 
 Most are produced for real: a worker is crashed, killed, signalled, wedged or
 made to disagree about its collection, and the incident is read back from the
