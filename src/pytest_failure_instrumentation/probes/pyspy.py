@@ -112,7 +112,7 @@ def unavailable_reason() -> str:
     """Why there is no external reader, phrased for somebody who can fix it."""
     return (
         "py-spy is not installed in this environment (pip install py-spy), so "
-        "the stack of another process cannot be read from outside it"
+        "a live process's stack cannot be read from outside it"
     )
 
 

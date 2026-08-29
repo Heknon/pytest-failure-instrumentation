@@ -382,12 +382,19 @@ The verdict is reached from beats already on disk. A stack is asked for
 question can change its answer — see below.
 
 In a run with no workers the assessment is the same assessment, from the same
-files, made by a thread inside the process it is about. That makes the stack
-free and exact: `sys._current_frames()` rather than a signal, so nothing is
-waited for, nothing can return a blocked syscall early, and Windows — where no
-process can be asked for a stack at all — gets a current one like everywhere
-else. The exception is `STALLED_FROZEN`, which is precisely the case where no
-Python runs: that thread cannot run either, so a frozen lone run reports
+files, made by a thread inside the process it is about. The stack is read the
+way every live process here is read — py-spy, from outside — even though this
+one's frames are also directly to hand: a second reader for the single case
+that could avoid the first is a second set of failure modes and a second source
+to explain. It reads memory rather than asking the process to run anything, so
+no signal is sent that could return a blocked syscall early and dissolve the
+stall, and Windows — where no process can be *asked* for a stack — gets a
+current one like everywhere else. Without py-spy installed the verdict is
+unchanged, since it comes from beats rather than frames, and the stack is
+whatever the watchdog last wrote.
+
+The exception is `STALLED_FROZEN`, which is precisely the case where no Python
+runs: the watcher thread cannot run either, so a frozen lone run reports
 nothing until somebody reads what its fallback timer left behind.
 
 ### Workers collected different tests
@@ -1167,7 +1174,16 @@ anything, and stops the target before reading, so it never walks a frame that is
 being torn down. The server's *own* pid is answered from `sys._current_frames()`
 — no subprocess, no ptrace, no permission. In a run with no workers that is the
 whole run: the process being asked about is the one answering, so a plain
-`pytest` serves live stacks with nothing installed beyond this package.
+`pytest` serves live stacks over HTTP with nothing installed beyond this
+package.
+
+A stalled run's *incident* is the other way round, and deliberately: it carries
+a py-spy stack even for the process raising it, because one reader with one
+shape is worth more than saving a subprocess on the one process that could.
+That read is a child tracing its parent, which is the wrong direction for Yama
+— so the run declares `PR_SET_PTRACER` naming itself, admitting its own
+descendants and nothing else, at the moment of the read and only for a stall
+already diagnosed.
 
 Without py-spy the endpoint still answers, with the reason instead of a stack. A
 UI that is told *why* it has no stack can tell a dead process from a missing

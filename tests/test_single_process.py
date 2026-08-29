@@ -19,7 +19,13 @@ from pathlib import Path
 
 import pytest
 
+from pytest_failure_instrumentation.probes import pyspy
+
 from .conftest import needs_xdist
+
+needs_pyspy = pytest.mark.skipif(
+    not pyspy.available(), reason="py-spy is not installed in this environment"
+)
 
 SUITE = """
 def test_one():
@@ -264,6 +270,10 @@ def test_a_run_with_no_workers_reports_its_own_stall(runner):
     There is no controller watching from outside, and there does not need to
     be: a main thread blocked on a lock does not stop the other threads in its
     process, so the run says what is wrong with it while it is still wrong.
+
+    Nothing here needs py-spy. Where it is absent the verdict is the same
+    verdict - it is reached from beats, not from frames - and the stack is
+    whatever the watchdog last wrote, which names the same blocked test.
     """
     runner.pytester.makepyfile(test_hang=HANGS)
     incidents = runner.run(*STALL_ARGUMENTS, "test_hang.py", timeout=180)
@@ -273,12 +283,28 @@ def test_a_run_with_no_workers_reports_its_own_stall(runner):
     assert stall.verdict == "STALLED_BLOCKED"
     assert stall.test_in_flight == "test_hang.py::test_deadlocks"
     assert stall.run_ending is True
+    assert stall.blamed_frame is not None
+    assert stall.blamed_frame.function == "test_deadlocks"
 
-    # Read out of this process's own frames rather than asked for with a
-    # signal: there is nothing to signal, nothing to wait for, and nothing
-    # that could return a blocked syscall early and dissolve the stall.
-    assert stall.stack_source == "in-process"
+
+@needs_pyspy
+def test_a_lone_run_reads_its_stall_stack_the_way_every_process_is_read(runner):
+    """py-spy, not a second mechanism for the one process that could avoid it.
+
+    The frames are directly available in this process - it is the one that
+    stalled - and reading them that way would be a reader with its own failure
+    modes and its own source to explain. This is the reader everything else
+    uses, so the stack is current, it says which thread holds the GIL, and no
+    signal is sent that could return a blocked syscall early.
+    """
+    runner.pytester.makepyfile(test_hang=HANGS)
+    incidents = runner.run(*STALL_ARGUMENTS, "test_hang.py", timeout=180)
+
+    stall = runner.only(incidents, "worker_stall")
+    assert stall.stack_source == "py-spy"
     assert stall.stack_probed is True
+    # Taken at the moment of the report, rather than left by the watchdog some
+    # part of failure_slow_test_seconds ago.
     assert stall.stack_age_seconds is not None and stall.stack_age_seconds < 5
     assert stall.blamed_frame is not None
     assert stall.blamed_frame.function == "test_deadlocks"

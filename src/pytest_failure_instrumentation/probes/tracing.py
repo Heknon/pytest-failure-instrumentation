@@ -99,6 +99,30 @@ def permit_tracing(policy: str = "parent") -> bool:
     return _declare(os.getppid())
 
 
+def permit_own_children() -> bool:
+    """Let a py-spy *this* process spawns read *this* process.
+
+    Not a policy, and deliberately not a fourth word in :data:`POLICIES`:
+    those are what a run declares about who may read its workers, and this is
+    a process answering for itself at the moment it reads itself. A run with
+    no workers has no controller to nominate - the reader is its own child,
+    and Yama's rule runs the other way, admitting only tracers that are
+    *ancestors* of the tracee.
+
+    ``PR_SET_PTRACER`` with our own pid is the exception that covers exactly
+    that and nothing more: the nominated pid and its descendants, which here
+    is the py-spy we are about to spawn and whatever else this run already
+    started. Narrower than "parent", which admits everything under the process
+    that started us, and far narrower than "any".
+
+    Declared at the moment of the read rather than at startup, because by then
+    a stall has already been diagnosed - so the permission is granted on the
+    runs that use it and on no others, which is the rule
+    :attr:`..config.Settings.tracer_in_force` exists to keep.
+    """
+    return _declare(os.getpid()) if IS_LINUX else False
+
+
 def _declare(tracer: int) -> bool:
     """Make the prctl call, with every argument's type spelled out.
 

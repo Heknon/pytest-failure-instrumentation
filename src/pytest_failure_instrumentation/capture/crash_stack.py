@@ -29,7 +29,7 @@ import signal
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Any, Optional, TextIO
 
 from ..probes import stacks
 
@@ -410,37 +410,31 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
     return ([banner] + section) if banner else section
 
 
-def own_stack(limit: int = 12) -> list[str]:
-    """This process's own stack, in the shape one read off disk has.
+def from_threads(threads: list[dict[str, Any]], limit: int = 12) -> list[str]:
+    """A live reader's threads, as a dump read off disk would have looked.
 
-    The stall watcher of a run with no workers is a thread inside the very
-    process it is assessing, which makes the whole apparatus above
-    unnecessary: there is no signal to send, nothing to perturb, and no file
-    to wait for. ``sys._current_frames`` already has the answer.
+    :func:`.probes.pyspy.dump` and :func:`.probes.stacks.own_threads` both
+    answer in one structured shape, and everything downstream of a stack in
+    this package reads faulthandler's *text* - the thread selection below, the
+    attribution that walks it for an owner, the incident's ``raw_stack``. One
+    renderer here is what lets a stack that was never written to a file go
+    through all of it unchanged, instead of a second pipeline for frames that
+    arrived as objects.
 
-    Rendered as faulthandler renders it so that everything downstream - the
-    thread selection here, attribution, the incident's ``raw_stack`` - reads
-    one format rather than two. No section is labelled ``Current thread``,
-    which is right and is what makes the selection work: nothing here was
-    reached by a signal, so no thread is the current one in the sense that
-    label means, and :func:`_most_relevant` falls through to the thread
-    carrying the runtest protocol - the one running the test, rather than the
-    watcher thread that asked.
-
-    Empty where the frames could not be read at all. That is not a case worth
-    a reason of its own: the caller has one already for every platform that
-    cannot answer, and this platform is not one of them.
+    No section is labelled ``Current thread``, and that is right rather than a
+    shortcut: nothing here was reached by a signal, so no thread is current in
+    the sense that label means. :func:`_most_relevant` falls through to the
+    thread carrying the runtest protocol, which is the one running the test.
     """
-    try:
-        threads = stacks.own_threads()
-    except Exception:  # noqa: BLE001 - a stall reported without a stack beats none
-        return []
     lines: list[str] = []
     for thread in threads:
-        lines.append(f"Thread 0x{thread['thread_id']:016x} (most recent call first):")
+        name = thread.get("thread_name") or ""
+        title = f"Thread 0x{int(thread.get('thread_id') or 0):016x}"
+        lines.append(f"{title} ({name}, most recent call first):" if name
+                     else f"{title} (most recent call first):")
         lines.extend(
-            f"  File \"{frame['file']}\", line {frame['line']} in {frame['function']}"
-            for frame in thread["frames"]
+            f'  File "{frame.get("file")}", line {frame.get("line")} in {frame.get("function")}'
+            for frame in thread.get("frames") or []
         )
     sections = _thread_sections(lines)
     return _capped(_most_relevant(sections), limit) if sections else []
