@@ -64,14 +64,20 @@ class SampledWorker(BaseModel):
     cpu_rate: Optional[float] = None
     heartbeat_age_s: Optional[float] = None
 
-    #: How many tests this worker has been given, and how many of those the
-    #: controller has not seen finish. The denominator a row of statuses
-    #: otherwise has no way to carry: a worker's own files count what it has
-    #: run and nothing can tell them how much is left. ``None`` before the
-    #: workers have collected, and on any run whose scheduler this package
-    #: does not recognise - see :mod:`.schedule`.
+    #: How many tests this worker has been given - the denominator a row of
+    #: statuses otherwise has no way to carry, because a worker's own files
+    #: count what it has run and nothing can tell them how much is left.
+    #: ``None`` before the workers have collected, and on any run whose
+    #: scheduler this package does not recognise - see :mod:`.schedule`.
     tests_assigned: Optional[int] = None
-    tests_pending: Optional[int] = None
+    #: That total split three ways, so that it adds up: what this worker has
+    #: run, the one test in flight if there is one, and the ones it has not
+    #: begun. Every test it was given is in exactly one of them, which is why
+    #: a row carries the split rather than what is "left" - that would put the
+    #: test in flight in two counts at once.
+    tests_finished: Optional[int] = None
+    tests_running: Optional[int] = None
+    tests_queued: Optional[int] = None
 
 
 class WorkerSample(BaseModel):
@@ -121,7 +127,9 @@ class WorkerSampler:
                     cpu_rate=record.get("cpu_rate"),
                     heartbeat_age_s=record.get("heartbeat_age_s"),
                     tests_assigned=record.get("tests_assigned"),
-                    tests_pending=record.get("tests_pending"),
+                    tests_finished=record.get("tests_finished"),
+                    tests_running=record.get("tests_running"),
+                    tests_queued=record.get("tests_queued"),
                 )
                 for record in described.get("workers", [])
             ],

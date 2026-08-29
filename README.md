@@ -703,13 +703,14 @@ the run was writing anyway — no ptrace, no per-test cost, nothing written:
      {"worker": "gw0", "pid": 21615, "nodeid": "test_slow.py::test_alpha", "phase": "call",
       "status": "blocked", "why": "heartbeat 0.5s old but no CPU progress: the test thread is waiting on something",
       "process_exists": true, "heartbeat_age_s": 0.5, "cpu_rate": 0.001, "rss_mb": 32,
-      "tests_finished": 51, "tests_assigned": 64, "tests_pending": 13},
+      "tests_finished": 51, "tests_running": 1, "tests_queued": 12, "tests_assigned": 64},
      {"worker": "gw1", "pid": 21618, "nodeid": "test_slow.py::test_beta", "phase": "call",
       "status": "gone", "why": "process 21618 no longer exists; last seen in call of test_slow.py::test_beta",
-      "process_exists": false, "tests_finished": 12, "tests_assigned": 20, "tests_pending": 8},
+      "process_exists": false,
+      "tests_finished": 12, "tests_running": 1, "tests_queued": 7, "tests_assigned": 20},
      {"worker": "gw2", "pid": 21621, "nodeid": "test_slow.py::test_gamma", "phase": "call",
       "status": "working", "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0,
-      "tests_finished": 48, "tests_assigned": 60, "tests_pending": 12}]}]}
+      "tests_finished": 48, "tests_running": 1, "tests_queued": 11, "tests_assigned": 60}]}]}
 ```
 
 `?worker=` narrows it to particular workers, which on a sixty-four-way run is
@@ -787,10 +788,19 @@ the evidence pick it up like every other fact here.
 | field | on | meaning |
 |---|---|---|
 | `tests_assigned` | worker | tests handed to this worker **so far** |
-| `tests_pending` | worker | of those, how many it has not finished — the test in flight included |
+| `tests_finished` | worker | of those, how many it has run |
+| `tests_running` | worker | the test in flight — 1, or 0 between tests |
+| `tests_queued` | worker | the ones it has not begun |
 | `collected` | run | tests in the run's whole collection |
 | `unassigned` | run | tests that are nobody's yet — what every total can still grow by |
 | `settled` | run | whether any worker's total can still change |
+
+**The three worker counts partition the total**: `finished + running + queued
+== assigned`, always, with every test in exactly one of them. That shape is
+deliberate. Reporting what was *left* instead read more naturally and was a
+trap — "not finished" includes the test in flight, and so does `tests_started`,
+so the two obvious numbers to add were the two that overlapped, and a row
+saying `started 2, pending 2, assigned 3` looked broken while being correct.
 
 **It is a running total, not a plan, and `settled` is how you tell.** Under
 `--dist load` and its relatives the scheduler keeps most of the suite in a queue
@@ -810,9 +820,10 @@ been given — not a lag a reader can interpret, but a row that cannot be true.
 
 Two things stop it. The controller's record is rewritten *whenever a test
 starts* rather than on a timer, so it is never more than one test behind; and
-`tests_pending` is measured from the worker's own count rather than carried
-over from the controller's, so a stale total can only understate what is left,
-never contradict the line above it.
+only the total comes from it — the split is measured from the worker's own
+counts, and the total is floored at `tests_started`, because a worker cannot
+begin a test it was never given either. A stale total can then only understate
+the queue, never contradict the line above it.
 
 What can still move is `tests_assigned`, by one, for an instant. A worker tells
 the controller a test is finished before it tells the *scheduler*, so in
@@ -825,9 +836,10 @@ one's, and it lasts until the next test starts somewhere.
 xdist drops a dead worker's queue back into the global one and starts a
 replacement under a new id, and the test it died *in* is reported failed rather
 than reassigned. The dead worker's row stays as it was — `tests_assigned: 5,
-tests_pending: 2` is "it was given five, ran three, and died owing two", which
-is the line a death is triaged with, and the replacement gets a row of its own
-rather than overwriting it. What that costs is that the tests it was given and
+tests_finished: 3, tests_running: 1, tests_queued: 1` is "it was given five,
+ran three, died inside the fourth and never started the fifth", which is the
+line a death is triaged with, and the replacement gets a row of its own rather
+than overwriting it. What that costs is that the tests it was given and
 somebody else then ran are counted in both rows. So `collected` is the run's
 size and summing `tests_assigned` is not; `status: gone` is what marks a row as
 a record of a process rather than a report on one.
@@ -1036,7 +1048,8 @@ def pytest_failure_worker_sample(sample):
                     worker=worker.worker, nodeid=worker.nodeid,
                     phase=worker.phase, status=worker.status, why=worker.why,
                     rss_mb=worker.rss_mb, cpu_rate=worker.cpu_rate,
-                    assigned=worker.tests_assigned, pending=worker.tests_pending)
+                    assigned=worker.tests_assigned, done=worker.tests_finished,
+                    queued=worker.tests_queued)
 ```
 
 Off by default. It is the only hook here that fires when nothing is wrong, so it

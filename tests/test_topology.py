@@ -290,17 +290,59 @@ def test_a_worker_carries_the_total_it_cannot_know_itself(evidence):
     was given, because no worker is told. The controller works that out and
     writes it down, and this is where the two halves meet.
 
-    Only the *total* is taken from the controller. What is left of it is
-    measured from the worker's own count - here the controller is two tests
-    behind, and the row still adds up."""
+    Only the *total* is taken from the controller; the split of it comes from
+    the worker's own counts - here the controller is two tests behind, and the
+    row still adds up."""
     evidence.state("gw0", tests_started=10, tests_finished=9)
     evidence.beats("gw0", cpu_step=0.9)
     evidence.schedule(gw0=(14, 7), gw1=(11, 4))
 
     described = topology.run(evidence.run)["workers"][0]
     assert described["tests_finished"] == 9
+    assert described["tests_running"] == 1
+    assert described["tests_queued"] == 4
     assert described["tests_assigned"] == 14
-    assert described["tests_pending"] == 5
+
+
+def test_the_three_counts_partition_the_total(evidence):
+    """Every test a worker was given is in exactly one of them, so they add up
+    and no two of them count the same test. Reporting what was *left* instead
+    put the test in flight in two places at once, and a row reading
+    "started 2, pending 2, assigned 3" looked broken while being correct."""
+    evidence.state("gw0", tests_started=6, tests_finished=5)
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(9, 5))
+
+    row = topology.run(evidence.run)["workers"][0]
+    assert (row["tests_finished"], row["tests_running"], row["tests_queued"]) == (5, 1, 3)
+    assert row["tests_finished"] + row["tests_running"] + row["tests_queued"] == (
+        row["tests_assigned"]
+    )
+
+
+def test_a_worker_between_tests_has_nothing_running(evidence):
+    """The count is the test in flight, and between two tests there is not
+    one - which is the distinction that keeps a worker that died in the gap
+    from being blamed on the test that had already passed."""
+    evidence.state("gw0", tests_started=5, tests_finished=5, nodeid=None, phase=None)
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(9, 5))
+
+    row = topology.run(evidence.run)["workers"][0]
+    assert (row["tests_finished"], row["tests_running"], row["tests_queued"]) == (5, 0, 4)
+
+
+def test_a_record_whose_counts_cannot_be_read_keeps_the_total(evidence):
+    """The total stands on its own. A split invented out of a record that does
+    not make sense would be a row that looks whole and is not."""
+    evidence.state("gw0", tests_started=None, tests_finished=None)
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(9, 5))
+
+    row = topology.run(evidence.run)["workers"][0]
+    assert row["tests_assigned"] == 9
+    assert row["tests_running"] is None
+    assert row["tests_queued"] is None
 
 
 def test_a_total_the_worker_has_already_passed_is_the_stale_one(evidence):
@@ -313,8 +355,12 @@ def test_a_total_the_worker_has_already_passed_is_the_stale_one(evidence):
     evidence.schedule(gw0=(15, 15))
 
     described = topology.run(evidence.run)["workers"][0]
-    assert described["tests_assigned"] == 19
-    assert described["tests_pending"] == 0
+    # Floored at what it has *started*, not at what it has finished: a worker
+    # cannot begin a test it was never given either, and the lower floor would
+    # leave the queue below zero for as long as a test was in flight.
+    assert described["tests_assigned"] == 20
+    assert described["tests_running"] == 1
+    assert described["tests_queued"] == 0
 
 
 def test_a_run_says_how_much_of_it_is_nobody_s_yet(evidence):
@@ -340,7 +386,8 @@ def test_a_run_with_no_schedule_says_nothing_rather_than_zero(evidence):
 
     described = topology.run(evidence.run)
     assert described["workers"][0]["tests_assigned"] is None
-    assert described["workers"][0]["tests_pending"] is None
+    assert described["workers"][0]["tests_running"] is None
+    assert described["workers"][0]["tests_queued"] is None
     assert described["schedule"] == {
         "dist": None, "collected": None, "unassigned": None,
         "settled": None, "updated_at": None,

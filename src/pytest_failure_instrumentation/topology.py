@@ -241,7 +241,7 @@ def worker(
     record = read_state(state_path, run_id)
     beats = [event for event in events if event.get("event") == "heartbeat"]
 
-    assigned, pending = _progress(record, schedule or {})
+    assigned, running, queued = _progress(record, schedule or {})
     pid = record.get("pid")
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
@@ -268,10 +268,12 @@ def worker(
         # (a single-process run) or none yet (before the workers have
         # collected), which is not the same as a worker with nothing to do.
         "tests_assigned": assigned,
-        # What is left of that total. Measured from the worker's own count
-        # rather than carried over from the controller's, so the three numbers
-        # in this row always agree - see _progress.
-        "tests_pending": pending,
+        # And that total split three ways, so it adds up: the test in flight,
+        # if there is one, and the ones not begun. Every test this worker was
+        # given is in exactly one of finished, running and queued - see
+        # _progress for why "what is left" was the wrong shape.
+        "tests_running": running,
+        "tests_queued": queued,
         "state_age_s": _age(now, record.get("time")),
         "rss_mb": beats[-1].get("rss_mb") if beats else None,
         "status": status,
@@ -287,32 +289,55 @@ def worker(
 
 def _progress(
     record: dict[str, Any], schedule: dict[str, Any]
-) -> tuple[Optional[int], Optional[int]]:
-    """How much this worker was given, and how much of it is left.
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """This worker's total, split into three counts that do not overlap.
 
-    The two halves are written by different processes: the total by the
-    controller, into one file for the run, and the count of what has been run
-    by the worker itself, into its own slot. So a row that simply reported
-    both as it found them could say a worker had finished more tests than it
-    was ever given - which is not a lag a reader can interpret, it is a row
-    that cannot be true. It happened, on a suite whose tests were shorter than
-    the interval the controller's file was then written on.
+    ``finished``, ``running`` and ``queued`` partition ``assigned``: every test
+    it was given is in exactly one of them, so they add up and no two of them
+    count the same test. That is the whole reason for the shape. Reporting
+    what was *left* instead read naturally and was a trap - "not finished"
+    includes the test in flight, and so does ``tests_started``, so the two
+    obvious numbers to add were the two that overlapped, and a row saying
+    ``started 2, pending 2, assigned 3`` looked broken while being correct.
 
-    A worker cannot finish a test it was never given, so its own count is a
-    floor under the total, and what is left is measured from that same count.
-    The row then holds together however far apart the two files were written -
-    the worst a stale total can do is understate what is left, where before it
-    could contradict the line above it.
+    The counts come from two processes: ``assigned`` from the controller, into
+    one file for the whole run, and the rest from the worker's own slot. A row
+    that took them as it found them could say a worker had finished more tests
+    than it was ever given - not a lag a reader can interpret, but a row that
+    cannot be true. It happened, on a suite whose tests were shorter than the
+    interval the controller's file was then written on.
+
+    So the worker's own count is a floor under the total, and it is
+    ``tests_started`` rather than ``tests_finished`` that does the flooring: a
+    worker cannot *start* a test it was never given either, and a floor set at
+    the lower of the two would leave ``queued`` below zero for exactly as long
+    as a test was in flight.
     """
-    assigned = schedule.get("assigned")
-    if not isinstance(assigned, int) or isinstance(assigned, bool):
-        return None, None
-    finished = record.get("tests_finished")
-    if not isinstance(finished, int) or isinstance(finished, bool) or finished < 0:
-        pending = schedule.get("pending")
-        return assigned, pending if isinstance(pending, int) else None
-    assigned = max(assigned, finished)
-    return assigned, assigned - finished
+    assigned = _count(schedule.get("assigned"))
+    if assigned is None:
+        return None, None, None
+    finished = _count(record.get("tests_finished"))
+    started = _count(record.get("tests_started"))
+    if finished is None or started is None or finished > started:
+        # The total still stands on its own; the split does not, and inventing
+        # one out of a record this far from making sense would be a row that
+        # looks whole and is not.
+        return assigned, None, None
+    assigned = max(assigned, started)
+    return assigned, started - finished, assigned - started
+
+
+def _count(value: Any) -> Optional[int]:
+    """``value`` if it is a count this arithmetic can stand on, else None.
+
+    Every field here is read out of a JSON file that something else could have
+    written, so "a whole number, not negative" is checked rather than assumed -
+    and ``True`` is an ``int`` in Python, which an isinstance check alone would
+    wave through into the subtraction below.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _worker_run_id(events: list[dict[str, Any]]) -> Optional[str]:

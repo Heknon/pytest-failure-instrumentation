@@ -465,12 +465,15 @@ def test_a_worker_never_reports_finishing_more_tests_than_it_was_given(pytester)
                 if shown["tests_assigned"] is None:
                     continue
                 # And the row a reader is handed holds together whatever the
-                # two files were doing.
+                # two files were doing: the three counts partition the total.
                 assert shown["tests_finished"] <= shown["tests_assigned"], shown
                 assert (
-                    shown["tests_pending"]
-                    == shown["tests_assigned"] - shown["tests_finished"]
+                    shown["tests_finished"]
+                    + shown["tests_running"]
+                    + shown["tests_queued"]
+                    == shown["tests_assigned"]
                 ), shown
+                assert shown["tests_running"] in (0, 1), shown
 
     with _polling(poll):
         pytester.runpytest_subprocess("-n3", "--dist=load").assert_outcomes(passed=60)
@@ -556,4 +559,4 @@ def test_a_real_run_accounts_for_every_test(pytester, dist):
     assert described["schedule"]["settled"] is True
     for row in described["workers"]:
         assert row["tests_assigned"] == record["workers"][row["worker"]]["assigned"]
-        assert row["tests_pending"] == 0
+        assert (row["tests_running"], row["tests_queued"]) == (0, 0)

@@ -129,32 +129,32 @@ def test_a_row_carries_the_denominator_the_worker_cannot_supply(tmp_path):
     entry = WorkerSampler(root).sample().workers[0]
 
     assert entry.tests_assigned == 14
-    assert entry.tests_pending == 5
+    assert (entry.tests_finished, entry.tests_running, entry.tests_queued) == (9, 1, 4)
 
 
-def test_what_is_left_is_measured_from_the_worker_s_own_count(tmp_path):
+def test_the_split_is_measured_from_the_worker_s_own_counts(tmp_path):
     """The controller's count of what this worker has done and the worker's
     own are written by different processes into different files, and a row
     that took the total from one and the progress from the other could say a
     worker had finished more tests than it was given. So the total is the only
-    thing taken from the controller; what is left of it is measured here."""
+    thing taken from the controller; the split of it is measured here."""
     root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=11)
     _schedule(root, gw0=(14, 9))  # the controller is two behind the worker
     entry = WorkerSampler(root).sample().workers[0]
 
     assert entry.tests_assigned == 14
-    assert entry.tests_pending == 3
+    assert (entry.tests_finished, entry.tests_running, entry.tests_queued) == (11, 1, 2)
 
 
 def test_a_total_the_worker_has_already_passed_is_the_stale_one(tmp_path):
-    """A worker cannot finish a test it was never given, so its own count is a
+    """A worker cannot start a test it was never given, so its own count is a
     floor under the total rather than a contradiction of it."""
     root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=19)
     _schedule(root, gw0=(15, 15))
     entry = WorkerSampler(root).sample().workers[0]
 
-    assert entry.tests_assigned == 19
-    assert entry.tests_pending == 0
+    assert entry.tests_assigned == 20  # the slot says one is in flight past it
+    assert (entry.tests_finished, entry.tests_running, entry.tests_queued) == (19, 1, 0)
 
 
 def test_a_row_from_a_run_with_no_schedule_says_nothing_rather_than_zero(tmp_path):
@@ -163,7 +163,8 @@ def test_a_row_from_a_run_with_no_schedule_says_nothing_rather_than_zero(tmp_pat
     entry = WorkerSampler(root).sample().workers[0]
 
     assert entry.tests_assigned is None
-    assert entry.tests_pending is None
+    assert entry.tests_running is None
+    assert entry.tests_queued is None
 
 
 def test_an_empty_directory_samples_nothing_rather_than_raising(tmp_path):
