@@ -152,7 +152,8 @@ def pytest_failure_server_ready(server):
 
 #: A test that asks the live view what *it* is doing, over HTTP, while it is
 #: doing it. In a run with no workers the server is inside the process being
-#: asked about, so the answer comes out of its own frames and needs no py-spy.
+#: asked about, and is still read from outside it - one reader, whoever the
+#: target turns out to be.
 PULLS_ITS_OWN_STACK = """
 import json
 import os
@@ -191,6 +192,7 @@ def test_pulls_its_own_callstack():
         stack = json.loads(refused.read())
     Path("stack.json").write_text(json.dumps(stack), encoding="utf-8")
 """
+
 
 def read(pytester: pytest.Pytester, name: str):
     return json.loads((pytester.path / name).read_text(encoding="utf-8"))
