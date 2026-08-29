@@ -317,6 +317,72 @@ def test_a_write_that_cannot_land_costs_this_one_and_not_the_run(tmp_path):
 # -- and what a real run produces --------------------------------------------
 
 
+CRASHING_SUITE = """
+import os
+import time
+
+import pytest
+
+
+@pytest.mark.parametrize("i", range(24))
+def test_thing(i):
+    if i == 3:
+        time.sleep(0.4)
+        os._exit(1)
+    time.sleep(0.05)
+"""
+
+
+@needs_xdist
+def test_a_crashed_worker_keeps_what_it_was_owed_and_the_rest_is_reassigned(pytester):
+    """The one case where a row outlives the worker it describes.
+
+    xdist drops a dead worker's queue back into the global one and starts a
+    replacement, so what that worker was *given* is a fact about a process
+    that no longer exists - and it is the fact a death is triaged with. It
+    survives because ``pytest_testnodedown`` fires before xdist takes the node
+    out of the scheduler, and because a worker the scheduler no longer has is
+    never recomputed.
+
+    The test it died *in* is not reassigned to anybody: xdist reports it
+    failed and moves on. So what every worker finished, added up, is the run
+    minus that one - and the crash report, which arrives on the dead node and
+    is not a teardown, is counted by nobody.
+    """
+    evidence = pytester.path / "evidence"
+    pytester.makepyfile(test_suite=CRASHING_SUITE)
+    pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
+
+    result = pytester.runpytest_subprocess("-n2", "--dist=load")
+    result.assert_outcomes(passed=23, failed=1)
+
+    runs = [path for path in evidence.iterdir() if path.is_dir()]
+    record = schedule.read(runs[0])
+    rows_by_worker = record["workers"]
+
+    # The replacement is a worker of its own, under an id of its own - the
+    # dead one's row is not overwritten by the process that took its place.
+    assert len(rows_by_worker) == 3, rows_by_worker
+
+    owing = {name: row for name, row in rows_by_worker.items() if row["pending"]}
+    assert len(owing) == 1, rows_by_worker
+    dead = next(iter(owing.values()))
+    # At least the test it was inside. Whatever else it had queued went back
+    # to the scheduler and was run by somebody else.
+    assert dead["pending"] >= 1
+    assert dead["completed"] < dead["assigned"]
+
+    # Every test that ran to completion is counted once, by whichever worker
+    # ran it - the one that crashed is counted by nobody.
+    assert sum(row["completed"] for row in rows_by_worker.values()) == 23
+    assert record["collected"] == 24
+    assert record["unassigned"] == 0
+
+    # And the sum of what the workers were *given* is larger than the run,
+    # by the tests the dead worker was given and somebody else then ran.
+    assert sum(row["assigned"] for row in rows_by_worker.values()) > 24
+
+
 SUITE = """
 def test_one(): pass
 def test_two(): pass

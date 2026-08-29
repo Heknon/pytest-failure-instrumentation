@@ -124,6 +124,13 @@ class ScheduleTracker:
         #: ``pytest_testnodedown`` is the last moment anything can be read
         #: about it - which is early enough, because xdist fires that hook
         #: before it takes the node out of the scheduler.
+        #:
+        #: A replacement worker arrives under a new gateway id and so gets a
+        #: row of its own; the dead one's is not overwritten by the process
+        #: that took over its work. What that costs is that a test the dead
+        #: worker was given and somebody else then ran is counted in both
+        #: rows - which is why ``collected`` is the run's size and the sum of
+        #: these is not.
         self._rows: dict[str, dict[str, int]] = {}
         self._written = 0.0
 

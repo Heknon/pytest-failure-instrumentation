@@ -815,6 +815,17 @@ that worker is never inside that window — what is left is the rarer case of
 another worker's two messages straddling this one's, and it lasts until the
 next write.
 
+**A crashed worker keeps its row, so the rows can add up to more than the run.**
+xdist drops a dead worker's queue back into the global one and starts a
+replacement under a new id, and the test it died *in* is reported failed rather
+than reassigned. The dead worker's row stays as it was — `tests_assigned: 5,
+tests_pending: 2` is "it was given five, ran three, and died owing two", which
+is the line a death is triaged with, and the replacement gets a row of its own
+rather than overwriting it. What that costs is that the tests it was given and
+somebody else then ran are counted in both rows. So `collected` is the run's
+size and summing `tests_assigned` is not; `status: gone` is what marks a row as
+a record of a process rather than a report on one.
+
 Nothing is written for a run with no scheduler to ask — a single-process run,
 or a distributed one whose workers have not collected yet. Those fields come
 back `null`, which is not zero: zero pending is a worker about to finish, and
