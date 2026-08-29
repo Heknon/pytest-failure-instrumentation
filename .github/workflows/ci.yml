@@ -81,21 +81,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
 
-      # py-spy is what reads a process other than the one serving, so without
-      # it the test covering the live view's whole reason to exist skips -
-      # which is the same as not having it. Installed everywhere the platform
-      # table claims that read works, so the table is checked rather than
-      # asserted: Linux and Windows say yes, macOS says root only and is left
-      # out, since granting that would mean running the whole suite as root.
+      # py-spy is how this package reads any live process, the one doing the
+      # reading included, so without it every test covering the live view's
+      # whole reason to exist skips - which is the same as not having it.
+      # Installed everywhere the platform table claims that read works, so the
+      # table is checked rather than asserted: Linux and Windows say yes,
+      # macOS says root only and is left out, since granting that would mean
+      # running the whole suite as root.
       - name: Install the external stack reader
         if: runner.os != 'macOS'
         run: pip install -e ".[stacks]"
 
       # The restrictive setting, on purpose. Ubuntu and Debian ship
       # ptrace_scope=1, which is what makes a worker unreadable by a reader
-      # that is its sibling rather than its ancestor - so a runner left at 0
-      # would pass the live-view tests without ever exercising the exception
-      # that makes them work on a real user's machine. Set here rather than
+      # that is its sibling rather than its ancestor, and a process unreadable
+      # by the py-spy it spawns for itself - so a runner left at 0 would pass
+      # the live-view tests without ever exercising either exception that
+      # makes them work on a real user's machine. Set here rather than
       # assumed, and the tests report the value they observed either way.
       - name: Restrict ptrace the way a stock Linux box does
         if: runner.os == 'Linux'

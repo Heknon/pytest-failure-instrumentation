@@ -27,7 +27,6 @@ from ..analysis import stall as assessment
 from ..capture import crash_stack
 from ..capture import events as event_log
 from ..capture.state import read_state
-from ..probes import tracing
 from .base import Incident
 
 #: How long to wait for a signalled worker to write its stack.
@@ -356,15 +355,10 @@ def _own_stack(
     gives - the same position ``/stack`` has always been in, and better than a
     stack whose absence is unexplained.
 
-    The reader is our own child, which is the wrong way round for Yama: at
-    ``ptrace_scope=1`` a tracer must be an ancestor of its target. So the
-    declaration that admits it is made here, immediately before the read and
-    only for a stall already diagnosed - see
-    :func:`..probes.tracing.permit_own_children`, which is the narrowest of
-    the three this package makes.
+    The Yama declaration a self-read needs travels with the reader rather than
+    being made here - see :func:`..probes.stacks.live_stack`.
     """
-    tracing.permit_own_children()
-    threads, error = probes.external_stack(os.getpid())
+    threads, error = probes.live_stack(os.getpid())
     stack = crash_stack.from_threads(threads or [], limit=STACK_LINES)
     if stack:
         return stack, True, None, time.time(), "py-spy"

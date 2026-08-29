@@ -413,9 +413,9 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
 def from_threads(threads: list[dict[str, Any]], limit: int = 12) -> list[str]:
     """A live reader's threads, as a dump read off disk would have looked.
 
-    :func:`.probes.pyspy.dump` and :func:`.probes.stacks.own_threads` both
-    answer in one structured shape, and everything downstream of a stack in
-    this package reads faulthandler's *text* - the thread selection below, the
+    :func:`.probes.stacks.live_stack` answers in a structured shape, and
+    everything downstream of a stack in this package reads faulthandler's
+    *text* - the thread selection below, the
     attribution that walks it for an owner, the incident's ``raw_stack``. One
     renderer here is what lets a stack that was never written to a file go
     through all of it unchanged, instead of a second pipeline for frames that

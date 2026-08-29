@@ -822,8 +822,7 @@ looks like a path is just a name that matches nothing.
 A run with no workers is described the same way, under the name `main`. It is
 the case where the two halves of the view coincide: the process serving is the
 process running the tests, so `controller.pid` and the worker's pid are the same
-number, and `/stack` for it needs no py-spy and no permission — the server reads
-its own frames.
+number — and `/stack` for it is read exactly as any other pid is.
 
 ```console
 $ curl localhost:8080/workers
@@ -833,7 +832,7 @@ $ curl localhost:8080/workers
                 "why": "heartbeat 0.4s old but no CPU progress: the test thread is waiting on something"}]}]}
 
 $ curl 'localhost:8080/stack?pid=4212'
-{"pid": 4212, "source": "in-process", ...}
+{"pid": 4212, "source": "py-spy", ...}
 ```
 
 The status vocabulary is [`analysis/stall.py`](#how-it-knows)'s truth table, as
@@ -1164,30 +1163,34 @@ requirement entirely, so any reader on the machine that could already ptrace is
 permitted. That is the setting a shared server needs and the one a private run
 does not, which is why it is not the default.
 
-### Reading another process needs py-spy
+### Reading a live process needs py-spy
 
 `pip install pytest-failure-instrumentation[stacks]`. There is no way to walk
-another process's frames from Python, so any pid but the server's own is read
-externally. That is also what makes it work on a worker whose GIL is held by
-native code: py-spy reads the target's memory rather than asking it to run
-anything, and stops the target before reading, so it never walks a frame that is
-being torn down. The server's *own* pid is answered from `sys._current_frames()`
-— no subprocess, no ptrace, no permission. In a run with no workers that is the
-whole run: the process being asked about is the one answering, so a plain
-`pytest` serves live stacks over HTTP with nothing installed beyond this
-package.
+another process's frames from Python, so a live stack is read from outside the
+target: py-spy reads its memory rather than asking it to run anything, and
+stops it before reading, so it never walks a frame that is being torn down.
+That is what makes it work on a worker whose GIL is held by native code, and it
+is why nothing here has to be signalled.
 
-A stalled run's *incident* is the other way round, and deliberately: it carries
-a py-spy stack even for the process raising it, because one reader with one
-shape is worth more than saving a subprocess on the one process that could.
-That read is a child tracing its parent, which is the wrong direction for Yama
-— so the run declares `PR_SET_PTRACER` naming itself, admitting its own
-descendants and nothing else, at the moment of the read and only for a stall
-already diagnosed.
+**Every pid is read that way, including the process doing the reading.** Its
+own frames are also directly to hand — `sys._current_frames()`, no subprocess
+and no permission — and answering from them was a second reader with a second
+`source` for the one process that could avoid the first. A caller that has to
+know which mechanism answered has been handed two APIs, and a UI is where that
+ends up encoded. One reader, one shape, one thing to keep working.
 
-Without py-spy the endpoint still answers, with the reason instead of a stack. A
-UI that is told *why* it has no stack can tell a dead process from a missing
-permission; one that gets an empty response cannot.
+Reading yourself is a child tracing its parent, which is the wrong direction
+for Yama. The declaration that admits it names *this* process — so it permits
+this run's own descendants and nothing else, narrower than the `parent` policy
+above — and it is made at the moment of the read rather than at startup, so
+only the runs that read a stack make it.
+
+Without py-spy the endpoint still answers, with the reason instead of a stack.
+A UI that is told *why* it has no stack can tell a dead process from a missing
+permission; one that gets an empty response cannot. The same is true of a
+stall: the verdict comes from heartbeats rather than frames, so it is reached
+either way, and the stack falls back to whatever the watchdog last wrote with
+its age attached.
 
 On Windows there is no ptrace and no equivalent restriction: any process can
 read another running as the same user at the same integrity level, so the
@@ -1370,7 +1373,7 @@ its directory says so.
 | Current memory | procfs | psutil | psapi |
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
-| Live stack of another process (needs py-spy) | yes | root only | yes |
+| Live stack of a running process (needs py-spy) | yes | root only | yes |
 | Stack from a worker that stopped running Python | yes | yes | yes |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a

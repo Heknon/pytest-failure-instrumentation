@@ -1,21 +1,31 @@
-"""Asking a process for its stack - this one, or another one.
+"""Getting a stack out of a live process, whichever process it is.
 
-Another process is asked with a signal, which needs both a signal to send and
-a handler able to answer it. Windows has neither, so a stall there is reported
-without a stack rather than with a guess. Reading the target's memory instead
-lifts that restriction and lives in :mod:`.pyspy`.
+Two mechanisms, and they answer different questions.
 
-*This* process needs no asking at all: its frames are already here, and
-:func:`own_threads` reads them in the shape the external reader returns.
+**Asking** - :func:`request_stack` - sends a signal and lets the target's own
+faulthandler write the answer into its crash file. It needs both a signal to
+send and a handler able to answer it, so Windows has neither, and it perturbs
+the target: a C extension blocked in a syscall that does not handle EINTR
+returns early when the signal lands, which is exactly the stall it was sent to
+measure. It is a way to get a *fresher* stack out of a worker already
+diagnosed, and nothing more.
+
+**Reading** - :func:`live_stack` - pauses the target and reads its memory
+through py-spy, which asks it to run nothing and so works on a process that is
+not running anything. That is the one this package uses to answer "what is
+this process doing", for any process including the one asking.
+
+Including the one asking, deliberately. This process's own frames are also
+directly available through ``sys._current_frames``, and reading them that way
+was a second reader for a question that already had one: its own failure
+modes, its own source to explain to whoever reads the incident, and its own
+shape to keep in step. One reader is worth a subprocess.
 """
 
 from __future__ import annotations
 
 import os
 import signal
-import sys
-import threading
-from types import FrameType
 from typing import Any, Optional
 
 
@@ -41,45 +51,24 @@ def request_stack(pid: int) -> bool:
         return False
 
 
-def own_threads() -> list[dict[str, Any]]:
-    """This process's own threads, in the shape :mod:`.pyspy` returns.
+def live_stack(pid: int) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """``(threads, error)`` for any live process. Exactly one of them is None.
 
-    The free answer. Reading another process needs ptrace and a subprocess;
-    reading this one is a dict lookup, so a request that happens to name the
-    serving process should never pay for the external reader.
+    The single entry point, so that everything asking what a process is doing
+    - the live view's ``/stack``, a stall being assessed - gets the same
+    frames, the same thread shape and the same reason when there are none.
 
-    What it cannot do is the case the external reader exists for. Building
-    these records is Python, so a thread holding the GIL in native code stops
-    this from running at all - and the caller gets no answer rather than a
-    wrong one, which is the honest failure here.
+    **Reading ourselves is not a special case, except to Yama.** py-spy is a
+    subprocess, so a read of this process is our own child tracing its parent
+    - and at ``ptrace_scope=1``, the Ubuntu and Debian default, a tracer must
+    be an *ancestor* of its target. The declaration that admits it is made
+    here rather than at startup, so it is made by the runs that read a stack
+    and no others; it names this process, which admits this run's own
+    descendants and nothing else. See :mod:`.tracing`, where the two wider
+    policies live.
     """
-    names = {thread.ident: thread.name for thread in threading.enumerate()}
-    threads: list[dict[str, Any]] = []
-    for thread_id, top in sys._current_frames().items():
-        frames: list[dict[str, Any]] = []
-        frame: Optional[FrameType] = top
-        while frame is not None:
-            code = frame.f_code
-            frames.append(
-                {
-                    "function": code.co_name,
-                    "file": code.co_filename,
-                    "line": frame.f_lineno,
-                }
-            )
-            frame = frame.f_back
-        # f_back walks outwards, so this is already innermost-first - the
-        # order py-spy uses and the order the rest of this package reports.
-        threads.append(
-            {
-                "thread_id": thread_id,
-                "thread_name": names.get(thread_id),
-                # Only the external reader can say which thread holds the GIL.
-                # Reaching this code at all means *some* Python is running, but
-                # not which thread was executing when the request arrived.
-                "owns_gil": None,
-                "active": None,
-                "frames": frames,
-            }
-        )
-    return threads
+    from . import pyspy, tracing
+
+    if pid == os.getpid():
+        tracing.permit_own_children()
+    return pyspy.dump(pid)

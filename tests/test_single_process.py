@@ -157,6 +157,7 @@ PULLS_ITS_OWN_STACK = """
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -181,9 +182,14 @@ def pull(path):
 
 def test_pulls_its_own_callstack():
     Path("workers.json").write_text(json.dumps(pull("/workers")), encoding="utf-8")
-    Path("stack.json").write_text(
-        json.dumps(pull("/stack?pid=%d" % os.getpid())), encoding="utf-8"
-    )
+    try:
+        stack = pull("/stack?pid=%d" % os.getpid())
+    except urllib.error.HTTPError as refused:
+        # With no py-spy installed the endpoint answers with the reason
+        # instead of a stack, which is an answer and not a failure. What the
+        # view says about this run is the other file.
+        stack = json.loads(refused.read())
+    Path("stack.json").write_text(json.dumps(stack), encoding="utf-8")
 """
 
 def read(pytester: pytest.Pytester, name: str):
@@ -210,7 +216,8 @@ def test_the_live_view_answers_for_a_run_with_no_workers(runner):
     assert worker["pid"] == run["controller"]["pid"]
 
 
-def test_a_lone_run_reads_its_own_stack_without_py_spy(runner):
+@needs_pyspy
+def test_a_lone_run_reads_its_own_stack_the_way_it_reads_any_other(runner):
     runner.pytester.makeconftest(SERVER_CONFTEST)
     runner.pytester.makeini(ini(failure_stack_server="true"))
     runner.pytester.makepyfile(test_lone=PULLS_ITS_OWN_STACK)
@@ -218,10 +225,10 @@ def test_a_lone_run_reads_its_own_stack_without_py_spy(runner):
     assert runner.result.ret == 0, runner.result.stdout.str()
 
     stack = read(runner.pytester, "stack.json")
-    # Reading another process needs ptrace and a subprocess. Reading this one
-    # is a dict lookup - and in a run with no workers, this one is the only
-    # process there is.
-    assert stack["source"] == "in-process"
+    # In a run with no workers the process being asked about is the one
+    # answering, and it is still read from outside itself: one reader, one
+    # source, whoever the target turns out to be.
+    assert stack["source"] == "py-spy"
     frames = [frame for thread in stack["threads"] for frame in thread["frames"]]
     assert any(frame["function"] == "test_pulls_its_own_callstack" for frame in frames)
 
