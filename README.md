@@ -698,15 +698,18 @@ the run was writing anyway — no ptrace, no per-test cost, nothing written:
 {"served_by": {"service": "…", "pid": 17155}, "observed_at": 1787688175.421,
  "runs": [{"session": "run-19d52c2ff8e2", "run_id": "757f3cc51790…",
            "controller": {"pid": 17155, "alive": true},
+           "schedule": {"dist": "load", "collected": 812, "unassigned": 240, "settled": false},
    "workers": [
      {"worker": "gw0", "pid": 21615, "nodeid": "test_slow.py::test_alpha", "phase": "call",
       "status": "blocked", "why": "heartbeat 0.5s old but no CPU progress: the test thread is waiting on something",
-      "process_exists": true, "heartbeat_age_s": 0.5, "cpu_rate": 0.001, "rss_mb": 32},
+      "process_exists": true, "heartbeat_age_s": 0.5, "cpu_rate": 0.001, "rss_mb": 32,
+      "tests_finished": 51, "tests_assigned": 64, "tests_pending": 13},
      {"worker": "gw1", "pid": 21618, "nodeid": "test_slow.py::test_beta", "phase": "call",
       "status": "gone", "why": "process 21618 no longer exists; last seen in call of test_slow.py::test_beta",
-      "process_exists": false},
+      "process_exists": false, "tests_finished": 12, "tests_assigned": 20, "tests_pending": 8},
      {"worker": "gw2", "pid": 21621, "nodeid": "test_slow.py::test_gamma", "phase": "call",
-      "status": "working", "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0}]}]}
+      "status": "working", "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0,
+      "tests_finished": 48, "tests_assigned": 60, "tests_pending": 12}]}]}
 ```
 
 `?worker=` narrows it to particular workers, which on a sixty-four-way run is
@@ -766,6 +769,56 @@ the stall you were measuring.
 
 `nodeid` and `phase` are `null` between tests, and a very long `nodeid` is
 trimmed from both ends with `nodeid_elided: true` saying so.
+
+### How many tests each worker has
+
+`tests_started` and `tests_finished` come from the worker's own state slot, and
+on their own they are a numerator with no denominator: the one question anybody
+watching a run actually has is *is it nearly done*, and nothing a worker writes
+can answer it. **No worker knows.** It collects the whole suite and is then fed
+indices a chunk at a time, so an empty queue and a pause look the same from
+inside. The controller's scheduler holds what is outstanding per worker and
+throws an index away the moment that test completes, so it cannot say how many
+have been through either. The total exists only as the sum of the two, which is
+why the controller works it out and writes it into the run's directory as
+`schedule.json` — where `/workers`, the sample hook and anything else reading
+the evidence pick it up like every other fact here.
+
+| field | on | meaning |
+|---|---|---|
+| `tests_assigned` | worker | tests handed to this worker **so far** |
+| `tests_pending` | worker | of those, how many the controller has not seen finish |
+| `collected` | run | tests in the run's whole collection |
+| `unassigned` | run | tests that are nobody's yet — what every total can still grow by |
+| `settled` | run | whether any worker's total can still change |
+
+**It is a running total, not a plan, and `settled` is how you tell.** Under
+`--dist load` and its relatives the scheduler keeps most of the suite in a queue
+nobody is assigned yet and hands it out in chunks, so a worker's total grows for
+as long as `unassigned` is above zero — a percentage drawn without it is a bar
+whose end moves. Under `--dist each` it is settled from the first moment,
+because every worker is given the whole collection at once. Under
+`--dist worksteal` an empty queue is *still* not settled: that mode moves work
+between workers, so a total that has stopped growing there can still shrink.
+
+Two counts of the same tests appear in a row and they answer to different
+clocks. `tests_finished` is the worker's own, written as the test ends;
+`tests_assigned - tests_pending` is the controller's, which hears about it a
+moment later. Neither is wrong — they are two processes' answers to the same
+question, and a row where they differ by one is a test in the act of finishing.
+
+The same gap is why `tests_assigned` can read one high for an instant. A worker
+tells the controller a test is finished before it tells the *scheduler*, so in
+between the test is counted as run and still outstanding both. The record is
+written from the start of a test rather than the end of one, which is a moment
+that worker is never inside that window — what is left is the rarer case of
+another worker's two messages straddling this one's, and it lasts until the
+next write.
+
+Nothing is written for a run with no scheduler to ask — a single-process run,
+or a distributed one whose workers have not collected yet. Those fields come
+back `null`, which is not zero: zero pending is a worker about to finish, and
+not knowing is not.
 
 ### When there is no live view
 
@@ -965,7 +1018,8 @@ def pytest_failure_worker_sample(sample):
         rows.insert(session=sample.session_id, at=sample.observed_at,
                     worker=worker.worker, nodeid=worker.nodeid,
                     phase=worker.phase, status=worker.status, why=worker.why,
-                    rss_mb=worker.rss_mb, cpu_rate=worker.cpu_rate)
+                    rss_mb=worker.rss_mb, cpu_rate=worker.cpu_rate,
+                    assigned=worker.tests_assigned, pending=worker.tests_pending)
 ```
 
 Off by default. It is the only hook here that fires when nothing is wrong, so it
@@ -1080,7 +1134,8 @@ an unelevated one needs `SeDebugPrivilege`.
     gw0.state             this directory ours to delete
     gw0.events         <- every line carries the *reported* run id
     gw1.state
-    callstack-4213.json
+    schedule.json      <- how many tests each worker has been given, which is
+    callstack-4213.json   the one fact no worker can write about itself
 ```
 
 Runs used to share a flat directory and name their files after the worker,
@@ -1139,6 +1194,12 @@ overwhelming majority of what runs.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
   memory. Per second, per worker: two deadline comparisons and a timer rearm,
   which is why the first stack of a wedged test does not wait for a beat.
+- Per test, on the controller only: one dictionary increment, which is the
+  whole cost of `tests_assigned`. What each worker still owes is a length read
+  off the scheduler when `schedule.json` is written, and that is throttled to
+  twice a second. Nothing here diffs a queue against its last reading — under
+  `worksteal` and `each` a worker is handed its share up front, so that would
+  be the whole suite per test.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.

@@ -64,6 +64,15 @@ class SampledWorker(BaseModel):
     cpu_rate: Optional[float] = None
     heartbeat_age_s: Optional[float] = None
 
+    #: How many tests this worker has been given, and how many of those the
+    #: controller has not seen finish. The denominator a row of statuses
+    #: otherwise has no way to carry: a worker's own files count what it has
+    #: run and nothing can tell them how much is left. ``None`` before the
+    #: workers have collected, and on any run whose scheduler this package
+    #: does not recognise - see :mod:`.schedule`.
+    tests_assigned: Optional[int] = None
+    tests_pending: Optional[int] = None
+
 
 class WorkerSample(BaseModel):
     """One pass over this run's workers."""
@@ -111,6 +120,8 @@ class WorkerSampler:
                     rss_mb=record.get("rss_mb"),
                     cpu_rate=record.get("cpu_rate"),
                     heartbeat_age_s=record.get("heartbeat_age_s"),
+                    tests_assigned=record.get("tests_assigned"),
+                    tests_pending=record.get("tests_pending"),
                 )
                 for record in described.get("workers", [])
             ],

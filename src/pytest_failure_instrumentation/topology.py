@@ -25,6 +25,12 @@ The pid answers the narrowest question of the three - does a process with this
 number exist - and answers it about a number that can be reused. It is the
 weakest signal and is treated as such.
 
+There is a fourth file and it is not a worker's. ``schedule.json`` is the
+controller's, and it carries the one fact no worker can write about itself:
+how many tests it was given. See :mod:`.schedule` - it is read once per run
+here rather than once per worker, so that every row in a snapshot is measured
+against the same instant.
+
 **Nothing here asks a worker anything.** The verdicts come from beats already
 written, never from signalling the process, because asking a wedged process a
 question can change its answer: a raw syscall in native code that does not
@@ -50,6 +56,8 @@ from .capture.events import head_events, tail_events, this_run
 from .capture.heartbeat import DEFAULT_INTERVAL
 from .capture.state import ELIDED, read_state
 from .probes import is_running
+from .schedule import read as read_schedule
+from .schedule import worker_rows
 
 #: Written at the top of a run's directory by the controller. Its presence is
 #: what makes a directory a run of ours rather than somebody's build output.
@@ -152,8 +160,13 @@ def run(
     # saving is the same either way, because what costs is reading the file
     # rather than listing it.
     wanted = _wanted(only)
+    # One read for the whole run, not one per worker: it is a single file the
+    # controller assembles from a single object, and reading it per worker
+    # would report a run whose rows came from different instants.
+    schedule = read_schedule(directory)
+    rows = worker_rows(schedule)
     workers = [
-        worker(state, moment)
+        worker(state, moment, rows.get(state.stem))
         for state in sorted(directory.glob("*.state"))
         if wanted is None or state.stem in wanted
     ]
@@ -169,11 +182,28 @@ def run(
             "alive": is_running(int(controller_pid)) if controller_pid else None,
         },
         "started_at": owner.get("started_at"),
+        "schedule": _schedule_summary(schedule),
         "workers": workers,
     }
 
 
-def worker(state_path: Path, now: float) -> dict[str, Any]:
+def _schedule_summary(schedule: dict[str, Any]) -> dict[str, Any]:
+    """The run-level half of the schedule record, without the per-worker rows.
+
+    Those are already on the workers, and a payload that carried them twice
+    would let a consumer join a row to a worker it does not belong to. What is
+    left is what a worker's own numbers cannot say: how big the run is, how
+    much of it is nobody's yet, and whether any of it can still move.
+    """
+    return {
+        name: schedule.get(name)
+        for name in ("dist", "collected", "unassigned", "settled", "updated_at")
+    }
+
+
+def worker(
+    state_path: Path, now: float, schedule: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
     """One worker: what it is doing, and whether it is still doing it.
 
     The events are read before the state, and that order is the point. An
@@ -200,6 +230,10 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
     reached with a run id wrote a run's worth of real evidence, and discarding
     that to guard against nothing would report a live worker as one that never
     started.
+
+    ``schedule`` is this worker's row out of the controller's record, or None
+    where there is not one. It is passed in rather than read here because it
+    lives in one file for the whole run - see :func:`run`.
     """
     events = tail_events(state_path.with_name(f"{state_path.stem}.events"))
     run_id = _worker_run_id(events)
@@ -226,6 +260,17 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
         "phase": record.get("phase"),
         "tests_started": record.get("tests_started"),
         "tests_finished": record.get("tests_finished"),
+        # The denominator for the two above, and the only figure here that
+        # does not come out of this worker's own files: no worker knows how
+        # much it has been given, so the controller works it out and writes it
+        # down - see :mod:`.schedule`. None where there is no scheduler to ask
+        # (a single-process run) or none yet (before the workers have
+        # collected), which is not the same as a worker with nothing to do.
+        "tests_assigned": (schedule or {}).get("assigned"),
+        # Of those, how many the controller has not seen finish. It counts
+        # them itself, so it can differ by the test in flight from the
+        # worker's own count above - the two answer to different clocks.
+        "tests_pending": (schedule or {}).get("pending"),
         "state_age_s": _age(now, record.get("time")),
         "rss_mb": beats[-1].get("rss_mb") if beats else None,
         "status": status,

@@ -104,6 +104,34 @@ def test_each_pass_reports_the_evidence_as_it_stands(tmp_path):
     assert sampler.sample().workers[0].status == "blocked"
 
 
+def test_a_row_carries_the_denominator_the_worker_cannot_supply(tmp_path):
+    """A status without a total is the row a dashboard cannot draw a bar
+    from: the worker's files say what it has run and nothing says how much it
+    was given, because no worker is ever told."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]})
+    (root / "schedule.json").write_text(
+        json.dumps(
+            {
+                "dist": "load", "collected": 40, "unassigned": 12, "settled": False,
+                "workers": {"gw0": {"assigned": 14, "completed": 9, "pending": 5}},
+            }
+        )
+    )
+    entry = WorkerSampler(root).sample().workers[0]
+
+    assert entry.tests_assigned == 14
+    assert entry.tests_pending == 5
+
+
+def test_a_row_from_a_run_with_no_schedule_says_nothing_rather_than_zero(tmp_path):
+    """Zero pending is a worker about to finish; not knowing is not."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]})
+    entry = WorkerSampler(root).sample().workers[0]
+
+    assert entry.tests_assigned is None
+    assert entry.tests_pending is None
+
+
 def test_an_empty_directory_samples_nothing_rather_than_raising(tmp_path):
     sample = WorkerSampler(tmp_path / "nothing-here").sample()
     assert sample.workers == []
