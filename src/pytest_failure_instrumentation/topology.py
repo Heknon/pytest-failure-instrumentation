@@ -241,6 +241,7 @@ def worker(
     record = read_state(state_path, run_id)
     beats = [event for event in events if event.get("event") == "heartbeat"]
 
+    assigned, pending = _progress(record, schedule or {})
     pid = record.get("pid")
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
@@ -266,11 +267,11 @@ def worker(
         # down - see :mod:`.schedule`. None where there is no scheduler to ask
         # (a single-process run) or none yet (before the workers have
         # collected), which is not the same as a worker with nothing to do.
-        "tests_assigned": (schedule or {}).get("assigned"),
-        # Of those, how many the controller has not seen finish. It counts
-        # them itself, so it can differ by the test in flight from the
-        # worker's own count above - the two answer to different clocks.
-        "tests_pending": (schedule or {}).get("pending"),
+        "tests_assigned": assigned,
+        # What is left of that total. Measured from the worker's own count
+        # rather than carried over from the controller's, so the three numbers
+        # in this row always agree - see _progress.
+        "tests_pending": pending,
         "state_age_s": _age(now, record.get("time")),
         "rss_mb": beats[-1].get("rss_mb") if beats else None,
         "status": status,
@@ -282,6 +283,36 @@ def worker(
         # produces exactly the second one.
         "cpu_rate": None if rate is None else round(rate, 3),
     }
+
+
+def _progress(
+    record: dict[str, Any], schedule: dict[str, Any]
+) -> tuple[Optional[int], Optional[int]]:
+    """How much this worker was given, and how much of it is left.
+
+    The two halves are written by different processes: the total by the
+    controller, into one file for the run, and the count of what has been run
+    by the worker itself, into its own slot. So a row that simply reported
+    both as it found them could say a worker had finished more tests than it
+    was ever given - which is not a lag a reader can interpret, it is a row
+    that cannot be true. It happened, on a suite whose tests were shorter than
+    the interval the controller's file was then written on.
+
+    A worker cannot finish a test it was never given, so its own count is a
+    floor under the total, and what is left is measured from that same count.
+    The row then holds together however far apart the two files were written -
+    the worst a stale total can do is understate what is left, where before it
+    could contradict the line above it.
+    """
+    assigned = schedule.get("assigned")
+    if not isinstance(assigned, int) or isinstance(assigned, bool):
+        return None, None
+    finished = record.get("tests_finished")
+    if not isinstance(finished, int) or isinstance(finished, bool) or finished < 0:
+        pending = schedule.get("pending")
+        return assigned, pending if isinstance(pending, int) else None
+    assigned = max(assigned, finished)
+    return assigned, assigned - finished
 
 
 def _worker_run_id(events: list[dict[str, Any]]) -> Optional[str]:

@@ -18,7 +18,8 @@ from pytest_failure_instrumentation.sampling import WorkerSampler
 from .conftest import needs_xdist
 
 
-def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid=None):
+def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid=None,
+             finished=0):
     """A run directory shaped like one a real run leaves behind.
 
     ``workers`` is {name: cpu_seconds_series}, and the series is the knob these
@@ -34,7 +35,8 @@ def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid
     alive = os.getpid() if pid is None else pid
     for name, cpus in workers.items():
         state = {"pid": alive, "nodeid": f"test_x.py::{name}", "phase": "call",
-                 "time": moment, "tests_started": 1, "tests_finished": 0}
+                 "time": moment, "tests_started": finished + 1,
+                 "tests_finished": finished}
         raw = json.dumps(state).encode()
         (root / f"{name}.state").write_bytes(raw + b"\x00" * (5120 - len(raw)))
         lines = [json.dumps({"event": "watchdog_started", "interval": beats_apart,
@@ -104,23 +106,55 @@ def test_each_pass_reports_the_evidence_as_it_stands(tmp_path):
     assert sampler.sample().workers[0].status == "blocked"
 
 
-def test_a_row_carries_the_denominator_the_worker_cannot_supply(tmp_path):
-    """A status without a total is the row a dashboard cannot draw a bar
-    from: the worker's files say what it has run and nothing says how much it
-    was given, because no worker is ever told."""
-    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]})
+def _schedule(root, **workers):
     (root / "schedule.json").write_text(
         json.dumps(
             {
                 "dist": "load", "collected": 40, "unassigned": 12, "settled": False,
-                "workers": {"gw0": {"assigned": 14, "completed": 9, "pending": 5}},
+                "workers": {
+                    name: {"assigned": a, "completed": c, "pending": a - c}
+                    for name, (a, c) in workers.items()
+                },
             }
         )
     )
+
+
+def test_a_row_carries_the_denominator_the_worker_cannot_supply(tmp_path):
+    """A status without a total is the row a dashboard cannot draw a bar
+    from: the worker's files say what it has run and nothing says how much it
+    was given, because no worker is ever told."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=9)
+    _schedule(root, gw0=(14, 9))
     entry = WorkerSampler(root).sample().workers[0]
 
     assert entry.tests_assigned == 14
     assert entry.tests_pending == 5
+
+
+def test_what_is_left_is_measured_from_the_worker_s_own_count(tmp_path):
+    """The controller's count of what this worker has done and the worker's
+    own are written by different processes into different files, and a row
+    that took the total from one and the progress from the other could say a
+    worker had finished more tests than it was given. So the total is the only
+    thing taken from the controller; what is left of it is measured here."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=11)
+    _schedule(root, gw0=(14, 9))  # the controller is two behind the worker
+    entry = WorkerSampler(root).sample().workers[0]
+
+    assert entry.tests_assigned == 14
+    assert entry.tests_pending == 3
+
+
+def test_a_total_the_worker_has_already_passed_is_the_stale_one(tmp_path):
+    """A worker cannot finish a test it was never given, so its own count is a
+    floor under the total rather than a contradiction of it."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=19)
+    _schedule(root, gw0=(15, 15))
+    entry = WorkerSampler(root).sample().workers[0]
+
+    assert entry.tests_assigned == 19
+    assert entry.tests_pending == 0
 
 
 def test_a_row_from_a_run_with_no_schedule_says_nothing_rather_than_zero(tmp_path):

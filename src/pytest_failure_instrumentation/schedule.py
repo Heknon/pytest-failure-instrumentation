@@ -42,6 +42,21 @@ test is counted as finished *and* still outstanding, and the total reads one
 high. The record is written from the start of a test rather than the end of
 one, which is a moment that worker is never inside that window, so what is left
 is the rare case of a *different* worker's two events straddling this one's.
+
+**Written on every test, and that is what makes it usable.** It was throttled
+to twice a second at first, on the reasoning that a reader polls at seconds
+anyway. That reasoning is wrong, and measurably: a worker's ``.state`` slot is
+read *live*, so pairing it with a record up to half a second old put both in
+one row, and on a suite of tenth-of-a-second tests the row said a worker had
+finished nineteen tests out of the fifteen it had been given. A number that
+cannot be true is worse than a number that is late.
+
+What made the throttle look necessary was writing the file by rename, at 54
+microseconds a time. A record is a small buffer at a fixed offset, which is
+what :mod:`.capture.state` already writes a worker's state with and costs
+0.4 microseconds - so the file is now rewritten whenever a test starts, and a
+reader is never more than one test behind. Torn reads are the price, and
+:func:`read` retries through them exactly as ``read_state`` does.
 """
 
 from __future__ import annotations
@@ -52,16 +67,12 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-#: Written beside ``owner.json`` at the top of a run's directory, and replaced
-#: for the life of the run. One file per run rather than one per worker: it is
-#: assembled in one process from one object, and splitting it would mean a
-#: reader could see two workers at two different instants.
+#: Written beside ``owner.json`` at the top of a run's directory, and
+#: overwritten in place for the life of the run. One file per run rather than
+#: one per worker: it is assembled in one process from one object, and
+#: splitting it would mean a reader could see two workers at two different
+#: instants.
 SCHEDULE_FILE = "schedule.json"
-
-#: Smallest gap between two writes of that file. The numbers change on every
-#: test, and a controller that wrote them all would pay a rename per test on a
-#: run whose readers poll at seconds.
-WRITE_INTERVAL = 0.5
 
 
 def read(directory: Path) -> dict[str, Any]:
@@ -74,11 +85,24 @@ def read(directory: Path) -> dict[str, Any]:
     zero, so an empty record degrades to the view there was before this
     existed.
     """
-    try:
-        loaded = json.loads((directory / SCHEDULE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
+    path = directory / SCHEDULE_FILE
+    for _ in range(2):
+        try:
+            raw = path.read_bytes().strip()
+        except OSError:
+            return {}
+        if not raw:
+            return {}
+        try:
+            loaded = json.loads(raw)
+        except ValueError:
+            # The writer is mid-update. One small write at a fixed offset is
+            # not formally atomic, and a stale-but-whole record beats none -
+            # which is what ``read_state`` does with the same problem.
+            time.sleep(0.01)
+            continue
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
 
 
 def worker_rows(record: dict[str, Any]) -> dict[str, Any]:
@@ -132,7 +156,12 @@ class ScheduleTracker:
         #: rows - which is why ``collected`` is the run's size and the sum of
         #: these is not.
         self._rows: dict[str, dict[str, int]] = {}
-        self._written = 0.0
+        #: Opened on the first write and held for the run, so a write is one
+        #: syscall rather than a create, a write and a rename.
+        self._descriptor: Optional[int] = None
+        #: pwrite is one syscall but Unix-only; seek and write is the portable
+        #: equivalent, as in :mod:`.capture.state`.
+        self._pwrite = getattr(os, "pwrite", None)
 
     def saw_a_test_finish(self, worker: Optional[str]) -> None:
         """A test on ``worker`` has run its last phase.
@@ -200,44 +229,59 @@ class ScheduleTracker:
     # -- and writes down -------------------------------------------------
 
     def write(
-        self,
-        scheduler: Any,
-        directory: Path,
-        run_id: Optional[str] = None,
-        force: bool = False,
+        self, scheduler: Any, directory: Path, run_id: Optional[str] = None
     ) -> bool:
-        """Put the record where readers look, at most every ``WRITE_INTERVAL``.
+        """Put the record where readers look. Called whenever a test starts.
 
-        ``force`` is for the moments that change the answer rather than
-        advance it - a worker going down, a collection arriving - where being
-        half a second late is being wrong about which workers exist.
+        One small write at a fixed offset, into a descriptor held for the run.
+        That is what lets this happen per test rather than on a timer, and a
+        timer is what made a row able to contradict itself - see the module
+        docstring. The file is truncated to the record rather than padded to a
+        slot, so a run with sixty-four workers is not bounded by a size chosen
+        for a run with two.
 
-        Replaced rather than rewritten in place: a reader gets the old record
-        or the new one and never half of each, which for a file this size is
-        the difference between a poll that reports nothing and one that
-        reports the truth. Nothing here may break a run, so a filesystem that
-        refuses the rename - Windows, if a reader has the file open at that
-        instant - costs this write and not the next.
+        Nothing here may break a run, so every failure costs this write and
+        not the next one.
         """
-        now = time.time()
-        if not force and now - self._written < WRITE_INTERVAL:
-            return False
         try:
-            payload = json.dumps(self.record(scheduler, run_id))
+            payload = json.dumps(self.record(scheduler, run_id)).encode("utf-8")
         except Exception:  # noqa: BLE001 - bookkeeping never breaks a run
             return False
-        temporary = directory / f"{SCHEDULE_FILE}.{os.getpid()}.tmp"
-        try:
-            temporary.write_text(payload, encoding="utf-8")
-            os.replace(temporary, directory / SCHEDULE_FILE)
-        except OSError:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
+        descriptor = self._slot(directory)
+        if descriptor is None:
             return False
-        self._written = now
+        try:
+            if self._pwrite is not None:
+                self._pwrite(descriptor, payload, 0)
+            else:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.write(descriptor, payload)
+            # After the write, never before: a reader that catches the gap
+            # sees this record followed by the tail of the last one, which
+            # does not parse and is retried. Truncating first would leave a
+            # window where the file is empty, which parses as "no schedule".
+            os.ftruncate(descriptor, len(payload))
+        except OSError:
+            return False
         return True
+
+    def _slot(self, directory: Path) -> Optional[int]:
+        if self._descriptor is None:
+            flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0)
+            try:
+                self._descriptor = os.open(str(directory / SCHEDULE_FILE), flags, 0o644)
+            except OSError:
+                return None
+        return self._descriptor
+
+    def close(self) -> None:
+        if self._descriptor is None:
+            return
+        try:
+            os.close(self._descriptor)
+        except OSError:
+            pass
+        self._descriptor = None
 
 
 def _row(assigned: int, completed: int) -> dict[str, int]:

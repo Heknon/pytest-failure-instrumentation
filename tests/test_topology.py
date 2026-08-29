@@ -288,15 +288,33 @@ def test_a_worker_between_tests_reports_no_node_id(evidence):
 def test_a_worker_carries_the_total_it_cannot_know_itself(evidence):
     """Its own files count what it has run; nothing in them says how much it
     was given, because no worker is told. The controller works that out and
-    writes it down, and this is where the two halves meet."""
-    evidence.state("gw0", tests_started=8, tests_finished=7)
+    writes it down, and this is where the two halves meet.
+
+    Only the *total* is taken from the controller. What is left of it is
+    measured from the worker's own count - here the controller is two tests
+    behind, and the row still adds up."""
+    evidence.state("gw0", tests_started=10, tests_finished=9)
     evidence.beats("gw0", cpu_step=0.9)
     evidence.schedule(gw0=(14, 7), gw1=(11, 4))
 
     described = topology.run(evidence.run)["workers"][0]
-    assert described["tests_finished"] == 7
+    assert described["tests_finished"] == 9
     assert described["tests_assigned"] == 14
-    assert described["tests_pending"] == 7
+    assert described["tests_pending"] == 5
+
+
+def test_a_total_the_worker_has_already_passed_is_the_stale_one(evidence):
+    """A worker cannot finish a test it was never given. So when its own count
+    runs past the controller's total, the total is what is out of date - and
+    saying so is the difference between a row that is late and a row that
+    cannot be true."""
+    evidence.state("gw0", tests_started=20, tests_finished=19)
+    evidence.beats("gw0", cpu_step=0.9)
+    evidence.schedule(gw0=(15, 15))
+
+    described = topology.run(evidence.run)["workers"][0]
+    assert described["tests_assigned"] == 19
+    assert described["tests_pending"] == 0
 
 
 def test_a_run_says_how_much_of_it_is_nobody_s_yet(evidence):

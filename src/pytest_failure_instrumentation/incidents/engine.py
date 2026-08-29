@@ -255,9 +255,6 @@ class IncidentEngine:
         #: before anybody signals it. See _live_pid.
         self.nodes: dict[str, Any] = {}
         self.tests_seen = 0
-        #: Whether any test has started. The first one is the earliest moment
-        #: the scheduler has anything to say - see pytest_runtest_logstart.
-        self.run_started = False
         #: How many tests each worker has been handed, which no single
         #: process but this one can say - see :mod:`..schedule`. Written
         #: into the run's directory so that a live view assembles it from
@@ -797,14 +794,13 @@ class IncidentEngine:
         land inside that window every time, and the total would read one high
         every time. At the start of a test that worker is never inside it.
 
-        Forced on the first, because xdist hands the work out inside the same
-        call that fires ``pytest_xdist_node_collection_finished`` and *after*
-        that hook: the write from there is taken before anything has been
-        assigned, so without this the totals would read zero until the first
-        test finished. Throttled after that - see :mod:`..schedule`.
+        It matters that this is the *first* one too: xdist hands the work out
+        inside the same call that fires
+        ``pytest_xdist_node_collection_finished`` and *after* that hook, so
+        the write from there is taken before anything has been assigned, and
+        without this the totals would read zero until the first test finished.
         """
-        first, self.run_started = not self.run_started, True
-        self._record_schedule(force=first)
+        self._record_schedule()
 
     def pytest_runtest_logreport(self, report: Any) -> None:
         node = getattr(report, "node", None)
@@ -835,7 +831,7 @@ class IncidentEngine:
         # this same call and after this hook, so what is written here is a
         # collection and no assignment - the first test starting is where the
         # totals arrive, and pytest_runtest_logstart forces that one too.
-        self._record_schedule(force=True)
+        self._record_schedule()
 
     # -- how much work each worker has -----------------------------------
 
@@ -866,13 +862,18 @@ class IncidentEngine:
         session = self.config.pluginmanager.getplugin("dsession")
         return getattr(session, "sched", None)
 
-    def _record_schedule(self, force: bool = False) -> None:
-        """Publish where the scheduler has got to, if a write is due."""
+    def _record_schedule(self) -> None:
+        """Publish where the scheduler has got to.
+
+        Every time, on every test. It is one small write at a fixed offset -
+        see :mod:`..schedule` for why a timer here made a worker's row able to
+        say it had finished more tests than it was given.
+        """
         scheduler = self._scheduler()
         if scheduler is None:
             return
         try:
-            self.schedule.write(scheduler, self.directory, self.run_id, force=force)
+            self.schedule.write(scheduler, self.directory, self.run_id)
         except Exception:  # noqa: BLE001 - bookkeeping never breaks a run
             pass
 
@@ -953,7 +954,7 @@ class IncidentEngine:
         # scheduler, so the queue is still there to be read. Forced, and
         # before the incident below - what a worker was still owed when it
         # died is the interesting half of a death.
-        self._record_schedule(force=True)
+        self._record_schedule()
         if not error:
             return  # a clean shutdown is not an incident
         try:
@@ -1017,6 +1018,7 @@ class IncidentEngine:
                 self.distributed,
             )
         )
+        self.schedule.close()
         # The summary is the last word by definition - it says how many
         # incidents this run raised. Anything the watcher or the sampler still
         # manages to produce after it would contradict a number already

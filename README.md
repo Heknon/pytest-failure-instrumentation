@@ -787,7 +787,7 @@ the evidence pick it up like every other fact here.
 | field | on | meaning |
 |---|---|---|
 | `tests_assigned` | worker | tests handed to this worker **so far** |
-| `tests_pending` | worker | of those, how many the controller has not seen finish |
+| `tests_pending` | worker | of those, how many it has not finished — the test in flight included |
 | `collected` | run | tests in the run's whole collection |
 | `unassigned` | run | tests that are nobody's yet — what every total can still grow by |
 | `settled` | run | whether any worker's total can still change |
@@ -801,19 +801,25 @@ because every worker is given the whole collection at once. Under
 `--dist worksteal` an empty queue is *still* not settled: that mode moves work
 between workers, so a total that has stopped growing there can still shrink.
 
-Two counts of the same tests appear in a row and they answer to different
-clocks. `tests_finished` is the worker's own, written as the test ends;
-`tests_assigned - tests_pending` is the controller's, which hears about it a
-moment later. Neither is wrong — they are two processes' answers to the same
-question, and a row where they differ by one is a test in the act of finishing.
+**The three numbers in a row always agree**, and that took arranging, because
+they do not come from one place: the total is the controller's, written into
+one file for the whole run, and `tests_finished` is the worker's own, written
+into its own slot. Pairing a live read of one with a stale read of the other
+produced rows saying a worker had finished nineteen of the fifteen tests it had
+been given — not a lag a reader can interpret, but a row that cannot be true.
 
-The same gap is why `tests_assigned` can read one high for an instant. A worker
-tells the controller a test is finished before it tells the *scheduler*, so in
-between the test is counted as run and still outstanding both. The record is
-written from the start of a test rather than the end of one, which is a moment
-that worker is never inside that window — what is left is the rarer case of
-another worker's two messages straddling this one's, and it lasts until the
-next write.
+Two things stop it. The controller's record is rewritten *whenever a test
+starts* rather than on a timer, so it is never more than one test behind; and
+`tests_pending` is measured from the worker's own count rather than carried
+over from the controller's, so a stale total can only understate what is left,
+never contradict the line above it.
+
+What can still move is `tests_assigned`, by one, for an instant. A worker tells
+the controller a test is finished before it tells the *scheduler*, so in
+between it is counted as run and still outstanding both. Writing from the start
+of a test rather than the end of one keeps that worker out of its own window;
+what is left is the rarer case of another worker's two messages straddling this
+one's, and it lasts until the next test starts somewhere.
 
 **A crashed worker keeps its row, so the rows can add up to more than the run.**
 xdist drops a dead worker's queue back into the global one and starts a
@@ -1205,12 +1211,14 @@ overwhelming majority of what runs.
 - Per 5 seconds, per worker: one heartbeat carrying CPU time and resident
   memory. Per second, per worker: two deadline comparisons and a timer rearm,
   which is why the first stack of a wedged test does not wait for a beat.
-- Per test, on the controller only: one dictionary increment, which is the
-  whole cost of `tests_assigned`. What each worker still owes is a length read
-  off the scheduler when `schedule.json` is written, and that is throttled to
-  twice a second. Nothing here diffs a queue against its last reading — under
-  `worksteal` and `each` a worker is handed its share up front, so that would
-  be the whole suite per test.
+- Per test, on the controller only: `schedule.json` rewritten, which is a
+  length read off the scheduler per worker and one small write at a fixed
+  offset — 6µs at eight workers, 32µs at sixty-four. It was written by rename
+  at first, at 54µs a time, and throttled to twice a second to pay for that;
+  the throttle is what let a worker's row contradict itself, so the write got
+  cheap instead. Nothing here diffs a queue against its last reading either —
+  under `worksteal` and `each` a worker is handed its share up front, so that
+  would be the whole suite per test.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.

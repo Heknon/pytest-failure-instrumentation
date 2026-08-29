@@ -14,11 +14,14 @@ still real.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
 
 import pytest
 
 from pytest_failure_instrumentation import schedule, topology
+from pytest_failure_instrumentation.capture.state import read_state
 from pytest_failure_instrumentation.schedule import ScheduleTracker
 
 from .conftest import needs_xdist
@@ -272,21 +275,29 @@ def test_the_record_is_written_where_readers_look(tmp_path):
     assert schedule.read(tmp_path) == written
 
 
-def test_writes_are_throttled_and_counting_is_not(tmp_path):
-    """The numbers change on every test and a reader polls at seconds, so the
-    file is not rewritten per test - but nothing is lost to that, because what
-    is throttled is the write and not the count behind it."""
-    scheduler = Pending(collection=range(4), pending=[], gw0=[0, 1])
+def test_every_write_replaces_the_last_one_whole(tmp_path):
+    """Overwritten in place at a fixed offset, so it is cheap enough to write
+    on every test - and truncated to the record, so the shorter one that
+    follows a longer one does not leave the tail of it behind."""
+    scheduler = Pending(collection=range(4), pending=[], gw0=[0, 1], gw1=[2, 3])
     tracker = ScheduleTracker("load")
     assert tracker.write(scheduler, tmp_path) is True
 
     tracker.saw_a_test_finish("gw0")
     scheduler.complete("gw0")
-    assert tracker.write(scheduler, tmp_path) is False  # too soon
+    assert tracker.write(scheduler, tmp_path) is True
+    assert schedule.read(tmp_path)["workers"]["gw0"] == {
+        "assigned": 2, "completed": 1, "pending": 1
+    }
 
-    assert tracker.write(scheduler, tmp_path, force=True) is True
-    written = json.loads((tmp_path / schedule.SCHEDULE_FILE).read_text())
-    assert written["workers"]["gw0"] == {"assigned": 2, "completed": 1, "pending": 1}
+    # A record that got shorter is not read as the longer one it overwrote.
+    del scheduler.node2pending[scheduler.node("gw1")]
+    tracker._rows.pop("gw1")
+    assert tracker.write(scheduler, tmp_path) is True
+    raw = (tmp_path / schedule.SCHEDULE_FILE).read_bytes()
+    assert json.loads(raw)  # parses on its own, with nothing after it
+    assert b"gw1" not in raw
+    tracker.close()
 
 
 def test_a_directory_with_no_record_reads_as_nothing(tmp_path):
@@ -312,6 +323,19 @@ def test_a_write_that_cannot_land_costs_this_one_and_not_the_run(tmp_path):
     missing = tmp_path / "no-such-directory"
 
     assert ScheduleTracker("load").write(scheduler, missing) is False
+
+
+def test_a_reader_that_catches_a_write_half_done_waits_rather_than_gives_up(tmp_path):
+    """One small write at a fixed offset is not formally atomic, which is the
+    price of being cheap enough to do per test. A reader that treated the torn
+    read as "no schedule" would drop every worker's totals for that poll."""
+    (tmp_path / schedule.SCHEDULE_FILE).write_bytes(b'{"workers": {"gw0": {"assig')
+
+    assert schedule.read(tmp_path) == {}  # gave up only after retrying
+
+    good = {"workers": {"gw0": {"assigned": 2, "completed": 1, "pending": 1}}}
+    (tmp_path / schedule.SCHEDULE_FILE).write_text(json.dumps(good))
+    assert schedule.read(tmp_path) == good
 
 
 # -- and what a real run produces --------------------------------------------
@@ -381,6 +405,108 @@ def test_a_crashed_worker_keeps_what_it_was_owed_and_the_rest_is_reassigned(pyte
     # And the sum of what the workers were *given* is larger than the run,
     # by the tests the dead worker was given and somebody else then ran.
     assert sum(row["assigned"] for row in rows_by_worker.values()) > 24
+
+
+#: Short enough that several finish between any two glances at the evidence.
+#: That is the point: this suite is what caught the controller's record being
+#: written on a timer while the workers' own slots were read live.
+BRISK_SUITE = """
+import time
+
+import pytest
+
+
+@pytest.mark.parametrize("i", range(60))
+def test_thing(i):
+    time.sleep(0.08)
+"""
+
+
+@needs_xdist
+def test_a_worker_never_reports_finishing_more_tests_than_it_was_given(pytester):
+    """The row has to hold together, and the two halves of it do not come from
+    the same process: the total is the controller's, written into one file for
+    the run, and the count of what has run is the worker's own, written into
+    its own slot and read live.
+
+    So this polls a real run as hard as it can and checks the one thing that
+    can never be true - a worker past the end of its own denominator. It was
+    true, roughly two hundred times in one run, when the controller's file was
+    written on a half-second timer and the tests were shorter than that.
+    """
+    evidence = pytester.path / "evidence"
+    pytester.makepyfile(test_suite=BRISK_SUITE)
+    pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
+
+    watched: list[str] = []
+
+    def poll() -> None:
+        for directory in evidence.glob("*/"):
+            rows = schedule.worker_rows(schedule.read(directory))
+            for state in directory.glob("*.state"):
+                row = rows.get(state.stem)
+                if not row:
+                    continue
+                # The controller's record against the worker's own slot, both
+                # as they sit on disk. This is the pair that came apart: the
+                # clamp in topology cannot hide a stale total here, because
+                # there is no clamp here.
+                done = read_state(state).get("tests_finished")
+                if done is None:
+                    continue
+                watched.append(state.stem)
+                assert done <= row["assigned"], (
+                    f"{state.stem} finished {done} of the {row['assigned']} "
+                    f"the controller's record says it was given"
+                )
+
+            described = topology.run(directory)
+            for shown in (described or {}).get("workers", []):
+                if shown["tests_assigned"] is None:
+                    continue
+                # And the row a reader is handed holds together whatever the
+                # two files were doing.
+                assert shown["tests_finished"] <= shown["tests_assigned"], shown
+                assert (
+                    shown["tests_pending"]
+                    == shown["tests_assigned"] - shown["tests_finished"]
+                ), shown
+
+    with _polling(poll):
+        pytester.runpytest_subprocess("-n3", "--dist=load").assert_outcomes(passed=60)
+
+    # The check is only worth anything if it ran while the workers were going.
+    assert len(watched) > 50, len(watched)
+
+
+@contextlib.contextmanager
+def _polling(check):
+    """Run ``check`` on a thread for as long as the block takes.
+
+    A thread rather than a sampling loop after the fact, because what is being
+    checked is a pair of files mid-write: everything is consistent once the
+    run is over, and that is exactly the case that was never broken.
+    """
+    failures: list[BaseException] = []
+    stop = threading.Event()
+
+    def loop() -> None:
+        while not stop.wait(0.01):
+            try:
+                check()
+            except AssertionError as failure:
+                failures.append(failure)
+                return
+
+    watcher = threading.Thread(target=loop, daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        watcher.join(timeout=10)
+    if failures:
+        raise failures[0]
 
 
 SUITE = """
