@@ -1,0 +1,197 @@
+"""Periodic worker samples: what is in one, and that a real run pushes them.
+
+A sample is the run's own ``.state`` and ``.events`` files turned into a row
+per worker, so what these check is the classification that makes those rows
+worth reading - working against blocked - and the chain from a cadence setting
+to a product's hook, which none of the direct tests would notice breaking.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+from pytest_failure_instrumentation.sampling import WorkerSampler
+
+from .conftest import needs_xdist
+
+
+def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid=None):
+    """A run directory shaped like one a real run leaves behind.
+
+    ``workers`` is {name: cpu_seconds_series}, and the series is the knob these
+    tests turn: it is what decides working-vs-blocked.
+
+    The pid is this test process, because it has to be one that exists. A dead
+    pid is reported ``gone``, which outranks every other status by design - so
+    a fixture with invented pids would test nothing but that rule.
+    """
+    moment = time.time() if now is None else now
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "owner.json").write_text(json.dumps({"pid": 1, "started_at": moment - 60}))
+    alive = os.getpid() if pid is None else pid
+    for name, cpus in workers.items():
+        state = {"pid": alive, "nodeid": f"test_x.py::{name}", "phase": "call",
+                 "time": moment, "tests_started": 1, "tests_finished": 0}
+        raw = json.dumps(state).encode()
+        (root / f"{name}.state").write_bytes(raw + b"\x00" * (5120 - len(raw)))
+        lines = [json.dumps({"event": "watchdog_started", "interval": beats_apart,
+                             "run_id": run_id, "time": moment - 60})]
+        for i, cpu in enumerate(cpus):
+            lines.append(json.dumps({
+                "event": "heartbeat", "cpu_seconds": cpu, "rss_mb": 40,
+                "nodeid": f"test_x.py::{name}", "phase": "call", "run_id": run_id,
+                "time": moment - (len(cpus) - 1 - i) * beats_apart,
+            }))
+        (root / f"{name}.events").write_text("\n".join(lines) + "\n")
+    return root
+
+
+# -- what one sample says ---------------------------------------------------
+
+
+def test_a_busy_worker_and_a_stuck_one_are_told_apart(tmp_path):
+    """The distinction the rows exist for. Both workers are beating and both
+    are inside a test, so the node id and the phase say the same thing about
+    each; only the CPU between the beats separates the one making progress
+    from the one waiting on something."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0, 5.0, 7.0],
+                                       "gw1": [5.0, 5.0, 5.0, 5.0]})
+    sample = WorkerSampler(root, session_id="s-1").sample()
+
+    by_worker = {entry.worker: entry for entry in sample.workers}
+    assert by_worker["gw0"].status == "working"
+    assert by_worker["gw1"].status == "blocked"
+    # In words as well as in a status, because a product shows this to a human.
+    assert by_worker["gw1"].why
+
+
+def test_a_row_carries_what_a_dashboard_draws(tmp_path):
+    """All of it out of files the run was writing anyway - the sample asks the
+    worker nothing, which is what makes a cadence affordable."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0, 5.0, 7.0]})
+    sample = WorkerSampler(root, session_id="s-1").sample(now=1234.5678)
+
+    assert sample.session_id == "s-1"
+    assert sample.run_id == "run-1"
+    assert sample.observed_at == 1234.568
+    entry = sample.workers[0]
+    assert entry.worker == "gw0"
+    assert entry.pid == os.getpid()
+    assert entry.nodeid == "test_x.py::gw0"
+    assert entry.phase == "call"
+    assert entry.rss_mb == 40
+    assert entry.cpu_rate is not None
+    assert entry.heartbeat_age_s is not None
+
+
+def test_each_pass_reports_the_evidence_as_it_stands(tmp_path):
+    """One sampler serves the whole run, so a status must follow the files
+    rather than the first pass that read them: a worker that blocks, goes back
+    to work and blocks again is three different rows, not one remembered one."""
+    root = tmp_path / "run"
+    sampler = WorkerSampler(root)
+
+    evidence(root, {"gw0": [5.0, 5.0, 5.0]})
+    assert sampler.sample().workers[0].status == "blocked"
+
+    evidence(root, {"gw0": [1.0, 3.0, 5.0, 7.0]})
+    assert sampler.sample().workers[0].status == "working"
+
+    evidence(root, {"gw0": [9.0, 9.0, 9.0]})
+    assert sampler.sample().workers[0].status == "blocked"
+
+
+def test_an_empty_directory_samples_nothing_rather_than_raising(tmp_path):
+    sample = WorkerSampler(tmp_path / "nothing-here").sample()
+    assert sample.workers == []
+
+
+# -- the whole chain, in a real run -----------------------------------------
+
+
+@needs_xdist
+def test_a_real_run_pushes_samples_to_a_product_that_implements_the_hook(pytester):
+    """Everything above drives the sampler directly, so none of it would
+    notice the thread never starting or the hook never being registered."""
+    pytester.makeconftest(
+        """
+        import json
+
+
+        def pytest_failure_worker_sample(sample):
+            with open("samples.jsonl", "a") as handle:
+                handle.write(sample.model_dump_json() + "\\n")
+        """
+    )
+    pytester.makepyfile(
+        """
+        import time
+
+        def test_one():
+            time.sleep(6)
+
+        def test_two():
+            time.sleep(6)
+        """
+    )
+    result = pytester.runpytest_subprocess(
+        "-p", "failure_instrumentation", "-n", "2",
+        "-o", "failure_sample_seconds=1",
+        "-o", "failure_heartbeat_interval=1",
+    )
+    result.assert_outcomes(passed=2)
+
+    lines = (pytester.path / "samples.jsonl").read_text().strip().splitlines()
+    assert lines, "the sampler never pushed anything"
+    samples = [json.loads(line) for line in lines]
+    assert all(s["session_id"] for s in samples)
+    # Both workers show up, doing the tests they were given.
+    seen = {w["worker"] for s in samples for w in s["workers"]}
+    assert {"gw0", "gw1"} <= seen
+    nodeids = {w["nodeid"] for s in samples for w in s["workers"] if w["nodeid"]}
+    assert any("test_one" in n or "test_two" in n for n in nodeids)
+    # Statuses come from the truth table, not from a placeholder.
+    assert {w["status"] for s in samples for w in s["workers"]} <= {
+        "working", "blocked", "frozen", "gone", "unmeasured"
+    }
+    # And nothing was asked of a worker to produce any of it: a sample that
+    # grew a frames field again would be a per-worker pause on a timer.
+    assert not [key for s in samples for w in s["workers"] for key in w
+                if "stack" in key]
+
+
+def test_sampling_is_off_unless_it_is_asked_for(pytester):
+    """It is the only hook here that fires when nothing is wrong, so it is the
+    only one that must not arrive because somebody upgraded."""
+    pytester.makeconftest(
+        """
+        def pytest_failure_worker_sample(sample):
+            with open("samples.jsonl", "a") as handle:
+                handle.write("called\\n")
+        """
+    )
+    pytester.makepyfile("def test_one():\n    assert True\n")
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
+    result.assert_outcomes(passed=1)
+    assert not (pytester.path / "samples.jsonl").exists()
+
+
+def test_sampling_a_run_with_no_workers_says_so_rather_than_pushing_nothing(pytester):
+    """The recorder is installed on workers only, so a single-process run
+    writes no state at all and the sampler would poll an empty directory for
+    the life of the run. From the outside that is indistinguishable from a
+    product whose hook is simply never called - which is the misreading this
+    package exists to prevent, arriving in its own newest feature."""
+    pytester.makepyfile("def test_one():\n    assert True\n")
+    result = pytester.runpytest_subprocess(
+        "-p", "failure_instrumentation", "-o", "failure_sample_seconds=1"
+    )
+    result.assert_outcomes(passed=1)
+    # Raised at session start, which is outside the window pytest folds into
+    # its warnings summary, so it lands on stderr - where a person running the
+    # suite still sees it.
+    combined = result.stdout.str() + result.stderr.str()
+    assert "not distributed" in combined and "no workers to sample" in combined

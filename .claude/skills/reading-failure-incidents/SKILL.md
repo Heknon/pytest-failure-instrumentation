@@ -1,6 +1,6 @@
 ---
 name: reading-failure-incidents
-description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error] or [run_summary] appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
+description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error], [run_summary] or [stack_server_unavailable] appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
 ---
 
 # Reading a failure incident
@@ -64,7 +64,11 @@ wrong conclusion. Check this list before quoting a figure back to anyone.
 | `started=N finished=M` | throughput | where in the worker's life it died. `started=1 finished=0` is a death on the very first test, not a leak accumulating over a long worker lifetime |
 | `missing` / `extra` | the whole difference | capped at 500 per side. `missing_count` / `extra_count` are the true totals |
 | `test_in_flight` | the node id, verbatim | written to a fixed-size slot, so a very long id is elided from the middle and marked `...` — head and tail are kept, since the module is at the front and a parametrized hash at the end. Match on the parts, not the whole string, and do not report an elided id as the test's real name |
+| `last_test` | the test that failed | the last test the worker *ran*, set whether or not it finished. It is only ever context. When `test_in_flight` is null nothing was running — the worker was between tests, still collecting, or waiting to be handed work — and `last_test` had already finished. Never report it as the test that died or hung |
+| `test_in_flight: null` on a stall | the worker had no work | one of three ordinary things that look identical from outside: between tests, collecting, or idle awaiting work. The silence is still real (the run cannot end while a worker never comes back) but the confidence drops to `low` and nothing is blamed on a test |
+| `no stack: pid … could not be confirmed` | the probe failed | the probe was *never sent*. `SIGUSR1` terminates by default, and the pid came out of a file — an exited worker leaves its number to be reused, so an unconfirmable pid is left alone rather than signalled. Not a finding about the worker |
 | `exitstatus` on a `run_summary` | the run's outcome | sometimes reported before pytest applies `INTERNAL_ERROR`; `run_ending_incidents` is the one to trust when they disagree |
+| `run_ending_incidents` on a `run_summary` | that many incidents ended the run | that many were *raised as* run-ending. A summary exists only because the run reached session finish, so a stall counted here is one that resolved — the worker came back. For an `internal_error` the count is the correction to a `0` exit status; for a `worker_stall` it is a prediction the summary itself disproves |
 
 ## The shared fields
 
@@ -155,6 +159,13 @@ a job that hangs to its timeout is the symptom and the stall is the cause. And
 the incident was raised at the threshold, often an hour before that timeout, so
 the useful advice is usually to act on the incident rather than wait.
 
+That is an inference from the evidence at detection time, not an observation,
+and one thing can falsify it: a `run_summary` arriving afterwards. The summary
+is written at session finish, so its existence proves the run got there — the
+wedged worker came back. Treat a stall followed by a summary as a hang that
+resolved, worth fixing and not worth paging about; a stall with no summary
+beside it is the run-ending one.
+
 `stack` is asked for *after* the verdict is reached, because asking a wedged
 process a question can change its answer. `stack_probed: false` means the
 platform was never asked (Windows, or probing disabled) — a fact about the
@@ -218,6 +229,23 @@ is a run whose controller died**, which nothing inside that process could tell
 you. Worth checking alongside any other incident: its absence turns "one worker
 died" into "the whole job was killed". `incidents` maps fingerprint → count.
 
+### `stack_server_unavailable` — the live view was asked for and is not there
+
+The only kind that reports on the instrumentation rather than on the run. It is
+raised when `failure_stack_server` was switched on and the server could not
+serve, because otherwise nothing says so: the run is unaffected, and a UI with
+no data looks exactly like a machine with no tests running.
+
+`PORT_TAKEN` means something that is not one of ours holds the port — name
+another with `--callstack-port`. `BIND_REFUSED` means the address could not be
+bound at all, which naming another port does not fix. `requested_port` is what
+was asked for and `drawn` says whether a port was to be drawn (`0`) or named.
+
+Always `owner=runtime` and `severity=informational`: nobody's test is at fault
+and nothing is broken. **It is never raised because another pytest session holds
+the port** — that is the shared mode working as designed, so seeing this kind
+always means a stranger or a bad address, never a colleague.
+
 ## The decision each kind forces
 
 Every one of these reaches a person who has to do something before morning.
@@ -230,6 +258,7 @@ The incident usually settles it, and saying so is most of the value.
 | `collection_mismatch` | the run aborted, or quietly lost a worker | retrying repeats it — an unstable parametrize re-rolls its values, an environment-dependent collection diverges the same way again. Nothing improves until collection is deterministic |
 | `internal_error` | the session is over | nobody's test is at fault, so no test-level triage will surface it — it needs the framework or plugin owner |
 | `run_summary` | the run ended cleanly | nothing, except as the control: its absence next to another incident means the controller died too |
+| `stack_server_unavailable` | the run finished normally and nobody could watch it live | reconfigure rather than retry — the same port will be taken again. Nothing about the tests is in question, so it argues for a settings change and never for a rerun |
 
 `run_ending` is the field to automate on. An incident raised at detection can
 beat a CI timeout by the better part of an hour, and that lead time is only

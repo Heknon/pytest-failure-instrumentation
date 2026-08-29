@@ -237,8 +237,9 @@ anything it could read itself. `run_id` travels with it, which is what lets a
 build id group a whole run's incidents.
 
 **Turning auto-registration off.** `-p no:failure_instrumentation` skips the
-entry point entirely; `install` puts back the hookspec so `pytest_failure_incident`
-still reaches its implementers. Note that it also skips `pytest_addoption`, so
+entry point entirely; `install` puts back the hookspecs so
+`pytest_failure_incident`, `pytest_failure_worker_sample` and
+`pytest_failure_server_ready` all still reach their implementers. Note that it also skips `pytest_addoption`, so
 `failure_*` ini keys become unknown config options — which is the point if your
 framework owns the settings, and a reason to leave the entry point enabled and
 just call `install` if it does not.
@@ -479,6 +480,21 @@ because both ends carry something the other does not — the head is the module
 attribution reads, and the tail is where a parametrize puts the value saying
 which case this was.
 
+The slot carries *two* node ids, and the difference is why it is read at all.
+`test_in_flight` is the test currently running and is cleared when teardown
+returns; `last_test` is the most recent test whether or not it finished. One
+field cannot be both, and being both is how a worker that died in the gap
+between two tests came to be reported as having died *in* the one that had
+already passed — attributed to whoever owns it, with an owner and a severity on
+it. Where nothing is in flight the incident says so, and the lead it offers
+names itself as the last test rather than the running one.
+
+It carries the run id too. The evidence directory outlives a run and clearing
+it is best-effort — on Windows a file another process still has open cannot be
+unlinked at all — so a record stamped with a different run is refused rather
+than read as this one's. That check is load-bearing beyond the report: the pid
+in a stale record is a pid this run's stack probe would otherwise signal.
+
 **The exit status, taken from the OS.** Where a `Popen` object survives, its
 return code. Otherwise `waitid(P_PID, pid, WEXITED | WNOWAIT | WNOHANG)` —
 `WNOWAIT` reads the status *without consuming it*, so execnet's own reaping
@@ -590,6 +606,28 @@ dump goes to `<worker>.frozen`, because it means something the watchdog's does
 not — not "this test is slow" but "this process stopped responding" — and the
 incident says which file its stack came out of in `stack_source`.
 
+**It stands down where pytest is using that timer.** There is exactly one
+`faulthandler.dump_traceback_later` timer per process, and arming it cancels
+whatever was armed before. pytest's own faulthandler plugin arms it at the
+start of every test when `faulthandler_timeout` is set, and this fallback
+re-arms every second — so the fallback always won, and a configured timeout
+silently never fired, `faulthandler_exit_on_timeout` and all. Where that ini is
+set the fallback is not armed at all, and the worker records
+`frozen_fallback_stood_down` in its event log saying why. It costs a stalled
+worker its frozen-fallback stack, which is a worse report; the alternative is a
+run that hangs past a timeout somebody configured, which is a worse run.
+
+**Nothing is signalled that cannot be confirmed.** `SIGUSR1`'s default
+disposition is to *terminate*, and the pid the on-demand probe would signal was
+read back out of a file the worker wrote. A worker that has since exited leaves
+its number to be handed on by the kernel, so signalling it does not produce a
+bad report — it kills an unrelated process. The pid is signalled only once
+something says it is still ours: the controller can see that process running
+under this worker's gateway, or the machine can be asked and answers that it is
+a child of this one. A machine that cannot be asked at all is not taken as a
+yes, and the incident says which of those it was instead of showing a stack it
+never had.
+
 **A heartbeat carrying CPU time.** One line every five seconds per worker,
 bounded by wall-clock rather than by how many tests run. `time.process_time()`
 in each beat is what turns silence into a verdict: alive with no CPU is
@@ -599,6 +637,491 @@ reported as nothing at all.
 **Evidence written before it is needed.** Every mechanism above puts its output
 on disk during the healthy part of the run, because a process that is about to
 be killed gets no warning. The controller reads files, never the corpse.
+
+## Live stacks over HTTP
+
+Everything above is for reading afterwards. This is the other direction: a UI
+watching a run, asking what a test is doing *while it is still doing it*.
+
+```console
+$ curl localhost:8080/stack?pid=48213
+{"pid": 48213, "source": "py-spy", "captured_at": 1756142887.31,
+ "threads": [{"thread_id": 8632442880, "thread_name": "MainThread",
+              "owns_gil": true, "active": true,
+              "frames": [{"function": "_wait_for_lease", "file": "/app/pool.py", "line": 91},
+                         {"function": "checkout", "file": "/app/pool.py", "line": 44},
+                         {"function": "test_concurrent_writes", "file": "/tests/test_pool.py", "line": 210}]}]}
+```
+
+Off by default — a plugin installed for crash reporting should not start
+opening listening sockets on everybody who upgrades it:
+
+```ini
+[pytest]
+failure_stack_server = true
+```
+
+```console
+$ pytest --callstack-port 8080          # also switches it on
+$ pytest --callstack-host 0.0.0.0       # so does this - and needs a token
+$ PYTEST_CALLSTACK_TOKEN=$(openssl rand -hex 16) pytest --callstack-host 0.0.0.0
+```
+
+A token does *not* switch it on: "authenticate the server I am already
+running" and "start a server" are different requests, and an exported
+`PYTEST_CALLSTACK_TOKEN` in a shell profile must not open a socket on every
+pytest run in that shell.
+
+### Two modes, and the port number picks between them
+
+**Drawn** — the default, when no port is named. The session binds whatever the
+kernel hands it and writes the address into the evidence directory. Nothing is
+shared, so nothing is contended and nothing can be lost to another session.
+
+**Named** — `--callstack-port 8080`, or the ini equivalent. The session claims
+that exact port and shares it with every other session on the machine, since a
+fixed port cannot be bound twice. First to start serves; the rest wait, and take
+over within five seconds of the holder exiting.
+
+Name a port when something outside has to be told the address once and for all —
+a firewall rule, a UI with it compiled in, a published container port. Otherwise
+let one be drawn: a UI that can read the evidence directory needs no agreement
+about numbers, and it has to read that directory anyway to know which pid is
+running which test.
+
+### What is running where
+
+`GET /workers` answers the whole question in one request, assembled from files
+the run was writing anyway — no ptrace, no per-test cost, nothing written:
+
+```json
+{"served_by": {"service": "…", "pid": 17155}, "observed_at": 1787688175.421,
+ "runs": [{"session": "run-19d52c2ff8e2", "run_id": "757f3cc51790…",
+           "controller": {"pid": 17155, "alive": true},
+   "workers": [
+     {"worker": "gw0", "pid": 21615, "nodeid": "test_slow.py::test_alpha", "phase": "call",
+      "status": "blocked", "why": "heartbeat 0.5s old but no CPU progress: the test thread is waiting on something",
+      "process_exists": true, "heartbeat_age_s": 0.5, "cpu_rate": 0.001, "rss_mb": 32},
+     {"worker": "gw1", "pid": 21618, "nodeid": "test_slow.py::test_beta", "phase": "call",
+      "status": "gone", "why": "process 21618 no longer exists; last seen in call of test_slow.py::test_beta",
+      "process_exists": false},
+     {"worker": "gw2", "pid": 21621, "nodeid": "test_slow.py::test_gamma", "phase": "call",
+      "status": "working", "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0}]}]}
+```
+
+`?worker=` narrows it to particular workers, which on a sixty-four-way run is
+the difference between reading one state file and reading all of them. Both
+spellings and both shapes work, and they mix:
+
+```console
+$ curl 'localhost:8080/workers?worker=gw1'
+$ curl 'localhost:8080/workers?worker=gw0,gw3'
+$ curl 'localhost:8080/workers?worker=gw0&worker=gw2'
+```
+
+Runs left with no matching worker drop out, and names that matched nothing
+anywhere come back under `filter.unmatched` — otherwise a caller cannot tell
+"not running" from "misspelt". An empty `?worker=` is treated as no filter,
+because that is what a UI sends when its filter box is empty. The names are
+compared against a directory listing and never joined onto one, so a value that
+looks like a path is just a name that matches nothing.
+
+The status vocabulary is [`analysis/stall.py`](#how-it-knows)'s truth table, as
+a live status rather than a post-hoc verdict:
+
+| status | heartbeat | CPU | process |
+|---|---|---|---|
+| `working` | fresh | above 0.05 cores | exists |
+| `blocked` | fresh | below that | exists |
+| `frozen` | stale | — | exists |
+| `gone` | — | — | absent |
+| `unmeasured` | never any | — | — |
+
+Three files answer three different questions, and keeping them apart is what
+makes this cheap and correct. `.state` says *what* a worker is doing and is
+written before each phase runs, so it is ahead of anything the controller
+knows — but a twenty-minute test writes nothing for twenty minutes, so a stale
+record says nothing about liveness. `.events` carries a heartbeat every few
+seconds whatever the test is doing, and the CPU time on each beat is the only
+thing separating a worker that is *working* from one that is *stuck*. The pid
+answers the narrowest question of the three, about a number that can be reused.
+
+Two details that are easy to get wrong and are handled here:
+
+- **A killed worker is a zombie until its parent reaps it**, and the kernel
+  accepts signals for it the whole time — so a `kill(pid, 0)` check reports a
+  worker killed a moment ago as alive, which is the opposite of what a crash
+  view is for. Linux answers from procfs, which is cheaper than building a
+  psutil object per worker per request; everywhere else psutil answers.
+- **Liveness is a different mechanism per platform.** Signal 0 is a POSIX
+  question; on Windows it is not a question at all (see below), so the platform
+  picks the mechanism before anything else happens.
+- **`cpu_rate: null` is not zero.** "It burned nothing" and "we could not
+  measure" are different findings, and a worker at full tilt whose beats
+  collide produces the second.
+
+Nothing here signals a worker or asks it anything: every verdict comes from
+beats already on disk, because asking a wedged process a question can dissolve
+the stall you were measuring.
+
+`nodeid` and `phase` are `null` between tests, and a very long `nodeid` is
+trimmed from both ends with `nodeid_elided: true` saying so.
+
+### When there is no live view
+
+Switching the server on and getting no server raises a
+`stack_server_unavailable` incident through the same hook as everything else.
+Without it the run continues perfectly well and your UI shows nothing forever
+with no error anywhere — because from the outside "no server" and "no tests
+running" look identical, which is the exact misreading this package exists to
+prevent:
+
+```
+[stack_server_unavailable] PORT_TAKEN  severity=informational  owner=runtime
+    no live stacks this run: 127.0.0.1 could not serve on port 8080
+    port 8080 is held by something that is not a stack server (Address already in use);
+    pass --callstack-port with an unused port, or leave it off entirely and let one be drawn
+    · the run itself is unaffected; what is missing is the live view
+```
+
+Two verdicts, because they have different remedies. `PORT_TAKEN` is a stranger
+on the port — name another one. `BIND_REFUSED` is an address that is not an
+interface on this machine, or a sandbox that forbids listening — naming another
+port does not help.
+
+Neither is raised when **another of your own sessions** holds the port: that is
+the shared mode working as designed, and alerting on the ordinary case is how a
+kind gets filtered out entirely. It is reported once per address per run, not
+once per retry, though a named port held by a stranger is re-probed for the
+life of the run.
+
+`owner=runtime`, `severity=informational`: no test is at fault and nothing is
+broken. What is lost is a diagnostic, and somebody has to decide whether to
+reconfigure it.
+
+### Who may ask
+
+Four things, and the token is only one of them.
+
+**The bind.** Loopback by default, and anything else refuses to open without a
+token — see below.
+
+**The `Host` header.** A request naming a host this server never bound is
+refused with 403. That is not about the network, which the bind already
+settles; it is about a browser. A page you visit can re-resolve its own
+hostname to `127.0.0.1`, at which point its origin *is* this server's and the
+same-origin policy stops protecting you. Checking `Host` costs nothing and
+closes that. A bind that is not loopback is exempt, because the address a
+legitimate client outside a container uses is one this process never learns —
+there the token is what stands in for the check.
+
+**Which pids `/stack` will answer for.** This run's: the serving process, plus
+the worker pids read out of the evidence directory. Anything else is 403. The
+server reads any process it has permission to read, so without this a caller
+who got past the bind could walk pids and collect the stack of every process
+you own — and each read pauses its target.
+
+**A token, if you supplied one.** On loopback you usually will not:
+
+```console
+$ curl localhost:8080/workers
+```
+
+With a token, which is what any bind but loopback requires:
+
+```console
+$ export PYTEST_CALLSTACK_TOKEN=$(openssl rand -hex 16)
+$ pytest -n8 --callstack-host 0.0.0.0 &
+$ curl -H "Authorization: Bearer $PYTEST_CALLSTACK_TOKEN" host:8080/workers
+$ curl "host:8080/workers?token=$PYTEST_CALLSTACK_TOKEN"   # for a hurry
+```
+
+**The token is supplied, never minted, and never written to disk.** That is the
+whole design, and it comes from the two halves of the problem being opposites.
+
+*The port has to be published.* A port drawn at random is unguessable by
+construction — that is the point of drawing it — so the run must write it down
+for anything outside to find it.
+
+*The token does not.* It is the one value both ends can agree on in advance,
+because whoever starts the run picks it. Minting one here made it discoverable
+instead, which meant writing it into the address file — and that turned every
+question about where a run may write its evidence into a question about where a
+*secret* may live. POSIX answers that with an `0o600`. Windows does not answer
+it at all: a mode there is not an ACL, so the file inherits the evidence
+directory's and the promise quietly stops holding on a supported platform.
+
+So the address file is ordinary data — a host, a port and a pid, the address of
+a server anyone who can reach it may query anyway. Put `failure_directory`
+wherever evidence goes, on any platform. And the secret arrives the way secrets
+already reach a container, a CI job and a shell:
+
+| | |
+|---|---|
+| `PYTEST_CALLSTACK_TOKEN` | a shell, a CI job, `docker run -e` — prefer this |
+| `--callstack-token SECRET` | one run, at the cost below |
+| *(nothing)* | no authentication — the default, and right on loopback |
+
+There is no ini setting, deliberately: ini files live in the repository.
+
+**The two are not equally private.** `--callstack-token` puts the secret in the
+controller's command line, and a command line is public on a shared machine:
+`/proc/<pid>/cmdline` is world-readable on Linux, so any other account can take
+the token out of `ps -eww` for as long as the run lasts — on exactly the
+machine a token is worth having. Shell history and an echoed CI command keep it
+after the run has ended, too. `PYTEST_CALLSTACK_TOKEN` reaches the same setting
+by the same path and has none of that: `/proc/<pid>/environ` is `0400`, the
+owner alone. The flag still works — runs use it, and it is unobjectionable on a
+machine with one user on it — and a run that uses it warns once, saying this.
+
+**No token is the default and the right one on loopback**, where the bind
+already bounds the reachable set to processes on this machine. On a box you
+share with people you would not hand a debugger to, supply one or leave the
+server off — "only local" and "only you" are different statements, and without
+a token only the first is being made.
+
+**Off loopback without a token is refused**, before the socket is opened, and
+reported as a `stack_server_unavailable` incident. Serving every local
+process's stack to whatever can route to the host is not something anybody
+configures on purpose, and a warning is the wrong instrument for it: by the
+time one is read the port has been open for the length of the run.
+
+`/identity` stays open even with a token set: it is what one session asks
+another before standing down from a contested port, and two sessions that
+minted nothing have no way to share a credential. It answers with a service
+name, a version and a pid.
+
+### Finding the server
+
+The run tells you, on a hook, the moment it is serving:
+
+```python
+def pytest_failure_server_ready(server):
+    registry.upsert(
+        session=server.session_id,       # names this run's evidence directory
+        url=server.url,                  # already bracketed if the host is IPv6
+        port=server.port,                # what got bound, never the 0 you asked for
+        token=server.token,              # what you supplied, or "" if you did not
+        pid=server.pid,                  # the controller, not any worker
+    )
+```
+
+That is the whole address, and for a drawn port it is the only way to learn it
+before the run is over — nobody can configure a number that did not exist a
+moment ago. `server` is a `LiveStackServer`; `server.headers()` gives you the
+`Authorization` header the endpoints want — `{}` when this run supplied no
+token, so the same client code works either way — and `server.endpoint("/workers")`
+joins the URL, so neither the scheme nor the slash is yours to get right.
+
+The hook fires on a thread of its own once the server is already accepting, so
+it is free to call straight back into the server it was just handed. It does not
+fire at all when the server was never switched on, nor when this session stood
+down because another of ours already holds a named port — that session announced
+itself, and one server should not be stored twice.
+
+**No run id in the payload.** At the moment the server binds, xdist has usually
+not built its node manager, so this run's real id does not exist yet; stamping
+the placeholder onto a row you will join against later is a key that silently
+matches nothing. `session_id` is stable from the first moment, and `/workers`
+reports the run id per directory as soon as a worker beats.
+
+If you would rather poll the filesystem than implement a hook, the address is
+also on disk. A drawn port is written to `callstack-<pid>.json` in **this run's**
+evidence directory (see the layout below), one file per serving session, and
+removed when that session ends. Files left by a
+session that was killed are swept by whoever publishes next — by checking the pid
+in the filename, so a live session's address is never deleted.
+
+```python
+for address in Path(".pytest-failures").glob("*/callstack-*.json"):
+    run = address.parent                      # one directory per run
+    server = json.loads(address.read_text())["url"]
+    for state in run.glob("*.state"):
+        record = json.loads(state.read_bytes().rstrip(b"\x00").strip())
+        stack = requests.get(f"{server}/stack?pid={record['pid']}").json()
+        print(run.name, record["nodeid"], record["phase"], stack["threads"][0]["frames"][0])
+```
+
+```
+test_pool.py::test_concurrent_writes call {'function': '_wait_for_lease', ...}
+```
+
+### Pushing samples instead of polling for them
+
+`/workers` and `/stack` are a pull: something outside asks, when it wants to
+know. Where a dashboard can reach the run, that is the better route — it reports
+more per worker than a sample does, at whatever cadence it chooses, and costs
+nothing at all while nobody is watching.
+
+What it needs is a listening socket, and there are runs that cannot have one: a
+CI job forbidden to open a port, a container with nothing routed into it, a run
+too short-lived for anything to discover and poll before it is over.
+`failure_sample_seconds` turns the same information around and pushes it out of
+the process instead, with no port and nothing to discover:
+
+```python
+def pytest_failure_worker_sample(sample):
+    for worker in sample.workers:
+        rows.insert(session=sample.session_id, at=sample.observed_at,
+                    worker=worker.worker, nodeid=worker.nodeid,
+                    phase=worker.phase, status=worker.status, why=worker.why,
+                    rss_mb=worker.rss_mb, cpu_rate=worker.cpu_rate)
+```
+
+Off by default. It is the only hook here that fires when nothing is wrong, so it
+is the only one with a running cost — and that cost is a directory walk: every
+field above comes from the `.state` and `.events` files the run was writing
+anyway, and nothing is asked of a worker itself. No ptrace, no subprocess, no
+pause. A sample of sixty-four workers is a few kilobytes of statuses.
+
+**No frames, deliberately.** Reading a stack per stuck worker per pass was tried
+here and taken out again: `blocked` is the status of any worker under 0.05
+cores, so on an I/O-bound suite every healthy worker waiting on a database
+qualified, and each pass paid a subprocess and a pause for each of them. Frames
+are worth that when a human is asking about one worker — `/stack?pid=`, on
+demand — rather than for every stuck worker on a timer. `session_id` and the
+worker's pid are what join a sample to a stack fetched that way.
+
+### Containers
+
+`--callstack-host 0.0.0.0` is what a container needs: its UI is outside, and
+127.0.0.1 inside a container is unreachable from there. That bind requires a
+token and is refused without one — see [Who may ask](#who-may-ask) — which
+suits a container better than the alternative did:
+
+```console
+$ docker run -e PYTEST_CALLSTACK_TOKEN -p 8080:8080 yourimage \
+      pytest -n8 --callstack-host 0.0.0.0 --callstack-port 8080
+```
+
+The UI outside reads the same value from the same place. Nothing has to be
+mounted out for it to find a secret in a file, which is what a minted token
+would have required.
+
+Two things about containers make this easier than it looks:
+
+- **Each container has its own network namespace**, so `8080` inside one pod is
+  not `8080` inside another. The port contention that the named mode exists to
+  resolve does not arise between pods at all — it is a bare-metal and laptop
+  problem. Name a port in a container, publish it, and every pod can use the
+  same number.
+- **Each container has its own PID namespace**, so a server in one pod could not
+  read another pod's workers even with every permission granted. Sharing is
+  neither possible nor needed there.
+
+Reading a process needs ptrace, which modern Docker permits under its default
+seccomp profile. Where it is refused, the endpoint says so and names the fix
+rather than returning nothing:
+
+```json
+{"pid": 48213, "source": "py-spy", "error": "Operation not permitted (os error 1)
+ - ptrace is not permitted: check /proc/sys/kernel/yama/ptrace_scope (0 or 1 allows
+ this; 1 requires the target to be a descendant of the reader, which xdist workers
+ are), and add --cap-add=SYS_PTRACE if this is a container"}
+```
+
+`ptrace_scope` is a host-wide sysctl and is **not namespaced**, so a container
+inherits the node's value and cannot change it. At `ptrace_scope=1` the
+*tracer* must be an ancestor of what it reads — and the tracer is not the
+controller but py-spy, which the controller spawns. py-spy and a worker are
+both children of the controller, so they are siblings, and a sibling is not an
+ancestor.
+
+A worker therefore nominates its parent as a permitted tracer at startup, via
+`prctl(PR_SET_PTRACER, <controller pid>)` — the exception Yama provides for
+exactly this. `worker_start` records whether it was granted, so a refused read
+has an answer beside it rather than only a message.
+
+Yama admits the nominated pid **and every descendant of it**, so this is wider
+than "the controller's py-spy may read this worker". The controller's
+descendants are the whole process tree of the run: every other worker, and any
+subprocess a test spawns while the declaration stands. The reader it exists for
+is one of them and is not the only one.
+
+**So the declaration is only made where something is going to read a worker's
+stack** — the live stack server, or the sampler (`failure_sample_seconds`) —
+and is `off` on every run where neither is on, which is most runs. The
+controller resolves that, being the only process that can see either, and hands
+each worker the answer; a worker never judges it for itself. `failure_tracer`
+says *which* declaration such a run makes, not that one is made.
+
+A *named* port shared across sessions still reads only the workers of the
+session hosting it: another session's workers nominated *their* controller, not
+this one. `failure_tracer = any` is what lifts that — it drops the relationship
+requirement entirely, so any reader on the machine that could already ptrace is
+permitted. That is the setting a shared server needs and the one a private run
+does not, which is why it is not the default.
+
+### Reading another process needs py-spy
+
+`pip install pytest-failure-instrumentation[stacks]`. There is no way to walk
+another process's frames from Python, so any pid but the server's own is read
+externally. That is also what makes it work on a worker whose GIL is held by
+native code: py-spy reads the target's memory rather than asking it to run
+anything, and stops the target before reading, so it never walks a frame that is
+being torn down. The server's *own* pid is answered from `sys._current_frames()`
+— no subprocess, no ptrace, no permission.
+
+Without py-spy the endpoint still answers, with the reason instead of a stack. A
+UI that is told *why* it has no stack can tell a dead process from a missing
+permission; one that gets an empty response cannot.
+
+On Windows there is no ptrace and no equivalent restriction: any process can
+read another running as the same user at the same integrity level, so the
+descendant rule above simply does not apply. Reading an *elevated* process from
+an unelevated one needs `SeDebugPrivilege`.
+
+## One directory per run
+
+```
+.pytest-failures/
+  run-70a514cc7a93/    <- this pytest process's own name for itself
+    owner.json         <- the controller's pid, and the only thing that makes
+    gw0.state             this directory ours to delete
+    gw0.events         <- every line carries the *reported* run id
+    gw1.state
+    callstack-4213.json
+```
+
+Runs used to share a flat directory and name their files after the worker,
+which works exactly until two runs happen at once — and on a laptop or a
+bare-metal runner that is the ordinary case. Every worker is `gw0`, so the
+second run's `gw0.state` *is* the first run's `gw0.state`: one run reads the
+other's evidence, believes it, and attributes a stall to a test a different run
+is running. The old start-of-run cleanup made it worse rather than better,
+because it deleted the files of a run still using them.
+
+A directory per run removes the class of bug rather than a symptom. Nothing
+inside is named for the run, because the directory already is, so every path a
+reader builds is unchanged.
+
+**Why the directory is not named after the run id you see on incidents.** The
+obvious name is xdist's own run id, and it cannot be used: it does not exist
+until xdist has built its node manager, and there is no hook order that
+reliably puts that first. `trylast` does not do it, because xdist's own session
+start is *also* `trylast` — so which of the two runs first comes down to which
+plugin registered first, and that differs between installing from the entry
+point and installing from a framework's `pytest_configure`. The directory is
+therefore named by something this process fixes for itself and nothing can
+reorder. The reported run id still prefers xdist's, so incidents still line up
+with xdist's logs, and every `.events` line inside carries it — which is how a
+directory is matched back to a run.
+
+`PYTEST_RUN_ID` names the directory if you set it, which is also the way to
+make two runs deliberately share one. The value has to be a *name* rather
+than a path: 1–128 characters of letters, digits, `.`, `-` and `_`, and
+neither `.` nor `..`. Anything else is refused with a warning and the run
+names itself — so a slugified branch works and a raw `feature/x` does not,
+because a separator in there would put this run's evidence somewhere other
+than `failure_directory`.
+
+**What gets cleaned up.** Whole directories of runs that are *over* — not old.
+The controller's pid is in `owner.json`, so a run still going is recognisable
+as such however long it has been going, which matters precisely because several
+run at once. A directory without that marker is not ours and is left alone
+whatever it looks like, which includes the flat files an older version of this
+plugin left behind: they cannot be mistaken for a current run's evidence,
+because a current run does not look there for any.
 
 ## Cost
 
@@ -619,6 +1142,9 @@ overwhelming majority of what runs.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.
+- The live stack server, when switched on: one thread per session, which
+  either serves or retries the claim every five seconds. Nothing is sampled
+  and nothing is written unless something asks.
 - pydantic is imported on the controller, and only when xdist is active. A
   worker never loads it, so nothing about the per-test path changed when the
   payload became typed.
@@ -631,7 +1157,8 @@ overwhelming majority of what runs.
 | Setting | Default | Purpose |
 |---|---|---|
 | `failure_packages` | — | Your top-level packages, for attribution |
-| `failure_directory` | `.pytest-failures` | Where evidence is written |
+| `failure_directory` | `.pytest-failures` | Where evidence is written; each run gets a subdirectory under it |
+| `failure_product_version` | — | Version recorded on every incident, for telling which build a failure came from |
 | `failure_watchdog` | `true` | Memory and liveness sampling |
 | `failure_heartbeat_interval` | `5.0` | Seconds between liveness beats (floor 1.0) |
 | `failure_tracemalloc_depth` | `0` | 1 names the allocating line for OOM attribution |
@@ -641,6 +1168,18 @@ overwhelming majority of what runs.
 | `failure_slow_test_seconds` | `20` | How often a running test refreshes its stack (setup through teardown; needs `failure_watchdog`) |
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
+| `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
+| `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
+| `failure_stack_server` | `false` | Serve live stacks over HTTP |
+| `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
+| `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
+
+There is deliberately **no ini setting for the token**. It comes from
+`PYTEST_CALLSTACK_TOKEN` or `--callstack-token` and nowhere else: an ini file
+lives in the repository, and a credential in the repository is the thing this
+design exists to avoid. Prefer the environment variable — a token on the
+command line is readable by every other user of the machine. See
+[Who may ask](#who-may-ask).
 
 `failure_slow_test_seconds` and `failure_stall_seconds` are not independent.
 The stack a stalled worker is reported with is whatever the watchdog last
@@ -653,6 +1192,21 @@ allocation fail *inside* the process, so you get a `MemoryError` with a
 traceback and a node id instead of an uncatchable kill with neither. It costs
 you a hard ceiling per worker, which is why it is opt-in.
 
+`failure_directory` is safe to share between runs going at once, and it has to
+be: worker ids start at `gw0` in every run, so a flat directory would have two
+sessions writing the same file names. Each run gets a subdirectory of its own
+named for its session, holding an owner marker with the pid that made it.
+Cleanup prunes *whole directories whose owner is no longer running* rather than
+a list of file suffixes, so a live run's evidence is never what a starting run
+deletes, and a coverage report that happens to live there is never touched at
+all.
+
+Two things back that up rather than repeating it. Every record carries the run
+that wrote it, and a reader refuses one naming a different run — so even a
+directory that somehow got crossed yields missing evidence rather than another
+run's attributed to yours. And a run that finds a live session already owning
+its directory says so.
+
 ## Platform coverage
 
 | Capability | Linux | macOS | Windows |
@@ -660,9 +1214,20 @@ you a hard ceiling per worker, which is why it is opt-in.
 | Test in flight, phase, exit status | yes | yes | yes |
 | Crash stack | yes | yes | yes |
 | Stack from a *slow or hung* test | yes | yes | yes |
-| Current memory | procfs | psutil, else peak only | psapi |
+| Current memory | procfs | psutil | psapi |
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
+| Live stack of another process (needs py-spy) | yes | root only | yes |
+| Stack from a worker that stopped running Python | yes | yes | yes |
+
+The last row is the frozen-interpreter fallback, and it is the one capability a
+*setting* takes away on every platform rather than a platform taking away: where
+`faulthandler_timeout` is set, pytest owns the single
+`dump_traceback_later` timer it would arm, and it stands down rather than
+cancel a timeout somebody configured. On Windows that leaves a worker frozen in
+native code with no stack at all, since the on-demand probe is not available
+there either — which is why the worker records `frozen_fallback_stood_down` in
+its event log rather than leaving the absence to be guessed at.
 
 Two Windows differences are worth knowing about, because they change what you
 will see rather than how it is reported.
@@ -679,8 +1244,14 @@ deliberate `os._exit(3)` gives. What separates a crash from a clean exit there
 is whether a dump was written, not the exit status, which is why the crash
 stack is evidence in its own right rather than a decoration on the verdict.
 
-`psutil` is never required, only ever an upgrade: `pip install
-pytest-failure-instrumentation[psutil]`.
+`psutil` is a dependency, imported like any other. It is the only
+cross-platform way to ask whether a process is still there, and the POSIX way
+is actively dangerous on Windows: `os.kill(pid, 0)` sends a console event only
+for `CTRL_C_EVENT` and `CTRL_BREAK_EVENT`, and calls `TerminateProcess` for
+every other value — including zero. A liveness check written the obvious way
+would kill each worker it inspected, and the live view inspects every worker on
+every request. psutil also carries the memory figures on macOS and Windows,
+which procfs cannot.
 
 ## Tests
 
@@ -704,8 +1275,6 @@ cgroup counters — and none of the Windows or macOS paths can be exercised on a
 Linux runner, which is the whole reason the matrix exists. Two axes matter as
 much as the operating system, so each gets its own job:
 
-- **without `psutil`**, which is what most people actually have. Every probe
-  has to degrade to a declared "unavailable" rather than to a wrong number.
 - **without `pytest-xdist`**, where `pytest_testnodedown` has no hookspec at
   all and an unspecced hookimpl is a registration error — the failure mode that
   once made a plain `pytest` run report nothing.

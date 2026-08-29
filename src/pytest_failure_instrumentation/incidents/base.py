@@ -61,6 +61,11 @@ class Capabilities(BaseModel):
     cgroup_oom_counter: bool = False
     exit_status: str = "unavailable"
     live_stack: bool = False
+    #: Whether a process can be read from *outside* it, which is the only way
+    #: to get a stack out of a worker whose GIL is held by native code.
+    #: Declared rather than left to ``extra="allow"`` so that it reaches the
+    #: JSON schema a consumer migrates their table from.
+    external_stack: str = "unavailable"
     psutil: bool = False
 
 
@@ -106,6 +111,21 @@ class Incident(BaseModel):
     def ends_this_run(self) -> bool:
         """Whether *this* incident ended the session. Constant for most kinds."""
         return type(self).ends_run
+
+    def owner_when_unattributable(self) -> Optional[str]:
+        """Who owns this when there is no stack to work it out from.
+
+        Attribution reads frames, and a kind with no frames gets "unknown" -
+        which means "we could not tell" and is scored ``needs-triage``. For a
+        kind that fails without ever running anybody's code, that is not
+        uncertainty being reported honestly, it is a certainty being thrown
+        away: nobody's test is at fault and the answer was known before the
+        incident was built.
+
+        Only consulted when attribution came back unknown, so a kind that does
+        have a stack is never overridden by a guess made in its absence.
+        """
+        return None
 
     def raw_stack(self) -> list[str]:
         """Everything captured, as text, whatever kind this is.

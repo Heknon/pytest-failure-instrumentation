@@ -72,51 +72,58 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      # Deliberately without psutil: that is the configuration most people
-      # actually have, and every probe is supposed to degrade to a declared
-      # "unavailable" rather than to a wrong number.
-      - name: Install without psutil
+      # The ordinary install. psutil is a hard dependency, so it arrives with
+      # everything else; the capabilities dump below records what this
+      # particular runner can actually measure, since that varies by platform
+      # even when every dependency is present.
+      - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test]"
 
-      - name: Show what this machine can measure
+      # py-spy is what reads a process other than the one serving, so without
+      # it the test covering the live view's whole reason to exist skips -
+      # which is the same as not having it. Installed everywhere the platform
+      # table claims that read works, so the table is checked rather than
+      # asserted: Linux and Windows say yes, macOS says root only and is left
+      # out, since granting that would mean running the whole suite as root.
+      - name: Install the external stack reader
+        if: runner.os != 'macOS'
+        run: pip install -e ".[stacks]"
+
+      # The restrictive setting, on purpose. Ubuntu and Debian ship
+      # ptrace_scope=1, which is what makes a worker unreadable by a reader
+      # that is its sibling rather than its ancestor - so a runner left at 0
+      # would pass the live-view tests without ever exercising the exception
+      # that makes them work on a real user's machine. Set here rather than
+      # assumed, and the tests report the value they observed either way.
+      - name: Restrict ptrace the way a stock Linux box does
+        if: runner.os == 'Linux'
         run: |
-          python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
-
-      - name: Test
-        run: pytest -q
-
-  with-psutil:
-    # psutil is never required, only ever an upgrade - so it gets its own job
-    # rather than being folded into the matrix and hiding the default.
-    name: ${{ matrix.os }} / psutil
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install with psutil
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test,psutil]"
+          sudo sysctl -w kernel.yama.ptrace_scope=1
+          cat /proc/sys/kernel/yama/ptrace_scope
 
       - name: Show what this machine can measure
         run: |
           python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
 
+      # -n 4 on Linux, and only there. Measured on a 4-vCPU Linux box, which is
+      # the shape of this runner: 596s serially against 268s under -n 4, with
+      # the same 406 passed, the same 12 skipped, and the same skip reasons
+      # both ways. 4 rather than auto, because 4 is the number that comparison
+      # was made with. macOS and Windows stay serial - the suite spends nearly
+      # all of its time in subprocesses it starts itself, several of which are
+      # xdist runs of their own with timeouts on them, and how a 4x
+      # oversubscribed runner handles that has not been measured there.
+      #
+      # Running it parallel somewhere is the point: the reason -n was unusable
+      # until now was that inner runs inherited PYTEST_XDIST_WORKER from the
+      # outer one, and nothing in CI would have noticed it come back.
+      # oldest-supported, without-xdist and wheel below all run the suite in
+      # one process, so an ordering bug between two tests still has three
+      # places to show itself.
       - name: Test
-        run: pytest -q
+        run: pytest -q ${{ runner.os == 'Linux' && '-n 4' || '' }}
 
   oldest-supported:
     # pyproject declares pytest>=7.0 and python>=3.9. Everything else in this

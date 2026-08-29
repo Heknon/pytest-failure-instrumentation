@@ -14,12 +14,24 @@ single ``pwrite`` of a small buffer is not formally atomic, so the reader
 tolerates a torn read by retrying once; a stale-but-valid record is always
 better than a crash in the reader.
 
-What a fixed slot costs is a bound on the record, and the node id is the only
-field that can approach it - a parametrized id runs to hundreds of characters.
-So the *node id* is trimmed to fit, never the encoded record: a truncated JSON
+What a fixed slot costs is a bound on the record, and the node ids are the only
+fields that can approach it - a parametrized id runs to hundreds of characters.
+So the *node ids* are trimmed to fit, never the encoded record: a truncated JSON
 object does not parse, and the reader then loses the phase and the counters
 too, and reports a worker that died mid-test as one that died before running
 anything.
+
+There are two of them, and the difference is the whole reason this file is
+read at all. ``nodeid`` is the test *in flight* and is cleared when the test
+ends; ``last_nodeid`` is the most recent test whether or not it finished. A
+single field cannot be both, and being both is how a worker that died in the
+gap between two tests came to be reported as having died in the one that had
+already passed - with an owner, a severity and somebody's name on it.
+
+The record also carries the run that wrote it. This directory outlives a run,
+and cleaning it is best-effort: a file another process still has open cannot be
+unlinked on Windows. A reader that skips the check attributes an earlier run's
+pid to this one, and that pid is the one the stall probe signals.
 
 The slot is sized so that eliding is the exception rather than the rule. It is
 one write of one buffer at whatever size it is, and the syscall costs the same
@@ -55,16 +67,39 @@ ELIDED = "..."
 HEAD_SHARE = 0.6
 
 
+def _elide(nodeid: str | None, keep: int) -> str | None:
+    """``keep`` characters of a node id, taken from both ends.
+
+    A hash lives at the end of a parametrized id and the module lives at
+    the start, so a cut that keeps only one end throws away either what
+    the incident is attributed to or which case it was.
+    """
+    if nodeid is None:
+        return None
+    if keep <= 0 or not nodeid:
+        return ""
+    if keep >= len(nodeid):
+        return nodeid
+    head = round(keep * HEAD_SHARE)
+    tail = keep - head
+    return nodeid[:head] + ELIDED + (nodeid[-tail:] if tail else "")
+
+
 class WorkerState:
     """The current nodeid, phase and counters for one worker."""
 
-    def __init__(self, path: Path, pid: int) -> None:
+    def __init__(self, path: Path, pid: int, run_id: str | None = None) -> None:
         self.path = path
         self.pid = pid
+        self.run_id = run_id
         self.sequence = 0
         self.tests_started = 0
         self.tests_finished = 0
         self.nodeid: str | None = None
+        #: The most recent test, kept after ``nodeid`` is cleared. See the
+        #: module docstring: "which test was it in" and "which test was it
+        #: last in" are different questions and only one of them is a finding.
+        self.last_nodeid: str | None = None
         self.phase: str | None = None
         # Opened once; the descriptor lives for the process lifetime so a
         # write costs one syscall and survives interpreter shutdown.
@@ -75,14 +110,16 @@ class WorkerState:
         # pwrite is one syscall but Unix-only; seek+write is the portable
         # equivalent and still cheap enough for a per-phase write.
         self._pwrite = getattr(os, "pwrite", None)
-        #: The last id that had to be trimmed, and what it was trimmed to.
-        #: update() runs six times per test with the same id, and the search
-        #: below is the only expensive thing in this file.
-        self._trimmed: tuple[str, str] | None = None
+        #: The last pair of ids that had to be trimmed, and how much of each
+        #: was kept. update() runs six times per test with the same ids, and
+        #: the search below is the only expensive thing in this file.
+        self._trimmed: tuple[tuple[str | None, str | None], int] | None = None
 
     def update(self, **fields: Any) -> None:
         for name, value in fields.items():
             setattr(self, name, value)
+        if self.nodeid:
+            self.last_nodeid = self.nodeid
         self.sequence += 1
         payload_bytes = self._encode().ljust(SLOT_SIZE)
         try:
@@ -95,7 +132,7 @@ class WorkerState:
             pass  # never let bookkeeping break a test run
 
     def _encode(self) -> bytes:
-        """The record as bytes, with the node id elided until it fits.
+        """The record as bytes, with the node ids elided until it fits.
 
         Trimming the encoded JSON instead would save a byte count and lose the
         record: the reader gets an unparseable object and falls back to knowing
@@ -103,59 +140,52 @@ class WorkerState:
         exists to prevent.
         """
         stamp = round(time.time(), 3)
-        encoded = self._record(self.nodeid, stamp)
-        if len(encoded) <= SLOT_SIZE - 1 or not self.nodeid:
+        ids = (self.nodeid, self.last_nodeid)
+        encoded = self._record(self.nodeid, self.last_nodeid, stamp)
+        if len(encoded) <= SLOT_SIZE - 1 or not any(ids):
             return encoded
 
-        if self._trimmed is not None and self._trimmed[0] == self.nodeid:
-            # The same id arrives six times per test. Re-checked rather than
-            # trusted, because the counters beside it gain a digit as the run
+        if self._trimmed is not None and self._trimmed[0] == ids:
+            # The same ids arrive six times per test. Re-checked rather than
+            # trusted, because the counters beside them gain a digit as the run
             # goes on and a fit is a fit of the whole record.
-            cached = self._record(self._trimmed[1], stamp)
+            cached = self._elided(self._trimmed[1], stamp)
             if len(cached) <= SLOT_SIZE - 1:
                 return cached
 
-        # The most of the id that still fits, found by search rather than by
+        # The most of each id that still fits, found by search rather than by
         # subtracting an overflow: json escaping means a character is not a
-        # byte, and a quote or a non-ASCII parameter costs several. Keeping
-        # more can only lengthen the record, so the fit is monotone and the
-        # search is exact. It runs once per oversized id, not per write.
-        low, high = 0, len(self.nodeid)
+        # byte, and a quote or a non-ASCII parameter costs several. Both ids
+        # are held to the same budget, so there is one number to search for;
+        # keeping more of either can only lengthen the record, so the fit is
+        # monotone and the search is exact. It runs once per oversized pair,
+        # not per write.
+        low, high = 0, max(len(text or "") for text in ids)
         while low < high:
             middle = (low + high + 1) // 2
-            if len(self._record(self._elide(middle), stamp)) <= SLOT_SIZE - 1:
+            if len(self._elided(middle, stamp)) <= SLOT_SIZE - 1:
                 low = middle
             else:
                 high = middle - 1
-        trimmed = self._elide(low)
-        self._trimmed = (self.nodeid, trimmed)
-        return self._record(trimmed, stamp)
+        self._trimmed = (ids, low)
+        return self._elided(low, stamp)
 
-    def _elide(self, keep: int) -> str:
-        """``keep`` characters of the node id, taken from both ends.
+    def _elided(self, keep: int, stamp: float) -> bytes:
+        return self._record(
+            _elide(self.nodeid, keep), _elide(self.last_nodeid, keep), stamp
+        )
 
-        A hash lives at the end of a parametrized id and the module lives at
-        the start, so a cut that keeps only one end throws away either what
-        the incident is attributed to or which case it was.
-        """
-        # Bound locally: the caller only reaches here with a nodeid set, but
-        # the attribute is Optional and nothing in the signature says so.
-        nodeid = self.nodeid or ""
-        if keep <= 0 or not nodeid:
-            return ""
-        if keep >= len(nodeid):
-            return nodeid
-        head = round(keep * HEAD_SHARE)
-        tail = keep - head
-        return nodeid[:head] + ELIDED + (nodeid[-tail:] if tail else "")
-
-    def _record(self, nodeid: str | None, stamp: float) -> bytes:
+    def _record(
+        self, nodeid: str | None, last_nodeid: str | None, stamp: float
+    ) -> bytes:
         payload = json.dumps(
             {
                 "sequence": self.sequence,
                 "time": stamp,
+                "run_id": self.run_id,
                 "pid": self.pid,
                 "nodeid": nodeid,
+                "last_nodeid": last_nodeid,
                 "phase": self.phase,
                 "tests_started": self.tests_started,
                 "tests_finished": self.tests_finished,
@@ -170,8 +200,16 @@ class WorkerState:
             pass
 
 
-def read_state(path: Path) -> dict[str, Any]:
-    """Read a worker's current state; empty dict if unavailable."""
+def read_state(path: Path, run_id: str | None = None) -> dict[str, Any]:
+    """Read a worker's current state; empty dict if unavailable or not ours.
+
+    ``run_id`` is the run doing the reading. A record stamped with a different
+    one was left by an earlier run whose files this one could not delete, and
+    every field in it is wrong for this one - including the pid, which is what
+    the stall probe signals. Only a *disagreement* rejects it: a record with no
+    id at all was written by a worker the controller never reached with one,
+    and dropping that loses real evidence to protect against nothing.
+    """
     for _ in range(2):
         try:
             with path.open("rb") as handle:
@@ -182,7 +220,14 @@ def read_state(path: Path) -> dict[str, Any]:
         if not text:
             return {}
         try:
-            return json.loads(text)
+            record = json.loads(text)
         except ValueError:
             time.sleep(0.01)  # torn read; the writer is mid-update
+            continue
+        if not isinstance(record, dict):
+            return {}
+        written_by = record.get("run_id")
+        if run_id and written_by and written_by != run_id:
+            return {}
+        return record
     return {}

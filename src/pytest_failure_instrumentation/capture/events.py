@@ -83,8 +83,99 @@ def of_run(events: list[dict[str, Any]], run_id: str | None) -> list[dict[str, A
     return [event for event in events if event.get("run_id") == run_id]
 
 
+def this_run(events: list[dict[str, Any]], run_id: str | None) -> list[dict[str, Any]]:
+    """Events that could be this run's, which is not the same set as ``of_run``.
+
+    ``of_run`` drops an unplaceable event, and is right to: it is looking for
+    one specific event, and reporting an internal error that belonged to a
+    previous run is inventing a failure. This is looking for *all* the evidence
+    there is about a worker, and dropping the unplaceable there has the
+    opposite cost - a worker the controller never reached with a run id wrote a
+    run's worth of unstamped beats, and discarding them reports a healthy
+    worker as one that never beat at all.
+
+    So a record is refused only when it names a *different* run, which is the
+    case that matters: an earlier run's beats read as this one's make a live
+    worker look frozen, with high confidence and the wrong pid attached.
+    """
+    if not run_id:
+        return events
+    return [event for event in events if event.get("run_id") in (None, run_id)]
+
+
 def worker_pid(events: list[dict[str, Any]]) -> int | None:
     for event in events:
         if event.get("event") == "worker_start" and event.get("pid"):
             return int(event["pid"])
     return None
+
+
+#: How much of an event log to read when only the recent past matters. Beats
+#: accumulate with wall-clock rather than with the suite - roughly twelve lines
+#: per worker per minute - so a long run's log is large while the part worth
+#: reading stays the same size. 64 KiB is many minutes of beats.
+TAIL_BYTES = 64 * 1024
+
+
+def tail_events(path: Path, limit: int = TAIL_BYTES) -> list[dict[str, Any]]:
+    """The most recent events, at constant cost however long the run has been.
+
+    ``read_events`` parses the whole file, which is right for a report written
+    once and wrong for anything polled: a UI asking every second would pay for
+    the entire history each time, and pay more as the run goes on.
+
+    Seeking into the middle of a file lands mid-line, so the first line is
+    dropped rather than parsed - the same tolerance ``read_events`` has for a
+    truncated last line, at the other end.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            raw = handle.read()
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if size > limit and lines:
+        lines = lines[1:]  # the seek landed inside it
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+#: Enough to reach the startup records a worker writes before its first beat -
+#: capabilities, limits, the interval - without reading a long run's whole log.
+HEAD_BYTES = 8 * 1024
+
+
+def head_events(path: Path, limit: int = HEAD_BYTES) -> list[dict[str, Any]]:
+    """The first events a worker wrote, which is where its setup is described.
+
+    The tail is what says how a worker is doing *now*; the head is what says
+    how it was configured, and the two are not the same read. A worker writes
+    ``watchdog_started`` once, before anything else, so on a run long enough to
+    fill the tail window that record is only in the head - and a reader that
+    looked for it in the tail would find nothing and assume a default.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(limit)
+    except OSError:
+        return []
+    text = raw.decode("utf-8", "replace")
+    # A read that stopped mid-line leaves a partial last line; it is dropped
+    # rather than parsed, the same way the tail drops its partial first one.
+    if not text.endswith("\n"):
+        text = text.rpartition("\n")[0]
+    events = []
+    for line in text.splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events

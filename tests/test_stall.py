@@ -521,3 +521,44 @@ def test_a_finalizer_that_blocks_in_teardown_is_named(distributed):
     assert stall.stack, "a hang in teardown left no stack"
     assert stall.blamed_frame is not None
     assert stall.blamed_frame.function == "leaky_client"
+
+
+def test_a_crashed_worker_is_not_also_reported_as_stalled(distributed):
+    """A corpse is not a stalled process, and it used to be reported as one.
+
+    When a worker crashes, xdist writes up the test it abandoned as a failure
+    and attributes that report to the *dead* node - so the last report a worker
+    ever produces arrives after ``pytest_testnodedown`` has said it is gone.
+    Read as a sign of life it put the dead worker back among those being
+    watched, where nothing could remove it again, and one
+    ``failure_stall_seconds`` later it was reported a second time as
+    STALLED_FROZEN: "the process is stopped", which was true, useless, and
+    counted as another run-ending incident against the run.
+
+    The other workers here burn CPU rather than sleeping, so the run outlasts
+    the stall threshold several times over without any of them being a stall in
+    its own right.
+    """
+    busy = """
+
+def test_busy_{index}():
+    deadline = time.time() + 8
+    total = 0
+    while time.time() < deadline:
+        total += sum(range(10000))
+    assert total
+"""
+    distributed.pytester.makepyfile(
+        test_crash_then_work="import time\n\nimport victim\n\n\n"
+        "def test_dies_early():\n    victim.hard_exit(9)\n"
+        + "".join(busy.format(index=index) for index in range(4))
+    )
+    incidents = distributed.run(
+        "-n", "2", *STALL_ARGUMENTS, "test_crash_then_work.py", timeout=180
+    )
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.exit_status == 9
+    assert distributed.of_kind(incidents, "worker_stall") == []
+    summary = distributed.only(incidents, "run_summary")
+    assert summary.run_ending_incidents == 0

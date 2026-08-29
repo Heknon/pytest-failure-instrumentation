@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from ..config import Settings
+from ..probes import tracing
 from . import crash_stack
 from . import memory as memory_capture
 from .events import EventLog
@@ -29,9 +30,20 @@ from .state import WorkerState
 
 
 class WorkerRecorder:
-    def __init__(self, directory: Path, worker_id: str, settings: Settings) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        worker_id: str,
+        settings: Settings,
+        *,
+        faulthandler_timeout: float = 0.0,
+    ) -> None:
         self.worker_id = worker_id
         self.directory = directory
+        #: pytest's own ``faulthandler_timeout``. Not a setting of ours - it
+        #: decides only whether the frozen-interpreter fallback may arm the
+        #: one timer the two plugins share. See config.pytest_faulthandler_timeout.
+        self.faulthandler_timeout = faulthandler_timeout
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
         # Filled as each resource is opened, so close() works on a recorder
@@ -50,7 +62,7 @@ class WorkerRecorder:
         directory.mkdir(parents=True, exist_ok=True)
 
         self.state = self._track(
-            WorkerState(directory / f"{worker_id}.state", os.getpid())
+            WorkerState(directory / f"{worker_id}.state", os.getpid(), settings.run_id)
         )
         self.events = self._track(
             EventLog(directory / f"{worker_id}.events", settings.run_id)
@@ -78,17 +90,40 @@ class WorkerRecorder:
         # own threads cannot run while native code holds the GIL. Never
         # closed, for the same reason as the crash stream - the C timer keeps
         # the descriptor and may write to it long after Python has stopped.
-        self._frozen_stream = (
-            directory / f"{worker_id}.frozen"
-        ).open("w", buffering=1, encoding="utf-8")
-        self._open_resources.append(self._frozen_stream)
-        self.frozen = crash_stack.FrozenInterpreterFallback(
-            self._frozen_stream,
-            settings.heartbeat_interval if settings.watchdog else 0.0,
-        )
+        #
+        # It stands down when pytest is using that timer itself. There is one
+        # per process and arming it cancels what was armed before, so the
+        # fallback - which re-arms every second - would quietly take over a
+        # user's faulthandler_timeout and with it the exit that was meant to
+        # end a hung run. Losing a stack is a worse report; losing somebody's
+        # configured timeout is a worse run.
+        self._frozen_stream = None
+        self.frozen = crash_stack.FrozenInterpreterFallback(None, 0.0)
+        if settings.watchdog and self.faulthandler_timeout <= 0:
+            self._frozen_stream = self._track(
+                (directory / f"{worker_id}.frozen").open(
+                    "w", buffering=1, encoding="utf-8"
+                )
+            )
+            self.frozen = crash_stack.FrozenInterpreterFallback(
+                self._frozen_stream, settings.heartbeat_interval
+            )
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
+
+        # Before anything can be asked to read this process. Without it a
+        # live-stack read of this worker is refused wherever Yama enforces
+        # ptrace_scope=1, because the reader is a *sibling* rather than an
+        # ancestor - see probes.tracing.
+        #
+        # The policy in force, which the controller resolved and this process
+        # obeys rather than judges. It is "off" for every run that reads no
+        # worker stacks - which is nearly all of them, and which used to widen
+        # ptrace here anyway, on every Linux machine that installed this. The
+        # worker has not been told enough to reach that answer itself, on
+        # purpose; see Settings.tracer_in_force.
+        traceable = tracing.permit_tracing(settings.tracer_in_force)
 
         self.events.record(
             "worker_start",
@@ -96,7 +131,22 @@ class WorkerRecorder:
             python=sys.version.split()[0],
             platform=platform.platform(),
             executable=sys.executable,
+            # Recorded because it is the difference between "no stack" and
+            # "no stack, and here is the reason", and it is only knowable here.
+            traceable_by_parent=traceable,
+            # What was declared, not what was configured: on a run with
+            # nothing reading stacks those differ, and the reader of this line
+            # is asking about the process it names.
+            tracer_policy=settings.tracer_in_force,
         )
+        if settings.watchdog and self.faulthandler_timeout > 0:
+            self.events.record(
+                "frozen_fallback_stood_down",
+                reason="pytest's faulthandler_timeout is set and owns the one "
+                "dump_traceback_later timer this process has; re-arming it "
+                "would cancel that timeout",
+                faulthandler_timeout=self.faulthandler_timeout,
+            )
         self.state.update()
 
     def _track(self, resource: Any) -> Any:
@@ -208,13 +258,22 @@ class WorkerRecorder:
         if phase == "setup":
             self.slow_test.start_test()
         yield
-        if phase == "teardown":
-            self.slow_test.end_test()
-        if phase == "teardown":
-            self.state.tests_finished += 1
         if self.heartbeat is not None:
             self.heartbeat.phase = None
-        self.state.update(phase=None)
+        if phase != "teardown":
+            self.state.update(phase=None)
+            return
+        self.slow_test.end_test()
+        self.state.tests_finished += 1
+        # The node id is cleared with the *test*, not with each phase. A worker
+        # that dies or wedges in the gap between two tests has no test in
+        # flight, and saying it had one names a test that already passed - to
+        # which the incident is then attributed, with an owner and a severity.
+        # What that test was is still worth knowing, so the slot keeps it in
+        # `last_nodeid`, where nothing can mistake it for the present.
+        if self.heartbeat is not None:
+            self.heartbeat.nodeid = None
+        self.state.update(phase=None, nodeid=None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_internalerror(self, excrepr: object) -> None:

@@ -100,3 +100,21 @@ def test_a_measured_zero_keeps_the_confidence_it_earns():
     )
     assert verdict.cpu_rate == 0.0
     assert verdict.confidence is None  # the state's own confidence stands
+
+
+def test_only_this_run_s_events_are_this_run_s_evidence():
+    """An earlier run's beats are old by definition, and old beats are exactly
+    what FROZEN is read off. A record with no run id at all cannot be placed
+    either way and is kept: dropping it reports a worker whose controller never
+    reached it with an id as one that never beat at all."""
+    from pytest_failure_instrumentation.capture import events
+
+    log = [
+        {"event": "heartbeat", "run_id": "run-earlier"},
+        {"event": "heartbeat", "run_id": "run-now"},
+        {"event": "heartbeat", "run_id": None},
+    ]
+
+    kept = events.this_run(log, "run-now")
+    assert [event.get("run_id") for event in kept] == ["run-now", None]
+    assert events.this_run(log, None) == log

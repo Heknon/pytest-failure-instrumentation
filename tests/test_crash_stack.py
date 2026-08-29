@@ -8,11 +8,15 @@ writes them.
 
 from __future__ import annotations
 
+import contextlib
+import faulthandler
+import threading
 import time
+from pathlib import Path
 
 import pytest
 
-from pytest_failure_instrumentation.capture import crash_stack
+from pytest_failure_instrumentation.capture import crash_stack, heartbeat
 
 HEARTBEAT_SECTION = """\
 Thread 0x00007fb0d66146c0 (most recent call first):
@@ -238,21 +242,37 @@ def test_the_dump_is_dropped_when_the_test_that_left_it_ends(tmp_path):
     assert not list(tmp_path.glob("*.part")), "a half-written dump was left behind"
 
 
-def test_the_cadence_is_per_test_and_not_per_tick(tmp_path):
+def test_the_cadence_is_per_test_and_not_per_tick(tmp_path, monkeypatch):
     """The heartbeat ticks far more often than the timeout, and each tick is a
     dump of every thread in the process. Writing one per tick would turn a
-    twenty-second cadence into a five-second one nobody asked for."""
+    twenty-second cadence into a five-second one nobody asked for.
+
+    Counted rather than timed. This compared the file's ``st_mtime_ns`` before
+    and after, which asks the filesystem a question NTFS answers imprecisely:
+    its last-write time has ~15.6 ms granularity and is updated lazily, so two
+    stats around a single write could differ by a tick of the system clock and
+    the test failed on Windows having found no second dump at all. What it
+    means to assert is that the cadence *decided* not to dump, so that is what
+    is asserted.
+    """
     path = tmp_path / "gw0.slow"
     watchdog = crash_stack.SlowTestWatchdog(path, timeout=0.2)
+
+    dumps = []
+    real_dump = watchdog._dump
+    monkeypatch.setattr(
+        watchdog, "_dump", lambda: (dumps.append(time.monotonic()), real_dump())[1]
+    )
 
     watchdog.start_test()
     time.sleep(0.25)
     watchdog.tick()
-    first = path.stat().st_mtime_ns
+    assert len(dumps) == 1, "the first tick past the timeout wrote nothing"
+    assert path.exists(), "the dump named a file it did not write"
 
     for _ in range(5):
         watchdog.tick()
-    assert path.stat().st_mtime_ns == first, "a tick inside the cadence re-dumped"
+    assert len(dumps) == 1, "a tick inside the cadence re-dumped"
 
 
 def test_a_reader_never_sees_half_a_dump(tmp_path):
@@ -310,6 +330,31 @@ def test_the_dumping_thread_is_not_reported_as_the_stalled_one(tmp_path):
     assert not any("heartbeat.py" in line for line in lines)
 
 
+def _settled(path, quiet: float = 0.3, timeout: float = 10.0) -> str:
+    """The dump's contents, once it has stopped being written to.
+
+    A dump has no marker for where it ends, so a read taken while the C timer
+    is still writing returns part of one - and part of a dump differs from the
+    whole of it, which is indistinguishable from a second dump having been
+    appended. That is what it looked like on a loaded runner: the comparison
+    below failed with frames *added* to a continuing stack rather than with a
+    second "Timeout (" banner, which is the shape a real repeat would have.
+
+    So the file is left to settle first. This weakens nothing: the assertion is
+    that no *further* dump arrives, and it can only be made against a dump that
+    has finished arriving.
+    """
+    deadline = time.monotonic() + timeout
+    last = -1
+    while time.monotonic() < deadline:
+        size = path.stat().st_size
+        if size and size == last:
+            break
+        last = size
+        time.sleep(quiet)
+    return path.read_text(encoding="utf-8")
+
+
 def test_the_fallback_timer_never_fires_while_the_heartbeat_is_beating(tmp_path):
     """This is the whole safety argument, so it is asserted rather than argued.
 
@@ -342,8 +387,11 @@ def test_the_fallback_timer_never_fires_while_the_heartbeat_is_beating(tmp_path)
 
         # And when the beats stop, it fires - once, which is the whole answer
         # for a process that is no longer changing.
+        # Past the deadline, so it has certainly fired - and then read only
+        # once it has stopped being written to, since a partial dump differs
+        # from the whole one in exactly the way a second dump would.
         time.sleep(2.5)
-        first = path.read_text(encoding="utf-8")
+        first = _settled(path)
         assert first.startswith("Timeout (")
         time.sleep(2.0)
         assert path.read_text(encoding="utf-8") == first, "the timer repeated"
@@ -461,3 +509,274 @@ def test_a_cut_stack_says_it_was_cut(tmp_path):
 
     # And nothing is added when nothing was dropped.
     assert not any("more frames" in line for line in crash_stack.read(path, limit=200))
+
+
+def test_a_dump_that_could_not_be_deleted_is_tried_again(tmp_path, monkeypatch):
+    """Windows refuses to unlink a file another process has open, and the other
+    process is the controller reading this very stack while it assesses a
+    stall. Forgetting the file on a refused unlink stranded it for the rest of
+    the run: no later test tried again, and the next stall read a finished
+    test's frames as the live worker's."""
+    watchdog = crash_stack.SlowTestWatchdog(tmp_path / "gw0.slow", timeout=0.01)
+    watchdog.path.write_text("Timeout (0:00:01)!\n", encoding="utf-8")
+    watchdog._on_disk = True
+
+    refused = []
+    real_unlink = Path.unlink
+
+    def refuse_once(self, *arguments, **keywords):
+        if self == watchdog.path and not refused:
+            refused.append(self)
+            raise PermissionError(32, "The process cannot access the file")
+        return real_unlink(self, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, "unlink", refuse_once)
+
+    watchdog.end_test()
+    assert watchdog.path.exists(), "the unlink was refused, as the test arranged"
+
+    watchdog.start_test()
+    watchdog.end_test()
+    assert not watchdog.path.exists(), "the refused dump was never tried again"
+
+
+def test_a_dump_somebody_else_removed_is_not_retried_forever(tmp_path):
+    watchdog = crash_stack.SlowTestWatchdog(tmp_path / "gw0.slow", timeout=0.01)
+    watchdog._on_disk = True
+
+    watchdog.end_test()
+    assert watchdog._on_disk is False
+
+
+# -- the one timer two plugins share ---------------------------------------
+
+
+def test_the_fallback_stands_down_when_it_is_given_no_stream(tmp_path):
+    """How the worker says "pytest owns the timer". There is one
+    dump_traceback_later per process and arming it cancels what was armed
+    before - so a fallback that re-arms every second silently takes over a
+    configured faulthandler_timeout, exit and all."""
+    fallback = crash_stack.FrozenInterpreterFallback(None, interval=0.05)
+    assert fallback.enabled is False
+
+    import faulthandler
+
+    marker = tmp_path / "someone-else.txt"
+    with marker.open("w", buffering=1, encoding="utf-8") as stream:
+        faulthandler.dump_traceback_later(0.5, repeat=False, file=stream, exit=False)
+        try:
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                fallback.tick()      # must not cancel and re-aim the timer
+                time.sleep(0.05)
+            assert marker.stat().st_size > 0, "the other plugin's timer never fired"
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+    # And stopping a fallback that armed nothing must not disarm whoever did.
+    with marker.open("w", buffering=1, encoding="utf-8") as stream:
+        faulthandler.dump_traceback_later(0.5, repeat=False, file=stream, exit=False)
+        try:
+            fallback.stop()
+            time.sleep(1.5)
+            assert marker.stat().st_size > 0, "the fallback cancelled a timer it never armed"
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+
+def test_a_worker_leaves_pytest_s_own_timeout_alone(tmp_path):
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(
+        tmp_path, "gw0", Settings(heartbeat_interval=1), faulthandler_timeout=30.0
+    )
+    try:
+        assert recorder.frozen.enabled is False
+        assert not (tmp_path / "gw0.frozen").exists()
+    finally:
+        recorder.close()
+
+    events = (tmp_path / "gw0.events").read_text(encoding="utf-8")
+    assert "frozen_fallback_stood_down" in events
+    assert "faulthandler_timeout" in events
+
+
+def test_a_worker_with_no_timeout_configured_still_arms_the_fallback(tmp_path):
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(tmp_path, "gw0", Settings(heartbeat_interval=1))
+    try:
+        assert recorder.frozen.enabled is True
+        assert (tmp_path / "gw0.frozen").exists()
+    finally:
+        recorder.heartbeat.stop()
+        recorder.close()
+
+
+# -- the timer at the end of a run -----------------------------------------
+
+
+@contextlib.contextmanager
+def _hang_protection(config):
+    """Give the outer run back the timer these tests take off it.
+
+    There is one ``dump_traceback_later`` per process, so cancelling it here -
+    which is what disarming the fallback does - also cancels the one pytest's
+    own faulthandler plugin armed for this very test out of the
+    ``faulthandler_timeout`` in pyproject.toml. Nothing re-arms it until the
+    next test starts, and that ini exists because a test below wedges things on
+    purpose: without it back, a hang costs the whole 25-minute CI job instead
+    of a stack and a dead run.
+    """
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        try:
+            timeout = float(config.getini("faulthandler_timeout") or 0)
+        except ValueError:
+            timeout = 0.0  # the plugin is switched off, so there was nothing to restore
+        if timeout > 0:
+            faulthandler.dump_traceback_later(timeout, exit=True)
+
+
+def test_a_rearm_that_lost_the_race_with_stop_arms_nothing(tmp_path, pytestconfig):
+    """Cancelling the timer is not the whole of stopping.
+
+    The heartbeat's thread can be anywhere when the run ends, including one
+    instruction past the wait it would have exited on. That tick calls rearm,
+    and a rearm that still believes it is enabled re-aims the C timer at
+    session teardown - the one stretch of the run with nothing left to push
+    the deadline forward, and Python running flat out for it to land in.
+    """
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream, _hang_protection(pytestconfig):
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.05)
+        fallback.tick()
+        fallback.stop()
+
+        fallback.rearm()  # the tick that was already in flight
+        time.sleep(0.4)  # well past the 0.15s deadline it would have set
+        assert path.stat().st_size == 0, "a rearm after stop left a live timer behind"
+
+
+class _SlowTicker:
+    """A ticker that is guaranteed to still be running when stop is called.
+
+    Holding the heartbeat's thread inside a tick is what makes the interleaving
+    a fact of the test rather than a coincidence of scheduling: stop is entered
+    while a round of ticks is in flight, on every run and on every machine.
+    """
+
+    def __init__(self, hold: float) -> None:
+        self.hold = hold
+        self.entered = threading.Event()
+        self.thread: threading.Thread | None = None
+        #: Whether the thread that ticks was still alive at each call to stop,
+        #: which is the ordering the fallback's deadline rests on. A list
+        #: rather than a flag, so that a stop reached twice cannot answer for
+        #: the one that came too early.
+        self.alive_at_stop: list[bool] = []
+
+    def tick(self) -> None:
+        self.entered.set()
+        time.sleep(self.hold)
+
+    def stop(self) -> None:
+        self.alive_at_stop.append(self.thread is not None and self.thread.is_alive())
+
+
+def test_stopping_the_heartbeat_mid_tick_leaves_no_timer_armed(
+    tmp_path, pytestconfig, monkeypatch
+):
+    """The worker must not leave pytest_sessionfinish with a deadline running.
+
+    Stopping the tickers before the thread that drives them does not disarm
+    anything for long: the thread runs one more round of ticks, the fallback's
+    rearms the C timer just after it was cancelled, and the worker finishes the
+    session with a dump due three heartbeat intervals later - fifteen seconds
+    at the defaults, in the middle of teardown. What lands is either the
+    segfault the fallback's own docstring measured at 10 runs out of 10, or a
+    ``.frozen`` file that incidents/stall.py presents as evidence that this
+    healthy process had stopped running Python.
+
+    The wake is shortened so the thread ticks promptly; nothing else about the
+    interleaving depends on it.
+    """
+    monkeypatch.setattr(heartbeat, "TICK_SECONDS", 0.02)
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream, _hang_protection(pytestconfig):
+        # The deadline has to sit well beyond one round of ticks, or this test
+        # fails for a reason that is not the one it is about. A round is the
+        # 0.02s wake plus the gate's hold; at interval=0.15 the deadline was
+        # 0.45s against a 0.32s round, and a runner that lost 130ms anywhere in
+        # there fired the timer while the heartbeat was still healthy - which
+        # this test then reported as the stop ordering. Measured: one round
+        # stretched to 0.5s writes a dump at that deadline and none at this
+        # one. macOS found it; the margin is now about ten rounds.
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=1.0)
+        gate = _SlowTicker(hold=0.3)
+        beat = heartbeat.Heartbeat(
+            lambda *arguments, **keywords: None,
+            interval=1.0,
+            tickers=[gate, fallback],
+        )
+        gate.thread = beat._thread
+
+        beat.start()
+        gate.entered.clear()  # start() ticks on this thread; wait for the heartbeat's
+        try:
+            assert gate.entered.wait(5.0), "the heartbeat thread never ticked"
+            # Nothing may have landed yet: a dump here is the deadline being
+            # crossed by a slow round, not by the ordering under test, and the
+            # two are indistinguishable once the file has bytes in it. Checked
+            # before stop so a failure says which of them happened.
+            assert path.stat().st_size == 0, (
+                "the fallback's deadline was crossed while the heartbeat was "
+                "still beating, so this machine could not hold a tick cadence "
+                f"inside {fallback.timeout}s - the ordering below is untested, "
+                "not disproved"
+            )
+        finally:
+            beat.stop()
+
+        time.sleep(fallback.timeout + 0.5)
+        assert path.stat().st_size == 0, (
+            "the run finished with faulthandler's timer still armed"
+        )
+        assert gate.alive_at_stop == [False], (
+            "the tickers were stood down while the thread that ticks them was still running"
+        )
+
+
+def test_a_stop_after_a_failed_rearm_still_cancels_the_live_timer(
+    tmp_path, pytestconfig, monkeypatch
+):
+    """``enabled`` answers "may this arm the timer again", and stop is asking
+    something else: "is there a timer of ours running".
+
+    A rearm that fails - a stream closed under it, a timeout that came back
+    non-positive - stands the fallback down, because nothing here is worth
+    failing a run over. The deadline armed by the rearm before it is still
+    counting, and reading the stood-down flag as "armed nothing" declined to
+    cancel it. That is the same live timer at teardown, reached by a longer
+    road.
+    """
+    path = tmp_path / "gw0.frozen"
+    with path.open("w", buffering=1, encoding="utf-8") as stream, _hang_protection(pytestconfig):
+        fallback = crash_stack.FrozenInterpreterFallback(stream, interval=0.1)
+        fallback.tick()  # armed, and counting
+
+        def refuse(*arguments, **keywords):
+            raise RuntimeError("the stream went away under it")
+
+        monkeypatch.setattr(faulthandler, "dump_traceback_later", refuse)
+        fallback.rearm()
+        assert fallback.enabled is False, "the arrangement failed: the rearm did not"
+        monkeypatch.undo()
+
+        fallback.stop()
+        time.sleep(0.5)  # past the 0.3s deadline the first tick armed
+        assert path.stat().st_size == 0, "stop declined to cancel a timer that was armed"

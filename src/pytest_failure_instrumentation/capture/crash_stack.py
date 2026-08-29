@@ -46,6 +46,10 @@ def arm_fatal_handler(stream: TextIO) -> bool:
     faulthandler.enable(file=stream, all_threads=True)
     if not stacks.can_request_stack():
         return False
+    # chain=False deliberately. Chaining re-raises the signal with whatever was
+    # installed before, and what is installed before is almost always SIG_DFL -
+    # whose action for SIGUSR1 is to *terminate*. A probe whose whole purpose is
+    # to ask a wedged worker a question must not be the thing that kills it.
     faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=False)
     return True
 
@@ -179,11 +183,23 @@ class SlowTestWatchdog:
                 pass
 
     def _discard(self) -> None:
-        self._on_disk = False
+        """Forget the dump only once it is actually gone.
+
+        Windows refuses to unlink a file another process has open, and the
+        other process here is the controller reading this very stack while it
+        assesses a stall. Clearing the flag first meant one refused unlink
+        stranded the dump for the rest of the run: no later test would try
+        again, and the next stall would read a finished test's frames as the
+        live worker's. The retry costs one failing unlink per test, and only
+        on a worker that has already written a dump somebody refused to let go.
+        """
         try:
             self.path.unlink()
+        except FileNotFoundError:
+            pass  # somebody else got there first, which is the outcome wanted
         except OSError:
-            pass  # bookkeeping must never break a run
+            return  # still on disk; the next end_test tries again
+        self._on_disk = False
 
 
 class FrozenInterpreterFallback:
@@ -213,6 +229,16 @@ class FrozenInterpreterFallback:
     Its dump goes to its own file. It means something different from the
     watchdog's - not "this test is slow" but "this process stopped responding"
     - and a reader that cannot tell them apart cannot say which.
+
+    **Why it can be switched off entirely.** ``dump_traceback_later`` is one
+    timer per process, and arming it cancels whatever was armed before.
+    pytest's own faulthandler plugin arms it at the start of every test when
+    ``faulthandler_timeout`` is set - and this re-arms every second, so this
+    always won, and a user's configured timeout (with the process exit that
+    was supposed to end a hung run) silently never fired. Where that ini is
+    set the worker constructs this with no stream, which disables it: a stall
+    reported without a frozen-fallback stack is a worse report, and a run that
+    hangs past a timeout somebody configured is a worse run.
     """
 
     #: Beats that have to be missed before the deadline passes. Two would be
@@ -220,10 +246,18 @@ class FrozenInterpreterFallback:
     #: running Python.
     MISSED_BEATS = 3
 
-    def __init__(self, stream: TextIO, interval: float) -> None:
+    def __init__(self, stream: Optional[TextIO], interval: float) -> None:
         self.stream = stream
         self.timeout = interval * self.MISSED_BEATS
-        self.enabled = self.timeout > 0
+        #: A stream of None is how the worker says "stand down entirely" -
+        #: pytest's own faulthandler_timeout is using the timer this would
+        #: arm, and there is only one of it per process.
+        self.enabled = self.timeout > 0 and stream is not None
+        #: Whether this object has ever aimed the process's one timer, which
+        #: is what makes cancelling it ours to do. ``enabled`` cannot answer
+        #: that question: it is cleared when an arm fails and when the run
+        #: ends, either of which can happen with a deadline already counting.
+        self._armed = False
 
     def rearm(self) -> None:
         """Push the deadline out by another window.
@@ -232,11 +266,17 @@ class FrozenInterpreterFallback:
         interpreter's stack does not change, and a repeat would keep dumping
         into a process that may be recovering - which is the unsafe case.
         """
-        if not self.enabled:
+        stream = self.stream
+        if not self.enabled or stream is None:
             return
         try:
+            # Recorded before the call and not after it. A stop can land
+            # between the two, and a flag set afterwards would be set after
+            # the cancel that needed to read it - which is the one arrangement
+            # that leaves a live timer behind rather than a spurious one.
+            self._armed = True
             faulthandler.dump_traceback_later(
-                self.timeout, repeat=False, file=self.stream, exit=False
+                self.timeout, repeat=False, file=stream, exit=False
             )
         except (RuntimeError, ValueError):
             self.enabled = False  # nothing here is worth failing a run over
@@ -250,11 +290,36 @@ class FrozenInterpreterFallback:
         Session teardown is Python running flat out with nothing left to push
         the deadline forward, which is precisely the window the arming above
         exists to stay out of.
+
+        **Stood down first, cancelled second.** The cancel alone does not end
+        anything, because the heartbeat's thread can be one instruction past
+        the wait it would have exited on: it runs one more tick, rearms, and
+        the deadline is live again a moment after it was taken away. Clearing
+        the flag first makes that racing tick a no-op whichever way the two
+        threads interleave. :meth:`Heartbeat.stop` joins its thread before it
+        stops its tickers, so no tick should be in flight by the time this is
+        reached at all - but that is one caller's ordering, and what is at
+        stake if it is ever wrong is a C timer left armed over teardown: a
+        dump that lands while the interpreter is executing, which the class
+        docstring above measured killing the worker in 10 runs out of 10.
+
+        **Only what this armed.** A disabled fallback armed nothing, and
+        cancelling anyway would take out whatever else in the process is using
+        the timer - which, when this is disabled, is exactly what is using it.
+        That question is asked of ``_armed`` rather than of ``enabled``,
+        because the two are not the same question and answering the second one
+        was wrong in one case: a rearm that fails clears ``enabled``, and the
+        deadline armed by the rearm before it is still counting. Reading
+        "stood down" as "armed nothing" left that one running.
         """
+        self.enabled = False
+        if not self._armed:
+            return
         try:
             faulthandler.cancel_dump_traceback_later()
         except (RuntimeError, ValueError):
             pass
+        self._armed = False
 
 
 #: What faulthandler writes before the first thread when the process is dying.

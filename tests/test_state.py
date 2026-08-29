@@ -100,3 +100,49 @@ def test_a_record_stays_readable_as_the_counters_grow_digits(tmp_path):
 
 def test_a_missing_file_reads_as_nothing_known(tmp_path):
     assert read_state(tmp_path / "absent.state") == {}
+
+
+def test_the_test_in_flight_and_the_last_test_are_different_fields(tmp_path):
+    """A worker between two tests has no test in flight, and saying it has one
+    puts a passing test's name on whatever happened next."""
+    state = WorkerState(tmp_path / "gw0.state", 4242)
+    state.update(nodeid="t.py::test_a", phase="call")
+    state.update(phase=None, nodeid=None)
+
+    record = read_state(tmp_path / "gw0.state")
+    assert record["nodeid"] is None
+    assert record["last_nodeid"] == "t.py::test_a"
+
+
+def test_the_last_test_is_elided_too_rather_than_bursting_the_slot(tmp_path):
+    state = WorkerState(tmp_path / "gw0.state", 4242)
+    state.update(nodeid=OVERSIZED_NODEID, phase="call")
+    state.update(phase=None, nodeid=None)
+
+    assert (tmp_path / "gw0.state").stat().st_size == SLOT_SIZE
+    record = read_state(tmp_path / "gw0.state")
+    assert record["nodeid"] is None
+    assert ELIDED in record["last_nodeid"]
+    assert record["tests_started"] == 0  # the rest of the record still parsed
+
+
+def test_a_record_another_run_left_behind_is_not_this_run_s(tmp_path):
+    """The directory outlives a run and cleaning it is best-effort - on Windows
+    a file somebody still has open cannot be unlinked at all. Read as this
+    run's, the record hands over an earlier run's pid, and that pid is what the
+    stall probe signals."""
+    state = WorkerState(tmp_path / "gw0.state", 4242, run_id="run-earlier")
+    state.update(nodeid="t.py::test_a", phase="call")
+
+    assert read_state(tmp_path / "gw0.state", "run-now") == {}
+    assert read_state(tmp_path / "gw0.state", "run-earlier")["pid"] == 4242
+
+
+def test_a_record_with_no_run_id_at_all_is_still_read(tmp_path):
+    """A worker the controller never reached with an id wrote a record that
+    cannot be placed either way. Dropping it loses real evidence to protect
+    against nothing: only a disagreement proves the file is somebody else's."""
+    state = WorkerState(tmp_path / "gw0.state", 4242)
+    state.update(nodeid="t.py::test_a", phase="call")
+
+    assert read_state(tmp_path / "gw0.state", "run-now")["nodeid"] == "t.py::test_a"

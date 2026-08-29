@@ -9,6 +9,7 @@ for.
 
 from __future__ import annotations
 
+import signal
 import time
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional
@@ -21,6 +22,78 @@ from ..capture import crash_stack
 from ..capture import events as event_log
 from ..capture.state import read_state
 from .base import CgroupMemory, Incident
+
+#: The signals faulthandler installs a handler for, and therefore the deaths
+#: that are expected to leave a dump behind. A worker killed by anything else -
+#: SIGKILL above all, which cannot be caught - never wrote one, and waiting for
+#: it would cost every OOM-killed worker a delay for a file that is not coming.
+DUMPING_SIGNALS = frozenset(
+    number
+    for number in (
+        getattr(signal, name, None)
+        for name in ("SIGSEGV", "SIGFPE", "SIGABRT", "SIGBUS", "SIGILL")
+    )
+    if number is not None
+)
+
+#: How long to wait for the dump of a worker that died in a way that writes
+#: one. The dying process writes it before it exits, so it is normally on disk
+#: already; this covers only the window where the controller notices the death
+#: first.
+FATAL_DUMP_WAIT_SECONDS = 1.0
+FATAL_DUMP_POLL_SECONDS = 0.05
+
+
+def _expects_a_dump(status: Optional[int]) -> bool:
+    """Whether this death is one that writes a dump on its way out.
+
+    Decided from the status rather than from the kind string, because the kind
+    is not one value. ``waitid`` answers ``killed`` normally and
+    ``killed-core-dumped`` when core dumps are enabled - which is the *usual*
+    case for a real SIGSEGV, so keying on ``killed`` alone skipped the wait for
+    exactly the deaths it exists for. And the path checked before either of
+    them, ``popen.returncode``, reports no kind at all.
+
+    A negative status is the POSIX convention for "killed by signal N" and is
+    the one thing all three paths agree on. Windows statuses are normalised to
+    unsigned, so they never match here and never wait.
+    """
+    return status is not None and status < 0 and abs(status) in DUMPING_SIGNALS
+
+
+def _crash_dump(path: Path, status: Optional[int]) -> list[str]:
+    """The dump that describes the death, waiting for it if it is still landing.
+
+    The crash file accumulates, and an on-demand stack taken while the worker
+    was merely stalled has no banner at all - so if the fatal dump has not been
+    written yet, the newest thing in the file is the *probe* stack, and reading
+    it there reports the frames from before the crash as the frames of the
+    crash. The verdict still says NATIVE_CRASH, because that comes from the
+    exit status: a confident wrong answer of exactly the kind this package
+    exists to prevent.
+
+    That window is real rather than theoretical. It is widest when the stall
+    probe is what perturbed the worker into crashing - the signal returns a
+    blocked C call early - because then the two dumps are microseconds apart
+    instead of minutes.
+
+    Waited for only when the exit status says a dump is coming. Everything else
+    reads once and moves on.
+    """
+    dump = crash_stack.read(path, limit=40)
+    if crash_stack.is_fatal(dump) or not _expects_a_dump(status):
+        return dump
+    deadline = time.monotonic() + FATAL_DUMP_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(FATAL_DUMP_POLL_SECONDS)
+        landed = crash_stack.read(path, limit=40)
+        if crash_stack.is_fatal(landed):
+            return landed
+    # It never arrived. The probe stack is still evidence and is still
+    # returned - is_fatal() is what tells a reader it is not the death stack,
+    # and dropping it would trade a labelled stack for none at all.
+    return dump
+
 
 
 class WorkerDeathIncident(Incident):
@@ -43,6 +116,11 @@ class WorkerDeathIncident(Incident):
     exit_status_meaning: str = "unknown"
 
     test_in_flight: Optional[str] = None
+    #: The most recent test this worker ran, whether or not it finished. A
+    #: worker that died in the gap between two tests died *after* this one,
+    #: not in it - which is why it is not ``test_in_flight``, and why the
+    #: attribution below says which of the two it is working from.
+    last_test: Optional[str] = None
     phase: Optional[str] = None
     tests_started: int = 0
     tests_finished: int = 0
@@ -79,7 +157,15 @@ class WorkerDeathIncident(Incident):
         return self.crash_stack, False  # faulthandler prints deepest first
 
     def suspect_nodeid(self) -> str | None:
-        return self.test_in_flight
+        return self.test_in_flight or self.last_test
+
+    def suspect_basis_for(self, path: str) -> str:
+        if self.test_in_flight:
+            return f"owner of the test in flight ({path})"
+        return (
+            f"owner of the last test this worker finished ({path}); the worker "
+            "died between tests, so no test was running"
+        )
 
     def fingerprint_parts(self) -> list[str]:
         return [self.kind, self.verdict, str(self.exit_status)]
@@ -89,6 +175,8 @@ class WorkerDeathIncident(Incident):
         if self.test_in_flight:
             phase = f"  phase={self.phase}" if self.phase else ""
             return [f"in flight {self.test_in_flight}{phase}  {counted}"]
+        if self.last_test:
+            return [f"no test in flight; last was {self.last_test}  {counted}"]
         return [f"no test in flight  {counted}"]
 
 
@@ -97,15 +185,22 @@ def build(
     error: object,
     directory: Path,
     baseline_oom_kills: int | None,
+    run_id: str | None = None,
 ) -> WorkerDeathIncident:
     worker = node.gateway.id
     crash_file = directory / f"{worker}.crash"
-    dump = crash_stack.read(crash_file, limit=40)
-    events = event_log.read_events(directory / f"{worker}.events")
-    state = read_state(directory / f"{worker}.state")
+    events = event_log.this_run(
+        event_log.read_events(directory / f"{worker}.events"), run_id
+    )
+    # The run id keeps a record an earlier run left behind - one this run could
+    # not delete, which on Windows is any file somebody still had open - from
+    # being read as this worker's last moments.
+    state = read_state(directory / f"{worker}.state", run_id)
     pid = state.get("pid") or event_log.worker_pid(events)
     popen = getattr(getattr(node.gateway, "_io", None), "popen", None)
+    # Read before the dump, because it decides whether a dump is still coming.
     status, status_kind, source = probes.exit_status(pid, popen)
+    dump = _crash_dump(crash_file, status)
     oom_kills = probes.cgroup_oom_kills()
     beats = event_log.heartbeats(events)
     cgroup = probes.cgroup_memory()
@@ -119,6 +214,7 @@ def build(
         exit_status_source=source,
         exit_status_meaning=exit_status.describe(status),
         test_in_flight=state.get("nodeid"),
+        last_test=state.get("last_nodeid"),
         phase=state.get("phase"),
         tests_started=state.get("tests_started") or 0,
         tests_finished=state.get("tests_finished") or 0,

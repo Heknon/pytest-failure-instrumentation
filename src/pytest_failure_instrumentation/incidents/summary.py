@@ -78,13 +78,24 @@ def build(
         ]
         + (
             [
-                f"{run_ending} of them ended the session; the exit status above "
-                "is what pytest reported at session finish, before it applied "
+                f"{run_ending} incident(s) were raised as run-ending, and the "
+                "run still reached session finish: either the condition resolved - "
+                "a wedged worker that came back is the usual one - or the exit "
+                "status above is what pytest reported before it applied "
                 "INTERNAL_ERROR"
             ]
             # Only when the exit status does not already show it: pytest applies
             # INTERNAL_ERROR after some paths through sessionfinish and before
             # others, so the note is a correction, not a caption.
+            #
+            # And it says "raised as run-ending" rather than "ended the
+            # session", because this line only exists at all in a run that
+            # reached session finish. run_ending is the inference the evidence
+            # supported when the incident was raised - a worker silent past the
+            # threshold has handed xdist work it will never give back - and a
+            # summary is the one thing emitted late enough to know that it did
+            # not happen. Asserting it here reported a run that passed as one
+            # that could not complete.
             if run_ending and exitstatus == 0
             else []
         ),
