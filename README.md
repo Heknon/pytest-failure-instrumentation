@@ -84,11 +84,17 @@ when it did not.
 
 Worker death at least fires a hook. Three others do not.
 
-**A worker that stalls.** `pytest_testnodedown` needs a dead process; a wedged
+**A run that stalls.** `pytest_testnodedown` needs a dead process; a wedged
 one is alive. And the controller hears from a worker only when a phase
 *completes*, so from outside, a twenty-minute test and a deadlock are the same
 event: nothing. The run does not fail — it never ends, and CI kills the job an
 hour later with no artifact naming a test.
+
+Without xdist there is no outside at all, which sounds like the harder case and
+is the easier one: a main thread blocked on a lock or a socket does not stop
+the other threads in its process, so the run can be asked what it is doing by a
+thread of its own. A plain `pytest` that deadlocks now names the test, prints
+the stack of the thread that is stuck, and says so *while it is still stuck*.
 
 **Workers that collected different tests.** xdist notices, writes a unified
 diff per differing worker into its own log, and aborts. Nothing structured
@@ -260,13 +266,14 @@ have nothing to say to each other, so they are not fields of the same object:
 | `kind` | Model | Raised on |
 |---|---|---|
 | `worker_death` | `WorkerDeathIncident` | needs xdist |
-| `worker_stall` | `WorkerStallIncident` | needs xdist |
+| `worker_stall` | `WorkerStallIncident` | any run |
 | `collection_mismatch` | `CollectionMismatchIncident` | needs xdist |
 | `internal_error` | `InternalErrorIncident` | any run |
 | `run_summary` | `RunSummaryIncident` | any run |
 
-The last two are not distributed problems, so the plugin registers whether or
-not you run under xdist and a plain `pytest` gets both.
+A worker death needs workers. Everything else is raised whether or not you run
+under xdist, because the process that records is whichever one runs the tests —
+under xdist a worker, and without it the session itself.
 
 They share `verdict`, `confidence`, `severity`, `owner`, `fingerprint`,
 `run_id`, `worker` and `evidence`. `str(incident)` is the alert text — every
@@ -365,6 +372,15 @@ The verdict is reached from beats already on disk. A stack is asked for
 *afterwards*, once the decision is made, because asking a wedged process a
 question can change its answer — see below.
 
+In a run with no workers the assessment is the same assessment, from the same
+files, made by a thread inside the process it is about. That makes the stack
+free and exact: `sys._current_frames()` rather than a signal, so nothing is
+waited for, nothing can return a blocked syscall early, and Windows — where no
+process can be asked for a stack at all — gets a current one like everywhere
+else. The exception is `STALLED_FROZEN`, which is precisely the case where no
+Python runs: that thread cannot run either, so a frozen lone run reports
+nothing until somebody reads what its fallback timer left behind.
+
 ### Workers collected different tests
 
 | Verdict | Means |
@@ -461,6 +477,22 @@ collection after scheduling has begun. The run then continues one worker short,
 and `run_ending` reflects which of the two happened.
 
 ## How it knows
+
+**Whichever process runs the tests is the one that records.** Everything below
+is written from inside that process, because a process that is about to be
+killed gets no warning and nothing it knew only in memory survives. Under
+xdist that process is a worker and the controller reads what it left. Without
+xdist there is one process and it does both jobs — so a plain `pytest` writes
+the same state slot, the same heartbeat and the same stacks a worker does,
+under the name `main`, and the live view, the sampler and the stall watcher
+read them the same way.
+
+The one thing it does not take is the fatal dump. `faulthandler` keeps exactly
+one destination for a fatal signal and pytest's own plugin has already pointed
+it at stderr; a worker claims it and loses nothing, because that stderr is
+shared with fifteen others and a dump written into it belongs to nobody. A run
+with no workers would be taking the crash out of a terminal somebody is
+watching, so it leaves it there.
 
 **A fixed-size state file.** Which test and phase is open right now is written
 to a fixed-size slot with `os.pwrite` — one syscall, no append, no growth, and a
@@ -726,6 +758,23 @@ because that is what a UI sends when its filter box is empty. The names are
 compared against a directory listing and never joined onto one, so a value that
 looks like a path is just a name that matches nothing.
 
+A run with no workers is described the same way, under the name `main`. It is
+the case where the two halves of the view coincide: the process serving is the
+process running the tests, so `controller.pid` and the worker's pid are the same
+number, and `/stack` for it needs no py-spy and no permission — the server reads
+its own frames.
+
+```console
+$ curl localhost:8080/workers
+{"runs": [{"session": "run-8f21c0b4e5d7", "controller": {"pid": 4212, "alive": true},
+   "workers": [{"worker": "main", "pid": 4212, "nodeid": "test_pool.py::test_writes",
+                "phase": "call", "status": "blocked",
+                "why": "heartbeat 0.4s old but no CPU progress: the test thread is waiting on something"}]}]}
+
+$ curl 'localhost:8080/stack?pid=4212'
+{"pid": 4212, "source": "in-process", ...}
+```
+
 The status vocabulary is [`analysis/stall.py`](#how-it-knows)'s truth table, as
 a live status rather than a post-hoc verdict:
 
@@ -968,6 +1017,8 @@ def pytest_failure_worker_sample(sample):
                     rss_mb=worker.rss_mb, cpu_rate=worker.cpu_rate)
 ```
 
+A run with no workers pushes one row per pass, for `main`, from the same files.
+
 Off by default. It is the only hook here that fires when nothing is wrong, so it
 is the only one with a running cost — and that cost is a directory walk: every
 field above comes from the `.state` and `.events` files the run was writing
@@ -1060,7 +1111,9 @@ externally. That is also what makes it work on a worker whose GIL is held by
 native code: py-spy reads the target's memory rather than asking it to run
 anything, and stops the target before reading, so it never walks a frame that is
 being torn down. The server's *own* pid is answered from `sys._current_frames()`
-— no subprocess, no ptrace, no permission.
+— no subprocess, no ptrace, no permission. In a run with no workers that is the
+whole run: the process being asked about is the one answering, so a plain
+`pytest` serves live stacks with nothing installed beyond this package.
 
 Without py-spy the endpoint still answers, with the reason instead of a stack. A
 UI that is told *why* it has no stack can tell a dead process from a missing
@@ -1081,6 +1134,17 @@ an unelevated one needs `SeDebugPrivilege`.
     gw0.events         <- every line carries the *reported* run id
     gw1.state
     callstack-4213.json
+```
+
+A run with no workers writes the same files under `main`, since it is the
+process running the tests:
+
+```
+.pytest-failures/
+  run-8f21c0b4e5d7/
+    owner.json
+    main.state
+    main.events
 ```
 
 Runs used to share a flat directory and name their files after the worker,
@@ -1360,7 +1424,10 @@ PyPI rejects a distribution carrying both.
 ## Status
 
 All five kinds and every verdict in the tables above are covered, on all three
-platforms.
+platforms, with and without xdist — a run with no workers records, serves and
+watches itself through the same code paths a distributed one uses, and the
+tests drive it the same way: a real run, wedged for real, read back through the
+hook.
 
 Most are produced for real: a worker is crashed, killed, signalled, wedged or
 made to disagree about its collection, and the incident is read back from the

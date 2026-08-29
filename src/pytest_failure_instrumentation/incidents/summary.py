@@ -14,6 +14,7 @@ from typing import ClassVar, Literal
 
 from pydantic import ConfigDict, Field
 
+from ..config import SOLE_WORKER
 from .base import Incident
 
 
@@ -62,7 +63,7 @@ def build(
     distributed: bool = False,
 ) -> RunSummaryIncident:
     return RunSummaryIncident(
-        worker="controller" if distributed else "main",
+        worker="controller" if distributed else SOLE_WORKER,
         verdict="RUN_FINISHED",
         confidence="high",
         exitstatus=int(exitstatus),

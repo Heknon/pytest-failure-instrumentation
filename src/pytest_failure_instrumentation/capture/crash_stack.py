@@ -41,9 +41,37 @@ def arm_fatal_handler(stream: TextIO) -> bool:
     ``trylast``, aiming at shared stderr where every worker's output
     interleaves. Calling this later claims the handler back.
 
+    Claiming is right *because* the stderr it takes over is shared. Sixteen
+    workers writing dumps into one stream produce interleaved sections that
+    belong to nobody, and the process that reads them afterwards is the
+    controller, out of a file. Nothing is lost by moving them.
+
+    That argument does not survive a run with no workers in it, where the
+    stderr in question is a terminal somebody is watching. Such a run arms
+    :func:`arm_on_demand_handler` alone and leaves the fatal dump where pytest
+    put it, because moving the only account of a crash out of the place it is
+    read from is not an improvement.
+
+    There is no third option to reach for. ``faulthandler`` keeps exactly one
+    destination for a fatal signal, and the obvious way to have both -
+    ``register(SIGSEGV, chain=True)``, writing our copy and then calling
+    pytest's - is refused by CPython itself: ``signal 11 cannot be registered,
+    use enable() instead``, and the same for every other fatal signal.
+
     Returns whether an on-demand stack can also be requested later.
     """
     faulthandler.enable(file=stream, all_threads=True)
+    return arm_on_demand_handler(stream)
+
+
+def arm_on_demand_handler(stream: TextIO) -> bool:
+    """Let ``SIGUSR1`` ask this process for a stack. False where it cannot.
+
+    Separate from the fatal handler above because the two are armed together
+    in a worker and apart in a run with no workers, where the fatal dump stays
+    pytest's and this one is still ours to take. Nothing holds SIGUSR1
+    beforehand, so there is nothing to take away.
+    """
     if not stacks.can_request_stack():
         return False
     # chain=False deliberately. Chaining re-raises the signal with whatever was
@@ -379,6 +407,42 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
 
     section = _capped(_most_relevant(sections), limit)
     return ([banner] + section) if banner else section
+
+
+def own_stack(limit: int = 12) -> list[str]:
+    """This process's own stack, in the shape one read off disk has.
+
+    The stall watcher of a run with no workers is a thread inside the very
+    process it is assessing, which makes the whole apparatus above
+    unnecessary: there is no signal to send, nothing to perturb, and no file
+    to wait for. ``sys._current_frames`` already has the answer.
+
+    Rendered as faulthandler renders it so that everything downstream - the
+    thread selection here, attribution, the incident's ``raw_stack`` - reads
+    one format rather than two. No section is labelled ``Current thread``,
+    which is right and is what makes the selection work: nothing here was
+    reached by a signal, so no thread is the current one in the sense that
+    label means, and :func:`_most_relevant` falls through to the thread
+    carrying the runtest protocol - the one running the test, rather than the
+    watcher thread that asked.
+
+    Empty where the frames could not be read at all. That is not a case worth
+    a reason of its own: the caller has one already for every platform that
+    cannot answer, and this platform is not one of them.
+    """
+    try:
+        threads = stacks.own_threads()
+    except Exception:  # noqa: BLE001 - a stall reported without a stack beats none
+        return []
+    lines: list[str] = []
+    for thread in threads:
+        lines.append(f"Thread 0x{thread['thread_id']:016x} (most recent call first):")
+        lines.extend(
+            f"  File \"{frame['file']}\", line {frame['line']} in {frame['function']}"
+            for frame in thread["frames"]
+        )
+    sections = _thread_sections(lines)
+    return _capped(_most_relevant(sections), limit) if sections else []
 
 
 def _capped(lines: list[str], limit: int) -> list[str]:

@@ -14,6 +14,7 @@ already made, because the asking can perturb what it measures.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ SOURCE_WORDING = {
     "watchdog": "the slow-test watchdog",
     "frozen-fallback": "the fallback timer, after the worker stopped running Python",
     "crash": "the worker, into its crash file",
+    "in-process": "this process, out of its own frames",
 }
 
 
@@ -172,6 +174,11 @@ def build(
     worker's gateway. It is what licenses the signal in :func:`_stack`; a pid
     read back from a file is only a number, and the process that owns it now
     may be somebody else's.
+
+    A run with no workers reaches all of this unchanged. The evidence is the
+    same evidence, written to the same files by the same recorder, and the
+    only thing that differs is that the process holding it is this one - which
+    :func:`_stack` notices for itself.
     """
     path = directory / f"{worker}.events"
     # Only this run's. An earlier run's beats - left where the directory could
@@ -270,6 +277,30 @@ def _stack(
     having been signalled - and that one describes whenever the watchdog last
     fired rather than now.
     """
+    if pid == os.getpid():
+        # A run with no workers assesses itself: this is the watcher thread of
+        # the very process that has gone quiet, so the frames are already here.
+        # Nothing is signalled and nothing is waited for, which also makes this
+        # the one path that produces a fresh stack on Windows - and the one
+        # that cannot perturb what it is measuring, since reading
+        # sys._current_frames() is not something the stalled thread has to
+        # notice.
+        #
+        # ``failure_stack_probe`` is not consulted here, and is not being
+        # ignored either: it exists to keep a signal away from a worker that a
+        # signal could nudge out of the stall being measured, and there is no
+        # signal on this path to withhold.
+        #
+        # It answers only while *some* Python still runs. A process frozen by
+        # native code holding the GIL cannot run this thread either, so nothing
+        # here is reached at all; what that case leaves behind is the fallback
+        # timer's dump, read by whoever comes after.
+        stack = crash_stack.own_stack(limit=STACK_LINES)
+        if stack:
+            return stack, True, None, time.time(), "in-process"
+        stack, written, source = _passive_stack(directory, worker)
+        return stack, True, "this process could not read its own frames", written, source
+
     crash_file = directory / f"{worker}.crash"
     try:
         before = crash_file.stat().st_size

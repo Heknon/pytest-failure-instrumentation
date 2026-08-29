@@ -49,6 +49,7 @@ import pytest
 from . import hookspec
 from .config import (
     SECRET_SETTINGS,
+    SOLE_WORKER,
     Settings,
     advise,
     pytest_faulthandler_timeout,
@@ -61,6 +62,11 @@ STASH_KEY = "_failure_instrumentation_settings"
 
 CONTROLLER_NAME = "failure-instrumentation-controller"
 WORKER_NAME = "failure-instrumentation-worker"
+#: The same recorder as ``WORKER_NAME``, in a run that has no workers. Named
+#: apart because it is not one: ``--trace-config`` listing a worker in a
+#: process that is plainly a session is the kind of small lie that costs
+#: somebody an afternoon.
+RECORDER_NAME = "failure-instrumentation-recorder"
 
 
 def installed_settings(config: pytest.Config) -> Optional[Settings]:
@@ -108,14 +114,13 @@ def install(
         return existing
 
     _ensure_hookspecs(config)
-    plugin = _build(config, wanted)
-    if plugin is None:
+    plugins = _build(config, wanted)
+    if not plugins:
         return None
 
     setattr(config, STASH_KEY, wanted)
-    config.pluginmanager.register(
-        plugin, WORKER_NAME if hasattr(config, "workerinput") else CONTROLLER_NAME
-    )
+    for name, plugin in plugins:
+        config.pluginmanager.register(plugin, name)
     return wanted
 
 
@@ -139,12 +144,25 @@ def _resolve(
     return base.with_overrides(**overrides)
 
 
-def _build(config: pytest.Config, settings: Settings) -> Any:
-    """The plugin object for this process, or None if it could not be made.
+def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
+    """The plugin objects for this process, in the order they register.
 
-    Both branches import inside the callable ``_built`` guards rather than at
+    There are three processes this can be, and two jobs to do in them.
+    *Recording* is done by whichever process runs the tests, because
+    everything worth knowing about a death or a stall is in that process and
+    leaves it only if it was written down beforehand. *Reporting* is done by
+    whichever process survives to do it.
+
+    Under xdist those are different processes and the split is the obvious
+    one: a worker records, the controller reports. A run with no workers is
+    the case that was missing. There the two jobs land in one process, so it
+    does both - and a plain ``pytest`` gets the state slot, the heartbeat, the
+    watchdog stack and the live view it had none of, rather than only the two
+    incident kinds a controller can raise without help.
+
+    Every branch imports inside the callable ``_built`` guards rather than at
     the top of the branch, and that placement is the whole point rather than
-    style. Either import reaches ``probes`` - the recorder through the memory
+    style. Each import reaches ``probes`` - the recorder through the memory
     and stack probes, the engine directly - and ``probes`` imports psutil at
     module scope. psutil is a declared dependency and is normally there, but
     "normally" is doing real work in that sentence: no wheel for the platform
@@ -157,22 +175,24 @@ def _build(config: pytest.Config, settings: Settings) -> Any:
     Inside the guard the same failure is the warning-and-disable path the
     module docstring promises: no instrumentation, and a run that still runs.
     """
+    # pytest's faulthandler_timeout is read here rather than in the recorder:
+    # it is not a setting of this plugin's and does not travel in Settings,
+    # but it decides whether the frozen-interpreter fallback may arm the one
+    # process-wide timer the two plugins share.
+    timeout = pytest_faulthandler_timeout(config)
+
     if hasattr(config, "workerinput"):
         worker_id = config.workerinput["workerid"]
-        # pytest's faulthandler_timeout is read here rather than in the
-        # recorder: it is not a setting of this plugin's and does not travel
-        # in Settings, but it decides whether the frozen-interpreter fallback
-        # may arm the one process-wide timer the two plugins share.
-        timeout = pytest_faulthandler_timeout(config)
 
-        def recorder() -> Any:
+        def worker() -> Any:
             from .capture.recorder import WorkerRecorder
 
             return WorkerRecorder(
                 settings.directory, worker_id, settings, faulthandler_timeout=timeout
             )
 
-        return _built(recorder, "worker")
+        built = _built(worker, "worker")
+        return [(WORKER_NAME, built)] if built is not None else []
 
     # Registered whether or not xdist is in the picture. Two of the five kinds
     # are not distributed problems - an internal error ends a single-process
@@ -183,7 +203,44 @@ def _build(config: pytest.Config, settings: Settings) -> Any:
 
         return IncidentEngine(config, settings)
 
-    return _built(engine, "run")
+    running = _built(engine, "run")
+    if running is None:
+        return []
+    plugins: list[tuple[str, Any]] = [(CONTROLLER_NAME, running)]
+    if running.distributed:
+        return plugins  # the workers record; this process only reports
+
+    def alone() -> Any:
+        from .capture.recorder import WorkerRecorder
+
+        return WorkerRecorder(
+            # The *run's* directory, not the configured one. A worker is handed
+            # this through workerinput because it cannot work out which run it
+            # belongs to; here the two objects are in one process and the
+            # engine has already named it, so it is asked rather than guessed.
+            running.directory,
+            SOLE_WORKER,
+            # Stamped with the id the engine reports, so this process's own
+            # evidence carries the same name its incidents do. A worker is
+            # handed one through workerinput for the same reason; here the
+            # engine is in the room and can simply be asked.
+            settings.with_overrides(run_id=running.run_id),
+            faulthandler_timeout=timeout,
+            # The one thing a lone run does differently from a worker. There
+            # is a single destination for a fatal dump and pytest has already
+            # pointed it at stderr; taking it here would take the crash out of
+            # a terminal somebody is watching, which a worker's shared stderr
+            # gives up nothing by doing. See crash_stack.arm_fatal_handler.
+            claims_fatal_dumps=False,
+        )
+
+    # A recorder that cannot be built leaves the engine registered rather than
+    # taking the run's reporting down with it: an internal error and a run
+    # summary need nothing from the filesystem.
+    recording = _built(alone, "session")
+    if recording is not None:
+        plugins.append((RECORDER_NAME, recording))
+    return plugins
 
 
 def _ensure_hookspecs(config: pytest.Config) -> None:

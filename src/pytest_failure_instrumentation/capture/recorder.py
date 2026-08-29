@@ -37,9 +37,17 @@ class WorkerRecorder:
         settings: Settings,
         *,
         faulthandler_timeout: float = 0.0,
+        claims_fatal_dumps: bool = True,
     ) -> None:
         self.worker_id = worker_id
         self.directory = directory
+        #: Whether to point fatal-signal dumps at this process's own crash
+        #: file, which means taking them off the stderr pytest aimed them at.
+        #: True for a worker, where that stderr is shared with fifteen others
+        #: and a dump written to it belongs to nobody. A run with no workers
+        #: decides for itself, because there the stderr in question is a
+        #: terminal somebody is watching - see ``failure_crash_stack``.
+        self.claims_fatal_dumps = claims_fatal_dumps
         #: pytest's own ``faulthandler_timeout``. Not a setting of ours - it
         #: decides only whether the frozen-interpreter fallback may arm the
         #: one timer the two plugins share. See config.pytest_faulthandler_timeout.
@@ -211,11 +219,24 @@ class WorkerRecorder:
     # -- hooks -----------------------------------------------------------
 
     def pytest_sessionstart(self, session: pytest.Session) -> None:
-        # After configure, so this wins over pytest's own faulthandler plugin,
-        # which registers trylast and points the handler at shared stderr.
-        on_demand = crash_stack.arm_fatal_handler(self._crash_stream)
+        # After configure, so this runs against pytest's own faulthandler
+        # plugin rather than before it: that one registers trylast and points
+        # the fatal dump at stderr.
+        #
+        # A worker takes it over, because the stderr in question is shared
+        # with every other worker and a dump written there belongs to nobody.
+        # A run with no workers only takes it if it was asked to - see
+        # crash_stack.arm_fatal_handler for both halves of that.
+        if self.claims_fatal_dumps:
+            on_demand = crash_stack.arm_fatal_handler(self._crash_stream)
+        else:
+            on_demand = crash_stack.arm_on_demand_handler(self._crash_stream)
         self.events.record(
             "faulthandler_armed",
+            # Which of the two. A death recovered from this evidence afterwards
+            # reads it to tell "the process wrote no dump" from "the dump went
+            # to the terminal, and was never this file's to hold".
+            fatal_stack="this file" if self.claims_fatal_dumps else "stderr",
             on_demand_stack=on_demand,
             slow_test_seconds=self.slow_test.timeout if self.slow_test.enabled else None,
         )

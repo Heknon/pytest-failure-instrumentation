@@ -153,6 +153,15 @@ outside. The heartbeat's CPU time is what separates them.
 A merely slow test — alive and burning CPU — is never reported at all, which is
 why a stall that *is* reported is not "the suite got slow".
 
+`stack_source` says which mechanism left the frames, and they are not
+interchangeable. `probe` and `in-process` are taken at detection and describe
+now; `watchdog` and `frozen-fallback` were written earlier and unprompted, and
+the alert prints how old they are for that reason. `in-process` is the run that
+had no workers reading its own frames — no signal was sent, so nothing could
+have perturbed the stall being measured, and it is the one way a stack exists
+on Windows. `frozen-fallback` means more than a stack: the interpreter had
+stopped running Python at all.
+
 Two things follow from `run_ending` being true here. The run has no path to
 completion, because xdist waits for work it handed out and never gets back — so
 a job that hangs to its timeout is the symptom and the stall is the cause. And

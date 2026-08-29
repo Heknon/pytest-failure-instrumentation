@@ -6,8 +6,10 @@ fraction of what goes wrong:
 
 * a worker process dies            - pytest_testnodedown          (xdist)
 * workers collect different tests  - pytest_xdist_node_collection_finished
-* a worker stops reporting         - polled here, because the absence of
-                                     anything being said fires no hook (xdist)
+* a process stops reporting        - polled here, because the absence of
+                                     anything being said fires no hook. A
+                                     worker, or this process itself when the
+                                     run has no workers        (any run)
 * pytest raises an internal error  - pytest_internalerror         (any run)
 * the run ends                     - a summary whose absence means the
                                      process died                 (any run)
@@ -47,7 +49,8 @@ from ..analysis import fingerprint as fingerprint_of
 from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
-from ..config import Settings, advise
+from ..config import SOLE_WORKER, Settings, advise
+from ..registration import RECORDER_NAME
 from . import collection, death, internal_error, stall, summary
 from .base import Capabilities, Incident, frame_from
 
@@ -269,6 +272,13 @@ class IncidentEngine:
         self.raised = 0
         self.suppressed = 0
         self.run_ending = 0
+        #: Whether this process is the one running the tests, which is so
+        #: exactly when the run has no workers. Settled at session start from
+        #: :attr:`recorder` and kept, because a report arriving from a worker
+        #: must never be mistaken for one of ours - a phantom entry in
+        #: ``activity`` is a stall watcher assessing a worker that does not
+        #: exist, and reporting one.
+        self.records_here = False
         #: The host's live-stack server, if this session ended up hosting it.
         #: Not an incident source - it answers questions rather than raising
         #: anything - but session start and finish are here, and giving it a
@@ -317,13 +327,27 @@ class IncidentEngine:
         """
         return self.settings.directory / self.session_id
 
+    @property
+    def recorder(self) -> Any:
+        """This process's own recorder, or None when it is not running tests.
+
+        A run with no workers records itself: the process that would be asked
+        what it was doing is this one, so the recorder is registered here
+        rather than in a worker, and this is how the engine reaches it.
+        Registered by :func:`..registration.install`, and absent whenever it
+        could not be built - a read-only directory, a psutil that will not
+        import - which is exactly the case each caller has to handle anyway.
+        """
+        return self.config.pluginmanager.get_plugin(RECORDER_NAME)
+
     def _prepare_directory(self) -> None:
         """Make this run's directory, and clear out the runs that are over.
 
-        Made when something is actually going to write there - workers, or the
-        stack server publishing its address. A single-process run with neither
-        has no reason to leave an empty directory in somebody's repository, and
-        a run that skips the marker would leave a directory nothing ever prunes.
+        Made when something is actually going to write there - workers, this
+        process recording its own tests, or the stack server publishing its
+        address. A run with none of the three has no reason to leave an empty
+        directory in somebody's repository, and a run that skips the marker
+        would leave a directory nothing ever prunes.
 
         What is pruned is *whole directories of finished runs*, which is a much
         safer thing to delete than a list of file suffixes: a directory is only
@@ -333,7 +357,7 @@ class IncidentEngine:
         coverage report has done more damage than any failure it might have
         explained.
         """
-        if not self.distributed and not self.settings.stack_server:
+        if not self.distributed and not self.settings.stack_server and not self.records_here:
             return
         self._warn_if_a_live_session_already_owns_this_directory()
         # Swept *before* this run's marker is written, not after. Written
@@ -614,6 +638,10 @@ class IncidentEngine:
         built its node manager yet - see the ``directory`` property for why
         that independence had to be designed in rather than assumed.
         """
+        # First, because everything below asks it. The recorder is registered
+        # alongside this object at configure time and nothing can add one
+        # later, so one read settles it for the run.
+        self.records_here = self.recorder is not None
         self._prepare_directory()
 
         # Whether or not this is distributed: a single-process run has a stack
@@ -637,16 +665,20 @@ class IncidentEngine:
                 self.settings.stack_server_token,
             )
 
-        if self.settings.sample_seconds > 0 and not self.distributed:
-            # Nothing writes a state file in a single-process run: the recorder
-            # is installed on workers only, and there are none. The sampler
-            # would poll an empty directory for the life of the run and push
-            # nothing, which from the outside is indistinguishable from a
+        if self.settings.sample_seconds > 0 and not self._anything_records():
+            # The sampler reads state files, so a run where nothing writes one
+            # would poll an empty directory for its whole length and push
+            # nothing - which from the outside is indistinguishable from a
             # product whose hook is never called. Say so instead.
+            #
+            # That used to be every run without xdist, and is now only a run
+            # whose recorder could not be built: the process running the tests
+            # records itself, so a plain pytest samples one worker called
+            # "main" the same way a distributed one samples sixty-four.
             advise(
-                "failure_sample_seconds is set but this run is not distributed, "
-                "so there are no workers to sample and no samples will be "
-                "pushed; run under xdist (-n) or unset it"
+                "failure_sample_seconds is set but nothing in this run is "
+                "recording what it does, so there is nothing to sample and no "
+                "samples will be pushed"
             )
         elif self.settings.sample_seconds > 0:
             self.sampler = threading.Thread(
@@ -656,15 +688,39 @@ class IncidentEngine:
             )
             self.sampler.start()
 
-        # Only distributed runs can strand a worker. A single process that
-        # wedges takes this detector down with it.
-        if self.distributed and self.settings.stall_seconds > 0:
+        if self._anything_records() and self.settings.stall_seconds > 0:
+            # A run with no workers watches itself, and can: the watcher is a
+            # thread, and a main thread blocked on a lock or a socket does not
+            # stop the others running. So a plain pytest that wedges says so
+            # while it is still wedged - which is the whole value of the kind,
+            # and was previously the one case that produced nothing at all
+            # because the run simply never ended.
+            #
+            # The exception is the process frozen by native code holding the
+            # GIL. Nothing in Python runs there, this thread included, so
+            # nothing is reported now; the fallback timer's dump is what is
+            # left, for whoever reads the directory afterwards.
+            if self.records_here:
+                # Before the first test, so a run whose *first* test hangs is
+                # watched. The clock has to be running before there is
+                # anything to report against it.
+                self._touch(SOLE_WORKER)
             self.watcher = threading.Thread(
                 target=self._watch_for_stalls,
                 name="failure-instrumentation-stall",
                 daemon=True,
             )
             self.watcher.start()
+
+    def _anything_records(self) -> bool:
+        """Whether any process in this run is writing down what it is doing.
+
+        The workers, when there are workers. This process, when there are not.
+        Neither, when the recorder could not be built at all - a read-only
+        evidence directory, a psutil that will not import - which is warned
+        about where it happens and is the one case with nothing to read.
+        """
+        return self.distributed or self.records_here
 
     def _sample_workers(self) -> None:
         """Push what every worker is doing, on a cadence, until the run ends.
@@ -782,6 +838,13 @@ class IncidentEngine:
         if node is not None:
             self.tests_seen += 1
             self._touch(getattr(getattr(node, "gateway", None), "id", None))
+        elif self.records_here:
+            # No node means the report was produced here rather than relayed
+            # from a worker, which in a run this process is recording means
+            # this process is the one still going. It is the same signal a
+            # worker's report is: something completed, so the silence clock
+            # starts again.
+            self._touch(SOLE_WORKER)
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_xdist_node_collection_finished(self, node: Any, ids: Any) -> None:

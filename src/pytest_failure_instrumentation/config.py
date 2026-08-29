@@ -25,6 +25,14 @@ import pytest
 
 DEFAULT_DIRECTORY = ".pytest-failures"
 
+#: What a run with no workers records itself under. xdist names its workers
+#: ``gw0`` upwards and everything downstream - the evidence files, the live
+#: view, a sample row - is keyed on that name, so a run that has no workers
+#: still needs one to be the process running the tests. It is the session
+#: itself, and this is what it is called. Already the name the run summary
+#: reports for a single-process run, which is where it comes from.
+SOLE_WORKER = "main"
+
 #: "Pick one for me" - the value the kernel itself reads as *any free port*,
 #: so the lottery costs no branch at the bind. It is the default because a
 #: session that has not been told which port to use has no reason to fight the
