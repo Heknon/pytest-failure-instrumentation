@@ -325,6 +325,28 @@ def test_a_write_that_cannot_land_costs_this_one_and_not_the_run(tmp_path):
     assert ScheduleTracker("load").write(scheduler, missing) is False
 
 
+def test_the_record_is_the_same_where_there_is_no_pwrite(tmp_path):
+    """pwrite is one syscall and Unix-only, so Windows takes the seek-and-write
+    path instead - and a path no machine in this suite runs is a path nobody
+    finds out about until somebody's Windows run reports no totals at all."""
+    scheduler = Pending(collection=range(4), pending=[], gw0=[0, 1], gw1=[2, 3])
+
+    with_pwrite = ScheduleTracker("load")
+    assert with_pwrite.write(scheduler, tmp_path) is True
+    expected = schedule.read(tmp_path)
+    with_pwrite.close()
+    (tmp_path / schedule.SCHEDULE_FILE).unlink()
+
+    without = ScheduleTracker("load")
+    without._pwrite = None  # what os.pwrite being absent looks like
+    assert without.write(scheduler, tmp_path) is True
+    written = schedule.read(tmp_path)
+    without.close()
+
+    assert written["workers"] == expected["workers"]
+    assert written["collected"] == expected["collected"]
+
+
 def test_a_reader_that_catches_a_write_half_done_waits_rather_than_gives_up(tmp_path):
     """One small write at a fixed offset is not formally atomic, which is the
     price of being cheap enough to do per test. A reader that treated the torn
@@ -522,8 +544,37 @@ def test_six(): pass
 """
 
 
+def _has_worksteal() -> bool:
+    """``--dist=worksteal`` arrived in pytest-xdist 3.2.
+
+    This package declares ``>=3.0`` and its own CI pins a job to the oldest of
+    those, where asking for the mode is a usage error rather than a different
+    answer. The scheduler is still read the same way when it *is* there - it
+    keeps ``node2pending`` like ``load`` does - so what is skipped here is the
+    real run, not the handling.
+    """
+    try:
+        import xdist.scheduler.worksteal  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+needs_worksteal = pytest.mark.skipif(
+    not _has_worksteal(), reason="--dist=worksteal arrived in pytest-xdist 3.2"
+)
+
+
 @needs_xdist
-@pytest.mark.parametrize("dist", ["load", "worksteal", "loadfile", "each"])
+@pytest.mark.parametrize(
+    "dist",
+    [
+        "load",
+        pytest.param("worksteal", marks=needs_worksteal),
+        "loadfile",
+        "each",
+    ],
+)
 def test_a_real_run_accounts_for_every_test(pytester, dist):
     """The shapes above are another project's internals, and this is what says
     they are still the shapes. Asserted at the end of the run, where the answer
