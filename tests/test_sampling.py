@@ -157,6 +157,28 @@ def test_a_total_the_worker_has_already_passed_is_the_stale_one(tmp_path):
     assert (entry.tests_finished, entry.tests_running, entry.tests_queued) == (19, 1, 0)
 
 
+def test_a_sample_says_how_big_the_run_is_and_whether_that_is_settled(tmp_path):
+    """A total is what a worker has been given *so far*, so a consumer handed
+    the totals and nothing else is drawing a bar whose end moves. This is the
+    path for runs that cannot open a port, where there is no /workers to ask
+    the run-level question instead."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=9)
+    _schedule(root, gw0=(14, 9))
+    sample = WorkerSampler(root).sample()
+
+    assert sample.collected == 40
+    assert sample.unassigned == 12
+    assert sample.settled is False
+    assert sample.dist == "load"
+
+
+def test_a_sample_from_a_run_with_no_schedule_carries_none_of_it(tmp_path):
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]})
+    sample = WorkerSampler(root).sample()
+
+    assert (sample.collected, sample.unassigned, sample.settled) == (None, None, None)
+
+
 def test_a_row_from_a_run_with_no_schedule_says_nothing_rather_than_zero(tmp_path):
     """Zero pending is a worker about to finish; not knowing is not."""
     root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]})

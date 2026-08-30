@@ -152,20 +152,58 @@ def test_a_stolen_test_stops_being_this_worker_s_total():
     assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 0, "pending": 2}
 
 
-def test_the_loadscope_family_is_read_rather_than_added_up():
-    """It keeps both numbers itself - every test it gave a node with a flag
-    beside it - so nothing here has to come from two sources."""
+def test_the_loadscope_family_says_the_total_and_is_counted_for_the_rest():
+    """It hands out whole scopes and keeps every test it ever gave a node, so
+    the total is a length per scope. What has *run* is counted here as it is
+    everywhere else, and deliberately not read off the done flag beside each
+    test: that flag is only reachable by walking the whole assignment, on
+    every test, which is quadratic in the size of the suite."""
     scheduler = Workload(
         collection=range(4),
         gw0={"test_a.py": {"test_a.py::one": True, "test_a.py::two": False}},
         gw1={"test_b.py": {"test_b.py::one": True}},
     )
     tracker = ScheduleTracker("loadscope")
+    tracker.saw_a_test_finish("gw0")
+    tracker.saw_a_test_finish("gw1")
 
     assert rows(tracker, scheduler) == {
         "gw0": {"assigned": 2, "completed": 1, "pending": 1},
         "gw1": {"assigned": 1, "completed": 1, "pending": 0},
     }
+
+
+def test_a_write_does_not_walk_the_tests_a_worker_was_given():
+    """The cost of a write has to follow the number of *workers*, not the size
+    of the suite - it happens on every test, so anything else is quadratic.
+    Reading the loadscope done flags cost 1.7ms a write at sixty thousand
+    assigned tests, which is near two minutes of controller time over a run."""
+    small = Workload(collection=range(2), gw0={"s.py": {"s.py::a": False}})
+    big = Workload(
+        collection=range(20_000),
+        gw0={
+            f"scope{s}.py": {f"scope{s}.py::t{i}": False for i in range(100)}
+            for s in range(200)
+        },
+    )
+    assert rows(ScheduleTracker("loadfile"), big)["gw0"]["assigned"] == 20_000
+
+    # Same shape, a ten-thousandfold difference in tests: the work done per
+    # write is the scopes, and touching a test would show up here.
+    touched = []
+
+    class Counting(dict):
+        def values(self):
+            touched.append(len(self))
+            return super().values()
+
+    for scheduler in (small, big):
+        scheduler.assigned_work = {
+            node: {scope: Counting(tests) for scope, tests in workload.items()}
+            for node, workload in scheduler.assigned_work.items()
+        }
+        rows(ScheduleTracker("loadfile"), scheduler)
+    assert touched == [], "a scope's tests were walked, not just counted"
 
 
 def test_each_gives_every_worker_the_whole_collection():
@@ -223,14 +261,38 @@ def test_an_empty_queue_settles_every_total():
     assert ScheduleTracker("load").record(scheduler)["settled"] is True
 
 
-def test_worksteal_is_not_settled_while_two_workers_still_have_work():
-    """Its queue emptying stops totals *growing* and not moving: the whole
-    point of the mode is that a busy worker's tests can go to an idle one."""
-    scheduler = Pending(collection=range(4), pending=[], gw0=[0, 1], gw1=[2, 3])
-    assert ScheduleTracker("worksteal").record(scheduler)["settled"] is False
+@pytest.mark.parametrize(
+    ("outstanding", "settled", "why"),
+    [
+        ({"gw0": 5, "gw1": 0}, False, "gw1 is idle and gw0's queue is raidable"),
+        ({"gw0": 3, "gw1": 1}, False, "one short of the floor is still idle"),
+        ({"gw0": 2, "gw1": 2}, True, "nobody idle, and neither may go below 2"),
+        ({"gw0": 3, "gw1": 2}, True, "gw1 holds the floor exactly, so is not idle"),
+        ({"gw0": 0, "gw1": 0}, True, "there is nothing left to move"),
+        ({"gw0": 1, "gw1": 0}, True, "too little to be worth taking"),
+    ],
+)
+def test_worksteal_settles_only_when_no_steal_can_happen(outstanding, settled, why):
+    """Its queue emptying stops totals *growing*, not moving, and the mode
+    takes both halves of a condition to fire: somebody idle to give work to,
+    and somebody holding enough to be worth taking it from.
 
-    scheduler.complete("gw1", 2)
-    assert ScheduleTracker("worksteal").record(scheduler)["settled"] is True
+    One worker running the tail of the run is the case that looks settled and
+    is not - everybody else is idle and its queue is exactly what gets raided.
+    Two workers holding two each is the mirror image."""
+    scheduler = Pending(
+        collection=range(20),
+        pending=[],
+        **{name: list(range(count)) for name, count in outstanding.items()},
+    )
+    assert ScheduleTracker("worksteal").record(scheduler)["settled"] is settled, why
+
+
+def test_the_other_modes_settle_as_soon_as_the_queue_is_empty():
+    """Nothing but worksteal moves work between workers, so an empty queue is
+    the whole question there."""
+    scheduler = Pending(collection=range(4), pending=[], gw0=[0, 1], gw1=[2, 3])
+    assert ScheduleTracker("load").record(scheduler)["settled"] is True
 
 
 def test_a_worker_that_shut_down_cleanly_ran_everything_it_was_given():

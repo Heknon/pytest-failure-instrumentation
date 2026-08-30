@@ -21,19 +21,27 @@ has stopped moving; a consumer that shows a percentage without them is drawing a
 bar whose end moves. Under ``--dist each`` it is settled from the first moment,
 because every worker is given the whole collection at once.
 
-**Two scheduler shapes.** The loadscope family keeps ``assigned_work`` - every
-test it ever gave a node, with a flag per test saying whether it is done - so
-both numbers are read straight off it. Everything else keeps ``node2pending``,
-which is indices *outstanding* and nothing more; what has already gone through
-is the controller's own count of finished tests, and the total is the two added
-together.
+**Two scheduler shapes, one formula.** The loadscope family keeps
+``assigned_work`` - every test it ever gave a node - and everything else keeps
+``node2pending``, which is what a node still *owes*. So the total is read
+directly from one and added up from the other, and what has gone through is
+the controller's own count of finished tests in both cases.
 
-**Every figure here is a length or a counter**, deliberately. The obvious way to
-reconstruct what has left a queue is to diff it against the last reading, and
-that costs the whole outstanding set per test - which under ``worksteal`` and
-``each``, where a worker is handed its share up front, is the *suite* per test.
-Quadratic bookkeeping to date a progress bar is not a trade this package makes,
-so nothing here is bigger than an integer per worker.
+That count is deliberately not taken from ``assigned_work``, which carries a
+done flag per test and could answer it. Reading it means walking every test
+ever assigned, on every write - which is per test, so the bookkeeping goes
+quadratic in the size of the suite. Measured before it was taken out: 1.7ms a
+write at sixty thousand assigned tests, near two minutes of controller time
+over such a run. A counter the controller already keeps costs a lookup.
+
+**Every figure here is a length, a counter or a count of work units**,
+deliberately. The obvious way to reconstruct what has left a queue is to diff
+it against the last reading, and that costs the whole outstanding set per test
+- which under ``worksteal`` and ``each``, where a worker is handed its share up
+front, is the *suite* per test. Quadratic bookkeeping to date a progress bar is
+not a trade this package makes, and nothing here scales with the number of
+tests: a write is one length per worker, or one length per *scope* per worker
+where the scheduler groups them.
 
 What that costs is one instant of imprecision, and where it lands is chosen: a
 finished test reaches the controller as a report before the scheduler is told -
@@ -66,6 +74,13 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+#: What ``worksteal`` will not let a worker's queue fall below before it takes
+#: work off somebody else - ``xdist.scheduler.worksteal.MIN_PENDING``, mirrored
+#: rather than imported so that a version without it is a missing mode rather
+#: than an ImportError at collection. It decides only whether a total that has
+#: stopped *growing* can still shrink; see :meth:`ScheduleTracker._settled`.
+STEAL_MIN_PENDING = 2
 
 #: Written beside ``owner.json`` at the top of a run's directory, and
 #: overwritten in place for the life of the run. One file per run rather than
@@ -182,10 +197,10 @@ class ScheduleTracker:
         Workers xdist has already let go of keep the row they had when it did
         - a dead one's is the whole point of keeping any of them.
         """
-        workload = _assigned_work(scheduler)
-        if workload is not None:
-            for name, (assigned, done) in workload.items():
-                self._rows[name] = _row(assigned, done)
+        given = _assigned_work(scheduler)
+        if given is not None:
+            for name, assigned in given.items():
+                self._rows[name] = _row(assigned, self._finished.get(name, 0))
         else:
             for name, outstanding in (_outstanding(scheduler) or {}).items():
                 done = self._finished.get(name, 0)
@@ -216,6 +231,15 @@ class ScheduleTracker:
         moves work *between* workers once it is: a total that has stopped
         growing there can still shrink, and a reader drawing a progress bar
         needs to be told that rather than to find out.
+
+        So the question there is whether a steal can still happen, and that
+        takes both halves of xdist's own condition: somebody idle to give the
+        work to, and somebody holding enough to be worth taking it from. One
+        worker left running the tail of the run is the case that looks settled
+        and is not - everyone else is idle, and its queue is exactly what gets
+        raided. Two workers holding two tests each is the mirror image: it
+        looks unsettled and nothing can move, because neither is idle and
+        neither may be taken below the floor.
         """
         if unassigned is None:
             return None
@@ -223,8 +247,12 @@ class ScheduleTracker:
             return False
         if self.dist != "worksteal":
             return True
-        outstanding = _outstanding(scheduler) or {}
-        return sum(1 for count in outstanding.values() if count) < 2
+        outstanding = list((_outstanding(scheduler) or {}).values())
+        if not outstanding:
+            return True
+        idle = any(count < STEAL_MIN_PENDING for count in outstanding)
+        worth_taking = max(outstanding) > STEAL_MIN_PENDING
+        return not (idle and worth_taking)
 
     # -- and writes down -------------------------------------------------
 
@@ -319,30 +347,26 @@ def _outstanding(scheduler: Any) -> Optional[dict[str, int]]:
     return found
 
 
-def _assigned_work(scheduler: Any) -> Optional[dict[str, tuple[int, int]]]:
-    """``(assigned, completed)`` per worker, where the scheduler keeps both.
+def _assigned_work(scheduler: Any) -> Optional[dict[str, int]]:
+    """How many tests each worker has been given, where the scheduler says.
 
     The loadscope family - ``loadscope``, ``loadfile``, ``loadgroup`` - holds
-    every test it has given a node with a done flag beside it, so nothing has
-    to be added up from two sources and nothing can drift: both numbers come
-    off one object, and the flag is set at the same moment the scheduler
-    considers the test complete.
+    every test it has given a node, grouped into the scopes it hands out whole.
+    A length per scope answers this; the done flag beside each test does not
+    get read, because reading it is a walk of the whole assignment on every
+    test - see the module docstring.
     """
     mapping = getattr(scheduler, "assigned_work", None)
     if not isinstance(mapping, dict):
         return None
-    found: dict[str, tuple[int, int]] = {}
+    found: dict[str, int] = {}
     for node, workload in list(mapping.items()):
         name = worker_of(node)
         if not name or not isinstance(workload, dict):
             continue
-        assigned = completed = 0
-        for scope in workload.values():
-            if not isinstance(scope, dict):
-                continue
-            assigned += len(scope)
-            completed += sum(1 for done in scope.values() if done)
-        found[name] = (assigned, completed)
+        found[name] = sum(
+            len(scope) for scope in workload.values() if isinstance(scope, dict)
+        )
     return found
 
 

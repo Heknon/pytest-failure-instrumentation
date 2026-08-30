@@ -808,8 +808,12 @@ nobody is assigned yet and hands it out in chunks, so a worker's total grows for
 as long as `unassigned` is above zero — a percentage drawn without it is a bar
 whose end moves. Under `--dist each` it is settled from the first moment,
 because every worker is given the whole collection at once. Under
-`--dist worksteal` an empty queue is *still* not settled: that mode moves work
-between workers, so a total that has stopped growing there can still shrink.
+`--dist worksteal` an empty queue is *still* not settled while a steal can
+happen: that mode moves work between workers, so a total that has stopped
+growing can still shrink. It takes both halves of xdist's own condition —
+somebody idle to give the work to, and somebody holding more than the floor of
+two to be worth taking it from — so one worker running the tail of a run is
+*not* settled, while two workers holding two tests each are.
 
 **The three numbers in a row always agree**, and that took arranging, because
 they do not come from one place: the total is the controller's, written into
@@ -1043,6 +1047,10 @@ the process instead, with no port and nothing to discover:
 
 ```python
 def pytest_failure_worker_sample(sample):
+    # collected / unassigned / settled ride on the sample too: a worker's
+    # total is what it has been given so far, so a bar drawn without them
+    # has a moving end — and this is the path for runs that cannot open a
+    # port, where there is no /workers to ask instead.
     for worker in sample.workers:
         rows.insert(session=sample.session_id, at=sample.observed_at,
                     worker=worker.worker, nodeid=worker.nodeid,
@@ -1229,9 +1237,11 @@ overwhelming majority of what runs.
   offset — 6µs at eight workers, 32µs at sixty-four. It was written by rename
   at first, at 54µs a time, and throttled to twice a second to pay for that;
   the throttle is what let a worker's row contradict itself, so the write got
-  cheap instead. Nothing here diffs a queue against its last reading either —
-  under `worksteal` and `each` a worker is handed its share up front, so that
-  would be the whole suite per test.
+  cheap instead. Nothing here scales with the number of *tests*: diffing a
+  queue against its last reading would, and so would reading the loadscope
+  family's per-test done flags — that one was measured at 1.7ms a write on a
+  sixty-thousand-test `--dist loadfile` run, near two minutes of controller
+  time over the run, and is now a length per scope instead (133µs, 8s).
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.

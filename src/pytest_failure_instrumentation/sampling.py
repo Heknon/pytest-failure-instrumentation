@@ -90,6 +90,20 @@ class WorkerSample(BaseModel):
     observed_at: float = 0.0
     workers: list[SampledWorker] = Field(default_factory=list)
 
+    #: How big the run is, and how much of it is nobody's yet. A worker's
+    #: total is what it has been given *so far* under every distribution mode
+    #: but ``each``, so a consumer handed the totals and not these is drawing
+    #: a bar whose end moves - and this is the path for the runs that cannot
+    #: open a port, where there is no ``/workers`` to ask instead.
+    collected: Optional[int] = None
+    unassigned: Optional[int] = None
+    #: Whether any worker's total can still change. False while the queue has
+    #: anything in it, and under ``worksteal`` while a steal is still possible
+    #: - see :mod:`.schedule`.
+    settled: Optional[bool] = None
+    #: What ``--dist`` this run was started with, reported as-is.
+    dist: Optional[str] = None
+
 
 class WorkerSampler:
     """Reads one sample per pass out of a run's evidence directory.
@@ -111,10 +125,15 @@ class WorkerSampler:
         if described is None:
             return WorkerSample(session_id=self.session_id, observed_at=round(moment, 3))
 
+        schedule = described.get("schedule") or {}
         return WorkerSample(
             session_id=self.session_id,
             run_id=described.get("run_id"),
             observed_at=round(moment, 3),
+            collected=schedule.get("collected"),
+            unassigned=schedule.get("unassigned"),
+            settled=schedule.get("settled"),
+            dist=schedule.get("dist"),
             workers=[
                 SampledWorker(
                     worker=record.get("worker") or "",
