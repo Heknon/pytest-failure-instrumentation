@@ -429,6 +429,50 @@ def test_a_crashed_worker_keeps_what_it_was_owed_and_the_rest_is_reassigned(pyte
     assert sum(row["assigned"] for row in rows_by_worker.values()) > 24
 
 
+#: Fails partway through, so a run can be cut short with work still queued.
+HALTING_SUITE = """
+import time
+
+import pytest
+
+
+@pytest.mark.parametrize("i", range(30))
+def test_thing(i):
+    time.sleep(0.2)
+    if i == 5:
+        assert False, "the failure that stops the run"
+"""
+
+
+@needs_xdist
+@pytest.mark.parametrize("stopping", ["-x", "--maxfail=1"])
+def test_a_run_cut_short_reports_the_tests_nobody_ran(pytester, stopping):
+    """xdist takes a different path out when the run is stopping: it does not
+    remove the nodes from the scheduler, so a worker keeps a queue it will
+    never get to. Those tests are neither finished nor running, and calling
+    them either would be a row claiming work that never happened.
+    """
+    evidence = pytester.path / "evidence"
+    pytester.makepyfile(test_suite=HALTING_SUITE)
+    pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
+
+    pytester.runpytest_subprocess("-n3", stopping)
+
+    runs = [path for path in evidence.iterdir() if path.is_dir()]
+    described = topology.run(runs[0])
+    rows = described["workers"]
+    assert rows, described
+
+    for row in rows:
+        assert (
+            row["tests_finished"] + row["tests_running"] + row["tests_queued"]
+            == row["tests_assigned"]
+        ), row
+    # Somebody was left holding work, and the run's own queue never drained.
+    assert any(row["tests_queued"] for row in rows), rows
+    assert described["schedule"]["settled"] is False
+
+
 #: Short enough that several finish between any two glances at the evidence.
 #: That is the point: this suite is what caught the controller's record being
 #: written on a timer while the workers' own slots were read live.
