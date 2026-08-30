@@ -509,10 +509,19 @@ def test_thing(i):
 @needs_xdist
 @pytest.mark.parametrize("stopping", ["-x", "--maxfail=1"])
 def test_a_run_cut_short_reports_the_tests_nobody_ran(pytester, stopping):
-    """xdist takes a different path out when the run is stopping: it does not
-    remove the nodes from the scheduler, so a worker keeps a queue it will
-    never get to. Those tests are neither finished nor running, and calling
-    them either would be a row claiming work that never happened.
+    """A cut-short run does not stop where it is: xdist's shutdown means
+    "finish what you were handed", so the workers drain the queues they
+    already hold and only the *unassigned* tests go unrun. Which is why what
+    is asserted here is the run's own queue rather than the workers' - whether
+    any worker is still holding something when the dust settles is a race, and
+    an earlier version of this test won it on one xdist and lost it on another.
+
+    The two counts diverge here more than anywhere else, and that is the point.
+    A worker goes on finishing tests the controller has stopped processing
+    reports for, so its own slot runs ahead of the controller's record - and
+    the row still has to hold together, with the total floored up to what the
+    worker says it started rather than left behind at what the controller last
+    heard about.
     """
     evidence = pytester.path / "evidence"
     pytester.makepyfile(test_suite=HALTING_SUITE)
@@ -530,9 +539,14 @@ def test_a_run_cut_short_reports_the_tests_nobody_ran(pytester, stopping):
             row["tests_finished"] + row["tests_running"] + row["tests_queued"]
             == row["tests_assigned"]
         ), row
-    # Somebody was left holding work, and the run's own queue never drained.
-    assert any(row["tests_queued"] for row in rows), rows
+        # And no worker is credited with more than it was given, however far
+        # ahead of the controller it ran before the run was called off.
+        assert row["tests_finished"] <= row["tests_assigned"], row
+
+    # The tests nobody ran: still in the run's own queue, never handed out.
+    assert described["schedule"]["unassigned"] > 0, described["schedule"]
     assert described["schedule"]["settled"] is False
+    assert described["schedule"]["collected"] == 30
 
 
 #: Short enough that several finish between any two glances at the evidence.
