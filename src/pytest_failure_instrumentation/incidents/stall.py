@@ -14,6 +14,7 @@ already made, because the asking can perturb what it measures.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ SOURCE_WORDING = {
     "watchdog": "the slow-test watchdog",
     "frozen-fallback": "the fallback timer, after the worker stopped running Python",
     "crash": "the worker, into its crash file",
+    "py-spy": "py-spy, reading the process from outside it",
 }
 
 
@@ -172,6 +174,11 @@ def build(
     worker's gateway. It is what licenses the signal in :func:`_stack`; a pid
     read back from a file is only a number, and the process that owns it now
     may be somebody else's.
+
+    A run with no workers reaches all of this unchanged. The evidence is the
+    same evidence, written to the same files by the same recorder, and the
+    only thing that differs is that the process holding it is this one - which
+    :func:`_stack` notices for itself.
     """
     path = directory / f"{worker}.events"
     # Only this run's. An earlier run's beats - left where the directory could
@@ -270,6 +277,9 @@ def _stack(
     having been signalled - and that one describes whenever the watchdog last
     fired rather than now.
     """
+    if pid == os.getpid():
+        return _own_stack(directory, worker)
+
     crash_file = directory / f"{worker}.crash"
     try:
         before = crash_file.stat().st_size
@@ -317,6 +327,46 @@ def _stack(
         written,
         source,
     )
+
+
+def _own_stack(
+    directory: Path, worker: str
+) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
+    """The stack of a run with no workers, which is this process.
+
+    Read the way every other live process in this package is read: py-spy,
+    from outside. The frames are also directly available here - this is a
+    thread of the process being assessed - and reading them that way was a
+    second mechanism for a question that already had one, with its own
+    failure modes to reason about and its own source to explain to whoever
+    reads the incident. One reader, one shape, one thing to keep working.
+
+    It buys two things beyond the tidiness. py-spy pauses the target and reads
+    its memory rather than asking it to run anything, so it does not need the
+    stalled process to cooperate and it says which thread holds the GIL - and
+    it is not a signal, so nothing here can return a blocked syscall early and
+    dissolve the stall being measured. ``failure_stack_probe`` is therefore
+    not consulted: it exists to keep a signal away from a worker, and there is
+    no signal on this path to withhold.
+
+    What it costs is a dependency. Without ``pip install
+    pytest-failure-instrumentation[stacks]`` there is no reader, and the stall
+    is reported with whatever the watchdog last wrote and the reason py-spy
+    gives - the same position ``/stack`` has always been in, and better than a
+    stack whose absence is unexplained.
+
+    The Yama declaration a self-read needs travels with the reader rather than
+    being made here - see :func:`..probes.stacks.live_stack`.
+    """
+    threads, error = probes.live_stack(os.getpid())
+    stack = crash_stack.from_threads(threads or [], limit=STACK_LINES)
+    if stack:
+        return stack, True, None, time.time(), "py-spy"
+    # Whatever this process wrote for itself unprompted is still evidence, and
+    # is what a run without py-spy is left with. The watchdog's dump names the
+    # same blocked test; it is only older, and the incident says by how much.
+    passive, written, source = _passive_stack(directory, worker)
+    return passive, True, error or "py-spy returned no frames", written, source
 
 
 def _cannot_probe(

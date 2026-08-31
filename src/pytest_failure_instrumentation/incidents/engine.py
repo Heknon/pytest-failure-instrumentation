@@ -6,8 +6,10 @@ fraction of what goes wrong:
 
 * a worker process dies            - pytest_testnodedown          (xdist)
 * workers collect different tests  - pytest_xdist_node_collection_finished
-* a worker stops reporting         - polled here, because the absence of
-                                     anything being said fires no hook (xdist)
+* a process stops reporting        - polled here, because the absence of
+                                     anything being said fires no hook. A
+                                     worker, or this process itself when the
+                                     run has no workers        (any run)
 * pytest raises an internal error  - pytest_internalerror         (any run)
 * the run ends                     - a summary whose absence means the
                                      process died                 (any run)
@@ -33,12 +35,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -47,16 +48,12 @@ from ..analysis import fingerprint as fingerprint_of
 from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
-from ..config import Settings, advise
+from ..config import SOLE_WORKER, Settings, advise
+from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
-from . import collection, death, internal_error, stall, summary
-from .base import Capabilities, Incident, frame_from
-
-#: Written at the top of each run's own directory, and the only thing that
-#: makes a directory this plugin's to delete. Matching on file suffixes instead
-#: is how a cleanup takes somebody's coverage report with it: ``failure_directory``
-#: is a natural thing to point at an existing artifacts directory.
-OWNER_FILE = "owner.json"
+from . import collection, death, internal_error, leftovers, stall, summary
+from .base import UNSET_RUN_ID, Capabilities, Incident, frame_from
+from .leftovers import OWNER_FILE, prune_finished_runs
 
 #: The environment variable that names this run's evidence directory, and the
 #: only value in this package that a person hands over and the filesystem then
@@ -170,38 +167,6 @@ def name_this_run(fallback: str) -> str:
     return fallback
 
 
-def prune_finished_runs(root: Path) -> None:
-    """Delete the directories of runs that are over.
-
-    Over, not old. The controller's pid is in the marker, so a run that is
-    still going is recognisable as such however long it has been going - which
-    matters, because the whole reason each run has a directory is that several
-    of them happen at once.
-
-    A directory without our marker is not ours and is left alone, whatever it
-    looks like.
-    """
-    try:
-        candidates = [path for path in root.iterdir() if path.is_dir()]
-    except OSError:
-        return
-    for path in candidates:
-        owner = _owner_of(path)
-        if owner is None or probes.is_running(owner):
-            continue
-        shutil.rmtree(path, ignore_errors=True)
-
-
-def _owner_of(directory: Path) -> Optional[int]:
-    """The pid that owns this run directory, or None if it is not ours."""
-    try:
-        record = json.loads((directory / OWNER_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    pid = record.get("pid") if isinstance(record, dict) else None
-    return int(pid) if isinstance(pid, int) else None
-
-
 class IncidentEngine:
     def __init__(self, config: pytest.Config, settings: Settings) -> None:
         self.config = config
@@ -276,6 +241,16 @@ class IncidentEngine:
         self.raised = 0
         self.suppressed = 0
         self.run_ending = 0
+        #: When this process started, stamped into the marker and kept so a
+        #: rewrite of it at session finish does not report a second start.
+        self.started_at = time.time()
+        #: Whether this process is the one running the tests, which is so
+        #: exactly when the run has no workers. Settled at session start from
+        #: :attr:`recorder` and kept, because a report arriving from a worker
+        #: must never be mistaken for one of ours - a phantom entry in
+        #: ``activity`` is a stall watcher assessing a worker that does not
+        #: exist, and reporting one.
+        self.records_here = False
         #: The host's live-stack server, if this session ended up hosting it.
         #: Not an incident source - it answers questions rather than raising
         #: anything - but session start and finish are here, and giving it a
@@ -324,13 +299,27 @@ class IncidentEngine:
         """
         return self.settings.directory / self.session_id
 
+    @property
+    def recorder(self) -> Any:
+        """This process's own recorder, or None when it is not running tests.
+
+        A run with no workers records itself: the process that would be asked
+        what it was doing is this one, so the recorder is registered here
+        rather than in a worker, and this is how the engine reaches it.
+        Registered by :func:`..registration.install`, and absent whenever it
+        could not be built - a read-only directory, a psutil that will not
+        import - which is exactly the case each caller has to handle anyway.
+        """
+        return self.config.pluginmanager.get_plugin(RECORDER_NAME)
+
     def _prepare_directory(self) -> None:
         """Make this run's directory, and clear out the runs that are over.
 
-        Made when something is actually going to write there - workers, or the
-        stack server publishing its address. A single-process run with neither
-        has no reason to leave an empty directory in somebody's repository, and
-        a run that skips the marker would leave a directory nothing ever prunes.
+        Made when something is actually going to write there - workers, this
+        process recording its own tests, or the stack server publishing its
+        address. A run with none of the three has no reason to leave an empty
+        directory in somebody's repository, and a run that skips the marker
+        would leave a directory nothing ever prunes.
 
         What is pruned is *whole directories of finished runs*, which is a much
         safer thing to delete than a list of file suffixes: a directory is only
@@ -340,9 +329,13 @@ class IncidentEngine:
         coverage report has done more damage than any failure it might have
         explained.
         """
-        if not self.distributed and not self.settings.stack_server:
+        if not self.distributed and not self.settings.stack_server and not self.records_here:
             return
         self._warn_if_a_live_session_already_owns_this_directory()
+        # Read before it is swept: the sweep is what removes this evidence,
+        # and the two orders differ by whether a killed run is reported once
+        # or never.
+        self._report_runs_that_never_came_back()
         # Swept *before* this run's marker is written, not after. Written
         # first, our own directory names a live pid - so a directory left
         # behind by a finished run that shared this PYTEST_RUN_ID is skipped
@@ -362,18 +355,51 @@ class IncidentEngine:
             # it before xdist has one, and the id this run reports would then
             # be a name nothing else agrees with. The events files inside carry
             # it, and they are written from the start.
-            (self.directory / OWNER_FILE).write_text(
-                json.dumps(
-                    {
-                        "pid": os.getpid(),
-                        "session_id": self.session_id,
-                        "started_at": time.time(),
-                    }
-                ),
-                encoding="utf-8",
-            )
+            self._write_marker()
         except OSError:
             return  # bookkeeping must never break a run
+
+    def _write_marker(self, finished: bool = False) -> None:
+        """Say that this directory is a run of ours, and whether it ended.
+
+        Rewritten whole at session finish rather than appended to, because it
+        is one small document and the read that matters most happens when
+        nobody is left to have finished writing it. What that reader takes
+        from a marker it cannot parse is "this run did not reach its end",
+        which is the safe way round: a run that did reach it is still here to
+        be asked, and one that did not is the case this exists for.
+        """
+        record: dict[str, Any] = {
+            "pid": os.getpid(),
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+        }
+        if finished:
+            # The absence of this is what makes a directory worth reporting
+            # rather than merely deleting - see :mod:`.leftovers`.
+            record[leftovers.FINISHED_KEY] = time.time()
+        (self.directory / OWNER_FILE).write_text(json.dumps(record), encoding="utf-8")
+
+    def _report_runs_that_never_came_back(self) -> None:
+        """Raise the incidents of runs that were killed before they could.
+
+        Every other source is something a live process notices. This is the
+        one that nothing in the run it describes was alive to notice, so it is
+        found rather than reported - by the next run over the same directory,
+        which was about to delete it.
+
+        Ordered before the sweep on purpose: the sweep is what removes this
+        evidence, and doing it first is the difference between a killed run
+        being reported once and never. Ordered after nothing else, because a
+        run reports what it finds before it has anything of its own to say.
+        """
+        try:
+            found = leftovers.deaths_left_behind(self.settings.directory, self.directory)
+        except Exception as failure:  # noqa: BLE001 - never break a starting run
+            advise(f"the previous runs' evidence could not be read: {failure!r}")
+            return
+        for incident in found:
+            self.raise_incident(incident)
 
     def _warn_if_a_live_session_already_owns_this_directory(self) -> None:
         """Two runs may share a directory on purpose - but not at once.
@@ -464,7 +490,12 @@ class IncidentEngine:
             incident.evidence.append(why)
 
         incident.fingerprint = fingerprint_of.of(incident, incident.blamed_frame)
-        incident.run_id = self.run_id
+        # This run's, unless the incident is about another one. A death
+        # recovered from a directory somebody else left behind carries the id
+        # of the run that died: it is the key a consumer joins on, and the
+        # run that merely found it is not the run it happened in.
+        if incident.run_id == UNSET_RUN_ID:
+            incident.run_id = self.run_id
         incident.raised_at = time.time()
         incident.capabilities = Capabilities(**probes.capabilities())
         incident.product_version = self.settings.product_version
@@ -621,6 +652,10 @@ class IncidentEngine:
         built its node manager yet - see the ``directory`` property for why
         that independence had to be designed in rather than assumed.
         """
+        # First, because everything below asks it. The recorder is registered
+        # alongside this object at configure time and nothing can add one
+        # later, so one read settles it for the run.
+        self.records_here = self.recorder is not None
         self._prepare_directory()
 
         # Whether or not this is distributed: a single-process run has a stack
@@ -644,16 +679,20 @@ class IncidentEngine:
                 self.settings.stack_server_token,
             )
 
-        if self.settings.sample_seconds > 0 and not self.distributed:
-            # Nothing writes a state file in a single-process run: the recorder
-            # is installed on workers only, and there are none. The sampler
-            # would poll an empty directory for the life of the run and push
-            # nothing, which from the outside is indistinguishable from a
+        if self.settings.sample_seconds > 0 and not self._anything_records():
+            # The sampler reads state files, so a run where nothing writes one
+            # would poll an empty directory for its whole length and push
+            # nothing - which from the outside is indistinguishable from a
             # product whose hook is never called. Say so instead.
+            #
+            # That used to be every run without xdist, and is now only a run
+            # whose recorder could not be built: the process running the tests
+            # records itself, so a plain pytest samples one worker called
+            # "main" the same way a distributed one samples sixty-four.
             advise(
-                "failure_sample_seconds is set but this run is not distributed, "
-                "so there are no workers to sample and no samples will be "
-                "pushed; run under xdist (-n) or unset it"
+                "failure_sample_seconds is set but nothing in this run is "
+                "recording what it does, so there is nothing to sample and no "
+                "samples will be pushed"
             )
         elif self.settings.sample_seconds > 0:
             self.sampler = threading.Thread(
@@ -663,15 +702,39 @@ class IncidentEngine:
             )
             self.sampler.start()
 
-        # Only distributed runs can strand a worker. A single process that
-        # wedges takes this detector down with it.
-        if self.distributed and self.settings.stall_seconds > 0:
+        if self._anything_records() and self.settings.stall_seconds > 0:
+            # A run with no workers watches itself, and can: the watcher is a
+            # thread, and a main thread blocked on a lock or a socket does not
+            # stop the others running. So a plain pytest that wedges says so
+            # while it is still wedged - which is the whole value of the kind,
+            # and was previously the one case that produced nothing at all
+            # because the run simply never ended.
+            #
+            # The exception is the process frozen by native code holding the
+            # GIL. Nothing in Python runs there, this thread included, so
+            # nothing is reported now; the fallback timer's dump is what is
+            # left, for whoever reads the directory afterwards.
+            if self.records_here:
+                # Before the first test, so a run whose *first* test hangs is
+                # watched. The clock has to be running before there is
+                # anything to report against it.
+                self._touch(SOLE_WORKER)
             self.watcher = threading.Thread(
                 target=self._watch_for_stalls,
                 name="failure-instrumentation-stall",
                 daemon=True,
             )
             self.watcher.start()
+
+    def _anything_records(self) -> bool:
+        """Whether any process in this run is writing down what it is doing.
+
+        The workers, when there are workers. This process, when there are not.
+        Neither, when the recorder could not be built at all - a read-only
+        evidence directory, a psutil that will not import - which is warned
+        about where it happens and is the one case with nothing to read.
+        """
+        return self.distributed or self.records_here
 
     def _sample_workers(self) -> None:
         """Push what every worker is doing, on a cadence, until the run ends.
@@ -805,6 +868,15 @@ class IncidentEngine:
     def pytest_runtest_logreport(self, report: Any) -> None:
         node = getattr(report, "node", None)
         if node is None:
+            # No node means the report was produced here rather than relayed
+            # from a worker, which in a run this process is recording means
+            # this process is the one still going. It is the same signal a
+            # worker's report is: something completed, so the silence clock
+            # starts again. There is no schedule to keep either way: the
+            # counts below come from xdist's scheduler, and a run with no
+            # workers has none.
+            if self.records_here:
+                self._touch(SOLE_WORKER)
             return
         self.tests_seen += 1
         worker = worker_of(node)
@@ -1019,6 +1091,13 @@ class IncidentEngine:
             )
         )
         self.schedule.close()
+        # Said after the summary rather than before it, and it is the last
+        # thing this run does that a later one can read: from here on, this
+        # directory says it reached its end and has nothing left to report.
+        try:
+            self._write_marker(finished=True)
+        except OSError:
+            pass  # the marker is bookkeeping, and this run is over anyway
         # The summary is the last word by definition - it says how many
         # incidents this run raised. Anything the watcher or the sampler still
         # manages to produce after it would contradict a number already

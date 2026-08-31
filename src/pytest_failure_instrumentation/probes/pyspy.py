@@ -112,7 +112,7 @@ def unavailable_reason() -> str:
     """Why there is no external reader, phrased for somebody who can fix it."""
     return (
         "py-spy is not installed in this environment (pip install py-spy), so "
-        "the stack of another process cannot be read from outside it"
+        "a live process's stack cannot be read from outside it"
     )
 
 
@@ -248,10 +248,10 @@ def _explained(stderr: bytes, pid: int) -> str:
 def _thread(entry: dict[str, Any]) -> dict[str, Any]:
     """One thread in the shape this package uses everywhere.
 
-    py-spy's own keys are not passed through. The in-process reader produces
-    the same records from ``sys._current_frames``, and a caller that has to
-    switch on which mechanism answered has been handed two APIs rather than
-    one - which is exactly what a UI would end up encoding.
+    py-spy's own keys are not passed through. What a caller gets is this
+    package's record whichever process it asked about, so nothing downstream -
+    the live view, a stall's rendered stack, a UI - has to know that py-spy is
+    what answered.
     """
     return {
         "thread_id": entry.get("thread_id"),

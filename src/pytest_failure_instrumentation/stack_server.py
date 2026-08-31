@@ -129,7 +129,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-from .probes import process, pyspy, stacks
+from .probes import process, stacks
 from .probes.platform_flags import IS_WINDOWS
 
 #: What ``/identity`` answers with. The whole singleton scheme rests on this
@@ -771,17 +771,19 @@ def identity() -> dict[str, Any]:
 def read_stack(pid: int) -> tuple[Optional[list[dict[str, Any]]], Optional[str], str]:
     """``(threads, error, source)`` for a live process.
 
-    This process answers for itself out of its own frames, which costs a dict
-    lookup and needs no permission from anybody. Every other pid needs the
-    external reader, because there is no way to walk another process's frames
-    from Python.
-    """
-    if pid == os.getpid():
-        try:
-            return stacks.own_threads(), None, "in-process"
-        except Exception as failure:  # noqa: BLE001 - a served error beats a 500
-            return None, f"could not read own frames: {failure!r}", "in-process"
+    Every pid is read the same way, this server's own included. Its frames are
+    also directly to hand and used to be answered that way - it costs a dict
+    lookup and no permission from anybody - and what that bought was a second
+    reader, answering with a second ``source``, for the one process that could
+    avoid the first. A caller that has to know which mechanism answered has
+    been handed two APIs.
 
+    All this adds on top of :func:`..probes.stacks.live_stack` is the bound on
+    how many reads may be in flight at once, which is the server's business
+    rather than the reader's: each one is a subprocess that pauses its target,
+    and a caller polling on a timer wants to be told to come back rather than
+    held until its own deadline passes.
+    """
     if not _readers.acquire(blocking=False):
         return (
             None,
@@ -789,7 +791,7 @@ def read_stack(pid: int) -> tuple[Optional[list[dict[str, Any]]], Optional[str],
             "py-spy",
         )
     try:
-        threads, error = pyspy.dump(pid)
+        threads, error = stacks.live_stack(pid)
     finally:
         _readers.release()
     return threads, error, "py-spy"

@@ -197,20 +197,21 @@ def test_an_empty_directory_samples_nothing_rather_than_raising(tmp_path):
 # -- the whole chain, in a real run -----------------------------------------
 
 
+RECORDING_CONFTEST = """
+import json
+
+
+def pytest_failure_worker_sample(sample):
+    with open("samples.jsonl", "a") as handle:
+        handle.write(sample.model_dump_json() + "\\n")
+"""
+
+
 @needs_xdist
 def test_a_real_run_pushes_samples_to_a_product_that_implements_the_hook(pytester):
     """Everything above drives the sampler directly, so none of it would
     notice the thread never starting or the hook never being registered."""
-    pytester.makeconftest(
-        """
-        import json
-
-
-        def pytest_failure_worker_sample(sample):
-            with open("samples.jsonl", "a") as handle:
-                handle.write(sample.model_dump_json() + "\\n")
-        """
-    )
+    pytester.makeconftest(RECORDING_CONFTEST)
     pytester.makepyfile(
         """
         import time
@@ -264,19 +265,27 @@ def test_sampling_is_off_unless_it_is_asked_for(pytester):
     assert not (pytester.path / "samples.jsonl").exists()
 
 
-def test_sampling_a_run_with_no_workers_says_so_rather_than_pushing_nothing(pytester):
-    """The recorder is installed on workers only, so a single-process run
-    writes no state at all and the sampler would poll an empty directory for
-    the life of the run. From the outside that is indistinguishable from a
-    product whose hook is simply never called - which is the misreading this
-    package exists to prevent, arriving in its own newest feature."""
-    pytester.makepyfile("def test_one():\n    assert True\n")
+def test_a_run_with_no_workers_is_sampled_like_any_other(pytester):
+    """It used to be refused, and the refusal was right at the time: the
+    recorder was installed on workers only, so a run without them wrote no
+    state and the sampler would have polled an empty directory for the length
+    of the run - which from the outside is indistinguishable from a product
+    whose hook is never called.
+
+    What changed is the premise. The process running the tests records itself
+    now, so there is one worker to sample and it is called ``main``.
+    """
+    pytester.makeconftest(RECORDING_CONFTEST)
+    pytester.makepyfile("import time\n\n\ndef test_one():\n    time.sleep(3)\n")
     result = pytester.runpytest_subprocess(
-        "-p", "failure_instrumentation", "-o", "failure_sample_seconds=1"
+        "-p", "failure_instrumentation",
+        "-o", "failure_sample_seconds=1",
+        "-o", "failure_heartbeat_interval=1",
     )
     result.assert_outcomes(passed=1)
-    # Raised at session start, which is outside the window pytest folds into
-    # its warnings summary, so it lands on stderr - where a person running the
-    # suite still sees it.
-    combined = result.stdout.str() + result.stderr.str()
-    assert "not distributed" in combined and "no workers to sample" in combined
+
+    lines = (pytester.path / "samples.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = [row for line in lines for row in json.loads(line)["workers"]]
+    assert rows, "the sampler pushed nothing for a run it should have sampled"
+    assert {row["worker"] for row in rows} == {"main"}
+    assert any(row["nodeid"] == "test_a_run_with_no_workers_is_sampled_like_any_other.py::test_one" for row in rows), rows

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytest-failure-instrumentation"
-version = "0.3.0"
-description = "Attribute the pytest failures that leave no trace: internal errors, and xdist worker deaths, stalls and collection mismatches"
+version = "0.4.0"
+description = "Attribute the pytest failures that leave no trace: process deaths, stalls, internal errors and xdist collection mismatches"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

@@ -29,7 +29,7 @@ import signal
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Any, Optional, TextIO
 
 from ..probes import stacks
 
@@ -41,9 +41,38 @@ def arm_fatal_handler(stream: TextIO) -> bool:
     ``trylast``, aiming at shared stderr where every worker's output
     interleaves. Calling this later claims the handler back.
 
+    Claiming is right *because* the stderr it takes over is shared. Sixteen
+    workers writing dumps into one stream produce interleaved sections that
+    belong to nobody, and the process that reads them afterwards is the
+    controller, out of a file. Nothing is lost by moving them.
+
+    That argument does not survive a run with no workers in it, where the
+    stderr in question is a terminal somebody is watching. Such a run arms
+    :func:`arm_on_demand_handler` alone and leaves the fatal dump where pytest
+    put it, unless ``failure_crash_stack`` says otherwise - moving the only
+    account of a crash out of the place it is read from is a trade rather than
+    an improvement, and it is the run's to make.
+
+    There is no third option to reach for. ``faulthandler`` keeps exactly one
+    destination for a fatal signal, and the obvious way to have both -
+    ``register(SIGSEGV, chain=True)``, writing our copy and then calling
+    pytest's - is refused by CPython itself: ``signal 11 cannot be registered,
+    use enable() instead``, and the same for every other fatal signal.
+
     Returns whether an on-demand stack can also be requested later.
     """
     faulthandler.enable(file=stream, all_threads=True)
+    return arm_on_demand_handler(stream)
+
+
+def arm_on_demand_handler(stream: TextIO) -> bool:
+    """Let ``SIGUSR1`` ask this process for a stack. False where it cannot.
+
+    Separate from the fatal handler above because the two are armed together
+    in a worker and, in a run with no workers, may be apart: the fatal dump
+    there stays pytest's unless it was asked for, while this one is always
+    ours. Nothing holds SIGUSR1 beforehand, so there is nothing to take away.
+    """
     if not stacks.can_request_stack():
         return False
     # chain=False deliberately. Chaining re-raises the signal with whatever was
@@ -379,6 +408,36 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
 
     section = _capped(_most_relevant(sections), limit)
     return ([banner] + section) if banner else section
+
+
+def from_threads(threads: list[dict[str, Any]], limit: int = 12) -> list[str]:
+    """A live reader's threads, as a dump read off disk would have looked.
+
+    :func:`.probes.stacks.live_stack` answers in a structured shape, and
+    everything downstream of a stack in this package reads faulthandler's
+    *text* - the thread selection below, the
+    attribution that walks it for an owner, the incident's ``raw_stack``. One
+    renderer here is what lets a stack that was never written to a file go
+    through all of it unchanged, instead of a second pipeline for frames that
+    arrived as objects.
+
+    No section is labelled ``Current thread``, and that is right rather than a
+    shortcut: nothing here was reached by a signal, so no thread is current in
+    the sense that label means. :func:`_most_relevant` falls through to the
+    thread carrying the runtest protocol, which is the one running the test.
+    """
+    lines: list[str] = []
+    for thread in threads:
+        name = thread.get("thread_name") or ""
+        title = f"Thread 0x{int(thread.get('thread_id') or 0):016x}"
+        lines.append(f"{title} ({name}, most recent call first):" if name
+                     else f"{title} (most recent call first):")
+        lines.extend(
+            f'  File "{frame.get("file")}", line {frame.get("line")} in {frame.get("function")}'
+            for frame in thread.get("frames") or []
+        )
+    sections = _thread_sections(lines)
+    return _capped(_most_relevant(sections), limit) if sections else []
 
 
 def _capped(lines: list[str], limit: int) -> list[str]:

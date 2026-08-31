@@ -26,10 +26,24 @@ def test_a_plain_pytest_run_gets_a_summary(runner):
     assert "single process" in str(summary)
 
 
-def test_no_evidence_directory_is_left_behind_by_a_plain_run(runner):
+def test_a_plain_run_leaves_one_directory_and_the_next_run_clears_it(runner):
+    """It used to leave none, because it recorded nothing, and that absence
+    was the whole assertion. Now it records itself and the evidence has to
+    outlive the process - which is the point of writing it down - so what has
+    to hold instead is that the directories do not pile up: every run sweeps
+    the ones that are over before it makes its own."""
     runner.pytester.makepyfile(test_suite=SUITE)
     runner.run("-p", "no:xdist", "test_suite.py")
-    assert not (runner.pytester.path / ".pytest-failures").exists()
+    first, = _run_directories(runner.pytester)
+
+    runner.run("-p", "no:xdist", "test_suite.py")
+    second, = _run_directories(runner.pytester)
+    assert second != first
+
+
+def _run_directories(pytester):
+    root = pytester.path / ".pytest-failures"
+    return sorted(path for path in root.iterdir() if path.is_dir())
 
 
 def test_a_run_without_xdist_still_gets_an_id_of_its_own(runner):

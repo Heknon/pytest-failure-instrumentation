@@ -12,8 +12,7 @@ from .memory import (
     system_available_megabytes,
 )
 from .process import exit_status, is_own_child, is_running
-from .pyspy import dump as external_stack
-from .stacks import can_request_stack, own_threads, request_stack
+from .stacks import can_request_stack, live_stack, request_stack
 
 __all__ = [
     "capabilities",
@@ -26,7 +25,6 @@ __all__ = [
     "is_own_child",
     "is_running",
     "can_request_stack",
-    "external_stack",
-    "own_threads",
+    "live_stack",
     "request_stack",
 ]

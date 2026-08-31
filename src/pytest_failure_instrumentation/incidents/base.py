@@ -23,6 +23,11 @@ from typing import Any, ClassVar, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+#: What ``run_id`` holds until somebody answers the question. "unknown" is
+#: what it has always read as, and it is spelled once here because two places
+#: now compare against it.
+UNSET_RUN_ID = "unknown"
+
 
 class Frame(BaseModel):
     """One line of a stack, with the answer to "whose code is this"."""
@@ -95,7 +100,11 @@ class Incident(BaseModel):
     owner: str = "unknown"
     run_ending: bool = False
     fingerprint: str = ""
-    run_id: str = "unknown"
+    #: Which run this is about. Filled by the engine, which is why it starts
+    #: at a value no run answers to: a kind that already knows - a death
+    #: recovered from an earlier run's evidence - sets it in its builder and
+    #: is left alone. See ``IncidentEngine._enrich``.
+    run_id: str = UNSET_RUN_ID
     raised_at: float = 0.0
     product_version: Optional[str] = None
     capabilities: Optional[Capabilities] = None

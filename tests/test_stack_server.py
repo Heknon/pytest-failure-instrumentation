@@ -26,7 +26,7 @@ import pytest
 
 from pytest_failure_instrumentation import stack_server
 from pytest_failure_instrumentation.incidents import stack_server as stack_server_incident
-from pytest_failure_instrumentation.probes import pyspy, stacks
+from pytest_failure_instrumentation.probes import pyspy
 from pytest_failure_instrumentation.probes.platform_flags import (
     IS_LINUX,
     IS_MACOS,
@@ -376,15 +376,22 @@ def test_a_session_that_is_serving_is_still_actually_shut_down(serving, tmp_path
 # -- answering ------------------------------------------------------------
 
 
-def test_a_request_for_the_serving_process_is_answered_from_its_own_frames(serving):
-    """No ptrace, no subprocess, no permission: this process already has them."""
+@needs_pyspy
+def test_the_serving_process_is_read_the_same_way_as_any_other(serving):
+    """Its own frames are directly to hand and are deliberately not used.
+
+    Answering for ourselves out of ``sys._current_frames`` costs a dict lookup
+    and needs no permission from anybody, and it was a second reader with a
+    second ``source`` for the one process that could avoid the first. A caller
+    that has to know which mechanism answered has been handed two APIs.
+    """
     port = free_port()
     service = serving(port)
     assert wait_for(lambda: service.serving), service.status
 
     status, body = get(port, f"/stack?pid={os.getpid()}")
     assert status == 200
-    assert body["source"] == "in-process"
+    assert body["source"] == "py-spy"
     assert body["pid"] == os.getpid()
     assert body["captured_at"] > 0
 
@@ -562,9 +569,11 @@ def test_only_the_processes_of_this_run_can_be_asked_about(serving, tmp_path):
     assert wait_for(lambda: service.serving), service.status
     port = service.bound_port
 
-    # The serving process answers for itself. It always has a reason to: this
-    # is the stack of whoever is asking for it.
-    assert get(port, f"/stack?pid={os.getpid()}")[0] == 200
+    # The serving process is one this server has a reason to answer about: it
+    # is the stack of whoever is asking. Whether a reader is installed to do
+    # the reading is a different question from whether it is allowed, and 403
+    # is the only answer this test is about.
+    assert get(port, f"/stack?pid={os.getpid()}")[0] != 403
 
     stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
@@ -591,7 +600,7 @@ def test_a_server_with_no_evidence_directory_answers_only_for_itself(serving):
     assert wait_for(lambda: service.serving), "never served"
     port = service.bound_port
 
-    assert get(port, f"/stack?pid={os.getpid()}")[0] == 200
+    assert get(port, f"/stack?pid={os.getpid()}")[0] != 403
 
     status, body = get(port, "/stack?pid=999999")
     assert status == 403
@@ -621,26 +630,6 @@ def test_an_unknown_endpoint_lists_the_ones_that_exist(serving):
     status, body = get(port, "/nothing")
     assert status == 404
     assert "/stack?pid=N" in body["endpoints"]
-
-
-# -- the two readers agree on a shape -------------------------------------
-
-
-def test_both_readers_describe_a_thread_the_same_way():
-    """A caller that has to switch on which mechanism answered has been handed
-    two APIs, and the UI is where that would end up being encoded."""
-    from_inside = stacks.own_threads()[0]
-    from_outside = pyspy._thread(
-        {
-            "thread_id": 1,
-            "thread_name": "MainThread",
-            "owns_gil": True,
-            "active": True,
-            "frames": [{"name": "f", "filename": "x.py", "line": 2}],
-        }
-    )
-    assert set(from_inside) == set(from_outside)
-    assert set(from_inside["frames"][0]) == set(from_outside["frames"][0])
 
 
 def test_two_reads_of_one_target_do_not_race_into_a_permissions_lecture(monkeypatch):
@@ -740,18 +729,6 @@ def test_a_reader_answering_an_unexpected_shape_explains_rather_than_raising(
     assert threads and threads[0]["frames"][0]["function"] == "f"
 
 
-def test_own_threads_reports_the_innermost_frame_first():
-    """py-spy's order, and this package's order everywhere else."""
-
-    def inner():
-        return stacks.own_threads()
-
-    threads = {thread["thread_id"]: thread for thread in inner()}
-    mine = threads[__import__("threading").get_ident()]
-    assert mine["frames"][0]["function"] == "own_threads"
-    assert mine["frames"][1]["function"] == "inner"
-
-
 def test_a_missing_reader_explains_itself_rather_than_raising(monkeypatch):
     monkeypatch.setattr(pyspy, "executable", lambda: None)
     threads, error = pyspy.dump(os.getpid())
@@ -774,6 +751,7 @@ def test_a_dead_process_is_named_as_such():
 # -- wired into a real run ------------------------------------------------
 
 
+@needs_pyspy
 def test_a_real_pytest_session_serves_its_own_stack(pytester):
     """The wiring, end to end: ini switches it on, session start claims the
     port, and a test that is *still running* can be asked what it is doing.
@@ -840,12 +818,12 @@ def test_reads_of_other_processes_are_bounded(monkeypatch):
     held = __import__("threading").Event()
     released = __import__("threading").Event()
 
-    def slow_dump(pid, timeout=None):
+    def slow_read(pid):
         held.set()
         released.wait(10)
         return [], None
 
-    monkeypatch.setattr(stack_server.pyspy, "dump", slow_dump)
+    monkeypatch.setattr(stack_server.stacks, "live_stack", slow_read)
     hog = __import__("threading").Thread(
         target=stack_server.read_stack, args=(os.getpid() + 1,), daemon=True
     )
@@ -1009,6 +987,7 @@ def test_a_host_that_cannot_be_bound_gives_up_rather_than_retrying(serving):
     assert not service.serving
 
 
+@needs_pyspy
 def test_a_real_run_draws_a_port_and_a_ui_finds_it_on_disk(pytester):
     """The whole default path, end to end and from the outside: no port named
     anywhere, and a UI still locates the server - because the address is
@@ -1358,7 +1337,10 @@ def test_a_run_that_supplied_no_token_asks_for_none(serving):
     assert wait_for(lambda: service.serving), service.status
 
     assert get(port, "/workers")[0] in (200, 503)  # 503: no directory, not 401
-    assert get(port, f"/stack?pid={os.getpid()}")[0] == 200
+    # Not 200: whether a reader is installed to do the reading is a
+    # different question from whether this request was authorised, and the
+    # second is the only one this test is about.
+    assert get(port, f"/stack?pid={os.getpid()}")[0] != 401
 
 
 def test_a_supplied_token_is_demanded_on_every_endpoint_but_identity(serving):
@@ -1373,10 +1355,12 @@ def test_a_supplied_token_is_demanded_on_every_endpoint_but_identity(serving):
     assert get(port, "/workers")[0] == 401
     assert get(port, f"/stack?pid={os.getpid()}", "not-the-token")[0] == 401
 
-    assert get(port, f"/stack?pid={os.getpid()}", "s3cret")[0] == 200
+    # The right token is not 401, whatever the reader then makes of the
+    # pid: this is about who is let in, not about what they are handed.
+    assert get(port, f"/stack?pid={os.getpid()}", "s3cret")[0] != 401
     # Either way it is sent: a header is the right place for a credential, and
     # the query parameter is there because a person with curl reaches for it.
-    assert get(port, f"/stack?pid={os.getpid()}&token=s3cret")[0] == 200
+    assert get(port, f"/stack?pid={os.getpid()}&token=s3cret")[0] != 401
 
     # And still open, because two sessions that minted nothing cannot share a
     # credential, and this is what one asks the other before standing down.
@@ -1479,7 +1463,7 @@ def test_a_token_makes_binding_off_loopback_a_decision_rather_than_a_refusal(ser
     unreachable from it, and the exposure is deliberate."""
     service = serving(0, host="0.0.0.0", token="s3cret")
     assert wait_for(lambda: service.serving), service.status
-    assert get(service.bound_port, f"/stack?pid={os.getpid()}", "s3cret")[0] == 200
+    assert get(service.bound_port, f"/stack?pid={os.getpid()}", "s3cret")[0] != 401
     assert get(service.bound_port, f"/stack?pid={os.getpid()}")[0] == 401
 
 
