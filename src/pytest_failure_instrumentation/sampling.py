@@ -64,6 +64,21 @@ class SampledWorker(BaseModel):
     cpu_rate: Optional[float] = None
     heartbeat_age_s: Optional[float] = None
 
+    #: How many tests this worker has been given - the denominator a row of
+    #: statuses otherwise has no way to carry, because a worker's own files
+    #: count what it has run and nothing can tell them how much is left.
+    #: ``None`` before the workers have collected, and on any run whose
+    #: scheduler this package does not recognise - see :mod:`.schedule`.
+    tests_assigned: Optional[int] = None
+    #: That total split three ways, so that it adds up: what this worker has
+    #: run, the one test in flight if there is one, and the ones it has not
+    #: begun. Every test it was given is in exactly one of them, which is why
+    #: a row carries the split rather than what is "left" - that would put the
+    #: test in flight in two counts at once.
+    tests_finished: Optional[int] = None
+    tests_running: Optional[int] = None
+    tests_queued: Optional[int] = None
+
 
 class WorkerSample(BaseModel):
     """One pass over this run's workers."""
@@ -74,6 +89,20 @@ class WorkerSample(BaseModel):
     run_id: Optional[str] = None
     observed_at: float = 0.0
     workers: list[SampledWorker] = Field(default_factory=list)
+
+    #: How big the run is, and how much of it is nobody's yet. A worker's
+    #: total is what it has been given *so far* under every distribution mode
+    #: but ``each``, so a consumer handed the totals and not these is drawing
+    #: a bar whose end moves - and this is the path for the runs that cannot
+    #: open a port, where there is no ``/workers`` to ask instead.
+    collected: Optional[int] = None
+    unassigned: Optional[int] = None
+    #: Whether any worker's total can still change. False while the queue has
+    #: anything in it, and under ``worksteal`` while a steal is still possible
+    #: - see :mod:`.schedule`.
+    settled: Optional[bool] = None
+    #: What ``--dist`` this run was started with, reported as-is.
+    dist: Optional[str] = None
 
 
 class WorkerSampler:
@@ -96,10 +125,15 @@ class WorkerSampler:
         if described is None:
             return WorkerSample(session_id=self.session_id, observed_at=round(moment, 3))
 
+        schedule = described.get("schedule") or {}
         return WorkerSample(
             session_id=self.session_id,
             run_id=described.get("run_id"),
             observed_at=round(moment, 3),
+            collected=schedule.get("collected"),
+            unassigned=schedule.get("unassigned"),
+            settled=schedule.get("settled"),
+            dist=schedule.get("dist"),
             workers=[
                 SampledWorker(
                     worker=record.get("worker") or "",
@@ -111,6 +145,10 @@ class WorkerSampler:
                     rss_mb=record.get("rss_mb"),
                     cpu_rate=record.get("cpu_rate"),
                     heartbeat_age_s=record.get("heartbeat_age_s"),
+                    tests_assigned=record.get("tests_assigned"),
+                    tests_finished=record.get("tests_finished"),
+                    tests_running=record.get("tests_running"),
+                    tests_queued=record.get("tests_queued"),
                 )
                 for record in described.get("workers", [])
             ],
