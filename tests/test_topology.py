@@ -85,6 +85,30 @@ def evidence(tmp_path):
             with path.open("a" if append else "w", encoding="utf-8") as handle:
                 handle.write("\n".join(lines) + "\n")
 
+        def schedule(self, **workers) -> None:
+            """What the controller writes about who was given what."""
+            (self.run / "schedule.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "the-reported-run-id",
+                        "updated_at": time.time(),
+                        "dist": "load",
+                        "scheduler": "LoadScheduling",
+                        "collected": 40,
+                        "unassigned": 12,
+                        "settled": False,
+                        "workers": {
+                            name: {
+                                "assigned": assigned,
+                                "completed": completed,
+                                "pending": assigned - completed,
+                            }
+                            for name, (assigned, completed) in workers.items()
+                        },
+                    }
+                )
+            )
+
         def worker(self, name: str) -> dict:
             return topology.worker(self.run / f"{name}.state", time.time())
 
@@ -256,6 +280,130 @@ def test_a_worker_between_tests_reports_no_node_id(evidence):
     described = evidence.worker("gw0")
     assert described["nodeid"] is None
     assert described["phase"] is None
+
+
+# -- how much each worker was given ----------------------------------------
+
+
+def test_a_worker_carries_the_total_it_cannot_know_itself(evidence):
+    """Its own files count what it has run; nothing in them says how much it
+    was given, because no worker is told. The controller works that out and
+    writes it down, and this is where the two halves meet.
+
+    Only the *total* is taken from the controller; the split of it comes from
+    the worker's own counts - here the controller is two tests behind, and the
+    row still adds up."""
+    evidence.state("gw0", tests_started=10, tests_finished=9)
+    evidence.beats("gw0", cpu_step=0.9)
+    evidence.schedule(gw0=(14, 7), gw1=(11, 4))
+
+    described = topology.run(evidence.run)["workers"][0]
+    assert described["tests_finished"] == 9
+    assert described["tests_running"] == 1
+    assert described["tests_queued"] == 4
+    assert described["tests_assigned"] == 14
+
+
+def test_the_three_counts_partition_the_total(evidence):
+    """Every test a worker was given is in exactly one of them, so they add up
+    and no two of them count the same test. Reporting what was *left* instead
+    put the test in flight in two places at once, and a row reading
+    "started 2, pending 2, assigned 3" looked broken while being correct."""
+    evidence.state("gw0", tests_started=6, tests_finished=5)
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(9, 5))
+
+    row = topology.run(evidence.run)["workers"][0]
+    assert (row["tests_finished"], row["tests_running"], row["tests_queued"]) == (5, 1, 3)
+    assert row["tests_finished"] + row["tests_running"] + row["tests_queued"] == (
+        row["tests_assigned"]
+    )
+
+
+def test_a_worker_between_tests_has_nothing_running(evidence):
+    """The count is the test in flight, and between two tests there is not
+    one - which is the distinction that keeps a worker that died in the gap
+    from being blamed on the test that had already passed."""
+    evidence.state("gw0", tests_started=5, tests_finished=5, nodeid=None, phase=None)
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(9, 5))
+
+    row = topology.run(evidence.run)["workers"][0]
+    assert (row["tests_finished"], row["tests_running"], row["tests_queued"]) == (5, 0, 4)
+
+
+def test_a_record_whose_counts_cannot_be_read_keeps_the_total(evidence):
+    """The total stands on its own. A split invented out of a record that does
+    not make sense would be a row that looks whole and is not."""
+    evidence.state("gw0", tests_started=None, tests_finished=None)
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(9, 5))
+
+    row = topology.run(evidence.run)["workers"][0]
+    assert row["tests_assigned"] == 9
+    assert row["tests_running"] is None
+    assert row["tests_queued"] is None
+
+
+def test_a_total_the_worker_has_already_passed_is_the_stale_one(evidence):
+    """A worker cannot finish a test it was never given. So when its own count
+    runs past the controller's total, the total is what is out of date - and
+    saying so is the difference between a row that is late and a row that
+    cannot be true."""
+    evidence.state("gw0", tests_started=20, tests_finished=19)
+    evidence.beats("gw0", cpu_step=0.9)
+    evidence.schedule(gw0=(15, 15))
+
+    described = topology.run(evidence.run)["workers"][0]
+    # Floored at what it has *started*, not at what it has finished: a worker
+    # cannot begin a test it was never given either, and the lower floor would
+    # leave the queue below zero for as long as a test was in flight.
+    assert described["tests_assigned"] == 20
+    assert described["tests_running"] == 1
+    assert described["tests_queued"] == 0
+
+
+def test_a_run_says_how_much_of_it_is_nobody_s_yet(evidence):
+    """A total that is still growing is a progress bar whose end moves, so the
+    queue behind it is reported beside it rather than left to be inferred."""
+    evidence.state("gw0")
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(14, 7))
+
+    described = topology.run(evidence.run)
+    assert described["schedule"]["collected"] == 40
+    assert described["schedule"]["unassigned"] == 12
+    assert described["schedule"]["settled"] is False
+    assert described["schedule"]["dist"] == "load"
+
+
+def test_a_run_with_no_schedule_says_nothing_rather_than_zero(evidence):
+    """A single-process run has no scheduler, and a distributed one has none
+    until its workers have collected. Zero would be a worker with nothing left
+    to do, which is the opposite finding."""
+    evidence.state("gw0")
+    evidence.beats("gw0")
+
+    described = topology.run(evidence.run)
+    assert described["workers"][0]["tests_assigned"] is None
+    assert described["workers"][0]["tests_running"] is None
+    assert described["workers"][0]["tests_queued"] is None
+    assert described["schedule"] == {
+        "dist": None, "collected": None, "unassigned": None,
+        "settled": None, "updated_at": None,
+    }
+
+
+def test_a_worker_the_schedule_does_not_mention_still_reports(evidence):
+    """A worker that came up after the record was last written is a worker,
+    not an error - everything else about it is readable from its own files."""
+    evidence.state("gw3")
+    evidence.beats("gw3")
+    evidence.schedule(gw0=(14, 7))
+
+    described = topology.worker(evidence.run / "gw3.state", time.time())
+    assert described["worker"] == "gw3"
+    assert described["tests_assigned"] is None
 
 
 # -- evidence another run left in the same directory -----------------------

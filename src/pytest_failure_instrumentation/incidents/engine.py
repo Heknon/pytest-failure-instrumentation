@@ -50,6 +50,7 @@ from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
 from ..config import SOLE_WORKER, Settings, advise
 from ..registration import RECORDER_NAME
+from ..schedule import ScheduleTracker, worker_of
 from . import collection, death, internal_error, leftovers, stall, summary
 from .base import UNSET_RUN_ID, Capabilities, Incident, frame_from
 from .leftovers import OWNER_FILE, prune_finished_runs
@@ -219,6 +220,12 @@ class IncidentEngine:
         #: before anybody signals it. See _live_pid.
         self.nodes: dict[str, Any] = {}
         self.tests_seen = 0
+        #: How many tests each worker has been handed, which no single
+        #: process but this one can say - see :mod:`..schedule`. Written
+        #: into the run's directory so that a live view assembles it from
+        #: files like everything else, including for a run some other
+        #: session's stack server is reporting on.
+        self.schedule = ScheduleTracker(self._dist_mode())
         self.lock = threading.Lock()
         self.stop = threading.Event()
         #: Set once the run summary has been raised. After that there is
@@ -840,18 +847,47 @@ class IncidentEngine:
                 self.nodes[worker] = node
         self._touch(worker)
 
+    def pytest_runtest_logstart(self, nodeid: str, location: Any) -> None:
+        """Where the schedule is written down, once a test is starting.
+
+        The start of a test rather than the end of one, on purpose. A worker
+        reports a finished test to the controller *before* it tells the
+        scheduler, and in between the test is counted as finished and still
+        outstanding both - so a record written from the end of a test would
+        land inside that window every time, and the total would read one high
+        every time. At the start of a test that worker is never inside it.
+
+        It matters that this is the *first* one too: xdist hands the work out
+        inside the same call that fires
+        ``pytest_xdist_node_collection_finished`` and *after* that hook, so
+        the write from there is taken before anything has been assigned, and
+        without this the totals would read zero until the first test finished.
+        """
+        self._record_schedule()
+
     def pytest_runtest_logreport(self, report: Any) -> None:
         node = getattr(report, "node", None)
-        if node is not None:
-            self.tests_seen += 1
-            self._touch(getattr(getattr(node, "gateway", None), "id", None))
-        elif self.records_here:
+        if node is None:
             # No node means the report was produced here rather than relayed
             # from a worker, which in a run this process is recording means
             # this process is the one still going. It is the same signal a
             # worker's report is: something completed, so the silence clock
-            # starts again.
-            self._touch(SOLE_WORKER)
+            # starts again. There is no schedule to keep either way: the
+            # counts below come from xdist's scheduler, and a run with no
+            # workers has none.
+            if self.records_here:
+                self._touch(SOLE_WORKER)
+            return
+        self.tests_seen += 1
+        worker = worker_of(node)
+        self._touch(worker)
+        # Teardown is once per test whatever happened in it - a test whose
+        # setup failed still has one, and a test that passed has no other
+        # phase that is guaranteed. This is the whole per-test cost of the
+        # schedule: what a worker still owes is read off the scheduler when
+        # the record is written, and the two added together are its total.
+        if getattr(report, "when", None) == "teardown":
+            self.schedule.saw_a_test_finish(worker)
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_xdist_node_collection_finished(self, node: Any, ids: Any) -> None:
@@ -862,6 +898,58 @@ class IncidentEngine:
         # collected differs, so the run continues a worker short.
         self.collections.record(worker, list(ids), replacement=self.tests_seen > 0)
         self._report_mismatch(partial=False)
+        # Which workers exist, which is the first thing about a run that can
+        # be said at all. Not yet how much each has: xdist schedules inside
+        # this same call and after this hook, so what is written here is a
+        # collection and no assignment - the first test starting is where the
+        # totals arrive, and pytest_runtest_logstart forces that one too.
+        self._record_schedule()
+
+    # -- how much work each worker has -----------------------------------
+
+    def _dist_mode(self) -> str:
+        """What ``--dist`` was asked for, or "" if nothing was.
+
+        Read once at construction. It is reported rather than acted on, with
+        one exception: ``worksteal`` is the only mode that moves work between
+        workers, and a total that can still shrink is a different promise from
+        one that cannot - see :meth:`..schedule.ScheduleTracker._settled`.
+        """
+        try:
+            return str(self.config.getoption("dist", "") or "")
+        except (ValueError, AttributeError):
+            return ""
+
+    def _scheduler(self) -> Any:
+        """xdist's scheduler, or None when there is not one.
+
+        There is not one on a single-process run, and there is not one yet
+        before the workers have collected - both of which are ordinary, and
+        neither of which is worth a line of output. The first is settled
+        without a lookup, because this is asked once per test and a run with
+        no workers is the one that can least afford to be asked anything.
+        """
+        if not self.distributed:
+            return None
+        session = self.config.pluginmanager.getplugin("dsession")
+        return getattr(session, "sched", None)
+
+    def _record_schedule(self) -> None:
+        """Publish where the scheduler has got to.
+
+        Every time, on every test. It is one small write at a fixed offset -
+        see :mod:`..schedule` for why a timer here made a worker's row able to
+        say it had finished more tests than it was given.
+        """
+        scheduler = self._scheduler()
+        if scheduler is None:
+            return
+        try:
+            self.schedule.write(scheduler, self.directory, self.run_id)
+        except Exception:  # noqa: BLE001 - bookkeeping never breaks a run
+            pass
+
+    # -- sources, continued ----------------------------------------------
 
     def _expected_collections(self) -> int:
         """How many collections this run should produce before anyone judges.
@@ -933,6 +1021,12 @@ class IncidentEngine:
         # One fewer collection to wait for, which may be the one that was
         # holding a mismatch back.
         self._report_mismatch(partial=False)
+        # The last reading anybody gets of this worker, and it is an accurate
+        # one: xdist fires this hook *before* it takes the node out of the
+        # scheduler, so the queue is still there to be read. Forced, and
+        # before the incident below - what a worker was still owed when it
+        # died is the interesting half of a death.
+        self._record_schedule()
         if not error:
             return  # a clean shutdown is not an incident
         try:
@@ -996,6 +1090,7 @@ class IncidentEngine:
                 self.distributed,
             )
         )
+        self.schedule.close()
         # Said after the summary rather than before it, and it is the last
         # thing this run does that a later one can read: from here on, this
         # directory says it reached its end and has nothing left to report.

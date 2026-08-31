@@ -25,6 +25,12 @@ The pid answers the narrowest question of the three - does a process with this
 number exist - and answers it about a number that can be reused. It is the
 weakest signal and is treated as such.
 
+There is a fourth file and it is not a worker's. ``schedule.json`` is the
+controller's, and it carries the one fact no worker can write about itself:
+how many tests it was given. See :mod:`.schedule` - it is read once per run
+here rather than once per worker, so that every row in a snapshot is measured
+against the same instant.
+
 **Nothing here asks a worker anything.** The verdicts come from beats already
 written, never from signalling the process, because asking a wedged process a
 question can change its answer: a raw syscall in native code that does not
@@ -50,6 +56,8 @@ from .capture.events import head_events, tail_events, this_run
 from .capture.heartbeat import DEFAULT_INTERVAL
 from .capture.state import ELIDED, read_state
 from .probes import is_running
+from .schedule import read as read_schedule
+from .schedule import worker_rows
 
 #: Written at the top of a run's directory by the controller. Its presence is
 #: what makes a directory a run of ours rather than somebody's build output.
@@ -152,8 +160,13 @@ def run(
     # saving is the same either way, because what costs is reading the file
     # rather than listing it.
     wanted = _wanted(only)
+    # One read for the whole run, not one per worker: it is a single file the
+    # controller assembles from a single object, and reading it per worker
+    # would report a run whose rows came from different instants.
+    schedule = read_schedule(directory)
+    rows = worker_rows(schedule)
     workers = [
-        worker(state, moment)
+        worker(state, moment, rows.get(state.stem))
         for state in sorted(directory.glob("*.state"))
         if wanted is None or state.stem in wanted
     ]
@@ -169,11 +182,28 @@ def run(
             "alive": is_running(int(controller_pid)) if controller_pid else None,
         },
         "started_at": owner.get("started_at"),
+        "schedule": _schedule_summary(schedule),
         "workers": workers,
     }
 
 
-def worker(state_path: Path, now: float) -> dict[str, Any]:
+def _schedule_summary(schedule: dict[str, Any]) -> dict[str, Any]:
+    """The run-level half of the schedule record, without the per-worker rows.
+
+    Those are already on the workers, and a payload that carried them twice
+    would let a consumer join a row to a worker it does not belong to. What is
+    left is what a worker's own numbers cannot say: how big the run is, how
+    much of it is nobody's yet, and whether any of it can still move.
+    """
+    return {
+        name: schedule.get(name)
+        for name in ("dist", "collected", "unassigned", "settled", "updated_at")
+    }
+
+
+def worker(
+    state_path: Path, now: float, schedule: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
     """One worker: what it is doing, and whether it is still doing it.
 
     The events are read before the state, and that order is the point. An
@@ -200,6 +230,10 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
     reached with a run id wrote a run's worth of real evidence, and discarding
     that to guard against nothing would report a live worker as one that never
     started.
+
+    ``schedule`` is this worker's row out of the controller's record, or None
+    where there is not one. It is passed in rather than read here because it
+    lives in one file for the whole run - see :func:`run`.
     """
     events = tail_events(state_path.with_name(f"{state_path.stem}.events"))
     run_id = _worker_run_id(events)
@@ -207,6 +241,7 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
     record = read_state(state_path, run_id)
     beats = [event for event in events if event.get("event") == "heartbeat"]
 
+    assigned, running, queued = _progress(record, schedule or {})
     pid = record.get("pid")
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
@@ -226,6 +261,19 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
         "phase": record.get("phase"),
         "tests_started": record.get("tests_started"),
         "tests_finished": record.get("tests_finished"),
+        # The denominator for the two above, and the only figure here that
+        # does not come out of this worker's own files: no worker knows how
+        # much it has been given, so the controller works it out and writes it
+        # down - see :mod:`.schedule`. None where there is no scheduler to ask
+        # (a single-process run) or none yet (before the workers have
+        # collected), which is not the same as a worker with nothing to do.
+        "tests_assigned": assigned,
+        # And that total split three ways, so it adds up: the test in flight,
+        # if there is one, and the ones not begun. Every test this worker was
+        # given is in exactly one of finished, running and queued - see
+        # _progress for why "what is left" was the wrong shape.
+        "tests_running": running,
+        "tests_queued": queued,
         "state_age_s": _age(now, record.get("time")),
         "rss_mb": beats[-1].get("rss_mb") if beats else None,
         "status": status,
@@ -237,6 +285,59 @@ def worker(state_path: Path, now: float) -> dict[str, Any]:
         # produces exactly the second one.
         "cpu_rate": None if rate is None else round(rate, 3),
     }
+
+
+def _progress(
+    record: dict[str, Any], schedule: dict[str, Any]
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """This worker's total, split into three counts that do not overlap.
+
+    ``finished``, ``running`` and ``queued`` partition ``assigned``: every test
+    it was given is in exactly one of them, so they add up and no two of them
+    count the same test. That is the whole reason for the shape. Reporting
+    what was *left* instead read naturally and was a trap - "not finished"
+    includes the test in flight, and so does ``tests_started``, so the two
+    obvious numbers to add were the two that overlapped, and a row saying
+    ``started 2, pending 2, assigned 3`` looked broken while being correct.
+
+    The counts come from two processes: ``assigned`` from the controller, into
+    one file for the whole run, and the rest from the worker's own slot. A row
+    that took them as it found them could say a worker had finished more tests
+    than it was ever given - not a lag a reader can interpret, but a row that
+    cannot be true. It happened, on a suite whose tests were shorter than the
+    interval the controller's file was then written on.
+
+    So the worker's own count is a floor under the total, and it is
+    ``tests_started`` rather than ``tests_finished`` that does the flooring: a
+    worker cannot *start* a test it was never given either, and a floor set at
+    the lower of the two would leave ``queued`` below zero for exactly as long
+    as a test was in flight.
+    """
+    assigned = _count(schedule.get("assigned"))
+    if assigned is None:
+        return None, None, None
+    finished = _count(record.get("tests_finished"))
+    started = _count(record.get("tests_started"))
+    if finished is None or started is None or finished > started:
+        # The total still stands on its own; the split does not, and inventing
+        # one out of a record this far from making sense would be a row that
+        # looks whole and is not.
+        return assigned, None, None
+    assigned = max(assigned, started)
+    return assigned, started - finished, assigned - started
+
+
+def _count(value: Any) -> Optional[int]:
+    """``value`` if it is a count this arithmetic can stand on, else None.
+
+    Every field here is read out of a JSON file that something else could have
+    written, so "a whole number, not negative" is checked rather than assumed -
+    and ``True`` is an ``int`` in Python, which an isinstance check alone would
+    wave through into the subtraction below.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _worker_run_id(events: list[dict[str, Any]]) -> Optional[str]:
