@@ -214,8 +214,12 @@ class Settings:
     stack_server_port: int = PORT_LOTTERY
     #: What the server binds. Loopback keeps it off the network, which is
     #: right on a laptop and wrong in a container, where the UI is outside and
-    #: 127.0.0.1 is unreachable from there. Anything else is a deliberate
-    #: exposure and says so.
+    #: 127.0.0.1 is unreachable from there. Anything else needs a token and is
+    #: refused without one - see refuses_to_bind_unauthenticated. With one it
+    #: is the deliberate exposure a container needs, and nothing is said about
+    #: it: the advice that used to restate the bind on every run was telling
+    #: the person who typed the address what they had typed, in the one place
+    #: it is typed for, at every start of every job.
     stack_server_host: str = DEFAULT_STACK_SERVER_HOST
     #: Whether the live server may answer ``/stack?locals`` with each frame's
     #: variables.
@@ -276,7 +280,6 @@ class Settings:
         object.__setattr__(self, "stack_server_port", int(self.stack_server_port))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
-        self._warn_if_the_stack_server_is_reachable_from_off_the_machine()
 
     def _usable_tracer(self) -> str:
         """The policy as written, or the default with the reason said out loud.
@@ -352,35 +355,6 @@ class Settings:
             "not a port - the range is 0-65535, where 0 means draw a free one. "
             "The live stack server cannot bind this and will report itself "
             "unavailable; the run is otherwise unaffected",
-        )
-
-    def _warn_if_the_stack_server_is_reachable_from_off_the_machine(self) -> None:
-        """Binding anything but loopback is a decision, and it is worth saying
-        out loud that it was made.
-
-        The server answers with the stack of any local process it can read. On
-        loopback the bind is the whole boundary and bounds the reachable set
-        to this machine; off loopback that boundary becomes the network, which
-        inside a cluster is every other pod.
-
-        With a token that is a decision worth stating rather than a problem:
-        the exposure is deliberate, which is what a container whose UI lives
-        outside it needs. Without one it cannot be deliberate - nobody chooses
-        to serve every process's stack to a cluster - so that combination is
-        refused rather than warned about, and this says nothing about it.
-        """
-        if not self.stack_server or self.stack_server_host in LOOPBACK:
-            return
-        if not self.stack_server_token:
-            return  # refused instead; see refuses_to_bind_unauthenticated
-        advise(
-            f"the live stack server is bound to {self.stack_server_host}, not "
-            "loopback, so anything that can reach this host on port "
-            f"{self.stack_server_port or '<drawn at random>'} and holds the token "
-            "can read the stack of any process it serves. Off loopback the "
-            "boundary is the network plus that token, rather than this machine. "
-            "This is what a container whose UI is outside it needs; it is not "
-            "what a shared machine or a routable host wants",
         )
 
     @property
