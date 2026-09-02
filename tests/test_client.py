@@ -34,11 +34,9 @@ from pytest_failure_instrumentation.client import (  # noqa: E402 - after the sk
     FailureServerClient,
     Fleet,
     NotFound,
-    PublishedServer,
     ReaderFailed,
     ServerRefused,
     ServerUnreachable,
-    discover_servers,
     read_fleet,
 )
 
@@ -333,40 +331,19 @@ def test_naming_no_server_at_all_is_refused_before_any_request():
 # -- the fleet ------------------------------------------------------------
 
 
-def test_discovery_finds_the_servers_that_published_an_address(serving, tmp_path: Path):
-    """The address files are the only place the port appears.
+def reachable(service: stack_server.StackService, token: str = "") -> LiveStackServer:
+    """The payload a run reports, which is all a fleet read needs.
 
-    ``/workers`` describes the machine and never states its own address, so a
-    consumer that was not handed a LiveStackServer finds one this way.
+    Built here the way the hook builds it: the bound port rather than the
+    requested one, and the run's own token.
     """
-    published_into = run_directory(tmp_path)
-    service = serving(directory=published_into)
-
-    published = wait_for(lambda: discover_servers(published_into))
-    assert published, "the serving session published no address"
-    assert published[0].port == service.bound_port
-    assert published[0].url == service.url
-    assert published[0].service == stack_server.SERVICE
-
-
-def test_a_stale_address_is_dropped_unless_it_is_asked_for(tmp_path: Path):
-    """A session killed hard never retracts its file.
-
-    Trusting one costs a caller its whole timeout on a port nobody is
-    listening to - but the check reads the kernel, which only answers for this
-    machine, so a shared directory has to be able to opt out of it.
-    """
-    dead = tmp_path / "callstack-999999.json"
-    dead.write_text('{"service": "x", "host": "127.0.0.1", "port": 1, "url": "http://127.0.0.1:1"}')
-
-    assert discover_servers(tmp_path) == []
-    assert len(discover_servers(tmp_path, include_dead=True)) == 1
-
-
-def test_a_half_written_address_is_skipped_rather_than_raised_on(tmp_path: Path):
-    # This runs against a directory a live run is writing into.
-    (tmp_path / f"callstack-{os.getpid()}.json").write_text("{not json at all")
-    assert discover_servers(tmp_path) == []
+    return LiveStackServer(
+        service=stack_server.SERVICE,
+        url=service.url,
+        host=service.host,
+        port=service.bound_port or 0,
+        token=token,
+    )
 
 
 def evidence_with_worker(root: Path, session: str, name: str) -> Path:
@@ -388,11 +365,11 @@ def evidence_with_worker(root: Path, session: str, name: str) -> Path:
     return directory
 
 
-def test_the_fleet_reads_every_server_and_says_where_each_worker_is(serving, tmp_path: Path):
+def test_the_fleet_reads_every_server(serving, tmp_path: Path):
     first = serving(directory=run_directory(tmp_path))
     second = serving(directory=run_directory(tmp_path))
 
-    fleet = run(read_fleet([first.url, second.url]))
+    fleet = run(read_fleet([reachable(first), reachable(second)]))
 
     assert len(fleet.answered) == 2
     assert fleet.silent == []
@@ -410,7 +387,7 @@ def test_two_machines_can_hold_the_same_worker_name_and_the_same_pid(serving, tm
     here = serving(directory=evidence_with_worker(tmp_path / "here", "run-a", "gw0"))
     there = serving(directory=evidence_with_worker(tmp_path / "there", "run-b", "gw0"))
 
-    fleet = run(read_fleet([here.url, there.url]))
+    fleet = run(read_fleet([reachable(here), reachable(there)]))
 
     rows = fleet.workers
     assert len(rows) == 2
@@ -430,7 +407,7 @@ def test_one_host_that_did_not_answer_costs_only_that_host(serving, tmp_path: Pa
     alive = serving(directory=run_directory(tmp_path))
     gone = f"http://127.0.0.1:{free_port()}"
 
-    fleet = run(read_fleet([alive.url, gone]))
+    fleet = run(read_fleet([reachable(alive), LiveStackServer(url=gone)]))
 
     assert [member.url for member in fleet.answered] == [alive.url]
     silent = fleet.silent
@@ -449,48 +426,12 @@ def test_a_refusal_is_kept_beside_the_servers_that_answered(serving, tmp_path: P
     answering = serving(directory=run_directory(tmp_path))
     bare = serving()
 
-    fleet = run(read_fleet([answering.url, bare.url]))
+    fleet = run(read_fleet([reachable(answering), reachable(bare)]))
 
     refused = [member for member in fleet.members if member.url == bare.url][0]
     assert refused.status == 503
     assert refused.error and "evidence directory" in refused.error
     assert len(fleet.answered) == 1
-
-
-def test_a_published_server_carries_its_address_into_the_fleet(serving, tmp_path: Path):
-    published_into = run_directory(tmp_path)
-    service = serving(directory=published_into)
-    published = wait_for(lambda: discover_servers(published_into))
-
-    fleet = run(read_fleet(published))
-
-    assert len(fleet.answered) == 1
-    member = fleet.members[0]
-    assert member.server is not None
-    assert member.server.port == service.bound_port
-
-
-def test_a_live_stack_server_brings_its_own_token(serving, tmp_path: Path):
-    """A fleet can span runs, and two runs need not share a token."""
-    guarded = serving(directory=run_directory(tmp_path), token="s3cret")
-
-    named = LiveStackServer(
-        service=stack_server.SERVICE,
-        url=guarded.url,
-        host=guarded.host,
-        port=guarded.bound_port or 0,
-        token="s3cret",
-    )
-    assert run(read_fleet([named])).answered
-
-    # And without it, the same server refuses - so the token above was doing
-    # the work rather than the run being open.
-    assert run(read_fleet([guarded.url])).silent
-
-
-def test_an_entry_that_is_not_a_server_is_refused_by_type(serving):
-    with pytest.raises(TypeError):
-        run(read_fleet([object()]))
 
 
 def test_an_empty_fleet_is_a_fleet(tmp_path: Path):
@@ -510,36 +451,17 @@ def test_every_server_is_reached_with_its_own_token(serving, tmp_path: Path):
     """
     first = serving(directory=run_directory(tmp_path / "a"), token="first-secret")
     second = serving(directory=run_directory(tmp_path / "b"), token="second-secret")
-    tokens = {first.url: "first-secret", second.url: "second-secret"}
 
-    published = [
-        PublishedServer(url=service.url, host=service.host, port=service.bound_port or 0)
-        for service in (first, second)
-    ]
-    fleet = run(read_fleet([entry.with_token(tokens[entry.url]) for entry in published]))
-
+    fleet = run(read_fleet([reachable(first, "first-secret"), reachable(second, "second-secret")]))
     assert len(fleet.answered) == 2, [member.error for member in fleet.members]
 
     # And swapped, to show the tokens were doing the work rather than the
     # servers being open: each is refused the other's.
     swapped = run(
-        read_fleet([
-            published[0].with_token(tokens[second.url]),
-            published[1].with_token(tokens[first.url]),
-        ])
+        read_fleet([reachable(first, "second-secret"), reachable(second, "first-secret")])
     )
     assert len(swapped.silent) == 2
     # Refused on the credential, and saying so: not the same as a host that is
     # gone, and not something restarting a machine would fix.
     assert [member.status for member in swapped.silent] == [401, 401]
     assert all("token" in (member.error or "") for member in swapped.silent)
-
-
-def test_one_token_still_covers_a_fleet_that_shares_one(serving, tmp_path: Path):
-    # The fallback, for the entries that cannot carry their own: an address
-    # file holds no credential, and a bare URL is only a string.
-    first = serving(directory=run_directory(tmp_path / "a"), token="shared")
-    second = serving(directory=run_directory(tmp_path / "b"), token="shared")
-
-    fleet = run(read_fleet([first.url, second.url], token="shared"))
-    assert len(fleet.answered) == 2

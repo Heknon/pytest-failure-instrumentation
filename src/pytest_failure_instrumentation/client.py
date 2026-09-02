@@ -23,21 +23,14 @@ and a run that never talks to a live view never pays for it - see the
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 from .live_view import LiveStackServer
-from .stack_server import (
-    AUTH_HEADER,
-    AUTH_SCHEME,
-    DISCOVERY_PREFIX,
-    DISCOVERY_SUFFIX,
-)
+from .stack_server import AUTH_HEADER, AUTH_SCHEME
 
 try:  # pragma: no cover - exercised by the import test
     import httpx
@@ -520,103 +513,6 @@ def _message(response: httpx.Response, payload: dict[str, Any]) -> str:
 # it is a pid on.
 
 
-class PublishedServer(_Wire):
-    """A server's address, as it wrote it down for anyone to find.
-
-    This is the ``callstack-<pid>.json`` a serving session publishes, and it is
-    the only place the port appears: ``/workers`` describes the machine and
-    never states its own address, so a caller that did not keep the address it
-    dialled cannot recover it from the answer.
-
-    No token. The file held one once, and taking it out is what let the file be
-    world-readable so a UI running as another uid can find the run at all.
-    """
-
-    service: str = ""
-    version: str = ""
-    #: The serving session. Under xdist the controller, and none of the pids
-    #: ``/workers`` reports on. The discovery file is named for it, so that two
-    #: sessions sharing a directory do not overwrite each other's address.
-    pid: int = 0
-    host: str = ""
-    #: What got bound, never what was asked for: a drawn port is requested as 0.
-    port: int = 0
-    url: str = ""
-    drawn: bool = False
-    started_at: Optional[float] = None
-
-    def with_token(self, token: str = "") -> LiveStackServer:
-        """This address, plus the credential it takes to be let in.
-
-        The address file carries no token - taking the credential out of it is
-        what let it be world-readable, so a UI running as another uid can find
-        the run at all - and the token is not one value per fleet either. It is
-        one per *run*: two sessions on one machine can have been started with
-        different ones, and two hosts almost certainly were.
-
-        So this is the seam. A caller that knows which token goes with which
-        address pairs them here, and hands :func:`read_fleet` a server that
-        brings its own rather than one the fleet has to guess for::
-
-            servers = [found.with_token(tokens[found.url])
-                       for found in discover_servers(directory)]
-        """
-        return LiveStackServer(
-            service=self.service,
-            version=self.version,
-            url=self.url,
-            host=self.host,
-            port=self.port,
-            token=token,
-            pid=self.pid,
-        )
-
-
-def discover_servers(directory: Path, *, include_dead: bool = False) -> list[PublishedServer]:
-    """Every server that has published an address under ``directory``.
-
-    The evidence directory is the join key a product has from the first moment
-    of a run, before xdist has built a run id, so this is how a consumer that
-    was not handed a :class:`~.live_view.LiveStackServer` finds one.
-
-    A session killed hard never retracts its file, and trusting a stale one
-    costs a caller its whole timeout on a port nobody is listening to - so a
-    record whose process is gone is dropped. That check reads the pid out of
-    the filename and asks the kernel, which only answers for *this* machine:
-    pass ``include_dead`` where the directory is shared from somewhere else and
-    the local answer would be meaningless.
-
-    Unreadable and half-written files are skipped rather than raised on. This
-    runs against a directory a live run is writing into, and a caller asking
-    who is serving should not be handed an exception because one file was mid
-    rename.
-    """
-    try:
-        candidates = sorted(directory.glob(f"{DISCOVERY_PREFIX}*{DISCOVERY_SUFFIX}"))
-    except OSError:
-        return []
-
-    found: list[PublishedServer] = []
-    for path in candidates:
-        if not include_dead and not _still_running(path):
-            continue
-        try:
-            record = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if isinstance(record, dict):
-            found.append(PublishedServer.model_validate(record))
-    return found
-
-
-def _still_running(path: Path) -> bool:
-    """Whether the session that published this address is still alive."""
-    from .probes.process import is_running
-
-    pid = path.stem[len(DISCOVERY_PREFIX) :]
-    return is_running(int(pid)) if pid.isdigit() else True
-
-
 class FleetMember(_Wire):
     """One server's answer, or the reason there is not one.
 
@@ -624,13 +520,15 @@ class FleetMember(_Wire):
     workers, and a fleet that dropped it would read as smaller rather than as
     partly unknown - which is the difference between "the run is nearly done"
     and "we cannot see half of it".
+
+    The address identifies the member, and the token deliberately is not here:
+    this is a model, and a model gets dumped into a log.
     """
 
     #: The address asked, which is what identifies this member: a pid is unique
     #: on one machine and nowhere else, so a consumer flattening the fleet into
     #: rows needs this beside each one.
     url: str = ""
-    server: Optional[PublishedServer] = None
     snapshot: Optional[WorkersSnapshot] = None
     #: The refusal, verbatim, or the transport failure. None where it answered.
     error: Optional[str] = None
@@ -687,31 +585,26 @@ class Fleet(_Wire):
 
 
 async def read_fleet(
-    servers: Sequence[Any],
+    servers: Sequence[LiveStackServer],
     *,
-    token: str = "",
     only: Optional[Sequence[str]] = None,
     timeout: Optional[float] = None,
     client: Optional[httpx.AsyncClient] = None,
 ) -> Fleet:
     """Ask every server at once, and keep what each of them said.
 
-    ``servers`` takes whatever a caller has: the
-    :class:`~.live_view.LiveStackServer` payloads a run reported, the
-    :class:`PublishedServer` records :func:`discover_servers` found, or bare
-    URL strings.
+    Takes the :class:`~.live_view.LiveStackServer` payloads the runs reported
+    to :func:`~.hookspec.pytest_failure_server_ready`, since that is where a
+    bound port, a URL already bracketed for an IPv6 literal and the run's own
+    token arrive together - a caller holding one has everything it takes to
+    reach that server. One built by hand is as good: every field has a default.
 
     **A token belongs to a run, not to a fleet.** Two sessions on one machine
-    can have been started with different ones, and two hosts almost certainly
-    were - so each entry carries its own where it has one, and a
-    ``LiveStackServer`` always does. ``token`` is the fallback for the entries
-    that cannot: an address file holds no credential by design, and a bare URL
-    is just a string. Where those need one each, pair them first with
-    :meth:`PublishedServer.with_token` rather than reaching for this.
-
-    The headers go out per request rather than on the transport, so servers on
-    different tokens share one connection pool without ever being sent each
-    other's.
+    can have been started with different ones and two hosts almost certainly
+    were, so each server is reached with the token it carries rather than with
+    one the fleet had to be told. The headers go out per request rather than on
+    the transport, so servers on different tokens share one connection pool
+    without ever being sent each other's.
 
     **One host failing costs only that host.** The reads run concurrently and
     every failure is caught per member, because the case this exists for is
@@ -721,16 +614,11 @@ async def read_fleet(
     """
     if client is None:
         async with httpx.AsyncClient(timeout=timeout or DEFAULT_TIMEOUT) as owned:
-            return await read_fleet(
-                servers, token=token, only=only, timeout=timeout, client=owned
-            )
+            return await read_fleet(servers, only=only, timeout=timeout, client=owned)
 
-    async def ask(entry: Any) -> FleetMember:
-        url, carried, published = _target(entry, token)
-        member = FleetMember(url=url, server=published)
-        reader = FailureServerClient(
-            url=url, token=carried, timeout=timeout or DEFAULT_TIMEOUT, client=client
-        )
+    async def ask(server: LiveStackServer) -> FleetMember:
+        member = FleetMember(url=server.url.rstrip("/"))
+        reader = FailureServerClient(server, timeout=timeout or DEFAULT_TIMEOUT, client=client)
         try:
             member.snapshot = await reader.workers(only=only, timeout=timeout)
         except ServerRefused as refused:
@@ -744,23 +632,5 @@ async def read_fleet(
             member.error = str(failed)
         return member
 
-    gathered = await asyncio.gather(*(ask(entry) for entry in servers))
+    gathered = await asyncio.gather(*(ask(server) for server in servers))
     return Fleet(observed_at=round(time.time(), 3), members=list(gathered))
-
-
-def _target(entry: Any, token: str) -> tuple[str, str, Optional[PublishedServer]]:
-    """One entry of ``servers``, as an address and the token to reach it with."""
-    if isinstance(entry, str):
-        return entry.rstrip("/"), token, None
-    if isinstance(entry, LiveStackServer):
-        # Its own, which is the point of being handed the payload: a fleet can
-        # span runs, and two runs need not have been started with one token.
-        return entry.url.rstrip("/"), entry.token, None
-    if isinstance(entry, PublishedServer):
-        # The address files carry no token by design, so this one falls back to
-        # the caller's.
-        return entry.url.rstrip("/"), token, entry
-    raise TypeError(
-        "a server is a LiveStackServer, a PublishedServer or a URL string, "
-        f"not {type(entry).__name__}"
-    )
