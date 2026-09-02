@@ -105,8 +105,9 @@ spelling of this bind is refused - see :meth:`_Handler._addressed_to_this_server
 
 **What it binds.** Loopback by default. A container is the exception that makes
 it configurable: its UI lives outside it, and 127.0.0.1 inside a container is
-unreachable from there. Binding anything else warns - and *without a token is
-refused outright*, before the socket is opened. Serving every local process's
+unreachable from there. Binding anything else *without a token is refused
+outright*, before the socket is opened; with one it is the deliberate exposure
+a container needs, and nothing more is said. Serving every local process's
 stack to whatever can route to the host is not a thing anybody configures on
 purpose, and a warning is the wrong instrument for it: by the time one is read
 the port has been open for the length of the run.

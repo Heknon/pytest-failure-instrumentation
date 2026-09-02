@@ -272,52 +272,56 @@ def test_no_port_asked_for_means_one_is_drawn():
     assert resolve(FakeConfig()).stack_server_host == "127.0.0.1"
 
 
-def test_the_command_line_outranks_ini_for_the_address():
+def test_the_command_line_outranks_ini_for_the_address(monkeypatch):
     """These answer "where does this run happen", which the person starting it
-    knows and the repository does not."""
-    with pytest.warns(FailureInstrumentationWarning):  # 0.0.0.0 is an exposure
-        resolved = resolve(
-            FakeConfig(
-                {
-                    "callstack_port": 9111,
-                    "callstack_host": "0.0.0.0",
-                    "callstack_token": "s3cret",
-                },
-                failure_stack_server_port="8080",
-                failure_stack_server_host="127.0.0.1",
-                failure_stack_server="true",
-            )
+    knows and the repository does not.
+
+    The token is there so the bind is not refused, and it comes from the
+    environment so that argv's own advice about a token typed there stays out
+    of a test about the address.
+    """
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
+    resolved = resolve(
+        FakeConfig(
+            {
+                "callstack_port": 9111,
+                "callstack_host": "0.0.0.0",
+            },
+            failure_stack_server_port="8080",
+            failure_stack_server_host="127.0.0.1",
+            failure_stack_server="true",
         )
+    )
     assert resolved.stack_server_port == 9111
     assert resolved.stack_server_host == "0.0.0.0"
 
 
-def test_naming_either_one_on_the_command_line_switches_the_server_on():
+def test_naming_either_one_on_the_command_line_switches_the_server_on(monkeypatch):
     """An option that is accepted, parsed and then ignored because a separate
     ini flag was left at its default is the worst available behaviour."""
+    monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
     assert resolve(FakeConfig({"callstack_port": 9111})).stack_server
-    with pytest.warns(FailureInstrumentationWarning):  # 0.0.0.0 is an exposure
-        assert resolve(
-            FakeConfig({"callstack_host": "0.0.0.0", "callstack_token": "s3cret"})
-        ).stack_server
+    assert resolve(FakeConfig({"callstack_host": "0.0.0.0"})).stack_server
     assert not resolve(FakeConfig()).stack_server
 
 
-def test_binding_off_loopback_says_what_it_exposes(monkeypatch):
-    """Right for a container whose UI is outside it, wrong on a shared machine,
-    and only the person who typed it can tell which this is.
-
-    Only reachable with a token, because without one this configuration is
-    refused rather than warned about - nobody means to serve every local
-    process's stack to a network, so there is no decision there to state.
+def test_binding_off_loopback_with_a_token_is_not_warned_about(monkeypatch):
+    """A bind off loopback is a decision, and with a token it is a complete
+    one: the exposure is deliberate, and it is what a container whose UI lives
+    outside it needs. It used to be advised about anyway, on every run, and
+    what the advice said was the address the person had just typed - in the
+    one place it is typed for, at every start of every job. Without a token
+    the same bind is refused rather than warned about (see below), so there is
+    no case left in which this configuration has anything to say.
 
     The token comes from the environment rather than the command line so that
-    the bind is the only thing this run is advised about; argv carries its own
-    warning now, which has nothing to do with what is being asserted here.
+    argv's own advice, which has nothing to do with the bind, stays out of it.
     """
     monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
-    with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
+    with warnings.catch_warnings(record=True) as raised:
+        warnings.simplefilter("always")
         resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+    assert [str(entry.message) for entry in raised] == []
 
 
 def test_loopback_by_any_of_its_names_is_not_an_exposure():
@@ -335,11 +339,12 @@ def test_advice_about_a_setting_cannot_end_the_run_that_asked_for_it(pytester):
     INTERNALERROR: exit status 3, not one test collected.
 
     Measured on the branch that added it: ``--callstack-host 0.0.0.0`` - the
-    documented way to reach the live view from outside a container, which
-    warns *on purpose* because it is a genuine exposure - ended the session
-    that way on any project with that filter. So did an unreadable
-    ``failure_stall_seconds``. The class docstring has always said these are
-    "never an error"; now they cannot be.
+    documented way to reach the live view from outside a container, which at
+    the time warned about the bind - ended the session that way on any project
+    with that filter. So did an unreadable ``failure_stall_seconds``. The
+    class docstring has always said these are "never an error"; now they
+    cannot be. The bind no longer warns; the token typed on the same command
+    line still does, and that is the advice this run now has to survive.
     """
     pytester.makeini(
         """
@@ -357,9 +362,9 @@ def test_advice_about_a_setting_cannot_end_the_run_that_asked_for_it(pytester):
     result.assert_outcomes(passed=1)
     assert result.ret == 0, result.stdout.str()
     assert "INTERNALERROR" not in result.stdout.str()
-    # Downgraded, not dropped: the exposure is still reported, in the same
-    # place it lands on a project with no filter at all.
-    assert "boundary is the network" in result.stderr.str()
+    # Downgraded, not dropped: the advice is still given, in the same place it
+    # lands on a project with no filter at all.
+    assert "--callstack-token puts the token" in result.stderr.str()
 
 
 def test_the_token_comes_from_the_command_line_or_the_environment(monkeypatch):
@@ -400,7 +405,7 @@ def test_a_token_alone_does_not_start_a_server(monkeypatch):
 def test_off_loopback_without_a_token_is_refused_rather_than_warned_about(monkeypatch):
     """Nobody configures "serve every local process's stack to the network",
     so it is not a decision to warn about - it is one to decline. With a token
-    it becomes a decision, and gets the warning instead."""
+    it becomes a decision, and is left alone."""
     monkeypatch.delenv(settings_module.TOKEN_ENV, raising=False)
     open_to_the_world = resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
     assert open_to_the_world.refuses_to_bind_unauthenticated
@@ -412,8 +417,7 @@ def test_off_loopback_without_a_token_is_refused_rather_than_warned_about(monkey
     assert [str(entry.message) for entry in raised] == []
 
     monkeypatch.setenv(settings_module.TOKEN_ENV, "s3cret")
-    with pytest.warns(FailureInstrumentationWarning, match="boundary is the network"):
-        guarded = resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
+    guarded = resolve(FakeConfig({"callstack_host": "0.0.0.0"}))
     assert not guarded.refuses_to_bind_unauthenticated
 
 
