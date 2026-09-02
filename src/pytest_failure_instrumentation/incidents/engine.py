@@ -677,6 +677,11 @@ class IncidentEngine:
                 # never written down - see the stack server's module docstring
                 # for why the address is published and the secret is not.
                 self.settings.stack_server_token,
+                # Whether ?locals may be answered. A frame's variables are the
+                # data a test is working on, so this is the one thing a server
+                # serves that a deployment might want withheld from a reader it
+                # otherwise trusts with the frames.
+                self.settings.stack_server_locals,
             )
 
         if self.settings.sample_seconds > 0 and not self._anything_records():

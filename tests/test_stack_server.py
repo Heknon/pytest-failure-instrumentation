@@ -818,29 +818,27 @@ def test_reads_of_other_processes_are_bounded(monkeypatch):
     held = __import__("threading").Event()
     released = __import__("threading").Event()
 
-    def slow_read(pid):
+    def slow_read(pid, options=None):
         held.set()
         released.wait(10)
-        return [], None
+        return pyspy.Reading([], None, options or pyspy.StackOptions())
 
-    monkeypatch.setattr(stack_server.stacks, "live_stack", slow_read)
+    monkeypatch.setattr(stack_server.stacks, "live_reading", slow_read)
     hog = __import__("threading").Thread(
         target=stack_server.read_stack, args=(os.getpid() + 1,), daemon=True
     )
     hog.start()
     try:
         assert held.wait(10)
-        threads, error, source = stack_server.read_stack(os.getpid() + 1)
-        assert threads is None
-        assert "already in flight" in error
-        assert source == "py-spy"
+        reading = stack_server.read_stack(os.getpid() + 1)
+        assert reading.threads is None
+        assert "already in flight" in reading.error
     finally:
         released.set()
         hog.join(timeout=10)
 
     # And the slot comes back once the reader in flight is done.
-    threads, error, _ = stack_server.read_stack(os.getpid() + 1)
-    assert error is None
+    assert stack_server.read_stack(os.getpid() + 1).error is None
 
 
 # -- drawing a port rather than claiming one ------------------------------
@@ -1903,3 +1901,379 @@ def test_a_named_port_on_an_unbindable_host_says_so_and_stops(tmp_path):
     assert "203.0.113.1" in detail
     # And it stopped rather than settling into a retry loop.
     assert not service.serving
+
+# -- what the reader was asked for, and what it did -----------------------
+
+
+def _reading(monkeypatch, payload: bytes, returncode: int = 0, stderr: bytes = b""):
+    """py-spy replaced by a fixed answer, so option handling is what is tested.
+
+    The mapping from py-spy's JSON to this package's shape is the thing under
+    test in several of these, and pinning the JSON is what makes them say
+    something on a machine with no py-spy and no process worth reading.
+    """
+
+    class Finished:
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.stdout = payload
+            self.stderr = stderr
+
+    recorded: list[list[str]] = []
+
+    def run(command, **kwargs):
+        recorded.append(list(command))
+        return Finished()
+
+    monkeypatch.setattr(pyspy, "executable", lambda: "/nonexistent/py-spy")
+    monkeypatch.setattr(pyspy.subprocess, "run", run)
+    return recorded
+
+
+#: One Python frame and one native frame, in py-spy's own shape - a native
+#: frame carries the binary in ``module`` and has no line, which is what tells
+#: the two apart.
+TWO_KINDS_OF_FRAME = json.dumps(
+    [
+        {
+            "thread_id": 7,
+            "thread_name": "MainThread",
+            "os_thread_id": 4242,
+            "owns_gil": True,
+            "active": True,
+            "frames": [
+                {
+                    "name": "sqlite3_step",
+                    "filename": "/usr/lib/_sqlite3.so",
+                    "module": "/usr/lib/_sqlite3.so",
+                    "line": 0,
+                    "locals": None,
+                },
+                {
+                    "name": "waiting",
+                    "filename": "/src/app.py",
+                    "module": None,
+                    "line": 41,
+                    "locals": [
+                        {"name": "lease", "addr": 94, "arg": True, "repr": '"l-77"'},
+                        {"name": "waited", "addr": 95, "arg": False, "repr": "27.4"},
+                    ],
+                },
+            ],
+        }
+    ]
+).encode()
+
+
+def test_each_option_reaches_py_spy_as_its_own_flag(monkeypatch):
+    """The three are independent and each has to actually be passed on."""
+    for options, expected in [
+        (pyspy.StackOptions(), []),
+        (pyspy.StackOptions(native=True), ["--native"]),
+        (pyspy.StackOptions(locals=True), ["--locals"]),
+        (pyspy.StackOptions(nonblocking=True), ["--nonblocking"]),
+        (pyspy.StackOptions(native=True, locals=True), ["--native", "--locals"]),
+    ]:
+        recorded = _reading(monkeypatch, b"[]")
+        pyspy.read(4321, options)
+        # --pid is how the target is named rather than an option, so it is
+        # not part of what this is checking.
+        chosen = [
+            flag
+            for flag in recorded[0]
+            if flag.startswith("--") and flag not in ("--pid",)
+        ]
+        assert chosen == ["--json", *expected]
+
+
+def test_native_gives_way_to_nonblocking_and_says_so(monkeypatch):
+    """py-spy refuses the pair outright, so passing both through would turn a
+    request that can be answered into a failed read.
+
+    Native is the half that goes: --nonblocking is a promise about the target,
+    and honouring native instead would pause a process somebody asked not to
+    have paused."""
+    recorded = _reading(monkeypatch, b"[]")
+    reading = pyspy.read(4321, pyspy.StackOptions(native=True, nonblocking=True))
+
+    assert "--native" not in recorded[0]
+    assert "--nonblocking" in recorded[0]
+    # What comes back is what was done, not what was asked for.
+    assert reading.options.native is False
+    assert reading.options.nonblocking is True
+    assert reading.notes and "refuses that pair" in reading.notes[0]
+
+
+def test_a_py_spy_that_cannot_unwind_still_answers_with_python_frames(monkeypatch):
+    """A build without native support is a reason to return fewer frames, not
+    a reason to return none - and the caller has to be told which it got."""
+    attempts: list[list[str]] = []
+
+    class Finished:
+        def __init__(self, command) -> None:
+            native = "--native" in command
+            self.returncode = 1 if native else 0
+            self.stdout = b"" if native else b"[]"
+            self.stderr = b"error: unexpected argument '--native'" if native else b""
+
+    def run(command, **kwargs):
+        attempts.append(list(command))
+        return Finished(command)
+
+    monkeypatch.setattr(pyspy, "executable", lambda: "/nonexistent/py-spy")
+    monkeypatch.setattr(pyspy.subprocess, "run", run)
+
+    reading = pyspy.read(4321, pyspy.StackOptions(native=True))
+
+    assert len(attempts) == 2, "the retry without --native never happened"
+    assert "--native" in attempts[0] and "--native" not in attempts[1]
+    assert reading.error is None and reading.threads == []
+    assert reading.options.native is False
+    assert reading.notes and "native frames" in reading.notes[0]
+
+
+def test_a_refused_attach_is_not_retried_as_a_native_problem(monkeypatch):
+    """The retry above must not swallow the failures that are about the
+    process rather than the flag - a refused ptrace re-read without --native
+    fails identically, and would be reported as a py-spy build feature."""
+    attempts = _reading(
+        monkeypatch,
+        b"",
+        returncode=1,
+        stderr=b"Failed to suspend process - Operation not permitted (os error 1)",
+    )
+    reading = pyspy.read(4321, pyspy.StackOptions(native=True))
+
+    assert len(attempts) == 1, "a permission failure was retried"
+    assert reading.error and "ptrace_scope" in reading.error
+    assert reading.notes == ()
+
+
+def test_locals_are_absent_rather_than_empty_when_nobody_asked(monkeypatch):
+    """None and [] are different answers: one says the caller did not ask, the
+    other says the frame holds nothing. A UI showing "no variables" for a
+    frame nobody requested variables for is reporting a fact it does not have.
+    """
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    without = pyspy.read(4321, pyspy.StackOptions())
+    assert [frame["locals"] for frame in without.threads[0]["frames"]] == [None, None]
+
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    with_them = pyspy.read(4321, pyspy.StackOptions(locals=True))
+    native, python = with_them.threads[0]["frames"]
+    # The native frame holds no Python variables, which is [] - not None, which
+    # would read as "you did not ask".
+    assert native["locals"] == []
+    assert python["locals"] == [
+        {"name": "lease", "repr": '"l-77"', "argument": True},
+        {"name": "waited", "repr": "27.4", "argument": False},
+    ]
+
+
+def test_a_locals_address_is_not_published(monkeypatch):
+    """py-spy offers the object's address, which says nothing about the value
+    and undoes what ASLR was buying."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    reading = pyspy.read(4321, pyspy.StackOptions(locals=True))
+    for frame in reading.threads[0]["frames"]:
+        for variable in frame["locals"] or []:
+            assert "addr" not in variable
+
+
+def test_a_native_frame_is_marked_by_its_module_not_its_line(monkeypatch):
+    """A Python frame in a generated file can have no useful line either, so
+    blaming the extension for that would be a wrong answer, not a missing
+    one."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    native, python = pyspy.read(4321).threads[0]["frames"]
+
+    assert native["native"] is True
+    assert native["module"] == "/usr/lib/_sqlite3.so"
+    assert native["line"] == 0
+    assert python["native"] is False
+    assert python["module"] is None
+
+
+def test_reading_without_a_pause_cannot_claim_to_know_who_holds_the_gil(
+    monkeypatch,
+):
+    """py-spy still reports both under --nonblocking, read at some instant
+    other than the one the frames came from. A UI captioning a thread from
+    that is being told something nobody measured."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    paused = pyspy.read(4321).threads[0]
+    assert paused["owns_gil"] is True and paused["active"] is True
+
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    unpaused = pyspy.read(4321, pyspy.StackOptions(nonblocking=True)).threads[0]
+    assert unpaused["owns_gil"] is None and unpaused["active"] is None
+    # The frames themselves are still the frames.
+    assert unpaused["frames"][0]["function"] == "sqlite3_step"
+    assert unpaused["os_thread_id"] == 4242
+
+
+# -- the options over HTTP ------------------------------------------------
+
+
+def test_the_stack_endpoint_reports_the_options_it_applied(monkeypatch, serving):
+    """A caller that showed its own request back to a user would caption
+    frames with a setting that did not produce them."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    port = free_port()
+    service = serving(port)
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(port, f"/stack?pid={os.getpid()}&native&nonblocking")
+    assert status == 200
+    assert body["options"] == {
+        "native": False,
+        "locals": False,
+        "nonblocking": True,
+    }
+    assert any("refuses that pair" in note for note in body["notes"])
+
+
+def test_a_bare_flag_switches_an_option_on(monkeypatch, serving):
+    """``?locals`` is how a URL carries a boolean, and reading it as false
+    would make the shortest spelling the one that does nothing. Only an
+    explicit falsehood is a no."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    port = free_port()
+    service = serving(port)
+    assert wait_for(lambda: service.serving), service.status
+
+    for query, expected in [
+        ("locals", True),
+        ("locals=1", True),
+        ("locals=true", True),
+        ("locals=0", False),
+        ("locals=false", False),
+        ("", False),
+    ]:
+        _, body = get(port, f"/stack?pid={os.getpid()}&{query}")
+        assert body["options"]["locals"] is expected, query
+
+
+def test_notes_are_absent_when_nothing_was_downgraded(monkeypatch, serving):
+    """Present means something was given up, so an always-empty list would
+    make the field say nothing."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    port = free_port()
+    service = serving(port)
+    assert wait_for(lambda: service.serving), service.status
+
+    _, body = get(port, f"/stack?pid={os.getpid()}&locals")
+    assert "notes" not in body
+
+
+def test_a_run_can_refuse_to_serve_locals_at_all(monkeypatch, serving):
+    """The variables are the one thing here that is the data a test works on
+    rather than the shape of the code, and no filter could tell a password
+    from a lease id - so the switch is honest and total."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    port = free_port()
+    service = serving(port, serves_locals=False)
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(port, f"/stack?pid={os.getpid()}&locals")
+    assert status == 403
+    assert "failure_stack_server_locals" in body["error"]
+
+    # The frames themselves are still served.
+    status, body = get(port, f"/stack?pid={os.getpid()}")
+    assert status == 200
+    assert body["threads"]
+
+
+# -- naming the process by worker -----------------------------------------
+
+
+def test_a_worker_can_be_named_instead_of_a_pid(monkeypatch, tmp_path, serving):
+    """A person looking at a stalled gw3 is asking about that worker. Making
+    them resolve it first costs a request whose answer can be stale by the
+    time the second one lands."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    a_run_of(tmp_path, gw0=os.getpid())
+    port = free_port()
+    service = serving(port, directory=tmp_path / "run-abc123")
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(port, "/stack?worker=gw0&locals")
+    assert status == 200
+    assert body["pid"] == os.getpid()
+    assert body["worker"] == "gw0"
+    assert body["threads"][0]["frames"][1]["locals"]
+
+
+def test_an_unknown_worker_is_not_found_rather_than_forbidden(
+    monkeypatch, tmp_path, serving
+):
+    """Unlike a pid, which may name a real process this server has no business
+    reading, a worker name is only ever a name in this run - so there is
+    nothing to refuse, only nothing to find."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    a_run_of(tmp_path, gw0=os.getpid())
+    port = free_port()
+    service = serving(port, directory=tmp_path / "run-abc123")
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(port, "/stack?worker=gw9")
+    assert status == 404
+    assert "gw9" in body["error"] or body.get("worker") == "gw9"
+
+
+def test_a_worker_name_never_becomes_a_path(monkeypatch, tmp_path, serving):
+    """The name arrives in a URL. Joining it onto the evidence root - or
+    interpolating it into a glob, which is the same mistake wearing a
+    pattern's clothes - would let a caller address files outside the run."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    a_run_of(tmp_path, gw0=os.getpid())
+    outside = tmp_path.parent / "elsewhere"
+    outside.mkdir(exist_ok=True)
+    (outside / "secret.state").write_bytes(
+        json.dumps({"pid": os.getpid(), "nodeid": "x"}).encode()
+    )
+    port = free_port()
+    service = serving(port, directory=tmp_path / "run-abc123")
+    assert wait_for(lambda: service.serving), service.status
+
+    for name in ("../elsewhere/secret", "..%2Felsewhere%2Fsecret", "*", "gw?"):
+        status, _ = get(port, f"/stack?worker={name}")
+        assert status == 404, f"{name!r} resolved to something"
+
+
+def test_a_finished_worker_does_not_resolve_to_its_last_pid(
+    monkeypatch, tmp_path, serving
+):
+    """Pids are reused and a state file outlives the process it describes.
+    Handing back a dead worker's pid means reading whatever the OS has since
+    given that number to - a stranger's process, served as this run's."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    run = a_run_of(tmp_path, gw0=os.getpid())
+    (run / "gw1.state").write_bytes(
+        json.dumps({"pid": 999_999, "nodeid": "test_x.py::test_one"}).encode() + b"\n"
+    )
+    port = free_port()
+    service = serving(port, directory=run)
+    assert wait_for(lambda: service.serving), service.status
+
+    status, _ = get(port, "/stack?worker=gw1")
+    assert status == 404, "a dead worker's pid was served"
+
+
+def test_naming_a_process_twice_or_not_at_all_is_refused(
+    monkeypatch, tmp_path, serving
+):
+    """Two names can disagree and there is no right one to prefer; no name at
+    all used to read as pid 0."""
+    _reading(monkeypatch, TWO_KINDS_OF_FRAME)
+    a_run_of(tmp_path, gw0=os.getpid())
+    port = free_port()
+    service = serving(port, directory=tmp_path / "run-abc123")
+    assert wait_for(lambda: service.serving), service.status
+
+    status, body = get(port, f"/stack?pid={os.getpid()}&worker=gw0")
+    assert status == 400 and "not both" in body["error"]
+
+    status, body = get(port, "/stack")
+    assert status == 400 and "endpoints" in body

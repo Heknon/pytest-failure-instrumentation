@@ -739,12 +739,83 @@ watching a run, asking what a test is doing *while it is still doing it*.
 ```console
 $ curl localhost:8080/stack?pid=48213
 {"pid": 48213, "source": "py-spy", "captured_at": 1756142887.31,
+ "options": {"native": false, "locals": false, "nonblocking": false},
  "threads": [{"thread_id": 8632442880, "thread_name": "MainThread",
-              "owns_gil": true, "active": true,
-              "frames": [{"function": "_wait_for_lease", "file": "/app/pool.py", "line": 91},
-                         {"function": "checkout", "file": "/app/pool.py", "line": 44},
-                         {"function": "test_concurrent_writes", "file": "/tests/test_pool.py", "line": 210}]}]}
+              "os_thread_id": 48213, "owns_gil": true, "active": true,
+              "frames": [{"function": "_wait_for_lease", "file": "/app/pool.py", "line": 91,
+                          "module": null, "native": false, "locals": null},
+                         {"function": "checkout", "file": "/app/pool.py", "line": 44,
+                          "module": null, "native": false, "locals": null},
+                         {"function": "test_concurrent_writes", "file": "/tests/test_pool.py",
+                          "line": 210, "module": null, "native": false, "locals": null}]}]}
 ```
+
+**Naming the process.** `?pid=` is what `/workers` reports and what a UI already
+holds. `?worker=gw3` is what a *person* holds — somebody looking at a stalled
+worker is asking about that worker, not about the test it happens to be on, and
+resolving the name at the moment of the read closes the window where xdist
+replaces it between two requests. The name is compared against a directory
+listing and never joined onto one, and a worker whose process has exited
+resolves to nothing rather than to its last pid — pids are reused, and reading
+one afterwards means reading whatever the machine has since given that number
+to. Name it one way or the other; both at once is refused, because they can
+disagree and there is no right one to prefer.
+
+**Asking for more than the frames.** Three options, each one py-spy flag, all
+off unless switched on. A bare `?locals` is on: only an explicit `?locals=0` is
+a no.
+
+| option | what it adds | what it costs |
+| --- | --- | --- |
+| `?native` | frames from C, C++ and Cython extensions | needs the process paused, and a py-spy that can unwind |
+| `?locals` | each frame's variables, rendered as text | the largest payload here, and the data a test is holding |
+| `?nonblocking` | reads without pausing the target at all | accuracy, and `owns_gil`/`active`, which become `null` |
+
+```console
+$ curl 'localhost:8080/stack?worker=gw3&locals'
+{"pid": 48219, "worker": "gw3", "source": "py-spy", "captured_at": 1756142889.02,
+ "options": {"native": false, "locals": true, "nonblocking": false},
+ "threads": [{"thread_name": "MainThread", "frames":
+   [{"function": "_wait_for_lease", "file": "/app/pool.py", "line": 91,
+     "module": null, "native": false,
+     "locals": [{"name": "timeout", "repr": "30.0", "argument": true},
+                {"name": "waited", "repr": "27.4", "argument": false}]}]}]}
+```
+
+**`options` on the way back is what was *applied*, not what was asked for**, and
+any difference is a sentence in `notes`. `--native` and `--nonblocking` are
+refused as a pair by py-spy, so asking for both drops native — `--nonblocking`
+is a promise about the target, and honouring native instead would pause a
+process somebody asked not to have paused. A py-spy that cannot unwind is
+likewise a reason to return the Python frames plus a note rather than an error.
+A caller that displayed its own request back to a user would be captioning
+frames with a setting that did not produce them, so read the toggles back from
+here.
+
+```console
+$ curl 'localhost:8080/stack?pid=48219&native&nonblocking'
+{"options": {"native": false, "locals": false, "nonblocking": true},
+ "notes": ["native frames need the process paused, and --nonblocking was asked
+            for as well; py-spy refuses that pair, ..."], ...}
+```
+
+`locals` is `null` when they were not asked for and `[]` when the frame holds
+none — a native frame has no Python variables, and answering `null` there would
+read as "you did not ask". The variables are rendered by py-spy inside its own
+process while the target is stopped, so what crosses the wire is text and no
+`__repr__` of yours is executed to produce it. They are nonetheless the one
+thing this server discloses that is the *data* a test is working on rather than
+the shape of the code — a fixture's credentials, a customer record, a decrypted
+payload — so a deployment that cannot have that leave the process turns them off
+and still gets the frames:
+
+```ini
+[pytest]
+failure_stack_server_locals = false
+```
+
+Nothing is redacted selectively. This package cannot tell a password from a
+lease id, and a filter that pretended to would be worse than the honest switch.
 
 Off by default — a plugin installed for crash reporting should not start
 opening listening sockets on everybody who upgrades it:
@@ -1416,6 +1487,7 @@ overwhelming majority of what runs.
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
+| `failure_stack_server_locals` | `true` | Whether `/stack?locals` answers with each frame's variables |
 
 There is deliberately **no ini setting for the token**. It comes from
 `PYTEST_CALLSTACK_TOKEN` or `--callstack-token` and nowhere else: an ini file

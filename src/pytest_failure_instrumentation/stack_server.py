@@ -131,6 +131,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .probes import process, stacks
 from .probes.platform_flags import IS_WINDOWS
+from .probes.pyspy import Reading, StackOptions
 
 #: What ``/identity`` answers with. The whole singleton scheme rests on this
 #: string being unique to this package, so it is the distribution name.
@@ -291,6 +292,7 @@ class _Server(ThreadingHTTPServer):
         handler: Any,
         evidence_root: Optional[Path] = None,
         token: str = "",
+        serves_locals: bool = True,
     ) -> None:
         # Set before the base class opens the socket, which reads it off the
         # instance. A class attribute cannot answer this: the family depends
@@ -304,6 +306,13 @@ class _Server(ThreadingHTTPServer):
         #: Supplied by whoever started the run and never written down - see
         #: the module docstring.
         self.token = token
+        #: Whether ``?locals`` may be honoured at all. On by default, because
+        #: the variables are most of what makes a live stack worth reading -
+        #: "waiting on a lease" and "waiting on a lease for 27 seconds" are
+        #: the same frame. Off is for a run whose tests hold data that must
+        #: not leave the process even to a reader already trusted with the
+        #: frames, which is a judgement only the deployment can make.
+        self.serves_locals = serves_locals
         super().__init__(address, handler)
 
     def server_bind(self) -> None:
@@ -405,7 +414,13 @@ class _Handler(BaseHTTPRequestHandler):
         """
         try:
             route = urlparse(self.path)
-            query = parse_qs(route.query)
+            # Blank values kept, because a bare ``?locals`` is how a URL
+            # carries a switched-on boolean and parse_qs drops it by default -
+            # which made the shortest spelling of every reader option the one
+            # that silently did nothing. The worker filter is unaffected: an
+            # empty ``?worker=`` still means "no filter" rather than "no
+            # workers", settled in topology._wanted where it always was.
+            query = parse_qs(route.query, keep_blank_values=True)
         except ValueError as malformed:
             self._reply(
                 400,
@@ -556,7 +571,43 @@ class _Handler(BaseHTTPRequestHandler):
         )
 
     def _stack(self, query: dict[str, list[str]]) -> None:
+        """The stack of one process, named by pid or by worker.
+
+        Both spellings reach the same read. A pid is what ``/workers`` reports
+        and what a UI already holds; a worker name is what a *person* holds -
+        somebody looking at a stalled ``gw3`` is asking about that worker, and
+        making them resolve it themselves means a second request whose answer
+        can be stale by the time the first one lands.
+        """
+        options, refused = self._reader_options(query)
+        if refused is not None:
+            self._reply(refused[0], {"error": refused[1], "options": options.as_payload()})
+            return
+
+        named = (query.get(WORKER_PARAMS[0]) or query.get(WORKER_PARAMS[1]) or [""])[0]
         raw = (query.get("pid") or [""])[0]
+        if raw and named:
+            self._reply(
+                400,
+                {
+                    "error": "name the process by pid or by worker, not both - "
+                    "they can disagree, and there is no right one to prefer"
+                },
+            )
+            return
+        if named:
+            self._stack_of_worker(named, options)
+            return
+        if not raw:
+            self._reply(
+                400,
+                {
+                    "error": "no process named: pass ?pid=N, or ?worker=gw0 to "
+                    "have this run's own worker looked up",
+                    "endpoints": ENDPOINTS,
+                },
+            )
+            return
         try:
             pid = int(raw)
         except ValueError:
@@ -596,22 +647,100 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
-        threads, error, source = read_stack(pid)
-        if error is not None:
+        self._read_and_reply(pid, options)
+
+    def _read_and_reply(
+        self, pid: int, options: StackOptions, worker: Optional[str] = None
+    ) -> None:
+        """The read both spellings end at, and the one shape they answer in.
+
+        ``options`` on the way out is what the reader **applied**, which is not
+        always what was asked for - see :class:`~.probes.pyspy.Reading`. A
+        caller that showed its own request back to a user would caption frames
+        with a setting that did not produce them, so the reply carries the
+        applied set and, in ``notes``, a sentence for every difference.
+        """
+        reading = read_stack(pid, options)
+        answer: dict[str, Any] = {
+            "pid": pid,
+            "source": STACK_SOURCE,
+            "options": reading.options.as_payload(),
+        }
+        if worker is not None:
+            answer["worker"] = worker
+        if reading.notes:
+            # Absent rather than empty when there is nothing to say, so a
+            # reader can treat its presence as "something was downgraded".
+            answer["notes"] = list(reading.notes)
+        if reading.error is not None:
             # 502: this server is a gateway to a reader that could not answer,
             # and the distinction from "this server is broken" is the whole
             # content of the reply.
-            self._reply(502, {"pid": pid, "source": source, "error": error})
+            self._reply(502, {**answer, "error": reading.error})
             return
         self._reply(
             200,
-            {
-                "pid": pid,
-                "source": source,
-                "captured_at": round(time.time(), 3),
-                "threads": threads,
-            },
+            {**answer, "captured_at": round(time.time(), 3), "threads": reading.threads},
         )
+
+    def _stack_of_worker(self, name: str, options: StackOptions) -> None:
+        """``?worker=gw3``, resolved against the same files ``/workers`` reads.
+
+        Resolved here rather than left to the caller because the two requests
+        it would otherwise take are not equivalent to one: a worker that xdist
+        replaced between them is a pid that now belongs to somebody else, and
+        the answer would be a stack from the wrong process with no way to tell.
+        Looking the name up at the moment of the read closes that window.
+
+        A name that matches nothing is 404 rather than 403. Unlike a pid, which
+        may well be a running process this server has no business reading, a
+        worker name is only ever a name *in this run* - so "there is no such
+        worker" is the whole truth and points at a typo or a finished run.
+        """
+        evidence_root = getattr(self.server, "evidence_root", None)
+        pid = worker_pid(name, evidence_root)
+        if pid is None:
+            self._reply(
+                404,
+                {
+                    "error": f"no worker named {name!r} is running under this "
+                    "server's evidence directory; /workers lists the ones there "
+                    "are"
+                    if evidence_root is not None
+                    else "this server was given no evidence directory, so it "
+                    "knows of no workers to look a name up in; name the process "
+                    "with ?pid= instead",
+                    "worker": name,
+                },
+            )
+            return
+        self._read_and_reply(pid, options, worker=name)
+
+    def _reader_options(
+        self, query: dict[str, list[str]]
+    ) -> tuple[StackOptions, Optional[tuple[int, str]]]:
+        """What the caller asked the reader for, or why it cannot be asked.
+
+        Every flag is off unless switched on, and each is read the way a URL
+        actually carries a boolean: ``?locals``, ``?locals=1`` and
+        ``?locals=true`` are one request, and only an explicit falsehood turns
+        one off. A caller that wrote ``?locals=0`` meant it.
+        """
+        options = StackOptions(
+            native=_switched_on(query, "native"),
+            locals=_switched_on(query, "locals"),
+            nonblocking=_switched_on(query, "nonblocking"),
+        )
+        if options.locals and not getattr(self.server, "serves_locals", True):
+            return options, (
+                403,
+                "this run serves stacks without locals: a frame's variables "
+                "carry the data a test is working on - fixture credentials, a "
+                "customer record, a decrypted payload - and this server was "
+                "started with failure_stack_server_locals off. Ask again "
+                "without ?locals",
+            )
+        return options, None
 
     def _workers(self, query: dict[str, list[str]]) -> None:
         """Every run on this machine, and what each worker is doing.
@@ -668,6 +797,10 @@ ENDPOINTS = {
     "/workers": "every run on this machine, and what each worker is doing",
     "/workers?worker=gw0,gw3": "only those workers; repeat the parameter or comma-separate",
     "/stack?pid=N": "the current stack of every thread in process N",
+    "/stack?worker=gw0": "the same, for a worker of this run named by xdist id",
+    "/stack?...&native": "frames from C, C++ and Cython extensions as well",
+    "/stack?...&locals": "each frame's variables, rendered as text",
+    "/stack?...&nonblocking": "read without pausing the target, less accurately",
 }
 
 
@@ -687,6 +820,64 @@ def _named(query: dict[str, list[str]]) -> Optional[list[str]]:
     if not values:
         return None
     return [name for value in values for name in value.split(",")]
+
+
+def _switched_on(query: dict[str, list[str]], name: str) -> bool:
+    """Whether a boolean query parameter is asking for something.
+
+    Every spelling a URL actually carries: ``?native`` with no value at all,
+    ``?native=1``, ``?native=true``, ``?native=yes``. Only an explicit
+    falsehood is a no - a caller that wrote ``?native=0`` said so on purpose,
+    and reading a bare parameter as false would make ``?locals`` mean nothing.
+    """
+    values = query.get(name)
+    if not values:
+        return False
+    said = str(values[-1]).strip().lower()
+    return said not in ("0", "false", "no", "off")
+
+
+def worker_pid(name: str, evidence_root: Optional[Path]) -> Optional[int]:
+    """The pid of a named worker that is still running, or None.
+
+    **The name never becomes a path.** It arrives in a URL, so joining it onto
+    the evidence root - or interpolating it into a glob, which is the same
+    mistake wearing a pattern's clothes - would let ``?worker=../../etc``
+    address files this run has nothing to do with. The listing is taken first
+    and the name compared against it, exactly as ``/workers`` filters, so the
+    set of things this can name is bounded by what the run itself wrote.
+
+    **A dead worker resolves to nothing rather than to its last pid.** Pids are
+    reused, and a state file outlives the process it describes: handing back a
+    pid whose process has exited means reading whatever the operating system
+    has since given that number to - a stranger's process, served as though it
+    were this run's worker. Liveness is therefore part of resolving the name,
+    not a check the reader is left to make afterwards.
+
+    Two runs under one evidence root both have a ``gw0``, so the live one wins
+    over a finished one's leftovers. Where both are live the first by path
+    order answers, which is arbitrary but stable - a caller that needs to tell
+    two concurrent runs apart has ``/workers`` and its run ids.
+    """
+    if evidence_root is None or not name:
+        return None
+
+    from .capture.state import read_state
+
+    try:
+        states = sorted(evidence_root.glob(f"*/*{STATE_SUFFIX}"))
+    except OSError:
+        return None
+    for state in states:
+        if state.stem != name:
+            continue
+        try:
+            pid = int(read_state(state)["pid"])
+        except (KeyError, TypeError, ValueError):
+            continue  # a torn or hand-written record says nothing either way
+        if process.is_running(pid):
+            return pid
+    return None
 
 
 def _hostname(header: str) -> str:
@@ -768,8 +959,8 @@ def identity() -> dict[str, Any]:
     return {"service": SERVICE, "version": __version__, "pid": os.getpid()}
 
 
-def read_stack(pid: int) -> tuple[Optional[list[dict[str, Any]]], Optional[str], str]:
-    """``(threads, error, source)`` for a live process.
+def read_stack(pid: int, options: Optional[StackOptions] = None) -> Reading:
+    """A :class:`~.probes.pyspy.Reading` for a live process.
 
     Every pid is read the same way, this server's own included. Its frames are
     also directly to hand and used to be answered that way - it costs a dict
@@ -778,23 +969,28 @@ def read_stack(pid: int) -> tuple[Optional[list[dict[str, Any]]], Optional[str],
     avoid the first. A caller that has to know which mechanism answered has
     been handed two APIs.
 
-    All this adds on top of :func:`..probes.stacks.live_stack` is the bound on
-    how many reads may be in flight at once, which is the server's business
+    All this adds on top of :func:`..probes.stacks.live_reading` is the bound
+    on how many reads may be in flight at once, which is the server's business
     rather than the reader's: each one is a subprocess that pauses its target,
     and a caller polling on a timer wants to be told to come back rather than
     held until its own deadline passes.
     """
+    wanted = options or StackOptions()
     if not _readers.acquire(blocking=False):
-        return (
+        return Reading(
             None,
             f"{MAX_CONCURRENT_READS} stack reads are already in flight; retry shortly",
-            "py-spy",
+            wanted,
         )
     try:
-        threads, error = stacks.live_stack(pid)
+        return stacks.live_reading(pid, wanted)
     finally:
         _readers.release()
-    return threads, error, "py-spy"
+
+
+#: What every reading this server produces says it came from. One reader, so
+#: one answer - see :func:`read_stack`.
+STACK_SOURCE = "py-spy"
 
 
 def reachable(host: str) -> str:
@@ -858,6 +1054,7 @@ class StackService:
         on_ready: Optional[Any] = None,
         session_id: str = "",
         token: str = "",
+        serves_locals: bool = True,
     ) -> None:
         #: What was asked for. 0 means "draw one", and is not what got bound.
         self.port = port
@@ -886,6 +1083,9 @@ class StackService:
         #: agree on in advance does not, and publishing it is what made the
         #: address file a credential store.
         self.token = token
+        #: Whether ``/stack?locals`` is answered or refused - see
+        #: :attr:`_Server.serves_locals`.
+        self.serves_locals = serves_locals
         self._announcer: Optional[threading.Thread] = None
         #: What is actually bound, which is the only number worth publishing.
         self.bound_port: Optional[int] = None
@@ -1014,6 +1214,7 @@ class StackService:
                 _Handler,
                 self.directory.parent if self.directory is not None else None,
                 self.token,
+                self.serves_locals,
             )
         except OSError as failure:
             if not _is_contention(failure):
@@ -1341,6 +1542,7 @@ def start(
     on_ready: Optional[Any] = None,
     session_id: str = "",
     token: str = "",
+    serves_locals: bool = True,
 ) -> Optional[StackService]:
     """Begin serving, or begin waiting to. None if it could not even start.
 
@@ -1357,6 +1559,7 @@ def start(
             on_ready=on_ready,
             session_id=session_id,
             token=token,
+            serves_locals=serves_locals,
         )
         service.start()
         return service

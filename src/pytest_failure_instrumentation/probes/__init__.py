@@ -12,7 +12,7 @@ from .memory import (
     system_available_megabytes,
 )
 from .process import exit_status, is_own_child, is_running
-from .stacks import can_request_stack, live_stack, request_stack
+from .stacks import can_request_stack, live_reading, live_stack, request_stack
 
 __all__ = [
     "capabilities",
@@ -25,6 +25,7 @@ __all__ = [
     "is_own_child",
     "is_running",
     "can_request_stack",
+    "live_reading",
     "live_stack",
     "request_stack",
 ]
