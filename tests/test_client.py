@@ -34,6 +34,7 @@ from pytest_failure_instrumentation.client import (  # noqa: E402 - after the sk
     FailureServerClient,
     Fleet,
     NotFound,
+    PublishedServer,
     ReaderFailed,
     ServerRefused,
     ServerUnreachable,
@@ -437,6 +438,9 @@ def test_one_host_that_did_not_answer_costs_only_that_host(serving, tmp_path: Pa
     # Verbatim, and per member: the reader is told which address and why.
     assert silent[0].error and gone in silent[0].error
     assert silent[0].snapshot is None
+    # Nothing answered, so there is no status to report - which is what tells
+    # this apart from a server that refused.
+    assert silent[0].status is None
 
 
 def test_a_refusal_is_kept_beside_the_servers_that_answered(serving, tmp_path: Path):
@@ -448,6 +452,7 @@ def test_a_refusal_is_kept_beside_the_servers_that_answered(serving, tmp_path: P
     fleet = run(read_fleet([answering.url, bare.url]))
 
     refused = [member for member in fleet.members if member.url == bare.url][0]
+    assert refused.status == 503
     assert refused.error and "evidence directory" in refused.error
     assert len(fleet.answered) == 1
 
@@ -493,3 +498,48 @@ def test_an_empty_fleet_is_a_fleet(tmp_path: Path):
     assert isinstance(fleet, Fleet)
     assert fleet.members == []
     assert fleet.workers == []
+
+
+def test_every_server_is_reached_with_its_own_token(serving, tmp_path: Path):
+    """A token belongs to a run, not to a fleet.
+
+    Two sessions on one machine can have been started with different ones, and
+    two hosts almost certainly were. The headers go out per request rather
+    than on the transport, so these two share a connection pool without ever
+    being sent each other's credential.
+    """
+    first = serving(directory=run_directory(tmp_path / "a"), token="first-secret")
+    second = serving(directory=run_directory(tmp_path / "b"), token="second-secret")
+    tokens = {first.url: "first-secret", second.url: "second-secret"}
+
+    published = [
+        PublishedServer(url=service.url, host=service.host, port=service.bound_port or 0)
+        for service in (first, second)
+    ]
+    fleet = run(read_fleet([entry.with_token(tokens[entry.url]) for entry in published]))
+
+    assert len(fleet.answered) == 2, [member.error for member in fleet.members]
+
+    # And swapped, to show the tokens were doing the work rather than the
+    # servers being open: each is refused the other's.
+    swapped = run(
+        read_fleet([
+            published[0].with_token(tokens[second.url]),
+            published[1].with_token(tokens[first.url]),
+        ])
+    )
+    assert len(swapped.silent) == 2
+    # Refused on the credential, and saying so: not the same as a host that is
+    # gone, and not something restarting a machine would fix.
+    assert [member.status for member in swapped.silent] == [401, 401]
+    assert all("token" in (member.error or "") for member in swapped.silent)
+
+
+def test_one_token_still_covers_a_fleet_that_shares_one(serving, tmp_path: Path):
+    # The fallback, for the entries that cannot carry their own: an address
+    # file holds no credential, and a bare URL is only a string.
+    first = serving(directory=run_directory(tmp_path / "a"), token="shared")
+    second = serving(directory=run_directory(tmp_path / "b"), token="shared")
+
+    fleet = run(read_fleet([first.url, second.url], token="shared"))
+    assert len(fleet.answered) == 2

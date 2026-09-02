@@ -545,6 +545,32 @@ class PublishedServer(_Wire):
     drawn: bool = False
     started_at: Optional[float] = None
 
+    def with_token(self, token: str = "") -> LiveStackServer:
+        """This address, plus the credential it takes to be let in.
+
+        The address file carries no token - taking the credential out of it is
+        what let it be world-readable, so a UI running as another uid can find
+        the run at all - and the token is not one value per fleet either. It is
+        one per *run*: two sessions on one machine can have been started with
+        different ones, and two hosts almost certainly were.
+
+        So this is the seam. A caller that knows which token goes with which
+        address pairs them here, and hands :func:`read_fleet` a server that
+        brings its own rather than one the fleet has to guess for::
+
+            servers = [found.with_token(tokens[found.url])
+                       for found in discover_servers(directory)]
+        """
+        return LiveStackServer(
+            service=self.service,
+            version=self.version,
+            url=self.url,
+            host=self.host,
+            port=self.port,
+            token=token,
+            pid=self.pid,
+        )
+
 
 def discover_servers(directory: Path, *, include_dead: bool = False) -> list[PublishedServer]:
     """Every server that has published an address under ``directory``.
@@ -608,6 +634,11 @@ class FleetMember(_Wire):
     snapshot: Optional[WorkersSnapshot] = None
     #: The refusal, verbatim, or the transport failure. None where it answered.
     error: Optional[str] = None
+    #: The status it refused with, or None where nothing answered at all. Worth
+    #: keeping apart: a 401 is a token this caller got wrong and a dead socket
+    #: is a host that is gone, and a fleet that reported both as "unreachable"
+    #: would send somebody restarting a machine over a credential.
+    status: Optional[int] = None
 
     @property
     def answered(self) -> bool:
@@ -668,9 +699,19 @@ async def read_fleet(
     ``servers`` takes whatever a caller has: the
     :class:`~.live_view.LiveStackServer` payloads a run reported, the
     :class:`PublishedServer` records :func:`discover_servers` found, or bare
-    URL strings. A ``LiveStackServer`` brings its own token; the others have
-    none to bring - the address files deliberately do not carry one - so
-    ``token`` is applied to those.
+    URL strings.
+
+    **A token belongs to a run, not to a fleet.** Two sessions on one machine
+    can have been started with different ones, and two hosts almost certainly
+    were - so each entry carries its own where it has one, and a
+    ``LiveStackServer`` always does. ``token`` is the fallback for the entries
+    that cannot: an address file holds no credential by design, and a bare URL
+    is just a string. Where those need one each, pair them first with
+    :meth:`PublishedServer.with_token` rather than reaching for this.
+
+    The headers go out per request rather than on the transport, so servers on
+    different tokens share one connection pool without ever being sent each
+    other's.
 
     **One host failing costs only that host.** The reads run concurrently and
     every failure is caught per member, because the case this exists for is
@@ -692,10 +733,14 @@ async def read_fleet(
         )
         try:
             member.snapshot = await reader.workers(only=only, timeout=timeout)
+        except ServerRefused as refused:
+            # Verbatim, and with the status: a refusal names its own fix, and
+            # which refusal it was decides whose fix it is.
+            member.error = refused.message
+            member.status = refused.status
         except FailureServerError as failed:
-            # Verbatim, and per member. A refusal names its own fix and a
-            # transport failure names an address; both are worth more to the
-            # reader than the fact that something went wrong.
+            # Nothing answered. The message names the address, which is the
+            # only thing there is to say about it.
             member.error = str(failed)
         return member
 
