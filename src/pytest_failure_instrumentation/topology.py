@@ -41,6 +41,20 @@ The classification is :mod:`.analysis.stall`'s, in its own words, with one
 difference: a stall is confirmed over two passes an interval apart, and a
 snapshot has only this instant. So ``frozen`` here says it is unconfirmed, and
 a caller that polls confirms it for free by asking again.
+
+**A worker that has run out of work does not exit.** xdist sends it
+``shutdown`` when the queue is empty, which ends its test loop and nothing
+else: the worker runs its own session finish, reports ``workerfinished``, and
+its process then sits inside execnet - main thread parked in
+``integrate_as_primary_thread`` on an ``Event.wait`` - until the *controller's*
+session finish tears every gateway down at once. Under ``--dist load`` that is
+however long the slowest worker's remaining tests take. Its heartbeat stopped
+with its session, so read off the beats alone it is a process that exists and
+has not beaten for a while - which is the ``frozen`` row, with wording about
+native code holding the GIL, for a worker doing exactly what it was told. The
+worker wrote ``worker_finish`` into its event log on the way out, and that
+record outranks the beats: ``finished`` is a status of its own, because it is
+the one row in the table that means nothing needs looking at.
 """
 
 from __future__ import annotations
@@ -240,6 +254,7 @@ def worker(
     events = this_run(events, run_id)
     record = read_state(state_path, run_id)
     beats = [event for event in events if event.get("event") == "heartbeat"]
+    finished = _finish(events)
 
     assigned, running, queued = _progress(record, schedule or {})
     pid = record.get("pid")
@@ -247,7 +262,8 @@ def worker(
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
     rate = stall_analysis.cpu_rate(beats[-RATE_WINDOW:]) if len(beats) >= 2 else None
     status, why = _status(
-        exists, beats, beat_age, rate, _interval(events, state_path), record
+        exists, beats, beat_age, rate, _interval(events, state_path), record,
+        finished=finished, now=now,
     )
 
     nodeid = record.get("nodeid")
@@ -372,14 +388,34 @@ def _status(
     rate: Optional[float],
     interval: float,
     record: dict[str, Any],
+    finished: Optional[dict[str, Any]] = None,
+    now: Optional[float] = None,
 ) -> tuple[str, str]:
     """:mod:`.analysis.stall`'s truth table, as a status rather than a verdict.
 
-    The order matters. A dead process outranks everything - its last heartbeat
-    is as old as its death and would otherwise read as ``frozen`` - and the
-    absence of any heartbeat at all outranks reasoning from beats there are
-    none of.
+    The order matters. A worker that wrote down that its session ended
+    outranks everything, because everything below it is inference from
+    silence and this is the worker saying, in its own words, why it went
+    silent: the heartbeat is stopped with the session, and the process is
+    kept alive by xdist rather than by anything it is doing - see the module
+    docstring. It outranks ``gone`` as well, since the same worker's process
+    being closed at the end of the run is the ordinary way it ends, not a
+    death. Then a dead process outranks the rest - its last heartbeat is as
+    old as its death and would otherwise read as ``frozen`` - and the absence
+    of any heartbeat at all outranks reasoning from beats there are none of.
     """
+    if finished is not None:
+        age = _age(time.time() if now is None else now, finished.get("time"))
+        when = f"{age:.0f}s ago" if age is not None else "already"
+        status = finished.get("exitstatus")
+        with_status = f" with exit status {status}" if status is not None else ""
+        return (
+            "finished",
+            f"the worker's session finished {when}{with_status}: its heartbeat "
+            "stopped with it, and the process only idles - inside execnet, "
+            "waiting to be told to exit - until the run ends and closes it",
+        )
+
     if exists is False:
         doing = record.get("nodeid")
         where = f"; last seen in {record.get('phase')} of {doing}" if doing else ""
@@ -414,6 +450,27 @@ def _status(
         f"heartbeat {beat_age:.1f}s old but no CPU progress: the test thread is "
         "waiting on something",
     )
+
+
+def _finish(events: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The record a worker writes as its session ends, or None while it runs.
+
+    Written by the recorder's own session-finish hook, which is after the last
+    test's teardown - and session-scoped fixtures are torn down inside that
+    teardown, so a finalizer blocking on a connection is still covered by the
+    heartbeat and still reads as ``blocked``, in ``teardown`` of the last
+    test. This is the moment after all of that: the point from which the
+    worker has nothing left to do and its beats are meant to stop.
+
+    The last one, should there be more than one. There is one per session, so
+    a second can only come from another session sharing this file, and the
+    filter that keeps the events to one run has already run by the time this
+    is asked.
+    """
+    for event in reversed(events):
+        if event.get("event") == "worker_finish":
+            return event
+    return None
 
 
 def _interval(events: list[dict[str, Any]], state_path: Optional[Path] = None) -> float:

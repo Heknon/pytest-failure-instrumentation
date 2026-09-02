@@ -920,6 +920,22 @@ a live status rather than a post-hoc verdict:
 | `frozen` | stale | — | exists |
 | `gone` | — | — | absent |
 | `unmeasured` | never any | — | — |
+| `finished` | stopped with the session | — | idle until the run ends |
+
+The last row is the one that is not a finding, and it exists because of what a
+worker does when it runs out of work: **it does not exit.** xdist sends it
+`shutdown` once the queue is empty, which ends its test loop and nothing else.
+The worker runs its own session finish, reports `workerfinished`, and its
+process then sits inside execnet — main thread parked in
+`integrate_as_primary_thread` on an `Event.wait` — until the *controller's*
+session finish tears every gateway down at once. Under `--dist load` that is
+however long the slowest worker's remaining tests take. Its heartbeat stopped
+with its session, so from the beats alone it is a live process that has not
+beaten for a while, which is the `frozen` row and its wording about native code
+holding the GIL. The worker writes `worker_finish` into its event log on the
+way out, and that record outranks the beats — and outranks `gone` too, since
+being closed at the end of the run is how a finished worker's process ends, not
+a death.
 
 Three files answer three different questions, and keeping them apart is what
 makes this cheap and correct. `.state` says *what* a worker is doing and is

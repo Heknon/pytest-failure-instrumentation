@@ -85,6 +85,16 @@ def evidence(tmp_path):
             with path.open("a" if append else "w", encoding="utf-8") as handle:
                 handle.write("\n".join(lines) + "\n")
 
+        def finished(self, worker: str, *, exitstatus: int = 0, age: float = 0.0,
+                     run_id: str = "the-reported-run-id") -> None:
+            """The record a worker writes as its session ends, after its beats."""
+            path = self.run / f"{worker}.events"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps({"event": "worker_finish", "exitstatus": exitstatus,
+                                "time": time.time() - age, "run_id": run_id}) + "\n"
+                )
+
         def schedule(self, **workers) -> None:
             """What the controller writes about who was given what."""
             (self.run / "schedule.json").write_text(
@@ -197,6 +207,56 @@ def test_one_beat_cannot_measure_a_rate_and_says_so(evidence):
     assert described["cpu_rate"] is None
     assert described["status"] == "blocked"
     assert "cannot be ruled out" in described["why"]
+
+
+def test_a_worker_that_ran_out_of_work_is_finished_not_frozen(evidence):
+    """A worker that has run its last test does not exit. xdist tells it to
+    shut down, it runs its session finish, and its process then idles inside
+    execnet - main thread parked in integrate_as_primary_thread - until the
+    controller's own session finish tears every gateway down. Its heartbeat
+    stopped with its session, so read off the beats alone it is a live process
+    that has not beaten for a while: frozen, with the wording about native code
+    holding the GIL, for as long as the slowest worker's remaining tests take.
+    The worker wrote down that it finished, and that outranks the silence."""
+    evidence.state("gw0", nodeid=None, phase=None, tests_started=3, tests_finished=3)
+    evidence.beats("gw0", cpu_step=0.5, age=60.0)
+    evidence.finished("gw0", exitstatus=0, age=59.0)
+
+    described = evidence.worker("gw0")
+    assert described["status"] == "finished"
+    assert "exit status 0" in described["why"]
+    # Rounded, and a second may have gone by since the record was written.
+    assert any(f"finished {seconds}s ago" in described["why"] for seconds in (59, 60))
+    assert "GIL" not in described["why"]
+    # Still reported, so a reader can see the beats did stop and when.
+    assert described["heartbeat_age_s"] > 10
+    assert described["process_exists"] is True
+
+
+def test_a_finished_worker_whose_process_was_closed_is_still_finished(evidence):
+    """Once the run ends xdist terminates the idle gateways, and an absent
+    process otherwise tops the table as ``gone`` - the crash row. A worker that
+    finished and was then closed went exactly where it was sent."""
+    evidence.state("gw0", pid=DEAD, nodeid=None, phase=None)
+    evidence.beats("gw0", age=60.0)
+    evidence.finished("gw0", age=55.0)
+
+    described = evidence.worker("gw0")
+    assert described["status"] == "finished"
+    assert described["process_exists"] is False
+
+
+def test_another_run_s_finish_does_not_finish_this_worker(evidence):
+    """Two sessions sharing one directory both write gw0.events, and the
+    earlier one's worker_finish is still in the file when this run's worker
+    is beating. A finish stamped with another run is not this worker's."""
+    evidence.beats("gw0", cpu_step=0.5, age=120.0, run_id="an-earlier-run")
+    evidence.finished("gw0", age=100.0, run_id="an-earlier-run")
+    evidence.state("gw0", run_id="the-reported-run-id")
+    evidence.beats("gw0", cpu_step=0.5, append=True)
+
+    described = evidence.worker("gw0")
+    assert described["status"] == "working"
 
 
 def test_the_heartbeat_interval_is_read_rather_than_assumed(evidence):
