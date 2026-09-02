@@ -22,12 +22,22 @@ and a run that never talks to a live view never pays for it - see the
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 from .live_view import LiveStackServer
+from .stack_server import (
+    AUTH_HEADER,
+    AUTH_SCHEME,
+    DISCOVERY_PREFIX,
+    DISCOVERY_SUFFIX,
+)
 
 try:  # pragma: no cover - exercised by the import test
     import httpx
@@ -466,9 +476,12 @@ class FailureServerClient:
 
 
 def _bearer(token: str) -> dict[str, str]:
-    """The header the server expects, or none where the run minted no token."""
-    from .stack_server import AUTH_HEADER, AUTH_SCHEME
+    """The header the server expects, or none where the run minted no token.
 
+    Built from the server's own constants rather than spelled out here: the
+    scheme is this package's to change, and a client that hard-coded it would
+    break quietly on the upgrade that changed it.
+    """
     return {AUTH_HEADER: f"{AUTH_SCHEME} {token}"} if token else {}
 
 
@@ -494,3 +507,215 @@ def _message(response: httpx.Response, payload: dict[str, Any]) -> str:
         return stated
     text = (response.text or "").strip()
     return text or f"the server answered {response.status_code} and said nothing"
+
+
+# --- the fleet ---------------------------------------------------------
+#
+# One server answers for one machine. A run that fans out across hosts, or a
+# repository where two sessions share an evidence directory, leaves several -
+# and each knows only its own. Reading them all and putting the answers back
+# together is a job every consumer would otherwise write again, and would get
+# subtly wrong in the same two places: losing the whole fleet to one host that
+# did not answer, and forgetting that a pid means nothing without the machine
+# it is a pid on.
+
+
+class PublishedServer(_Wire):
+    """A server's address, as it wrote it down for anyone to find.
+
+    This is the ``callstack-<pid>.json`` a serving session publishes, and it is
+    the only place the port appears: ``/workers`` describes the machine and
+    never states its own address, so a caller that did not keep the address it
+    dialled cannot recover it from the answer.
+
+    No token. The file held one once, and taking it out is what let the file be
+    world-readable so a UI running as another uid can find the run at all.
+    """
+
+    service: str = ""
+    version: str = ""
+    #: The serving session. Under xdist the controller, and none of the pids
+    #: ``/workers`` reports on. The discovery file is named for it, so that two
+    #: sessions sharing a directory do not overwrite each other's address.
+    pid: int = 0
+    host: str = ""
+    #: What got bound, never what was asked for: a drawn port is requested as 0.
+    port: int = 0
+    url: str = ""
+    drawn: bool = False
+    started_at: Optional[float] = None
+
+
+def discover_servers(directory: Path, *, include_dead: bool = False) -> list[PublishedServer]:
+    """Every server that has published an address under ``directory``.
+
+    The evidence directory is the join key a product has from the first moment
+    of a run, before xdist has built a run id, so this is how a consumer that
+    was not handed a :class:`~.live_view.LiveStackServer` finds one.
+
+    A session killed hard never retracts its file, and trusting a stale one
+    costs a caller its whole timeout on a port nobody is listening to - so a
+    record whose process is gone is dropped. That check reads the pid out of
+    the filename and asks the kernel, which only answers for *this* machine:
+    pass ``include_dead`` where the directory is shared from somewhere else and
+    the local answer would be meaningless.
+
+    Unreadable and half-written files are skipped rather than raised on. This
+    runs against a directory a live run is writing into, and a caller asking
+    who is serving should not be handed an exception because one file was mid
+    rename.
+    """
+    try:
+        candidates = sorted(directory.glob(f"{DISCOVERY_PREFIX}*{DISCOVERY_SUFFIX}"))
+    except OSError:
+        return []
+
+    found: list[PublishedServer] = []
+    for path in candidates:
+        if not include_dead and not _still_running(path):
+            continue
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict):
+            found.append(PublishedServer.model_validate(record))
+    return found
+
+
+def _still_running(path: Path) -> bool:
+    """Whether the session that published this address is still alive."""
+    from .probes.process import is_running
+
+    pid = path.stem[len(DISCOVERY_PREFIX) :]
+    return is_running(int(pid)) if pid.isdigit() else True
+
+
+class FleetMember(_Wire):
+    """One server's answer, or the reason there is not one.
+
+    Both halves are kept. A host that did not answer is not a host with no
+    workers, and a fleet that dropped it would read as smaller rather than as
+    partly unknown - which is the difference between "the run is nearly done"
+    and "we cannot see half of it".
+    """
+
+    #: The address asked, which is what identifies this member: a pid is unique
+    #: on one machine and nowhere else, so a consumer flattening the fleet into
+    #: rows needs this beside each one.
+    url: str = ""
+    server: Optional[PublishedServer] = None
+    snapshot: Optional[WorkersSnapshot] = None
+    #: The refusal, verbatim, or the transport failure. None where it answered.
+    error: Optional[str] = None
+
+    @property
+    def answered(self) -> bool:
+        return self.snapshot is not None
+
+
+class FleetWorker(_Wire):
+    """A worker, and the two things that say which one it is."""
+
+    #: The server it lives on. `gw0` is a name every machine hands out for
+    #: itself, so the name alone does not identify a worker in a fleet - and
+    #: neither does the pid.
+    url: str = ""
+    #: The run it belongs to, since one machine can host several at once.
+    session: str = ""
+    worker: Worker = Worker()
+
+
+class Fleet(_Wire):
+    """Every server that was asked, and everything they said."""
+
+    #: When the fleet was assembled, which is not any one server's
+    #: ``observed_at``: the reads are concurrent but not simultaneous.
+    observed_at: float = 0.0
+    members: list[FleetMember] = []
+
+    @property
+    def answered(self) -> list[FleetMember]:
+        return [member for member in self.members if member.answered]
+
+    @property
+    def silent(self) -> list[FleetMember]:
+        """The ones that did not answer. Their workers are absent, not gone."""
+        return [member for member in self.members if not member.answered]
+
+    @property
+    def workers(self) -> list[FleetWorker]:
+        """Every worker across every server that answered, each saying where it is."""
+        return [
+            FleetWorker(url=member.url, session=run.session, worker=record)
+            for member in self.members
+            if member.snapshot is not None
+            for run in member.snapshot.runs
+            for record in run.workers
+        ]
+
+
+async def read_fleet(
+    servers: Sequence[Any],
+    *,
+    token: str = "",
+    only: Optional[Sequence[str]] = None,
+    timeout: Optional[float] = None,
+    client: Optional[httpx.AsyncClient] = None,
+) -> Fleet:
+    """Ask every server at once, and keep what each of them said.
+
+    ``servers`` takes whatever a caller has: the
+    :class:`~.live_view.LiveStackServer` payloads a run reported, the
+    :class:`PublishedServer` records :func:`discover_servers` found, or bare
+    URL strings. A ``LiveStackServer`` brings its own token; the others have
+    none to bring - the address files deliberately do not carry one - so
+    ``token`` is applied to those.
+
+    **One host failing costs only that host.** The reads run concurrently and
+    every failure is caught per member, because the case this exists for is
+    precisely the one where something is wrong somewhere: a fleet reader that
+    raised on the first refusal would report nothing at exactly the moment
+    there was something to see.
+    """
+    if client is None:
+        async with httpx.AsyncClient(timeout=timeout or DEFAULT_TIMEOUT) as owned:
+            return await read_fleet(
+                servers, token=token, only=only, timeout=timeout, client=owned
+            )
+
+    async def ask(entry: Any) -> FleetMember:
+        url, carried, published = _target(entry, token)
+        member = FleetMember(url=url, server=published)
+        reader = FailureServerClient(
+            url=url, token=carried, timeout=timeout or DEFAULT_TIMEOUT, client=client
+        )
+        try:
+            member.snapshot = await reader.workers(only=only, timeout=timeout)
+        except FailureServerError as failed:
+            # Verbatim, and per member. A refusal names its own fix and a
+            # transport failure names an address; both are worth more to the
+            # reader than the fact that something went wrong.
+            member.error = str(failed)
+        return member
+
+    gathered = await asyncio.gather(*(ask(entry) for entry in servers))
+    return Fleet(observed_at=round(time.time(), 3), members=list(gathered))
+
+
+def _target(entry: Any, token: str) -> tuple[str, str, Optional[PublishedServer]]:
+    """One entry of ``servers``, as an address and the token to reach it with."""
+    if isinstance(entry, str):
+        return entry.rstrip("/"), token, None
+    if isinstance(entry, LiveStackServer):
+        # Its own, which is the point of being handed the payload: a fleet can
+        # span runs, and two runs need not have been started with one token.
+        return entry.url.rstrip("/"), entry.token, None
+    if isinstance(entry, PublishedServer):
+        # The address files carry no token by design, so this one falls back to
+        # the caller's.
+        return entry.url.rstrip("/"), token, entry
+    raise TypeError(
+        "a server is a LiveStackServer, a PublishedServer or a URL string, "
+        f"not {type(entry).__name__}"
+    )
