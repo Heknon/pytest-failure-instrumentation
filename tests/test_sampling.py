@@ -241,12 +241,57 @@ def test_a_real_run_pushes_samples_to_a_product_that_implements_the_hook(pyteste
     assert any("test_one" in n or "test_two" in n for n in nodeids)
     # Statuses come from the truth table, not from a placeholder.
     assert {w["status"] for s in samples for w in s["workers"]} <= {
-        "working", "blocked", "frozen", "gone", "unmeasured"
+        "working", "blocked", "frozen", "gone", "unmeasured", "finished"
     }
     # And nothing was asked of a worker to produce any of it: a sample that
     # grew a frames field again would be a per-worker pause on a timer.
     assert not [key for s in samples for w in s["workers"] for key in w
                 if "stack" in key]
+
+
+@needs_xdist
+def test_a_worker_that_ran_out_of_work_is_finished_and_not_frozen(pytester):
+    """Two workers, one test each, one of them slow. The worker with the quick
+    test is done within the first second and its process then idles inside
+    execnet until the slow one finishes and the controller tears both down -
+    which is xdist's design, not a hang. It was sampled as ``frozen`` for the
+    whole of that wait, with a py-spy stack showing nothing but
+    ``integrate_as_primary_thread`` on an ``Event.wait``, and a dashboard
+    drawing that row red for every run whose work is unevenly split."""
+    pytester.makeconftest(RECORDING_CONFTEST)
+    pytester.makepyfile(
+        """
+        import time
+
+        def test_fast():
+            pass
+
+        def test_slow():
+            time.sleep(6)
+        """
+    )
+    result = pytester.runpytest_subprocess(
+        "-p", "failure_instrumentation", "-n", "2", "--dist", "load",
+        "-o", "failure_sample_seconds=1",
+        "-o", "failure_heartbeat_interval=1",
+    )
+    result.assert_outcomes(passed=2)
+
+    lines = (pytester.path / "samples.jsonl").read_text(encoding="utf-8").splitlines()
+    statuses: dict[str, list[str]] = {}
+    for line in lines:
+        for row in json.loads(line)["workers"]:
+            statuses.setdefault(row["worker"], []).append(row["status"])
+    done = [worker for worker, seen in statuses.items() if "finished" in seen]
+    assert done, f"no worker was ever reported finished: {statuses}"
+    for worker in done:
+        seen = statuses[worker]
+        assert "frozen" not in seen, f"{worker} read as frozen while merely done: {seen}"
+        # And done is final: nothing a finished worker does afterwards is a
+        # sign of life, so the row never goes back to being a finding.
+        assert seen[seen.index("finished"):] == ["finished"] * (
+            len(seen) - seen.index("finished")
+        ), seen
 
 
 def test_sampling_is_off_unless_it_is_asked_for(pytester):

@@ -53,7 +53,10 @@ class SampledWorker(BaseModel):
     phase: Optional[str] = None
 
     #: ``working`` / ``blocked`` / ``frozen`` / ``gone`` / ``unmeasured`` -
-    #: :mod:`.analysis.stall`'s truth table as a live status.
+    #: :mod:`.analysis.stall`'s truth table as a live status - and
+    #: ``finished``, for a worker that has run its last test and whose
+    #: process is only being kept alive by xdist until the run ends. It is
+    #: the one status that is not a finding; see :mod:`.topology`.
     status: str = ""
     #: The same finding in words, safe to show a human as-is.
     why: str = ""
