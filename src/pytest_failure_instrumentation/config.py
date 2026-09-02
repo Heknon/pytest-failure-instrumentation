@@ -217,6 +217,26 @@ class Settings:
     #: 127.0.0.1 is unreachable from there. Anything else is a deliberate
     #: exposure and says so.
     stack_server_host: str = DEFAULT_STACK_SERVER_HOST
+    #: Whether the live server may answer ``/stack?locals`` with each frame's
+    #: variables.
+    #:
+    #: On, because the variables are most of what makes a live stack worth
+    #: reading: "waiting on a lease" and "waiting on a lease it has already
+    #: waited 27 seconds for" are the same frame and different bugs, and a
+    #: reader who has to know to ask is a reader who mostly does not.
+    #:
+    #: It is nonetheless the one thing this server discloses that is *data*
+    #: rather than the shape of the code - a fixture's credentials, a customer
+    #: record, a decrypted payload, whatever the failing test happens to be
+    #: holding - so a deployment that cannot have that leave the process turns
+    #: it off here and still gets the frames. Nothing is redacted selectively:
+    #: this package cannot tell a password from a lease id, and a filter that
+    #: pretended to would be worse than the honest switch.
+    #:
+    #: The variables are rendered by py-spy inside its own process while the
+    #: target is stopped, so what crosses the wire is text: no ``__repr__`` of
+    #: yours is executed to produce it.
+    stack_server_locals: bool = True
     #: What every endpoint but ``/identity`` demands, or "" for a server that
     #: asks nothing. Supplied rather than minted, and never written down by
     #: this package: the address of a drawn port has to be published, but the
@@ -573,6 +593,17 @@ def add_options(parser: pytest.Parser) -> None:
         default=DEFAULT_STACK_SERVER_HOST,
     )
     parser.addini(
+        "failure_stack_server_locals",
+        help="Whether that server answers /stack?locals with each frame's "
+        "variables. On by default, and the difference between 'waiting on a "
+        "lease' and 'waiting on a lease for 27 seconds'. Turn it off where a "
+        "test's data must not leave the process even to a reader trusted with "
+        "the frames: the variables are rendered as text by py-spy, but they "
+        "are the data itself, and nothing here can tell a password from a "
+        "lease id.",
+        default="true",
+    )
+    parser.addini(
         "failure_sample_seconds",
         help="Push a worker sample to pytest_failure_worker_sample this often, "
         "while the run is going. 0 disables, and is the default.",
@@ -841,6 +872,7 @@ def resolve(config: pytest.Config) -> Settings:
             or _ini(config, "failure_stack_server_host", "")
             or DEFAULT_STACK_SERVER_HOST
         ),
+        stack_server_locals=_flag(config, "failure_stack_server_locals", True),
         stack_server_token=chosen_token or "",
         worker_count=worker_count,
         run_id=run_id,

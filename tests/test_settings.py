@@ -53,6 +53,7 @@ DEFAULTS = {
     "failure_stack_server": "false",
     "failure_stack_server_port": "0",
     "failure_stack_server_host": "127.0.0.1",
+    "failure_stack_server_locals": "true",
 }
 
 

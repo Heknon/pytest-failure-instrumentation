@@ -26,7 +26,10 @@ from __future__ import annotations
 
 import os
 import signal
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:  # imported lazily below, so a run that never reads a stack
+    from .pyspy import Reading, StackOptions  # never pays for this module
 
 
 def can_request_stack() -> bool:
@@ -72,3 +75,18 @@ def live_stack(pid: int) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]
     if pid == os.getpid():
         tracing.permit_own_children()
     return pyspy.dump(pid)
+
+
+def live_reading(pid: int, options: Optional[StackOptions] = None) -> Reading:
+    """:func:`live_stack` for a caller that has options to ask for.
+
+    The same read, the same Yama declaration and the same single reader - what
+    differs is that the answer carries the options that were *applied* and a
+    note for any that could not be, which a caller offering those options to a
+    user needs and a caller with none does not.
+    """
+    from . import pyspy, tracing
+
+    if pid == os.getpid():
+        tracing.permit_own_children()
+    return pyspy.read(pid, options)
