@@ -2035,7 +2035,14 @@ def test_a_py_spy_that_cannot_unwind_still_answers_with_python_frames(monkeypatc
 def test_a_refused_attach_is_not_retried_as_a_native_problem(monkeypatch):
     """The retry above must not swallow the failures that are about the
     process rather than the flag - a refused ptrace re-read without --native
-    fails identically, and would be reported as a py-spy build feature."""
+    fails identically, and would be reported as a py-spy build feature.
+
+    The hint appended to it is platform-specific - ptrace_scope on Linux, SIP
+    on macOS, opening the process on Windows - so this asserts that one was
+    added rather than which, the way ``test_a_refused_attach_says_what_to_do
+    _about_it`` does. Asserting the Linux wording passed on Linux and failed
+    on every other job in the matrix.
+    """
     attempts = _reading(
         monkeypatch,
         b"",
@@ -2045,8 +2052,12 @@ def test_a_refused_attach_is_not_retried_as_a_native_problem(monkeypatch):
     reading = pyspy.read(4321, pyspy.StackOptions(native=True))
 
     assert len(attempts) == 1, "a permission failure was retried"
-    assert reading.error and "ptrace_scope" in reading.error
+    # Reported as itself: py-spy's own words, plus this platform's advice.
+    assert reading.error and "Operation not permitted" in reading.error
+    assert any(hint in reading.error for hint in pyspy.PERMISSION_HINTS.values())
+    # And not as a native problem: nothing downgraded, nothing explained away.
     assert reading.notes == ()
+    assert reading.options.native is True
 
 
 def test_locals_are_absent_rather_than_empty_when_nobody_asked(monkeypatch):
