@@ -24,6 +24,11 @@ computes its own settings installs it by hand instead::
 Nothing here imports pydantic. The incident models do, and they are loaded on
 the controller only, once something has already gone wrong - so a worker's
 per-test path is unaffected by any of it.
+
+A product reading a run's live view from outside it wants
+:class:`~.client.FailureServerClient`, which is async and needs httpx - so it
+lives in its own module behind the ``client`` extra, and nothing on a run's own
+path imports it.
 """
 
 from .config import Settings

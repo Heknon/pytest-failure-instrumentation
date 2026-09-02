@@ -43,6 +43,10 @@ psutil = ["psutil>=5.9"]
 # The external stack reader, for the live server. Only needed to read a
 # process other than the one serving, and only when the server is switched on.
 stacks = ["py-spy>=0.3"]
+# The async client for that server, for a product reading it from outside the
+# run. The plugin never imports it, so a run that serves a live view without
+# consuming one pays nothing for this.
+client = ["httpx>=0.24"]
 
 [project.urls]
 Homepage = "https://github.com/Heknon/pytest-failure-instrumentation"
