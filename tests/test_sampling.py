@@ -15,7 +15,7 @@ from pathlib import Path
 
 from pytest_failure_instrumentation.sampling import WorkerSampler
 
-from .conftest import needs_xdist
+from .conftest import ENABLE_FLAG, needs_xdist
 
 
 def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid=None,
@@ -224,7 +224,7 @@ def test_a_real_run_pushes_samples_to_a_product_that_implements_the_hook(pyteste
         """
     )
     result = pytester.runpytest_subprocess(
-        "-p", "failure_instrumentation", "-n", "2",
+        "-p", "failure_instrumentation", ENABLE_FLAG, "-n", "2",
         "-o", "failure_sample_seconds=1",
         "-o", "failure_heartbeat_interval=1",
     )
@@ -271,7 +271,7 @@ def test_a_worker_that_ran_out_of_work_is_finished_and_not_frozen(pytester):
         """
     )
     result = pytester.runpytest_subprocess(
-        "-p", "failure_instrumentation", "-n", "2", "--dist", "load",
+        "-p", "failure_instrumentation", ENABLE_FLAG, "-n", "2", "--dist", "load",
         "-o", "failure_sample_seconds=1",
         "-o", "failure_heartbeat_interval=1",
     )
@@ -305,7 +305,7 @@ def test_sampling_is_off_unless_it_is_asked_for(pytester):
         """
     )
     pytester.makepyfile("def test_one():\n    assert True\n")
-    result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation", ENABLE_FLAG)
     result.assert_outcomes(passed=1)
     assert not (pytester.path / "samples.jsonl").exists()
 
@@ -323,7 +323,7 @@ def test_a_run_with_no_workers_is_sampled_like_any_other(pytester):
     pytester.makeconftest(RECORDING_CONFTEST)
     pytester.makepyfile("import time\n\n\ndef test_one():\n    time.sleep(3)\n")
     result = pytester.runpytest_subprocess(
-        "-p", "failure_instrumentation",
+        "-p", "failure_instrumentation", ENABLE_FLAG,
         "-o", "failure_sample_seconds=1",
         "-o", "failure_heartbeat_interval=1",
     )

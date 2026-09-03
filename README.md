@@ -180,8 +180,26 @@ informational.
 pip install pytest-failure-instrumentation
 ```
 
-It registers itself as a `pytest11` entry point. Implement one hook to receive
-what it finds:
+Installed is not switched on. The package registers a `pytest11` entry point
+so that its hooks and its `failure_*` options exist on every run, and then does
+nothing until a run asks for it:
+
+```console
+pytest --failure-instrumentation
+```
+
+Put the switch in `addopts` to have every run ask, and tell it which packages
+are yours, so a failing frame in your code can be told from one in a dependency
+or in the customer's own tests:
+
+```ini
+[pytest]
+addopts = --failure-instrumentation
+failure_packages = yourcore, yourcore_ext
+failure_product_version = 4.2.0
+```
+
+Implement one hook to receive what it finds:
 
 ```python
 # conftest.py, or your own plugin
@@ -190,17 +208,14 @@ def pytest_failure_incident(incident):
     alerts.send(str(incident))
 ```
 
-Tell it which packages are yours, so a failing frame in your code can be told
-from one in a dependency or in the customer's own tests:
-
-```ini
-[pytest]
-failure_packages = yourcore, yourcore_ext
-failure_product_version = 4.2.0
-```
-
 Without the hook it still writes its evidence to `.pytest-failures/`.
-Disable it entirely with `-p no:failure_instrumentation`.
+
+Naming the live view switches it on as well: `--callstack-port` or
+`--callstack-host` is a request for a server that cannot run without the
+plugin under it, and an option accepted and then ignored for want of a second
+one is worse than either behaviour on its own. The other way to switch it on is
+to call `install` from your own code, below. `-p no:failure_instrumentation`
+removes the entry point altogether, options and hookspecs included.
 
 ## Installing it from your own framework
 
@@ -250,13 +265,15 @@ is in force is pushed down through `workerinput`, and a worker prefers it over
 anything it could read itself. `run_id` travels with it, which is what lets a
 build id group a whole run's incidents.
 
-**Turning auto-registration off.** `-p no:failure_instrumentation` skips the
+**Turning the entry point off.** `-p no:failure_instrumentation` skips the
 entry point entirely; `install` puts back the hookspecs so
 `pytest_failure_incident`, `pytest_failure_worker_sample` and
 `pytest_failure_server_ready` all still reach their implementers. Note that it also skips `pytest_addoption`, so
 `failure_*` ini keys become unknown config options — which is the point if your
 framework owns the settings, and a reason to leave the entry point enabled and
-just call `install` if it does not.
+just call `install` if it does not. Either way `install` is itself the switch:
+a framework that calls it has asked, and nobody has to pass
+`--failure-instrumentation` as well.
 
 `install` is idempotent and returns the settings in force. A second call keeps
 the first one's and warns rather than silently losing to it;
@@ -389,9 +406,9 @@ that could avoid the first is a second set of failure modes and a second source
 to explain. It reads memory rather than asking the process to run anything, so
 no signal is sent that could return a blocked syscall early and dissolve the
 stall, and Windows — where no process can be *asked* for a stack — gets a
-current one like everywhere else. Without py-spy installed the verdict is
-unchanged, since it comes from beats rather than frames, and the stack is
-whatever the watchdog last wrote.
+current one like everywhere else. Where py-spy cannot read the process — macOS
+without root — the verdict is unchanged, since it comes from beats rather than
+frames, and the stack is whatever the watchdog last wrote.
 
 The exception is `STALLED_FROZEN`, which is precisely the case where no Python
 runs: the watcher thread cannot run either, so a frozen lone run reports
@@ -1342,10 +1359,10 @@ requirement entirely, so any reader on the machine that could already ptrace is
 permitted. That is the setting a shared server needs and the one a private run
 does not, which is why it is not the default.
 
-### Reading a live process needs py-spy
+### Reading a live process is py-spy's job
 
-`pip install pytest-failure-instrumentation[stacks]`. There is no way to walk
-another process's frames from Python, so a live stack is read from outside the
+py-spy is installed with the package. There is no way to walk another
+process's frames from Python, so a live stack is read from outside the
 target: py-spy reads its memory rather than asking it to run anything, and
 stops it before reading, so it never walks a frame that is being torn down.
 That is what makes it work on a worker whose GIL is held by native code, and it
@@ -1364,7 +1381,8 @@ this run's own descendants and nothing else, narrower than the `parent` policy
 above — and it is made at the moment of the read rather than at startup, so
 only the runs that read a stack make it.
 
-Without py-spy the endpoint still answers, with the reason instead of a stack.
+Where py-spy cannot read the target — macOS without root, a sibling under Yama
+— the endpoint still answers, with the reason instead of a stack.
 A UI that is told *why* it has no stack can tell a dead process from a missing
 permission; one that gets an empty response cannot. The same is true of a
 stall: the verdict comes from heartbeats rather than frames, so it is reached
@@ -1564,7 +1582,7 @@ its directory says so.
 | Current memory | procfs | psutil | psapi |
 | Container limit, OOM counter | yes | n/a | n/a — no OOM killer |
 | On-demand stack from a stalled worker | yes | yes | no |
-| Live stack of a running process (needs py-spy) | yes | root only | yes |
+| Live stack of a running process (py-spy) | yes | root only | yes |
 | Stack from a worker that stopped running Python | yes | yes | yes |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a

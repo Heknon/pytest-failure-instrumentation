@@ -194,8 +194,9 @@ def available() -> bool:
 def unavailable_reason() -> str:
     """Why there is no external reader, phrased for somebody who can fix it."""
     return (
-        "py-spy is not installed in this environment (pip install py-spy), so "
-        "a live process's stack cannot be read from outside it"
+        "py-spy is not installed in this environment, so a live process's "
+        "stack cannot be read from outside it. It is a dependency of this "
+        "package, so this install is missing one (pip install py-spy)"
     )
 
 

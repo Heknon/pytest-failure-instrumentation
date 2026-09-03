@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from .conftest import INCIDENT_FILE, _has_xdist, needs_xdist
+from .conftest import ENABLE_FLAG, INCIDENT_FILE, _has_xdist, needs_xdist
 
 BOOM_PLUGIN = """
 import os
@@ -92,7 +92,7 @@ def test_a_previous_runs_evidence_is_not_reported_as_this_ones(runner, monkeypat
         # Run one: a worker fails, and its record stays on disk.
         monkeypatch.setenv("BOOM_ON", "gw1")
         runner.pytester.runpytest_subprocess(
-            "-n", "2", "-p", "boom_plugin", "test_suite.py", timeout=180
+            ENABLE_FLAG, "-n", "2", "-p", "boom_plugin", "test_suite.py", timeout=180
         )
         assert list(evidence.glob("*.events"))
     else:

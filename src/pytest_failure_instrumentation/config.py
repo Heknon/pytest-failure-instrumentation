@@ -546,8 +546,8 @@ def add_options(parser: pytest.Parser) -> None:
         "shared with nobody, unless failure_stack_server_port names one - a "
         "named port is shared with every other session on the host. Binds "
         "loopback unless failure_stack_server_host says otherwise, and off "
-        "loopback a token is required. Reading a process other than the "
-        "server's own needs py-spy installed.",
+        "loopback a token is required. Every process is read with py-spy, "
+        "which on macOS needs root.",
         default="false",
     )
     parser.addini(
@@ -635,6 +635,17 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
     """
     group = parser.getgroup("failure-instrumentation")
     group.addoption(
+        "--failure-instrumentation",
+        action="store_true",
+        default=False,
+        dest=ENABLE_OPTION,
+        help="Switch the plugin on for this run. Installed, it registers its "
+        "hooks and its failure_* options and does nothing else until asked - "
+        "here, by naming --callstack-port or --callstack-host, or by a call to "
+        "pytest_failure_instrumentation.install(). Put it in addopts to have "
+        "every run ask.",
+    )
+    group.addoption(
         "--callstack-port",
         type=int,
         default=None,
@@ -662,6 +673,48 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         "long as the run lasts, and which shell history and CI logs keep "
         "afterwards. A process's environment is readable only by its owner.",
     )
+
+
+#: The ``dest`` of ``--failure-instrumentation``: what ``getoption`` is asked for.
+ENABLE_OPTION = "failure_instrumentation"
+
+
+def switched_on(config: pytest.Config) -> bool:
+    """Whether this process was asked to run the plugin.
+
+    Installed is not switched on. The entry point registers the hookspecs and
+    the options on every run, so a conftest implementing
+    ``pytest_failure_incident`` never fails ``check_pending`` and a ``failure_*``
+    ini key is never an unknown option - and then does nothing more unless one
+    of three things asked it to:
+
+    ``--failure-instrumentation``, the switch itself.
+
+    ``--callstack-port`` or ``--callstack-host``, because naming either is a
+    request for the live-stack server (see :func:`_add_command_line_options`)
+    and the server cannot run without the plugin under it. An option accepted,
+    parsed and then ignored because a second switch was not also given is the
+    behaviour that docstring exists to rule out. The token does not count, for
+    the reason given there: it authenticates a server, it does not start one.
+
+    Settings handed down by the controller, on an xdist worker. A controller
+    that installed - by flag or by a framework calling :func:`install` - has
+    asked for its workers too, and the framework's code may not even be
+    loaded in the worker to ask again. The flag itself also reaches a worker,
+    through the argv xdist replays there; this covers the install() case,
+    where nothing is on the command line at all.
+
+    :func:`install` is the fourth way and needs none of these: a caller that
+    registers the plugin by hand has said what it wants by calling.
+    """
+    if _option(config, ENABLE_OPTION):
+        return True
+    if _option(config, "callstack_port") is not None:
+        return True
+    if _option(config, "callstack_host") is not None:
+        return True
+    workerinput: dict[str, Any] = getattr(config, "workerinput", {}) or {}
+    return bool(workerinput.get("failure_settings"))
 
 
 def _option(config: pytest.Config, name: str) -> Any:

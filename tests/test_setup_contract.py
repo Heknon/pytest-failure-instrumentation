@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from .conftest import needs_xdist
+from .conftest import ENABLE_FLAG, INNER_CONFTEST, needs_xdist
 
 SUITE = """
 def test_one():
@@ -39,7 +39,8 @@ def test_a_directory_that_cannot_be_created_does_not_end_the_run(runner):
     (runner.pytester.path / "taken").write_text("not a directory", encoding="utf-8")
 
     result = runner.pytester.runpytest_subprocess(
-        "-p", "no:xdist", "-o", "failure_directory=taken/evidence", "test_suite.py"
+        ENABLE_FLAG, "-p", "no:xdist", "-o", "failure_directory=taken/evidence",
+        "test_suite.py",
     )
     result.assert_outcomes(passed=2)
 
@@ -52,11 +53,109 @@ def test_a_worker_that_cannot_write_evidence_does_not_end_the_run(runner):
     (runner.pytester.path / "taken").write_text("not a directory", encoding="utf-8")
 
     result = runner.pytester.runpytest_subprocess(
-        "-n", "2", "-o", "failure_directory=taken/evidence", "test_suite.py", timeout=180
+        ENABLE_FLAG, "-n", "2", "-o", "failure_directory=taken/evidence", "test_suite.py",
+        timeout=180,
     )
     result.assert_outcomes(passed=2)
     # A warning, on stderr, from each worker - not an error and not silence.
     result.stderr.fnmatch_lines(["*failure instrumentation is off for this worker*"])
+
+
+#: A conftest that records whether the plugin was installed on this process,
+#: and implements the incident hook - which is the part that has to keep
+#: working when the plugin is off: the hookspec still has to be there, or a
+#: consumer's conftest fails the whole session at check_pending.
+REPORTS_WHETHER_INSTALLED = INNER_CONFTEST + """
+
+from pytest_failure_instrumentation import installed_settings
+
+
+def pytest_sessionstart(session):
+    worker = getattr(session.config, "workerinput", None)
+    name = worker["workerid"] if worker else "controller"
+    with open(f"installed-{name}.txt", "w", encoding="utf-8") as handle:
+        handle.write(repr(installed_settings(session.config)))
+"""
+
+
+def _installed_on(runner) -> dict[str, str]:
+    return {
+        path.stem.split("-", 1)[1]: path.read_text(encoding="utf-8")
+        for path in sorted(runner.pytester.path.glob("installed-*.txt"))
+    }
+
+
+def test_installed_is_not_switched_on(runner):
+    """A run that did not ask gets the hookspecs and the options and nothing
+    else: no evidence directory, no recorder, no summary at the end.
+
+    The switch is what makes ``pip install`` safe to leave in a shared
+    environment - a plugin that starts writing to every run's working
+    directory the moment it is present is one that gets uninstalled.
+    """
+    runner.pytester.makepyfile(test_suite=SUITE)
+    runner.pytester.makeconftest(REPORTS_WHETHER_INSTALLED)
+
+    result = runner.pytester.runpytest_subprocess("-p", "no:xdist", "test_suite.py")
+
+    result.assert_outcomes(passed=2)
+    assert "INTERNALERROR" not in result.stdout.str()
+    assert _installed_on(runner) == {"controller": "None"}
+    assert not (runner.pytester.path / ".pytest-failures").exists()
+    assert runner.incidents() == [], "nothing was watching, so nothing reports"
+    # The ini keys are still known, because the options are registered whether
+    # or not the plugin is on - a project's ini must not become invalid
+    # because one run left the switch off.
+    assert "unknown config option" not in result.stdout.str().lower()
+
+
+@needs_xdist
+def test_workers_are_not_switched_on_either(runner):
+    """A worker replays the controller's argv and is handed its settings, and
+    with neither saying anything the worker has nothing to obey."""
+    runner.pytester.makepyfile(test_suite=SUITE)
+    runner.pytester.makeconftest(REPORTS_WHETHER_INSTALLED)
+
+    result = runner.pytester.runpytest_subprocess("-n", "2", "test_suite.py", timeout=180)
+
+    result.assert_outcomes(passed=2)
+    assert _installed_on(runner) == {"controller": "None", "gw0": "None", "gw1": "None"}
+    assert not (runner.pytester.path / ".pytest-failures").exists()
+    assert runner.incidents() == []
+
+
+@needs_xdist
+def test_the_switch_on_the_controller_reaches_the_workers(runner):
+    """The flag travels: xdist replays argv on every worker, and the controller
+    hands its settings down as well, so a run switched on once is on
+    everywhere."""
+    runner.pytester.makepyfile(test_suite=SUITE)
+    runner.pytester.makeconftest(REPORTS_WHETHER_INSTALLED)
+
+    incidents = runner.run("-n", "2", "test_suite.py", timeout=180)
+
+    installed = _installed_on(runner)
+    assert set(installed) == {"controller", "gw0", "gw1"}
+    assert all(record != "None" for record in installed.values()), installed
+    assert runner.only(incidents, "run_summary").verdict == "RUN_FINISHED"
+
+
+def test_naming_the_live_view_switches_it_on(runner):
+    """``--callstack-port`` is a request for a server, and the server cannot
+    run without the plugin under it - so it is a request for the plugin. An
+    option accepted and then ignored for want of a second one is the failure
+    the option's own docstring exists to rule out."""
+    runner.pytester.makepyfile(test_suite=SUITE)
+    runner.pytester.makeconftest(REPORTS_WHETHER_INSTALLED)
+
+    result = runner.pytester.runpytest_subprocess(
+        "-p", "no:xdist", "--callstack-port", "0", "test_suite.py"
+    )
+
+    result.assert_outcomes(passed=2)
+    (record,) = _installed_on(runner).values()
+    assert "stack_server=True" in record
+    assert runner.only(runner.incidents(), "run_summary").verdict == "RUN_FINISHED"
 
 
 #: A psutil that is installed and will not import, which is what a platform
@@ -101,7 +200,7 @@ def test_a_psutil_that_will_not_import_does_not_end_the_run(runner, monkeypatch)
     runner.pytester.makepyfile(test_suite=SUITE)
     _psutil_that_will_not_import(runner, monkeypatch)
 
-    result = runner.pytester.runpytest_subprocess("-p", "no:xdist", "test_suite.py")
+    result = runner.pytester.runpytest_subprocess(ENABLE_FLAG, "-p", "no:xdist", "test_suite.py")
     result.assert_outcomes(passed=2)
     assert "INTERNALERROR" not in result.stdout.str()
     result.stderr.fnmatch_lines(["*failure instrumentation is off for this run*"])
@@ -120,7 +219,9 @@ def test_a_worker_whose_psutil_will_not_import_does_not_end_the_run(runner, monk
     runner.pytester.makepyfile(test_suite=SUITE)
     _psutil_that_will_not_import(runner, monkeypatch)
 
-    result = runner.pytester.runpytest_subprocess("-n", "2", "test_suite.py", timeout=180)
+    result = runner.pytester.runpytest_subprocess(
+        ENABLE_FLAG, "-n", "2", "test_suite.py", timeout=180
+    )
     result.assert_outcomes(passed=2)
     assert "INTERNALERROR" not in result.stdout.str()
     result.stderr.fnmatch_lines(["*failure instrumentation is off for this worker*"])

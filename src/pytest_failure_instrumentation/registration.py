@@ -1,8 +1,9 @@
 """Installing the plugin yourself, with settings you computed.
 
-The ``pytest11`` entry point covers the ordinary case: ``pip install`` and the
-plugin configures itself from ini. A framework that wraps pytest and ships it
-to its own teams usually cannot use that. Its settings come from its own
+The ``pytest11`` entry point covers the ordinary case: ``pip install``,
+``--failure-instrumentation`` on the command line, and the plugin configures
+itself from ini. A framework that wraps pytest and ships it to its own teams
+usually cannot use that. Its settings come from its own
 configuration - a service catalogue, a deploy manifest, an environment it
 already parsed - and asking every consuming team to copy an ini block that
 must stay in step with it is a migration that never finishes.

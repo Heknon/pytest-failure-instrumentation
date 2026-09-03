@@ -19,13 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from pytest_failure_instrumentation.probes import pyspy
-
-from .conftest import needs_xdist
-
-needs_pyspy = pytest.mark.skipif(
-    not pyspy.available(), reason="py-spy is not installed in this environment"
-)
+from .conftest import needs_pyspy, needs_xdist
 
 SUITE = """
 def test_one():
