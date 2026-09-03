@@ -135,6 +135,32 @@ def test_the_alert_text_leads_with_the_blame():
     assert "test_api.py::test_thing" in rendered[2]
 
 
+def test_a_death_says_which_worker_died():
+    """xdist's own line is ``[gw7] node down: Not properly terminated``, and
+    the alert used to carry everything but the one token that ties it to that
+    line. A replacement worker comes up under a new id, so a run that lost two
+    workers produced two alerts that differed in nothing a reader could see -
+    and ``<worker>.crash`` on the runner is named by the id the alert did not
+    print."""
+    in_flight = WorkerDeathIncident(
+        worker="gw7", test_in_flight="test_api.py::test_thing", phase="call"
+    )
+    between = WorkerDeathIncident(
+        worker="gw7", last_test="test_api.py::test_thing", tests_finished=3
+    )
+    before_any = WorkerDeathIncident(worker="gw7")
+    for death in (in_flight, between, before_any):
+        facts = [line.strip() for line in str(death).splitlines()[1:]]
+        assert facts[0].startswith("worker=gw7  "), facts
+
+    # A run with no workers still has one process, and it still has a name:
+    # the one its crash file carries.
+    alone = WorkerDeathIncident(worker="main", recovered_from_run="run-1")
+    lines = [line.strip() for line in str(alone).splitlines()]
+    assert lines[1].startswith("recovered from run-1")
+    assert lines[2].startswith("worker=main  ")
+
+
 def test_a_guess_is_never_rendered_as_a_finding():
     incident = WorkerDeathIncident(
         worker="gw1",

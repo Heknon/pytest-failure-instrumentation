@@ -201,12 +201,22 @@ class WorkerDeathIncident(Incident):
         return self._where(counted)
 
     def _where(self, counted: str) -> list[str]:
+        """Which worker, and what it was doing.
+
+        The worker leads, because it is the one fact the reader already has
+        from xdist's own line - ``[gw7] node down: Not properly terminated`` -
+        and the one that ties this alert to it. A replacement worker arrives
+        under a new id, so a run that lost two is two alerts that differ in
+        nothing else, and a reader who cannot see the id cannot tell which
+        ``<worker>.crash`` on the runner holds the rest of the dump.
+        """
+        who = f"worker={self.worker}"
         if self.test_in_flight:
             phase = f"  phase={self.phase}" if self.phase else ""
-            return [f"in flight {self.test_in_flight}{phase}  {counted}"]
+            return [f"{who}  in flight {self.test_in_flight}{phase}  {counted}"]
         if self.last_test:
-            return [f"no test in flight; last was {self.last_test}  {counted}"]
-        return [f"no test in flight  {counted}"]
+            return [f"{who}  no test in flight; last was {self.last_test}  {counted}"]
+        return [f"{who}  no test in flight  {counted}"]
 
 
 def build(

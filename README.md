@@ -16,7 +16,7 @@ hands you one structured incident per problem.
 ```
 [worker_death] NATIVE_CRASH  severity=critical  owner=product
     blamed on engine.py:6 in native_call
-    in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
+    worker=gw1  in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
     · died while running test_crashes.py::test_crashes (call)
     · exit status -11 - SIGSEGV: segmentation fault in native code (pid 805, via waitid)
     · the worker wrote a stack before dying
@@ -156,7 +156,7 @@ wrong:
 
 ```
 [worker_death] SIGKILLED  severity=needs-triage  owner=unknown
-    no test in flight  started=0 finished=0
+    worker=gw1  no test in flight  started=0 finished=0
     · died before running any test (startup or collection)
     · exit status -9 - SIGKILL: uncatchable kill (OOM killer or external kill) (pid 21780, via waitid)
     · resident memory 31 MB at last checkpoint
@@ -710,7 +710,7 @@ finished one is a death:
 [worker_death] UNKNOWN  severity=needs-triage  owner=unknown
     no stack; suspect customer-code (owner of the test in flight (test_pool.py))
     recovered from run-8f21c0b4e5d7, which ended without reaching session finish
-    in flight test_pool.py::test_writes  phase=call  started=12 finished=11
+    worker=main  in flight test_pool.py::test_writes  phase=call  started=12 finished=11
     · died while running test_pool.py::test_writes (call)
     · exit status unavailable (pid 21780): nothing was left to read it. Only a parent may, the parent was the run that died, and by the time this evidence was found the process was gone - so an OOM kill, a segfault and an os._exit cannot be told apart here
     · resident memory 412 MB at last checkpoint
