@@ -1394,6 +1394,133 @@ read another running as the same user at the same integrity level, so the
 descendant rule above simply does not apply. Reading an *elevated* process from
 an unelevated one needs `SeDebugPrivilege`.
 
+## Profiling
+
+Everything above waits for something to go wrong. `--profile` waits for
+nothing: it samples the process running the tests for the whole run and, at
+the end, names the functions that burnt the CPU and the tests that kept the
+memory — as incidents, through the same hook, because "your image comparison
+is 38% of the run" is a finding you want flagged the way a segfault is.
+
+```console
+pytest --profile
+```
+
+or `failure_profile = true` in ini for every run. Off by default: it is the
+one thing here with a running cost on a healthy run, about a percent of a
+core per worker.
+
+### What it measures
+
+A thread of its own wakes fifty times a second on each worker, reads every
+thread's stack, and charges the CPU each thread burnt since the last wake to
+the stack it is in now. **Weighted by CPU, not by wall time.** A thread asleep
+in `recv` weighs nothing and vanishes; a thread spinning on a poll becomes the
+widest thing in the profile. That is the difference between "where did the
+time go" and "where did the cores go", and only the second answers why a
+worker sits at 30%.
+
+The per-thread counters come from `clock_gettime` on each thread's CPU clock,
+which reads in a few hundred nanoseconds and — this is the part that matters —
+without releasing the GIL. A sampler that opens a file per thread per sample
+releases the GIL on every read and then waits a whole switch interval to get it
+back from a busy test; measured, that ran a fifty-hertz sampler at eight.
+
+Each stack is charged to the first frame, walking outward from the innermost,
+that belongs to somebody: your packages or the customer's tests first, a
+dependency failing that, the runtime failing everything. So two million calls
+into a C pixel accessor are charged to *your* `is_images_different`, and a
+second spent in `json/encoder.py` is charged to *your* `render_report`, below
+the json encoder. Threads Python has no stack for — a thread pool a C extension
+started — are counted by their kernel names, so CPU outside the interpreter is
+reported rather than quietly dropped.
+
+Per test it also records resident memory at every phase boundary, the peak
+between them, and — on glibc — how much of the heap is actually in use, so
+memory a test *freed* that the allocator kept mapped is told from memory that
+is still alive.
+
+### What it raises
+
+Two kinds, both `severity=informational` whoever owns them, because nothing
+failed.
+
+**`cpu_hotspot`** — one per function over `failure_profile_cpu_share` percent
+of the run's CPU (and at least half a second of it). The verdict says what kind
+of cost it is:
+
+| Verdict | Means |
+|---|---|
+| `PYTHON_CODE` | the function's own lines are hot: a Python loop, or C calls made from them that leave no frame |
+| `LIBRARY_CALL` | the cost is under a library or runtime call it makes, which is named |
+| `BACKGROUND_THREAD` | the CPU is on a thread that is not running the test — a poller, a watcher — and is paid whatever test is in flight |
+| `GC_PRESSURE` | the collector took more than a tenth of the run, and here are the tests that drove it |
+| `NATIVE_THREADS` | CPU in threads Python has no stack for, by kernel thread name |
+
+**`memory_profile`** — per test, against `failure_profile_retained_mb`:
+
+| Verdict | Means |
+|---|---|
+| `RETAINED_AFTER_TEST` | the worker was left holding more than it started with, still in use, with the phase it arrived in — `setup` is a fixture |
+| `HEAP_NOT_RETURNED` | it was left holding more, but none of it is in use: the allocator kept freed pages mapped. Fragmentation, not a leak |
+| `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
+| `STEADY_GROWTH` | a run of tests each left a little behind, none enough to be raised alone — the shape of a leak |
+| `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
+
+This is what the example suite under
+[`examples/profiling`](examples/profiling) prints, trimmed:
+
+```
+[cpu_hotspot] PYTHON_CODE  severity=informational  owner=product
+    blamed on image_compare.py:20 in is_images_different
+    12.6% of the run's CPU, 0.9 s
+    · 12.6% of the run's CPU (0.9 s) across 3 test(s), on thread 'MainThread'
+    · 100% of it is on this function's own lines: Python-level work, or C calls made from them that leave no frame of their own
+    · hottest lines: line 20 (100%)
+
+[cpu_hotspot] LIBRARY_CALL  severity=informational  owner=product
+    blamed on reports.py:22 in render_report
+    15.2% of the run's CPU, 1.0 s
+    below encoder.py in _make_iterencode.<locals>._iterencode_dict (runtime)
+    · 95.1% of it is below encoder.py (runtime), mostly in _make_iterencode.<locals>._iterencode_dict: the cost is in what this function calls, not in its own lines
+
+[cpu_hotspot] BACKGROUND_THREAD  severity=informational  owner=product
+    blamed on poller.py:30 in Poller._run
+    14.7% of the run's CPU, 1.0 s, on thread 'status-poller'
+    · 100% of it is on a thread other than the one running the test: this cost is paid whatever test is in flight
+
+[memory_profile] RETAINED_AFTER_TEST  severity=informational  owner=unknown
+    no stack; suspect customer-code (owner of the test the memory arrived in (tests/test_memory.py))
+    test tests/test_memory.py::test_big_fixture  worker=main
+    kept 143 MB in setup
+    · the C allocator has +143 MB more in use than before the test
+    · the step happened during setup, so a fixture built it - a session or module fixture keeps it for the rest of the run
+
+[memory_profile] STEADY_GROWTH  severity=informational  owner=unknown
+    test tests/test_memory.py::test_leaks_a_little[0]  worker=main
+    165 MB over 7 tests, 23.6 MB each
+    · no single test crossed the threshold, so a per-test check would never flag this; the pattern is what a leak looks like
+    · every one of them is a parametrisation of tests/test_memory.py::test_leaks_a_little
+```
+
+The same run prints a summary at the end of the terminal output — the run's
+CPU against its wall time, what each worker peaked at, and the top functions —
+and writes a [speedscope](https://www.speedscope.app/) flame graph for every
+test a finding names, and for the gaps between tests, under
+`<run directory>/profiles/`. The raw per-test records are in
+`<worker>.profile.jsonl` beside the rest of the evidence.
+
+### What it cannot see
+
+Sampling from inside the process needs the GIL, so a native call that holds it
+delays the next sample. The weighting takes care of the *amount* — the whole
+delay is charged when the sampler next runs — but not always the *place*: a
+sample that arrives late is charged to the stack seen before it rather than
+the one after, on the grounds that the CPU was burnt between the two and the
+earlier one is inside that span. Late by one sample, never wrong about the
+total. The per-thread clock is Linux and Windows; on macOS the profile falls
+back to wall weighting and the record says so.
+
 ## One directory per run
 
 ```
@@ -1527,6 +1654,10 @@ accepted and inert.
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
 | `failure_stack_server_locals` | `true` | Whether `/stack?locals` answers with each frame's variables |
+| `failure_profile` | `false` | Sample every thread's stack and CPU for the whole run and raise what crosses the two thresholds below (`--profile` for one run) |
+| `failure_profile_interval` | `0.02` | Seconds between profile samples (floor 0.002) |
+| `failure_profile_cpu_share` | `5` | Percent of the run's CPU one function must hold to be raised |
+| `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
 
 There is deliberately **no ini setting for the token**. It comes from
 `PYTEST_CALLSTACK_TOKEN` or `--callstack-token` and nowhere else: an ini file

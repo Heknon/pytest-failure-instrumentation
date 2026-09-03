@@ -54,6 +54,10 @@ DEFAULTS = {
     "failure_stack_server_port": "0",
     "failure_stack_server_host": "127.0.0.1",
     "failure_stack_server_locals": "true",
+    "failure_profile": "false",
+    "failure_profile_interval": "0.02",
+    "failure_profile_cpu_share": "5",
+    "failure_profile_retained_mb": "100",
 }
 
 
@@ -173,6 +177,7 @@ def test_every_setting_in_the_readme_table_is_registered():
         "--callstack-port",
         "--callstack-token",
         "--failure-instrumentation",
+        "--profile",
     ]
     assert sorted(parser.ini) == sorted(DEFAULTS)
     assert sorted(parser.ini) == sorted(_settings_named_in_the_readme_table())

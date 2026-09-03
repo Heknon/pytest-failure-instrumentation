@@ -54,6 +54,7 @@ class WorkerRecorder:
         self.faulthandler_timeout = faulthandler_timeout
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
+        self.profiler: Any = None
         # Filled as each resource is opened, so close() works on a recorder
         # that never finished being built.
         self._open_resources: list[Any] = []
@@ -119,6 +120,7 @@ class WorkerRecorder:
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
+        self._start_profiler(directory, worker_id, settings)
 
         # Before anything can be asked to read this process. Without it a
         # live-stack read of this worker is refused wherever Yama enforces
@@ -186,6 +188,28 @@ class WorkerRecorder:
             self.events.record("memory_limit_refused", detail=repr(failure))
             return
         self.events.record("memory_limit_applied", limit_mb=settings.memory_limit_mb)
+
+    def _start_profiler(self, directory: Path, worker_id: str, settings: Settings) -> None:
+        """The CPU and memory sampler, when this run asked for one.
+
+        A thread of its own rather than a tick of the heartbeat: the beat is
+        once a second at its fastest, and a profile needs fifty a second to
+        see a two-second spike as anything but one sample.
+        """
+        if not settings.profile:
+            return
+        from .. import probes
+        from ..profile.sampler import ProfileLog, Sampler
+
+        log = self._track(ProfileLog(directory / f"{worker_id}.profile.jsonl", settings.run_id))
+        self.profiler = Sampler(
+            log.write,
+            lambda: probes.resident_megabytes()[0],
+            interval=settings.profile_interval,
+            worker=worker_id,
+        )
+        self.profiler.start()
+        self.events.record("profiler_started", **self.profiler.describe())
 
     def _start_monitors(self, settings: Settings) -> None:
         if not settings.watchdog:
@@ -278,12 +302,20 @@ class WorkerRecorder:
         # reached it.
         if phase == "setup":
             self.slow_test.start_test()
+        if self.profiler is not None:
+            self.profiler.begin_phase(nodeid, phase)
         yield
+        if self.profiler is not None:
+            self.profiler.end_phase(phase)
         if self.heartbeat is not None:
             self.heartbeat.phase = None
         if phase != "teardown":
             self.state.update(phase=None)
             return
+        if self.profiler is not None:
+            # After the phase closes, so teardown's own cost and the memory
+            # a finalizer gives back are in the test's record.
+            self.profiler.end_test(nodeid)
         self.slow_test.end_test()
         self.state.tests_finished += 1
         # The node id is cleared with the *test*, not with each phase. A worker
@@ -318,5 +350,9 @@ class WorkerRecorder:
     def pytest_sessionfinish(self, exitstatus: int) -> None:
         if self.heartbeat is not None:
             self.heartbeat.stop()
+        if self.profiler is not None:
+            # Writes the background record, which is the CPU spent with no
+            # test in flight: what the controller reads a moment later.
+            self.profiler.stop()
         self.events.record("worker_finish", exitstatus=int(exitstatus))
         self.state.update(phase=None, nodeid=None)

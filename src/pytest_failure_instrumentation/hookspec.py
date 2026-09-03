@@ -25,7 +25,15 @@ hooks are, so none of them can collide with anyone else's.
 ``internal_error``        ``incidents.internal_error.InternalErrorIncident``    any run
 ``run_summary``           ``incidents.summary.RunSummaryIncident``              any run
 ``stack_server_unavailable`` ``incidents.stack_server.StackServerIncident``     live view on
+``cpu_hotspot``           ``incidents.profile.CpuHotspotIncident``              profiling on
+``memory_profile``        ``incidents.profile.MemoryProfileIncident``           profiling on
 ========================= ==================================================== =============
+
+The last two are findings rather than failures. With ``--profile`` or
+``failure_profile`` on, the process running the tests samples every thread's
+stack and CPU for the whole run, and at the end the functions that burnt the
+CPU and the tests that kept the memory arrive here - informational whoever
+owns them, because nothing went wrong. See :mod:`.profile`.
 
 Three of them reach no pytest hook of their own, which is why they need a
 source of their own: a stall is polled for, because the absence of anything

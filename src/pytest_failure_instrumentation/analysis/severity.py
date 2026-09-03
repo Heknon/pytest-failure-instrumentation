@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+#: Kinds the profiler raises. Findings rather than failures, and scored as such.
+PROFILE_KINDS = ("cpu_hotspot", "memory_profile")
+
 BY_OWNER = {
     "product": "critical",
     "third-party": "high",
@@ -23,6 +26,10 @@ def of(
     internal error, and cannot finish at all while a worker is wedged.
     """
     if kind == "run_summary":
+        return "informational", None
+    if kind in PROFILE_KINDS:
+        # Nothing failed. A hotspot in the product is a flag for somebody to
+        # look at, not a page for somebody to answer, whoever owns it.
         return "informational", None
     if verdict.startswith("SIGNAL_") and confidence == "high":
         # A deliberate stop signal, already identified as such. No owner to

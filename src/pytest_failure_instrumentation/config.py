@@ -253,6 +253,17 @@ class Settings:
     #: Which run this is. Minted by the controller and pushed down; likewise
     #: never copied from one process's settings to another's.
     run_id: Optional[str] = None
+    #: Sample every thread's stack and CPU for the whole run, and raise what
+    #: crosses the thresholds below as ``cpu_hotspot`` and ``memory_profile``
+    #: incidents - see :mod:`.profile`. Off: it is the one thing here with a
+    #: running cost on a healthy run, about a percent of a core per worker.
+    profile: bool = False
+    #: Seconds between samples.
+    profile_interval: float = 0.02
+    #: Percent of the run's CPU a function must hold to be raised.
+    profile_cpu_share: float = 5.0
+    #: Megabytes a test may keep, or climb by, before it is raised.
+    profile_retained_mb: int = 100
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "directory", Path(self.directory))
@@ -278,6 +289,12 @@ class Settings:
             self, "stack_server_token", str(self.stack_server_token or "").strip()
         )
         object.__setattr__(self, "stack_server_port", int(self.stack_server_port))
+        object.__setattr__(self, "profile", bool(self.profile))
+        object.__setattr__(
+            self, "profile_interval", max(MIN_PROFILE_INTERVAL, float(self.profile_interval))
+        )
+        object.__setattr__(self, "profile_cpu_share", max(0.0, float(self.profile_cpu_share)))
+        object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
 
@@ -462,6 +479,14 @@ class Settings:
             # itself would decline for every run with a live view on. What
             # travels is the answer, not the evidence for it.
             "tracer_handed_down": self.tracer_in_force,
+            # The profiler runs where the tests run, so a worker needs the
+            # switch and the cadence. The thresholds are read on the
+            # controller alone and travel only so that a worker's copy of the
+            # settings is the controller's copy.
+            "profile": self.profile,
+            "profile_interval": self.profile_interval,
+            "profile_cpu_share": self.profile_cpu_share,
+            "profile_retained_mb": self.profile_retained_mb,
             # crash_stack is absent, and for a reason of its own: it asks
             # whether a run with no workers should take the fatal dump off its
             # terminal, and a worker has no terminal and no choice. It always
@@ -595,6 +620,29 @@ def add_options(parser: pytest.Parser) -> None:
         "(POSIX only). Can nudge a C extension blocked in a syscall.",
         default="true",
     )
+    parser.addini(
+        "failure_profile",
+        help="Sample every thread's stack and CPU for the whole run and raise "
+        "the functions that burnt the CPU and the tests that kept the memory "
+        "as cpu_hotspot and memory_profile incidents. Off by default; "
+        "--profile switches it on for one run.",
+        default="false",
+    )
+    parser.addini(
+        "failure_profile_interval",
+        help="Seconds between profile samples.",
+        default="0.02",
+    )
+    parser.addini(
+        "failure_profile_cpu_share",
+        help="Percent of the run's CPU one function must hold to be raised.",
+        default="5",
+    )
+    parser.addini(
+        "failure_profile_retained_mb",
+        help="Megabytes a test may keep, or climb by, before it is raised.",
+        default="100",
+    )
 
 
 def _add_command_line_options(parser: pytest.Parser) -> None:
@@ -646,6 +694,17 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         "every run ask.",
     )
     group.addoption(
+        "--profile",
+        action="store_true",
+        default=False,
+        dest=PROFILE_OPTION,
+        help="Profile this run: sample every thread's stack and CPU on the "
+        "process running the tests, and raise the functions that burnt the "
+        "CPU and the tests that kept the memory as incidents. Switches the "
+        "plugin on, like --callstack-port does. failure_profile in ini does "
+        "the same for every run.",
+    )
+    group.addoption(
         "--callstack-port",
         type=int,
         default=None,
@@ -677,6 +736,10 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
 
 #: The ``dest`` of ``--failure-instrumentation``: what ``getoption`` is asked for.
 ENABLE_OPTION = "failure_instrumentation"
+#: The ``dest`` of ``--profile``.
+PROFILE_OPTION = "failure_profile_this_run"
+#: Faster than this and the sampler is most of what it measures.
+MIN_PROFILE_INTERVAL = 0.002
 
 
 def switched_on(config: pytest.Config) -> bool:
@@ -712,6 +775,10 @@ def switched_on(config: pytest.Config) -> bool:
     if _option(config, "callstack_port") is not None:
         return True
     if _option(config, "callstack_host") is not None:
+        return True
+    if _option(config, PROFILE_OPTION):
+        # A request for a profile is a request for the plugin that takes it,
+        # on the same grounds as the server options above.
         return True
     workerinput: dict[str, Any] = getattr(config, "workerinput", {}) or {}
     return bool(workerinput.get("failure_settings"))
@@ -903,4 +970,8 @@ def resolve(config: pytest.Config) -> Settings:
         stack_server_token=chosen_token or "",
         worker_count=worker_count,
         run_id=run_id,
+        profile=_flag(config, "failure_profile", False) or bool(_option(config, PROFILE_OPTION)),
+        profile_interval=_number(config, "failure_profile_interval", 0.02),
+        profile_cpu_share=_number(config, "failure_profile_cpu_share", 5.0),
+        profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
     )

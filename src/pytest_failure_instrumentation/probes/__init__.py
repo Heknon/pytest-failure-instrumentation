@@ -7,6 +7,7 @@ from .capabilities import capabilities
 from .memory import (
     cgroup_memory,
     cgroup_oom_kills,
+    heap_in_use_megabytes,
     memory_limit,
     resident_megabytes,
     system_available_megabytes,
@@ -18,6 +19,7 @@ __all__ = [
     "capabilities",
     "cgroup_memory",
     "cgroup_oom_kills",
+    "heap_in_use_megabytes",
     "memory_limit",
     "resident_megabytes",
     "system_available_megabytes",

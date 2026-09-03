@@ -102,6 +102,62 @@ def _windows_working_set() -> int | None:
         return None
 
 
+def heap_in_use_megabytes() -> tuple[int | None, str]:
+    """Bytes the C allocator currently has handed out, and how that was read.
+
+    Resident memory says what the process holds; this says what it is *using*.
+    The gap between them is the allocator keeping freed pages mapped, which is
+    what makes a worker that freed everything still sit at four gigabytes -
+    and it is the difference between a leak and fragmentation, which are
+    fixed in different places.
+
+    glibc only, through ``mallinfo2`` (2.33+; ``mallinfo`` before it wraps at
+    2 GB and is not consulted). Python's small objects live in arenas mmapped
+    outside malloc, so this sees the large allocations and
+    ``sys.getallocatedblocks`` covers the small ones; the two together are
+    the live heap.
+    """
+    if not IS_LINUX:
+        return None, "unavailable"
+    try:
+        info = _mallinfo2()
+    except Exception:
+        return None, "unavailable"
+    if info is None:
+        return None, "unavailable"
+    return round((info.uordblks + info.hblkhd) / 1048576), "mallinfo2"
+
+
+_libc: Any = None
+
+
+def _mallinfo2() -> Any:
+    global _libc
+    import ctypes
+    import ctypes.util
+
+    class MallInfo2(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_size_t)
+            for name in (
+                "arena", "ordblks", "smblks", "hblks", "hblkhd",
+                "usmblks", "fsmblks", "uordblks", "fordblks", "keepcost",
+            )
+        ]
+
+    if _libc is None:
+        name = ctypes.util.find_library("c")
+        if not name:
+            return None
+        library = ctypes.CDLL(name)
+        if not hasattr(library, "mallinfo2"):
+            return None
+        library.mallinfo2.restype = MallInfo2
+        library.mallinfo2.argtypes = ()
+        _libc = library
+    return _libc.mallinfo2()
+
+
 def system_available_megabytes() -> tuple[int | None, str]:
     """Free memory on the machine.
 
