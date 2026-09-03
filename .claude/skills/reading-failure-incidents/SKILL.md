@@ -33,7 +33,7 @@ inventing one.
 ```
 [worker_death] NATIVE_CRASH  severity=critical  owner=product
     blamed on engine.py:6 in native_call
-    in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
+    worker=gw1  in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
     · died while running test_crashes.py::test_crashes (call)
     · exit status -11 - SIGSEGV: segmentation fault in native code (pid 805, via waitid)
     · the worker wrote a stack before dying
@@ -44,7 +44,7 @@ inventing one.
 | `[kind] VERDICT severity= owner=` | the headline; `run-ending` is appended when the session died with it, and `owner=` is omitted on a `run_summary`, where nothing failed |
 | `blamed on file:line in func` | `blamed_frame` — the first frame on the stack owned by somebody |
 | *or* `no stack; suspect X (basis)` | `suspect_owner` — a lead, not a finding |
-| unprefixed lines | the kind's own facts |
+| unprefixed lines | the kind's own facts. On a `worker_death` the first of them leads with `worker=`, the xdist gateway id that matches the `[gwN] node down` line in pytest's own output (`main` for a run with no workers) |
 | `· …` lines | `evidence` — what the verdict was reached from |
 
 ## The numbers that mislead
