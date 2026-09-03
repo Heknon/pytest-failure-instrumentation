@@ -7,3 +7,4 @@ build/
 dist/
 .venv/
 examples/profiling/incidents*.jsonl
+examples/profiling/memray-out/
