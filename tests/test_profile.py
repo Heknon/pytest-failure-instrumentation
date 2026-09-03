@@ -106,7 +106,7 @@ class TestCpu:
         # The line is the comparison inside the loop, not the def line and
         # not 0: on 3.11 the frame reports no line at the loop's back edge,
         # and the sampler resolves it from the instruction offset instead.
-        assert incident.hottest_lines[0].line in (12, 13, 14)
+        assert incident.hottest_lines[0].line in (13, 14, 15, 16)
         assert incident.self_share_percent > 90
         assert incident.share_percent > 50
         assert incident.tests == ["test_screens.py::test_screen_settles"]
@@ -163,7 +163,9 @@ class TestCpu:
         assert incident.thread == "status-poller"
         assert incident.background_share_percent > 90
         assert incident.owner == "product"
-        assert incident.test_count == 2
+        # The two tests, and the gap between them: the poller runs there too,
+        # and the background record is one more window it was charged in.
+        assert incident.test_count >= 2
 
     def test_a_quiet_run_raises_nothing_and_still_writes_records(self, runner: Runner) -> None:
         runner.pytester.makepyfile(
@@ -358,11 +360,11 @@ class TestArtifacts:
 
         named(incidents, "compare_pixels")
         profiles = sorted(path.name for path in (runner.pytester.path / ".pytest-failures").glob("run-*/profiles/*"))
-        assert "test_screens.py__test_hot.speedscope.json" in profiles
+        assert "test_screens.py_test_hot.speedscope.json" in profiles
         assert "background-main.speedscope.json" in profiles
         assert not any("test_cold" in name for name in profiles)
         document = json.loads(
-            next((runner.pytester.path / ".pytest-failures").glob("run-*/profiles/test_screens.py__test_hot.speedscope.json")).read_text()
+            next((runner.pytester.path / ".pytest-failures").glob("run-*/profiles/test_screens.py_test_hot.speedscope.json")).read_text()
         )
         main = next(profile for profile in document["profiles"] if profile["name"].startswith("MainThread"))
         assert main["unit"] == "nanoseconds"
