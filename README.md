@@ -1501,6 +1501,11 @@ overwhelming majority of what runs.
 
 ## Settings
 
+All of these are read only once a run has switched the plugin on —
+`--failure-instrumentation` on the command line or in `addopts`, a
+`--callstack-*` option, or a call to `install`. Registered without it, they are
+accepted and inert.
+
 | Setting | Default | Purpose |
 |---|---|---|
 | `failure_packages` | — | Your top-level packages, for attribution |
