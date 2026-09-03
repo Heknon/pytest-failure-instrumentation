@@ -276,7 +276,7 @@ class TestMemory:
             from product import load_everything
 
             def test_loads_the_export():
-                assert load_everything(250_000) == 10_000_000
+                assert load_everything(450_000) == 18_000_000
             """
         )
         incidents = runner.run("--profile", "-p", "no:cacheprovider", timeout=120.0)
