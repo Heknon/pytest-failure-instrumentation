@@ -13,7 +13,15 @@ from typing import Any
 
 import pytest
 
+from pytest_failure_instrumentation.profile.sampler import ThreadClock
+
 from .conftest import Runner, needs_xdist
+
+#: A background thread can only be told from the test's thread where the CPU
+#: is read per thread; elsewhere the whole process is charged to the test.
+needs_thread_cpu = pytest.mark.skipif(
+    not ThreadClock().available, reason="no per-thread CPU clock on this platform"
+)
 
 PROFILE_INI = """
 [pytest]
@@ -143,6 +151,7 @@ class TestCpu:
         assert incident.below.owner == "runtime"
         assert incident.self_share_percent < 50
 
+    @needs_thread_cpu
     def test_a_background_thread_is_a_finding_whatever_test_is_running(self, runner: Runner) -> None:
         runner.pytester.makepyfile(
             test_polling="""
@@ -242,7 +251,9 @@ class TestMemory:
         assert body.verdict == "RETAINED_AFTER_TEST"
         assert body.phase == "call"
         assert body.delta_mb >= 40
-        assert body.suspect_owner == "customer-code"
+        # Attributed from the stack that was running while it climbed when one
+        # was seen, and from the test's module otherwise.
+        assert "customer-code" in (body.owner, body.suspect_owner)
         fixture = by_test["test_keep_fixture.py::test_first_use"]
         assert fixture.verdict == "RETAINED_AFTER_TEST"
         assert fixture.phase == "setup"

@@ -1539,8 +1539,13 @@ delay is charged when the sampler next runs — but not always the *place*: a
 sample that arrives late is charged to the stack seen before it rather than
 the one after, on the grounds that the CPU was burnt between the two and the
 earlier one is inside that span. Late by one sample, never wrong about the
-total. The per-thread clock is Linux and Windows; on macOS the profile falls
-back to wall weighting and the record says so.
+total. The per-thread clock is a POSIX thread clock on Linux, `thread_info`
+on macOS and psutil's thread times on Windows, where they move in the
+scheduler's sixteen-millisecond ticks and sum correctly over a test. Where
+none answers, the process's CPU is charged to the test's thread and the
+summary says so. The live-heap reading that tells freed-but-mapped memory
+from kept memory is glibc only; elsewhere what a test kept is its resident
+step alone.
 
 ## One directory per run
 
@@ -1742,6 +1747,8 @@ its directory says so.
 | On-demand stack from a stalled worker | yes | yes | no |
 | Live stack of a running process (py-spy) | yes | root only | yes |
 | Stack from a worker that stopped running Python | yes | yes | yes |
+| Profiler: CPU per thread | thread clocks | mach `thread_info` | psutil (16 ms ticks) |
+| Profiler: live heap, to tell freed-but-mapped from kept | glibc `mallinfo2` | no | no |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a
 *setting* takes away on every platform rather than a platform taking away: where

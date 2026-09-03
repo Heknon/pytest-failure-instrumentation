@@ -1135,7 +1135,12 @@ class IncidentEngine:
         write(
             f"{report.tests} tests, {report.process_cpu_s:.1f} s CPU over {report.wall_s:.1f} s of "
             f"worker time ({cores:.2f} cores), sampled {report.sampled_cpu_s:.1f} s of it"
-            + ("" if report.cpu_weighted else " (wall-weighted: no per-thread CPU clock here)")
+            + ("" if report.cpu_weighted else " (wall-weighted: no CPU clock here)")
+            + (
+                ""
+                if report.per_thread
+                else " (no per-thread CPU clock here: the process's CPU is charged to the test's thread)"
+            )
             + (f", {report.native_cpu_s:.1f} s in native threads" if report.native_cpu_s >= 0.1 else "")
             + (f", gc {report.gc_s:.1f} s" if report.gc_s >= 0.1 else "")
         )

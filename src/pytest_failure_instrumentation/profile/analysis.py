@@ -171,6 +171,10 @@ class Report:
     gc_s: float
     native_cpu_s: float
     cpu_weighted: bool
+    #: Whether the CPU was read per thread. Where it could not be, the whole
+    #: process's CPU is charged to the test's thread, and a background
+    #: thread's cost lands on the test that happened to be running.
+    per_thread: bool
     workers: dict[str, dict[str, Any]]
     tests: int
 
@@ -242,6 +246,7 @@ def analyse(
     gc_seconds = 0.0
     native_cpu = 0
     cpu_weighted = True
+    per_thread = True
     workers: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"tests": 0, "cpu_s": 0.0, "wall_s": 0.0, "peak_mb": None, "end_mb": None, "gc_s": 0.0}
     )
@@ -266,6 +271,7 @@ def analyse(
         process_cpu += float(record.get("cpu_s") or 0.0)
         wall += float(record.get("wall_s") or 0.0)
         cpu_weighted = cpu_weighted and bool(record.get("cpu_weighted", True))
+        per_thread = per_thread and bool(record.get("per_thread", True))
         seconds = float((record.get("gc") or {}).get("seconds") or 0.0)
         gc_seconds += seconds
         if record.get("nodeid") and seconds:
@@ -330,6 +336,7 @@ def analyse(
         gc_s=gc_seconds,
         native_cpu_s=native_cpu / 1e9,
         cpu_weighted=cpu_weighted,
+        per_thread=per_thread,
         workers=dict(workers),
         tests=tests,
     )

@@ -93,13 +93,26 @@ class ThreadClock:
     four threads' ``schedstat`` files cost sixty milliseconds a tick that
     way, and a fifty-hertz sampler ran at eight. Measured.
 
-    Everywhere else psutil's per-thread times are used; their ids match
-    Python's ``native_id`` on Windows and do not on macOS, where the profile
-    falls back to wall weighting and says so.
+    On macOS the kernel answers ``thread_info`` for each thread of the task
+    with its CPU times and, separately, the system-wide id that
+    ``pthread_threadid_np`` reports - which is what Python's ``native_id``
+    is there. Called through ctypes without releasing the GIL, for the same
+    reason. It is self-checked at start: the calling thread's own id has to
+    come back in the answer, or the layout is not what this expects and the
+    reader stands down rather than weight samples by somebody else's counter.
+
+    On Windows psutil's per-thread times are used; their ids are the Win32
+    thread ids ``native_id`` reports. They move in the scheduler's sixteen
+    millisecond ticks, which is coarse against a twenty millisecond sampling
+    interval but sums correctly over a test.
+
+    Where none of these answers, ``available`` is False and the sampler
+    charges the *process's* CPU to the test's thread - see ``Sampler._sample``.
     """
 
     def __init__(self) -> None:
         self.source = "unavailable"
+        self._mach: Any = None
         if IS_LINUX and hasattr(time, "clock_gettime_ns"):
             try:
                 time.clock_gettime_ns(_thread_clock_id(os.getpid()))
@@ -107,14 +120,24 @@ class ThreadClock:
                 return
             except (OSError, OverflowError, ValueError):
                 pass
+        if sys.platform == "darwin":
+            try:
+                mach = _MachThreads()
+                own = threading.get_native_id()
+                if own in mach.read():
+                    self._mach = mach
+                    self.source = "mach"
+                    return
+            except Exception:
+                pass
         try:
             import psutil
 
             self._process = psutil.Process()
             self._process.threads()
-            # macOS answers, but with ids that are not native_id: a profile
-            # weighted by a counter that belongs to some other thread is
-            # worse than one honestly weighted by wall time.
+            # macOS answers, but with ids that are indexes rather than
+            # native_id: a profile weighted by a counter that belongs to some
+            # other thread is worse than one honestly weighted otherwise.
             self.source = "psutil" if sys.platform != "darwin" else "unavailable"
         except Exception:
             self.source = "unavailable"
@@ -137,6 +160,11 @@ class ThreadClock:
                 except (OSError, OverflowError, ValueError):
                     continue
             return clocks
+        if self.source == "mach":
+            try:
+                return self._mach.read()
+            except Exception:
+                return {}
         if self.source == "psutil":
             try:
                 return {
@@ -150,18 +178,132 @@ class ThreadClock:
     def discover(self) -> list[int]:
         """Every thread the kernel knows in this process, Python's or not.
 
-        The one procfs read left, and it releases the GIL - so it is called
-        once a second rather than once a tick. A native thread that starts
-        and dies within that second goes unseen, which is the trade.
+        On Linux the one procfs read left, and it releases the GIL - so it
+        is called once a second rather than once a tick. A native thread that
+        starts and dies within that second goes unseen, which is the trade.
+        The other readers list every thread on every read anyway.
         """
         if self.source == "thread-clock":
             try:
                 return [int(name) for name in os.listdir("/proc/self/task")]
             except (OSError, ValueError):
                 return []
-        if self.source == "psutil":
+        if self.source in ("mach", "psutil"):
             return list(self.read(()))
         return []
+
+
+class _MachThreads:
+    """``thread_info`` over every thread of this task, through ctypes.
+
+    Layouts from ``<mach/thread_info.h>``: ``thread_basic_info`` is two
+    ``time_value_t`` (seconds and microseconds, both 32-bit) followed by six
+    32-bit integers, forty bytes; ``thread_identifier_info`` is three
+    64-bit fields, of which the first is the thread id. The counts passed
+    are those sizes in 32-bit words, as the kernel expects.
+    """
+
+    THREAD_BASIC_INFO = 3
+    THREAD_IDENTIFIER_INFO = 4
+    KERN_SUCCESS = 0
+
+    def __init__(self) -> None:
+        import ctypes
+        import ctypes.util
+
+        name = ctypes.util.find_library("System") or ctypes.util.find_library("c")
+        if not name:
+            raise OSError("no system library")
+        # PyDLL: none of these calls block, and a release of the GIL here
+        # costs the sampler a switch interval per call beside a busy thread.
+        self.lib = lib = ctypes.PyDLL(name, use_errno=True)
+        self.ctypes = ctypes
+        mach_port_t = ctypes.c_uint32
+        lib.mach_task_self.restype = mach_port_t
+        lib.mach_task_self.argtypes = ()
+        lib.task_threads.restype = ctypes.c_int
+        lib.task_threads.argtypes = (
+            mach_port_t,
+            ctypes.POINTER(ctypes.POINTER(mach_port_t)),
+            ctypes.POINTER(ctypes.c_uint32),
+        )
+        lib.thread_info.restype = ctypes.c_int
+        lib.thread_info.argtypes = (
+            mach_port_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        )
+        lib.mach_port_deallocate.restype = ctypes.c_int
+        lib.mach_port_deallocate.argtypes = (mach_port_t, mach_port_t)
+        lib.vm_deallocate.restype = ctypes.c_int
+        lib.vm_deallocate.argtypes = (mach_port_t, ctypes.c_void_p, ctypes.c_size_t)
+        self.mach_port_t = mach_port_t
+
+        class BasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("user_seconds", ctypes.c_int32),
+                ("user_microseconds", ctypes.c_int32),
+                ("system_seconds", ctypes.c_int32),
+                ("system_microseconds", ctypes.c_int32),
+                ("cpu_usage", ctypes.c_int32),
+                ("policy", ctypes.c_int32),
+                ("run_state", ctypes.c_int32),
+                ("flags", ctypes.c_int32),
+                ("suspend_count", ctypes.c_int32),
+                ("sleep_time", ctypes.c_int32),
+            ]
+
+        class IdentifierInfo(ctypes.Structure):
+            _fields_ = [
+                ("thread_id", ctypes.c_uint64),
+                ("thread_handle", ctypes.c_uint64),
+                ("dispatch_qaddr", ctypes.c_uint64),
+            ]
+
+        self.BasicInfo = BasicInfo
+        self.IdentifierInfo = IdentifierInfo
+
+    def read(self) -> dict[int, int]:
+        ctypes = self.ctypes
+        task = self.lib.mach_task_self()
+        threads = ctypes.POINTER(self.mach_port_t)()
+        count = ctypes.c_uint32(0)
+        if self.lib.task_threads(task, ctypes.byref(threads), ctypes.byref(count)) != self.KERN_SUCCESS:
+            return {}
+        clocks: dict[int, int] = {}
+        try:
+            for index in range(count.value):
+                port = threads[index]
+                try:
+                    identity = self.IdentifierInfo()
+                    size = ctypes.c_uint32(ctypes.sizeof(identity) // 4)
+                    if (
+                        self.lib.thread_info(
+                            port, self.THREAD_IDENTIFIER_INFO, ctypes.byref(identity), ctypes.byref(size)
+                        )
+                        != self.KERN_SUCCESS
+                    ):
+                        continue
+                    basic = self.BasicInfo()
+                    size = ctypes.c_uint32(ctypes.sizeof(basic) // 4)
+                    if (
+                        self.lib.thread_info(port, self.THREAD_BASIC_INFO, ctypes.byref(basic), ctypes.byref(size))
+                        != self.KERN_SUCCESS
+                    ):
+                        continue
+                    nanoseconds = (
+                        (basic.user_seconds + basic.system_seconds) * 1_000_000_000
+                        + (basic.user_microseconds + basic.system_microseconds) * 1_000
+                    )
+                    clocks[int(identity.thread_id)] = nanoseconds
+                finally:
+                    self.lib.mach_port_deallocate(task, port)
+        finally:
+            self.lib.vm_deallocate(
+                task, ctypes.cast(threads, ctypes.c_void_p), count.value * ctypes.sizeof(self.mach_port_t)
+            )
+        return clocks
 
 
 def _thread_clock_id(tid: int) -> int:
@@ -262,6 +404,7 @@ class Sampler:
         #: the test took is not also counted as the background's.
         self._paused: Optional[tuple[float, float]] = None
         self._ticks = 0
+        self._last_process_cpu = time.process_time_ns()
         self._last_rss: Optional[int] = None
         #: The live heap at the last reading, for the climbs resident memory
         #: cannot show: a test that fills pages an earlier test freed grows
@@ -405,23 +548,39 @@ class Sampler:
         clocks = self.clock.read(self._tids_to_read())
 
         late = wall_ns > LATE_TICK_FACTOR * self.interval * 1e9
+        process_cpu = time.process_time_ns()
+        process_delta = max(0, process_cpu - self._last_process_cpu)
+        self._last_process_cpu = process_cpu
         with self._lock:
             window = self._window
             phase = self.phase
             seen_tids: set[int] = set()
+            if not self.clock.available:
+                # No per-thread counter here. The process's own CPU clock is
+                # still exact, and the test's thread is where the CPU went
+                # in every case that has a test to blame - so it is charged
+                # all of it, and the other threads nothing. Wall weighting was
+                # the alternative and was worse: every idle thread earned the
+                # whole interval, and Condition.wait topped every profile.
+                culprit = window.test_thread if window.test_thread in frames else None
+                if culprit is None:
+                    culprit = next((ident for ident in frames if ident != self._own_ident), None)
+                frames = {culprit: frames[culprit]} if culprit is not None else {}
             for ident, frame in frames.items():
                 if ident == self._own_ident:
                     continue
                 tid, name = self._threads.get(ident, (0, f"thread {ident}"))
                 seen_tids.add(tid)
-                cpu_ns = self._cpu_delta(tid, clocks)
-                if cpu_ns is None:
-                    # No counter for this thread: weight by wall time so the
-                    # sample is not lost, and let the record say the profile
-                    # was not CPU weighted.
-                    cpu_ns = wall_ns if not self.clock.available else 0
-                if cpu_ns <= 0 and self.clock.available:
-                    continue  # idle: the whole point of the weighting
+                if self.clock.available:
+                    cpu_ns = self._cpu_delta(tid, clocks)
+                    if cpu_ns is None:
+                        cpu_ns = 0
+                    if cpu_ns <= 0:
+                        continue  # idle: the whole point of the weighting
+                else:
+                    cpu_ns = process_delta
+                    if cpu_ns <= 0:
+                        continue
                 stack = _stack_of(frame)
                 if not stack:
                     continue
@@ -596,8 +755,11 @@ class Sampler:
                 "collections": sum(window.gc_collections),
                 "by_generation": list(window.gc_collections),
             },
-            "cpu_weighted": self.clock.available,
-            "thread_clock": self.clock.source,
+            # Weighted by CPU either way; what differs is whether the CPU
+            # could be told apart per thread. See ThreadClock.
+            "cpu_weighted": True,
+            "per_thread": self.clock.available,
+            "thread_clock": self.clock.source if self.clock.available else "process",
             "frames": [f"{file}|{line}|{function}" for (file, line, function) in frames],
             "stacks": stacks,
             "growth": growth,
