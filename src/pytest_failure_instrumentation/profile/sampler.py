@@ -51,10 +51,13 @@ DEFAULT_INTERVAL = 0.02
 #: bound on what a runaway recursion costs the sampler.
 MAX_DEPTH = 80
 
-#: Resident memory is read every this many samples: it is a file read on
-#: Linux and a syscall elsewhere, and the peak it feeds needs no better than
-#: half-second resolution.
-RSS_EVERY = 25
+#: Resident memory is read every this many samples. It is a file read that
+#: releases the GIL, so not every tick; but every climb it sees is charged to
+#: the stack running at that moment, and a fixture that builds 150 MB in one
+#: comprehension is done in fifty milliseconds - so every other tick, which
+#: is a fortieth of a second and costs the sampler a GIL round trip each time
+#: rather than any CPU.
+RSS_EVERY = 2
 
 #: The kernel's thread list is re-read every this many samples, to find the
 #: threads Python does not know about. See ThreadClock.discover.
@@ -216,6 +219,9 @@ class _Window:
         )
         #: Threads with a CPU counter and no Python frames: tid -> [name, cpu_ns]
         self.native: dict[int, list[Any]] = {}
+        #: (thread name, stack) -> megabytes resident memory climbed while
+        #: that stack was running. The memory profile's answer to "who".
+        self.growth: dict[tuple[str, StackKey], int] = defaultdict(int)
         self.gc_seconds = 0.0
         self.gc_collections = [0, 0, 0]
         self.phase_cpu: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
@@ -256,6 +262,11 @@ class Sampler:
         #: the test took is not also counted as the background's.
         self._paused: Optional[tuple[float, float]] = None
         self._ticks = 0
+        self._last_rss: Optional[int] = None
+        #: The live heap at the last reading, for the climbs resident memory
+        #: cannot show: a test that fills pages an earlier test freed grows
+        #: the heap and not the process.
+        self._last_heap: Optional[int] = None
         self._window = _Window(None, self._rss())
         self._background = self._window
         self._gc_started = 0.0
@@ -270,6 +281,8 @@ class Sampler:
         self._all_tids = self.clock.discover()
         self._last_clock = self.clock.read(self._tids_to_read())
         self._last_tick = time.monotonic()
+        self._last_rss = self._rss()
+        self._last_heap = _heap_in_use()
         gc.callbacks.append(self._on_gc)
         self._thread.start()
 
@@ -300,6 +313,7 @@ class Sampler:
             window = self._window
             window.test_thread = threading.get_ident()
             window.rss_at[f"{phase}_start"] = self._rss()
+            self._settle_climb(window, window.rss_at[f"{phase}_start"])
             window.phase_started = (phase, time.monotonic(), time.process_time())
             self.nodeid = nodeid
             self.phase = phase
@@ -313,7 +327,30 @@ class Sampler:
                 window.phase_cpu[phase][1] += time.monotonic() - wall
                 window.phase_started = None
             window.rss_at[f"{phase}_end"] = self._rss()
+            self._settle_climb(window, window.rss_at[f"{phase}_end"])
             self.phase = None
+
+    def _settle_climb(self, window: _Window, rss: Optional[int]) -> None:
+        """A phase boundary is a reading too, and a climb it finds that the
+        sampler never saw is still charged - to no stack, because the frames
+        that made it are gone by now. The record then says how much of the
+        climb was too quick to be placed, rather than losing it or, worse,
+        resetting the baseline over it so it was never counted at all.
+
+        Called with the lock held, on the test's thread.
+        """
+        climb = 0
+        if rss is not None and self._last_rss is not None:
+            climb = rss - self._last_rss
+        heap = _heap_in_use()
+        if heap is not None and self._last_heap is not None:
+            climb = max(climb, heap - self._last_heap)
+        if climb > 0:
+            window.growth[("", ())] += climb
+        if rss is not None:
+            self._last_rss = rss
+        if heap is not None:
+            self._last_heap = heap
 
     def end_test(self, nodeid: str) -> None:
         with self._lock:
@@ -416,6 +453,29 @@ class Sampler:
                 rss = self._rss()
                 if rss is not None and (window.rss_peak is None or rss > window.rss_peak):
                     window.rss_peak = rss
+                climb = 0
+                if rss is not None and self._last_rss is not None:
+                    climb = rss - self._last_rss
+                heap = _heap_in_use()
+                if heap is not None and self._last_heap is not None:
+                    climb = max(climb, heap - self._last_heap)
+                if heap is not None:
+                    self._last_heap = heap
+                if climb > 0:
+                    # Charged to the test's own thread, or to whichever thread
+                    # is running when there is no test: the one allocating is
+                    # not knowable from outside, and the test thread is the
+                    # answer in every case that has a test to blame.
+                    culprit = window.test_thread
+                    if culprit is None or culprit not in frames:
+                        culprit = next(iter(frames), None)
+                    if culprit is not None:
+                        stack = _stack_of(frames[culprit])
+                        if stack:
+                            _, name = self._threads.get(culprit, (0, f"thread {culprit}"))
+                            window.growth[(name, stack)] += climb
+                if rss is not None:
+                    self._last_rss = rss
 
         self._last_clock = clocks
         del frames
@@ -497,6 +557,18 @@ class Sampler:
                     "samples": samples,
                 }
             )
+        growth = []
+        for (thread, stack), megabytes in window.growth.items():
+            indexes = []
+            for code, line, offset in stack:
+                if not line:
+                    line = _line_of(code, offset)
+                key = (code.co_filename, line, getattr(code, "co_qualname", code.co_name))
+                index = frames.get(key)
+                if index is None:
+                    index = frames[key] = len(frames)
+                indexes.append(index)
+            growth.append({"thread": thread, "frames": indexes, "mb": megabytes})
         record = {
             "record": kind,
             "worker": self.worker,
@@ -528,6 +600,7 @@ class Sampler:
             "thread_clock": self.clock.source,
             "frames": [f"{file}|{line}|{function}" for (file, line, function) in frames],
             "stacks": stacks,
+            "growth": growth,
             "native_threads": [
                 {"tid": tid, "name": name, "cpu_ns": cpu_ns}
                 for tid, (name, cpu_ns) in window.native.items()
@@ -542,6 +615,7 @@ class Sampler:
         # background window keeps accumulating between tests.
         window.stacks.clear()
         window.native.clear()
+        window.growth.clear()
         window.gc_seconds = 0.0
         window.gc_collections = [0, 0, 0]
         window.started = now

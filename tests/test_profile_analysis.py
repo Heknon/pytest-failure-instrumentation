@@ -41,6 +41,7 @@ def record(
     gc_seconds: float = 0.0,
     native: list[dict[str, Any]] | None = None,
     cpu_s: float | None = None,
+    growth: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     before, peak, after = rss
     sampled = sum(stack.get("cpu_ns", 0) for stack in stacks) / 1e9
@@ -63,6 +64,7 @@ def record(
         "thread_clock": "thread-clock",
         "frames": frames,
         "stacks": stacks,
+        "growth": growth or [],
         "native_threads": native or [],
     }
 
@@ -265,6 +267,75 @@ class TestPeak:
         (finding,) = findings_of(report, "TRANSIENT_PEAK")
         assert finding.peak_mb == 420
         assert finding.delta_mb == 320
+        assert finding.frame is None  # nothing was seen climbing
+
+    def test_the_climb_is_blamed_on_the_code_that_was_running(self) -> None:
+        frames = [frame(LIBRARY, 5, "loads"), frame(PRODUCT, 14, "load_everything"), frame(TEST, 30, "test_export")]
+        growth = [
+            {"thread": "MainThread", "frames": [0, 1, 2], "mb": 300},
+            {"thread": "MainThread", "frames": [2], "mb": 20},
+        ]
+        report = analyse([record("t::a", [], frames, rss=(100, 420, 110), growth=growth)], attributor)
+
+        (finding,) = findings_of(report, "TRANSIENT_PEAK")
+        assert finding.frame is not None
+        assert finding.frame.function == "load_everything"
+        assert finding.frame.owner == "product"
+        assert finding.climb_mb == 300
+        assert finding.climb_total_mb == 320
+        assert finding.stack[0].startswith(f'  File "{PRODUCT}", line 14')
+        expected = (
+            "300 MB of the 320 MB climb happened under imaging.py:14 in load_everything "
+            "(product), called from test_screens.py:30 in test_export"
+        )
+        assert any(expected in line for line in finding.evidence)
+
+    def test_the_ceiling_is_a_finding_whatever_the_test_started_from(self) -> None:
+        report = analyse(
+            [record("t::a", [], [], rss=(3000, 4100, 3010))],
+            attributor,
+            Thresholds(retained_mb=100, peak_mb=4000),
+        )
+
+        (finding,) = findings_of(report, "PEAK_OVER_CEILING")
+        assert finding.peak_mb == 4100
+        assert finding.delta_mb == 1100
+        assert not findings_of(report, "TRANSIENT_PEAK")
+
+    def test_a_test_already_over_the_ceiling_is_not_raised_for_sitting_there(self) -> None:
+        report = analyse(
+            [record("t::a", [], [], rss=(4050, 4060, 4060))],
+            attributor,
+            Thresholds(retained_mb=100, peak_mb=4000),
+        )
+
+        assert report.findings == []
+
+    def test_a_test_that_keeps_memory_and_crosses_the_ceiling_is_the_ceiling_and_says_so(self) -> None:
+        # The size is the finding; that it stayed is said rather than
+        # changing the verdict, so the ceiling is never hidden by a leak.
+        report = analyse(
+            [record("t::a", [], [], rss=(100, 4200, 4200), heap=(0, 4100))],
+            attributor,
+            Thresholds(retained_mb=100, peak_mb=4000),
+        )
+
+        (finding,) = report.findings
+        assert finding.verdict == "PEAK_OVER_CEILING"
+        assert any("4100 MB of it was still there" in line for line in finding.evidence)
+
+    def test_memory_kept_in_pages_an_earlier_test_freed_is_still_retained(self) -> None:
+        # Resident memory grew 60 MB; the live heap grew 150 MB. The test
+        # kept 150 and reused 90 MB the allocator was already holding.
+        report = analyse(
+            [record("t::a", [], [], rss=(500, 560, 560), heap=(100, 250))],
+            attributor,
+            Thresholds(retained_mb=100),
+        )
+
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
+        assert finding.delta_mb == 150
+        assert "understates" in finding.evidence[0]
 
 
 class TestGrowth:
@@ -283,6 +354,19 @@ class TestGrowth:
         assert any("parametrisation of t::leaks" in line for line in finding.evidence)
         # None of the steps was a finding of its own.
         assert not findings_of(report, "RETAINED_AFTER_TEST")
+
+    def test_growth_hidden_by_reused_pages_is_seen_through_the_heap(self) -> None:
+        # Resident memory is flat because every test fills pages the one before
+        # it freed; the live heap says what each one kept.
+        records = [
+            record(f"t::leaks[{case}]", [], [], rss=(800, 800, 800), heap=(100 + 30 * case, 130 + 30 * case))
+            for case in range(6)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 180
+        assert finding.growth_per_test_mb == 30.0
 
     def test_a_single_big_step_is_not_growth(self) -> None:
         records = [

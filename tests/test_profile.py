@@ -56,6 +56,14 @@ class Poller:
             hashlib.sha256(payload).hexdigest()
 '''
 
+LOADER_MODULE = '''
+
+def load_everything(records):
+    # Reads the whole export before doing anything with it.
+    payload = b"".join(b"record %d\\n" % index * 40 for index in range(records))
+    return len(payload.decode("ascii").splitlines())
+'''
+
 
 def profiled(runner: Runner, *arguments: str, timeout: float = 120.0) -> list[Any]:
     runner.pytester.makeini(PROFILE_INI)
@@ -260,6 +268,33 @@ class TestMemory:
         assert incident.nodeid == "test_peak.py::test_peak"
         assert incident.peak_mb >= incident.before_mb + 100
 
+    def test_a_climb_over_the_ceiling_is_blamed_on_the_code_that_climbed(self, runner: Runner) -> None:
+        runner.pytester.makeini(PROFILE_INI + "failure_profile_peak_mb = 300\n")
+        (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE + LOADER_MODULE, encoding="utf-8")
+        runner.pytester.makepyfile(
+            test_loading="""
+            from product import load_everything
+
+            def test_loads_the_export():
+                assert load_everything(250_000) == 10_000_000
+            """
+        )
+        incidents = runner.run("--profile", "-p", "no:cacheprovider", timeout=120.0)
+
+        ceiling = [incident for incident in memory(incidents) if incident.verdict == "PEAK_OVER_CEILING"]
+        assert len(ceiling) == 1
+        (incident,) = ceiling
+        assert incident.nodeid == "test_loading.py::test_loads_the_export"
+        assert incident.peak_mb >= 300
+        assert incident.after_mb < incident.peak_mb - 100
+        # The code that was running while the memory climbed, owned by the product.
+        assert incident.blamed_frame is not None
+        assert incident.blamed_frame.function == "load_everything"
+        assert incident.owner == "product"
+        assert incident.climb_mb > 0
+        assert incident.raw_stack()[0].startswith('  File "')
+        assert any("climb happened under product.py" in line for line in incident.evidence)
+
     def test_a_run_of_small_leaks_is_growth(self, runner: Runner) -> None:
         runner.pytester.makepyfile(
             test_leak="""
@@ -376,13 +411,16 @@ class TestSettings:
     def test_profile_settings_reach_a_worker_and_round_trip(self) -> None:
         from pytest_failure_instrumentation.config import Settings
 
-        settings = Settings(profile=True, profile_interval=0.05, profile_cpu_share=2.5, profile_retained_mb=64)
+        settings = Settings(
+            profile=True, profile_interval=0.05, profile_cpu_share=2.5, profile_retained_mb=64, profile_peak_mb=4096
+        )
         copied = Settings.from_payload(settings.as_payload(), worker_count=4)
 
         assert copied.profile is True
         assert copied.profile_interval == 0.05
         assert copied.profile_cpu_share == 2.5
         assert copied.profile_retained_mb == 64
+        assert copied.profile_peak_mb == 4096
 
     def test_the_interval_has_a_floor(self) -> None:
         from pytest_failure_instrumentation.config import MIN_PROFILE_INTERVAL, Settings

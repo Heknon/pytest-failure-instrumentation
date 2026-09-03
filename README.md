@@ -1466,6 +1466,27 @@ of cost it is:
 | `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
 | `STEADY_GROWTH` | a run of tests each left a little behind, none enough to be raised alone — the shape of a leak |
 | `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
+| `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
+
+A memory finding about one test also carries **the code that was running
+while the memory climbed**, blamed and attributed the way a crash is. The
+sampler charges every rise it sees in resident memory to the test thread's
+stack at that moment, so a test that reads a file whole instead of streaming
+it comes back as:
+
+```
+[memory_profile] PEAK_OVER_CEILING  severity=informational  owner=product
+    blamed on loader.py:14 in load_everything
+    test tests/test_loading.py::test_loads_the_export  worker=main
+    reached 1236 MB
+    · resident memory reached 1236 MB during the test, over the 1000 MB ceiling; it started at 84 MB and ended at 136 MB
+    · 1152 MB of the 1152 MB climb happened under loader.py:14 in load_everything (product), called from test_loading.py:11 in test_loads_the_export
+```
+
+What a test *kept* is measured as the larger of the resident step and the
+live-heap step. Resident memory understates it whenever the test fills pages
+an earlier test freed and the allocator held on to, and the heap figure is not
+fooled by that.
 
 This is what the example suite under
 [`examples/profiling`](examples/profiling) prints, trimmed:
@@ -1658,6 +1679,7 @@ accepted and inert.
 | `failure_profile_interval` | `0.02` | Seconds between profile samples (floor 0.002) |
 | `failure_profile_cpu_share` | `5` | Percent of the run's CPU one function must hold to be raised |
 | `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
+| `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
 
 There is deliberately **no ini setting for the token**. It comes from
 `PYTEST_CALLSTACK_TOKEN` or `--callstack-token` and nowhere else: an ini file

@@ -333,6 +333,19 @@ a test, so `suspect_owner` is the owner of the test's module.
   `median_mb` among its siblings (`worker_rss` has all of them), and `nodeid`
   is the test after which it first stood clear. Under xdist the worker that
   happened to receive the heavy fixture is the one that holds it.
+- `PEAK_OVER_CEILING`: the test climbed to `peak_mb`, at or over the configured
+  ceiling, whatever it started from and whether or not it came back. The size
+  is the finding: a worker that reaches it once needs the machine to have it.
+
+For the verdicts about one test's climb — `RETAINED_AFTER_TEST`,
+`TRANSIENT_PEAK`, `PEAK_OVER_CEILING` and `HEAP_NOT_RETURNED` — `blamed_frame`
+and `raw_stack()` are the code that was running while the memory climbed,
+with `climb_mb` of the `climb_total_mb` seen charged to it, and `owner` is
+attributed from that stack as for a crash. That is the line to open: a loader
+that reads whole rather than streams, a fixture that builds the world. When no
+climb was seen — a step too fast for the sampler's tenth-of-a-second reading,
+or a worker with no stack to read — there is no frame and `suspect_owner` is
+the owner of the test's module instead.
 
 ## The decision each kind forces
 

@@ -264,6 +264,9 @@ class Settings:
     profile_cpu_share: float = 5.0
     #: Megabytes a test may keep, or climb by, before it is raised.
     profile_retained_mb: int = 100
+    #: Resident megabytes no test may reach, whatever it started from. 0 is
+    #: off. The retained threshold catches a climb; this catches a size.
+    profile_peak_mb: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "directory", Path(self.directory))
@@ -295,6 +298,7 @@ class Settings:
         )
         object.__setattr__(self, "profile_cpu_share", max(0.0, float(self.profile_cpu_share)))
         object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
+        object.__setattr__(self, "profile_peak_mb", max(0, int(self.profile_peak_mb)))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
 
@@ -487,6 +491,7 @@ class Settings:
             "profile_interval": self.profile_interval,
             "profile_cpu_share": self.profile_cpu_share,
             "profile_retained_mb": self.profile_retained_mb,
+            "profile_peak_mb": self.profile_peak_mb,
             # crash_stack is absent, and for a reason of its own: it asks
             # whether a run with no workers should take the fatal dump off its
             # terminal, and a worker has no terminal and no choice. It always
@@ -642,6 +647,13 @@ def add_options(parser: pytest.Parser) -> None:
         "failure_profile_retained_mb",
         help="Megabytes a test may keep, or climb by, before it is raised.",
         default="100",
+    )
+    parser.addini(
+        "failure_profile_peak_mb",
+        help="Resident megabytes no test may reach, whatever it started from; "
+        "a test that does is raised with the code that was running while "
+        "the memory climbed. 0 is off.",
+        default="0",
     )
 
 
@@ -974,4 +986,5 @@ def resolve(config: pytest.Config) -> Settings:
         profile_interval=_number(config, "failure_profile_interval", 0.02),
         profile_cpu_share=_number(config, "failure_profile_cpu_share", 5.0),
         profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
+        profile_peak_mb=int(_number(config, "failure_profile_peak_mb", 0)),
     )

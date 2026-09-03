@@ -149,7 +149,12 @@ def _mallinfo2() -> Any:
         name = ctypes.util.find_library("c")
         if not name:
             return None
-        library = ctypes.CDLL(name)
+        # PyDLL, not CDLL: a CDLL call releases the GIL around the call, and
+        # this is read from the profiler's sampling thread beside a busy test
+        # thread, where every release costs a whole switch interval to get
+        # the GIL back. mallinfo2 walks the allocator's own bookkeeping and
+        # blocks on nothing, so it is safe to call holding it.
+        library = ctypes.PyDLL(name)
         if not hasattr(library, "mallinfo2"):
             return None
         library.mallinfo2.restype = MallInfo2

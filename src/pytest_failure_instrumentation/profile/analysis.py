@@ -31,7 +31,14 @@ and for memory:
 ``TRANSIENT_PEAK``      a test climbed and came back down
 ``STEADY_GROWTH``       a run of tests each left a little behind
 ``WORKER_IMBALANCE``    one worker holds far more than its siblings
+``PEAK_OVER_CEILING``   a test reached the absolute size nothing may reach
 ======================= =====================================================
+
+A memory finding about one test also names the code that was running while
+the memory climbed. The sampler charges every rise in resident memory to the
+test thread's stack at that moment, and those stacks are blamed the same way
+CPU is - so "peaked 900 MB" comes with "under ``load_everything`` in
+``reports.py``", which is the difference between a number and a fix.
 """
 
 from __future__ import annotations
@@ -67,6 +74,8 @@ class Thresholds:
     growth_tests: int = 4
     #: How many times the median a worker must hold to be called imbalanced.
     imbalance_ratio: float = 2.0
+    #: Resident MB no test may reach whatever it started from. 0 is off.
+    peak_mb: int = 0
 
 
 @dataclass
@@ -142,6 +151,10 @@ class Finding:
     growth_per_test_mb: float = 0.0
     worker_rss: dict[str, int] = field(default_factory=dict)
     median_mb: Optional[int] = None
+    #: For a memory finding: how much of the climb was charged to the blamed
+    #: stack, out of how much was charged at all.
+    climb_mb: int = 0
+    climb_total_mb: int = 0
 
 
 @dataclass
@@ -306,7 +319,7 @@ def analyse(
     findings.extend(_cpu_findings(ranked, total_cpu_ns, limits))
     findings.extend(_gc_finding(gc_seconds, total_cpu_ns, gc_by_test, limits))
     findings.extend(_native_finding(native_cpu, native_by_name, total_cpu_ns, limits))
-    findings.extend(_memory_findings(records, limits))
+    findings.extend(_memory_findings(records, limits, attributor))
 
     return Report(
         findings=findings,
@@ -451,7 +464,62 @@ def _native_finding(
     ]
 
 
-def _memory_findings(records: list[dict[str, Any]], limits: Thresholds) -> list[Finding]:
+def _climb(
+    record: dict[str, Any], attributor: Attributor
+) -> tuple[Optional[FrameRef], list[str], int, int, list[str]]:
+    """Who was running while this test's memory climbed.
+
+    The growth entries are charged to a frame like CPU stacks are - the first
+    that belongs to somebody, walking out from the innermost - and the heaviest
+    wins. Returns the frame, its stack as faulthandler lines, the megabytes
+    charged to it, the megabytes charged in total, and the evidence sentence.
+    """
+    table = [_frame(entry, attributor) for entry in record.get("frames") or []]
+    charged: dict[tuple[str, str], int] = defaultdict(int)
+    heaviest: dict[tuple[str, str], tuple[int, list[FrameRef]]] = {}
+    total = 0
+    unplaced = 0
+    for entry in record.get("growth") or []:
+        megabytes = int(entry.get("mb") or 0)
+        if megabytes <= 0:
+            continue
+        try:
+            frames = _without_the_instrumentation([table[index] for index in entry["frames"]])
+        except (IndexError, KeyError, TypeError):
+            continue
+        total += megabytes
+        if not frames:
+            unplaced += megabytes
+            continue
+        blamed_at = _blame_index(frames)
+        blamed = frames[blamed_at]
+        key = (blamed.file, blamed.function)
+        charged[key] += megabytes
+        if key not in heaviest or megabytes > heaviest[key][0]:
+            heaviest[key] = (megabytes, frames[blamed_at:])
+    too_quick = (
+        f"{unplaced} MB of the {total} MB climb happened between two readings and "
+        "could not be placed under a stack"
+    )
+    if not charged:
+        return None, [], 0, total, [too_quick] if unplaced else []
+    key, megabytes = max(charged.items(), key=lambda item: item[1])
+    stack = heaviest[key][1]
+    frame = stack[0]
+    evidence = [
+        f"{megabytes} MB of the {total} MB climb happened under "
+        f"{Path(frame.file).name}:{frame.line} in {frame.function} ({frame.owner})"
+    ]
+    if len(stack) > 1:
+        evidence[0] += f", called from {Path(stack[1].file).name}:{stack[1].line} in {stack[1].function}"
+    if unplaced:
+        evidence.append(too_quick)
+    return frame, _faulthandler_lines(stack), megabytes, total, evidence
+
+
+def _memory_findings(
+    records: list[dict[str, Any]], limits: Thresholds, attributor: Attributor
+) -> list[Finding]:
     findings: list[Finding] = []
     by_worker: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
@@ -465,15 +533,65 @@ def _memory_findings(records: list[dict[str, Any]], limits: Thresholds) -> list[
         for record in tests:
             before, after = int(record["rss_before_mb"]), int(record["rss_after_mb"])
             peak = int(record.get("rss_peak_mb") or max(before, after))
-            retained = after - before
-            if retained >= limits.retained_mb:
+            retained = _kept(record)
+            # A test is raised for the ceiling when it climbed to get there. A
+            # worker already over it from what earlier tests kept is every
+            # later test's problem, and the growth finding names the cause;
+            # raising each of them again would be the same finding N times.
+            over_ceiling = (
+                bool(limits.peak_mb)
+                and peak >= limits.peak_mb
+                and peak - before >= limits.retained_mb // 2
+            )
+            if over_ceiling:
+                frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
+                findings.append(
+                    Finding(
+                        kind="memory_profile",
+                        verdict="PEAK_OVER_CEILING",
+                        evidence=[
+                            f"resident memory reached {peak} MB during the test, over the "
+                            f"{limits.peak_mb} MB ceiling; it started at {before} MB and "
+                            f"ended at {after} MB",
+                            "the size is the finding whatever happened to it afterwards: "
+                            "a worker that reaches this once needs the machine to have "
+                            "it, and a run with several of them is an OOM kill waiting "
+                            "for the right schedule",
+                        ]
+                        + climb_evidence
+                        + (
+                            [f"and {retained} MB of it was still there once the test was over"]
+                            if retained >= limits.retained_mb
+                            else []
+                        ),
+                        nodeid=record["nodeid"],
+                        worker=worker,
+                        before_mb=before,
+                        after_mb=after,
+                        peak_mb=peak,
+                        delta_mb=peak - before,
+                        frame=frame,
+                        stack=stack,
+                        climb_mb=climb,
+                        climb_total_mb=climb_total,
+                    )
+                )
+            elif retained >= limits.retained_mb:
                 phase = _phase_of_step(record.get("rss_at") or {}, limits.retained_mb)
                 evidence = [
                     f"resident memory {before} MB before, {after} MB after: "
-                    f"{retained} MB kept once the test was over",
+                    f"{after - before} MB kept once the test was over",
                 ]
+                if retained > after - before:
+                    evidence[0] = (
+                        f"resident memory {before} MB before, {after} MB after, but the "
+                        f"live heap grew {retained} MB: the test filled pages an earlier "
+                        "test had freed, so the resident figure understates what it kept"
+                    )
                 live, live_evidence = _still_in_use(record, retained)
                 evidence.extend(live_evidence)
+                frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
+                evidence.extend(climb_evidence)
                 if live is False:
                     findings.append(
                         Finding(
@@ -493,6 +611,10 @@ def _memory_findings(records: list[dict[str, Any]], limits: Thresholds) -> list[
                             after_mb=after,
                             peak_mb=peak,
                             delta_mb=retained,
+                            frame=frame,
+                            stack=stack,
+                            climb_mb=climb,
+                            climb_total_mb=climb_total,
                         )
                     )
                     continue
@@ -520,26 +642,36 @@ def _memory_findings(records: list[dict[str, Any]], limits: Thresholds) -> list[
                         after_mb=after,
                         peak_mb=peak,
                         delta_mb=retained,
+                        frame=frame,
+                        stack=stack,
+                        climb_mb=climb,
+                        climb_total_mb=climb_total,
                     )
                 )
             elif peak - max(before, after) >= limits.retained_mb:
-                climb = peak - before
+                frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
+                risen = peak - before
                 findings.append(
                     Finding(
                         kind="memory_profile",
                         verdict="TRANSIENT_PEAK",
                         evidence=[
-                            f"resident memory climbed {climb} MB to {peak} MB during the "
+                            f"resident memory climbed {risen} MB to {peak} MB during the "
                             f"test and came back to {after} MB",
                             "freed on return, so it costs peak memory rather than a leak: "
                             "it is what decides how many workers fit on the machine",
-                        ],
+                        ]
+                        + climb_evidence,
                         nodeid=record["nodeid"],
                         worker=worker,
                         before_mb=before,
                         after_mb=after,
                         peak_mb=peak,
-                        delta_mb=climb,
+                        delta_mb=risen,
+                        frame=frame,
+                        stack=stack,
+                        climb_mb=climb,
+                        climb_total_mb=climb_total,
                     )
                 )
         findings.extend(_growth(worker, tests, limits))
@@ -650,7 +782,25 @@ def _growth(worker: str, tests: list[dict[str, Any]], limits: Thresholds) -> lis
 
 
 def _step(record: dict[str, Any]) -> int:
-    return int(record["rss_after_mb"]) - int(record["rss_before_mb"])
+    return _kept(record)
+
+
+def _kept(record: dict[str, Any]) -> int:
+    """What a test left behind: the resident step, or the live-heap step
+    when that is larger.
+
+    Resident memory understates what a test kept whenever the test reuses
+    pages an earlier test freed and the allocator held on to. The cache test
+    in the examples kept 146 MB and grew the process by 93, because the
+    loader before it had just given 500 MB back to the allocator. The heap
+    in-use figure is not fooled by that, so the larger of the two is what a
+    test is held to.
+    """
+    resident = int(record["rss_after_mb"]) - int(record["rss_before_mb"])
+    heap_before, heap_after = record.get("heap_before_mb"), record.get("heap_after_mb")
+    if heap_before is None or heap_after is None:
+        return resident
+    return max(resident, int(heap_after) - int(heap_before))
 
 
 def _trimmed(run: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -671,9 +821,7 @@ def _better(best: list[dict[str, Any]], candidate: list[dict[str, Any]]) -> list
 
 
 def _growth_total(run: list[dict[str, Any]]) -> int:
-    if not run:
-        return 0
-    return int(run[-1]["rss_after_mb"]) - int(run[0]["rss_before_mb"])
+    return sum(_kept(record) for record in run)
 
 
 def _imbalance(by_worker: dict[str, list[dict[str, Any]]], limits: Thresholds) -> list[Finding]:

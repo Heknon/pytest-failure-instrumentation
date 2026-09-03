@@ -58,6 +58,7 @@ DEFAULTS = {
     "failure_profile_interval": "0.02",
     "failure_profile_cpu_share": "5",
     "failure_profile_retained_mb": "100",
+    "failure_profile_peak_mb": "0",
 }
 
 

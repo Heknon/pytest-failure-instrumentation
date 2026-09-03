@@ -1080,6 +1080,7 @@ class IncidentEngine:
         thresholds = analysis.Thresholds(
             cpu_share_percent=self.settings.profile_cpu_share,
             retained_mb=self.settings.profile_retained_mb,
+            peak_mb=self.settings.profile_peak_mb,
         )
         report = analysis.analyse(records, self.attributor, thresholds)
         self.profile_report = report

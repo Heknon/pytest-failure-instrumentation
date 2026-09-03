@@ -124,6 +124,19 @@ class MemoryProfileIncident(Incident):
     worker_rss: dict[str, int] = Field(default_factory=dict)
     median_mb: Optional[int] = None
     tests: list[str] = Field(default_factory=list)
+    #: The stack that was running while most of the memory climbed, deepest
+    #: first, as faulthandler prints it. Empty for a finding that is not about
+    #: one test's climb, or when nothing was seen climbing.
+    stack: list[str] = Field(default_factory=list)
+    #: Megabytes of the climb charged to that stack, out of all charged.
+    climb_mb: int = 0
+    climb_total_mb: int = 0
+
+    def raw_stack(self) -> list[str]:
+        return list(self.stack)
+
+    def blame_stack(self) -> tuple[list[str], bool]:
+        return list(self.stack), False
 
     def suspect_nodeid(self) -> Optional[str]:
         return self.nodeid
@@ -148,6 +161,8 @@ class MemoryProfileIncident(Incident):
             lines.append(f"{self.delta_mb} MB still mapped after it, none of it in use")
         elif self.verdict == "TRANSIENT_PEAK" and self.delta_mb is not None:
             lines.append(f"peaked {self.delta_mb} MB above where it started")
+        elif self.verdict == "PEAK_OVER_CEILING" and self.peak_mb is not None:
+            lines.append(f"reached {self.peak_mb} MB")
         elif self.verdict == "STEADY_GROWTH" and self.growth is not None:
             lines.append(
                 f"{self.delta_mb} MB over {self.growth.tests} tests, "
@@ -209,4 +224,7 @@ def build(finding: Finding, worker: str) -> Incident:
         worker_rss=dict(finding.worker_rss),
         median_mb=finding.median_mb,
         tests=list(finding.tests),
+        stack=list(finding.stack),
+        climb_mb=finding.climb_mb,
+        climb_total_mb=finding.climb_total_mb,
     )
