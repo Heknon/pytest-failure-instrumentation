@@ -177,8 +177,8 @@ interchangeable. `probe` and `py-spy` are taken at detection and describe now;
 alert prints how old they are for that reason. `py-spy` is a run with no
 workers being read from outside — no signal was sent, so nothing could have
 perturbed the stall being measured, and it is the one way a current stack
-exists on Windows; its absence there means py-spy is not installed rather than
-anything about the run. `frozen-fallback` means more than a stack: the
+exists on Windows; its absence there means py-spy could not run or could not
+read the process rather than anything about the run. `frozen-fallback` means more than a stack: the
 interpreter had stopped running Python at all.
 
 Two things follow from `run_ending` being true here. The run has no path to

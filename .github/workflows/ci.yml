@@ -82,15 +82,12 @@ jobs:
           pip install -e ".[test]"
 
       # py-spy is how this package reads any live process, the one doing the
-      # reading included, so without it every test covering the live view's
-      # whole reason to exist skips - which is the same as not having it.
-      # Installed everywhere the platform table claims that read works, so the
-      # table is checked rather than asserted: Linux and Windows say yes,
-      # macOS says root only and is left out, since granting that would mean
-      # running the whole suite as root.
-      - name: Install the external stack reader
-        if: runner.os != 'macOS'
-        run: pip install -e ".[stacks]"
+      # reading included, and it is a required dependency, so the install
+      # above brought it everywhere. The platform table says reading works on
+      # Linux and Windows and needs root on macOS; the suite's needs_pyspy
+      # marker checks that claim rather than asserting it, and the macOS cell
+      # skips the live-read tests since granting root would mean running the
+      # whole suite as it.
 
       # The restrictive setting, on purpose. Ubuntu and Debian ship
       # ptrace_scope=1, which is what makes a worker unreadable by a reader

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytest-failure-instrumentation"
-version = "0.7.1"
+version = "0.8.0"
 description = "Attribute the pytest failures that leave no trace: process deaths, stalls, internal errors and xdist collection mismatches"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -33,15 +33,20 @@ classifiers = [
 # ask anything, it calls TerminateProcess - so a liveness check written the
 # POSIX way kills the worker it is inspecting. It also carries the memory
 # figures on macOS and Windows, which procfs cannot.
-dependencies = ["pytest>=7.0", "pydantic>=2.0", "psutil>=5.9"]
+# py-spy is required for the same reason. It is the only way to read a live
+# process's stack from outside it - a worker whose GIL is held by native code,
+# any process at all on Windows - and every live read here goes through it,
+# the reading process's own included. Optional, it was the one dependency a
+# stalled run needed and a fresh install did not have.
+dependencies = ["pytest>=7.0", "pydantic>=2.0", "psutil>=5.9", "py-spy>=0.3"]
 
 [project.optional-dependencies]
 test = ["pytest-xdist>=3.0"]
 # Kept so that an existing pin on [psutil] keeps resolving. It is a required
 # dependency now, so this extra adds nothing.
 psutil = ["psutil>=5.9"]
-# The external stack reader, for the live server. Only needed to read a
-# process other than the one serving, and only when the server is switched on.
+# Kept so that an existing pin on [stacks] keeps resolving. py-spy is a
+# required dependency now, so this extra adds nothing either.
 stacks = ["py-spy>=0.3"]
 # The async client for that server, for a product reading it from outside the
 # run. The plugin never imports it, so a run that serves a live view without

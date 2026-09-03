@@ -24,7 +24,7 @@ from pytest_failure_instrumentation import schedule, topology
 from pytest_failure_instrumentation.capture.state import read_state
 from pytest_failure_instrumentation.schedule import ScheduleTracker
 
-from .conftest import needs_xdist
+from .conftest import ENABLE_FLAG, needs_xdist
 
 
 class Gateway:
@@ -461,7 +461,7 @@ def test_a_crashed_worker_keeps_what_it_was_owed_and_the_rest_is_reassigned(pyte
     pytester.makepyfile(test_suite=CRASHING_SUITE)
     pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
 
-    result = pytester.runpytest_subprocess("-n2", "--dist=load")
+    result = pytester.runpytest_subprocess(ENABLE_FLAG, "-n2", "--dist=load")
     result.assert_outcomes(passed=23, failed=1)
 
     runs = [path for path in evidence.iterdir() if path.is_dir()]
@@ -527,7 +527,7 @@ def test_a_run_cut_short_reports_the_tests_nobody_ran(pytester, stopping):
     pytester.makepyfile(test_suite=HALTING_SUITE)
     pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
 
-    pytester.runpytest_subprocess("-n3", stopping)
+    pytester.runpytest_subprocess(ENABLE_FLAG, "-n3", stopping)
 
     runs = [path for path in evidence.iterdir() if path.is_dir()]
     described = topology.run(runs[0])
@@ -618,7 +618,7 @@ def test_a_worker_never_reports_finishing_more_tests_than_it_was_given(pytester)
                 assert shown["tests_running"] in (0, 1), shown
 
     with _polling(poll):
-        pytester.runpytest_subprocess("-n3", "--dist=load").assert_outcomes(passed=60)
+        pytester.runpytest_subprocess(ENABLE_FLAG, "-n3", "--dist=load").assert_outcomes(passed=60)
 
     # The check is only worth anything if it ran while the workers were going.
     assert len(watched) > 50, len(watched)
@@ -704,7 +704,7 @@ def test_a_real_run_accounts_for_every_test(pytester, dist):
     pytester.makepyfile(test_suite=SUITE)
     pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
 
-    result = pytester.runpytest_subprocess("-n2", f"--dist={dist}")
+    result = pytester.runpytest_subprocess(ENABLE_FLAG, "-n2", f"--dist={dist}")
     result.assert_outcomes(passed=6 if dist != "each" else 12)
 
     runs = [path for path in evidence.iterdir() if path.is_dir()]

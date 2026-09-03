@@ -33,10 +33,7 @@ from pytest_failure_instrumentation.probes.platform_flags import (
     IS_WINDOWS,
 )
 
-needs_pyspy = pytest.mark.skipif(
-    not pyspy.available(), reason="py-spy is not installed in this environment"
-)
-
+from .conftest import ENABLE_FLAG, needs_pyspy
 
 #: A process parked in a known frame, readable by its parent's descendants.
 VICTIM_THAT_PERMITS_TRACING = """
@@ -805,7 +802,7 @@ def test_a_real_pytest_session_serves_its_own_stack(pytester):
             assert "test_the_running_test_can_be_asked_what_it_is_doing" in functions
         """
     )
-    result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation", ENABLE_FLAG)
     result.assert_outcomes(passed=1)
 
 
@@ -1034,7 +1031,7 @@ def test_a_real_run_draws_a_port_and_a_ui_finds_it_on_disk(pytester):
             assert "test_a_ui_can_find_this_server_without_being_told_the_port" in functions
         """
     )
-    result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation", ENABLE_FLAG)
     result.assert_outcomes(passed=1)
     # And the address does not outlive the session that published it.
     assert not list((pytester.path / ".evidence").glob("*/callstack-*.json"))
@@ -1064,7 +1061,7 @@ def test_naming_a_port_on_the_command_line_is_enough_to_start_it(pytester):
         """
     )
     result = pytester.runpytest_subprocess(
-        "-p", "failure_instrumentation", "--callstack-port", str(port)
+        "-p", "failure_instrumentation", ENABLE_FLAG, "--callstack-port", str(port)
     )
     result.assert_outcomes(passed=1)
 
@@ -1840,7 +1837,7 @@ def test_a_real_run_hands_the_address_to_a_product_that_implements_the_hook(pyte
     )
     # Zero: the drawn port, which is the case a product cannot configure ahead
     # of the run and therefore the case this hook exists for.
-    result = pytester.runpytest_subprocess("-p", "failure_instrumentation", "--callstack-port", "0")
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation", ENABLE_FLAG, "--callstack-port", "0")
     result.assert_outcomes(passed=1)
 
     announced = json.loads((pytester.path / "server.json").read_text())
@@ -1871,7 +1868,7 @@ def test_implementing_the_hook_costs_nothing_when_the_server_is_off(pytester):
             assert True
         """
     )
-    result = pytester.runpytest_subprocess("-p", "failure_instrumentation")
+    result = pytester.runpytest_subprocess("-p", "failure_instrumentation", ENABLE_FLAG)
     result.assert_outcomes(passed=1)
     assert not (pytester.path / "server.json").exists()
 

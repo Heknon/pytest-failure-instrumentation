@@ -9,16 +9,25 @@ round-trip on every scenario rather than in one test of its own.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from typing import Any
 
 import pytest
 
 from pytest_failure_instrumentation.incidents.base import Incident
 from pytest_failure_instrumentation.incidents.registry import parse
+from pytest_failure_instrumentation.probes import pyspy
 
 pytest_plugins = ["pytester"]
 
 INCIDENT_FILE = "incidents.jsonl"
+
+#: The switch. Installed is not on: the plugin registers its hooks and options
+#: on every run and does nothing else until asked, and every scenario here is
+#: about a run it is watching - so the runner passes this for them, and a test
+#: that starts pytest on its own passes it too.
+ENABLE_FLAG = "--failure-instrumentation"
 
 INNER_CONFTEST = f"""
 import json
@@ -128,6 +137,11 @@ class Runner:
         return "".join(parts)
 
     def run(self, *arguments: str, timeout: float = 300.0) -> list[Incident]:
+        # Except where the entry point is turned off: then the option was never
+        # registered, pytest refuses argv it does not know, and those runs
+        # install by hand - which is the other way of asking.
+        if "no:failure_instrumentation" not in arguments:
+            arguments = (ENABLE_FLAG, *arguments)
         try:
             self._result = self.pytester.runpytest_subprocess(*arguments, timeout=timeout)
         except self.pytester.TimeoutExpired:  # type: ignore[attr-defined]
@@ -222,3 +236,25 @@ def _has_xdist() -> bool:
 
 
 needs_xdist = pytest.mark.skipif(not _has_xdist(), reason="needs pytest-xdist")
+
+
+def _pyspy_reads_here() -> bool:
+    """Whether py-spy can read another process on this machine.
+
+    Installed is no longer the question - it arrives with the package - but
+    an install can still be broken, and on macOS reading any other process
+    takes root, which no CI cell runs the suite as. The platform table in the
+    README says "root only" there, and this is where that claim is checked
+    rather than asserted.
+    """
+    if not pyspy.available():
+        return False
+    if sys.platform == "darwin" and os.geteuid() != 0:
+        return False
+    return True
+
+
+needs_pyspy = pytest.mark.skipif(
+    not _pyspy_reads_here(),
+    reason="py-spy cannot read another process here: not installed, or macOS without root",
+)
