@@ -15,7 +15,9 @@ import asyncio
 import json
 import os
 import socket
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,9 @@ from pytest_failure_instrumentation.live_view import LiveStackServer
 httpx = pytest.importorskip("httpx", reason="the client extra is not installed")
 
 from pytest_failure_instrumentation.client import (  # noqa: E402 - after the skip
+    CONNECT_TIMEOUT,
+    DEFAULT_TIMEOUT,
+    STACK_TIMEOUT,
     AccessRefused,
     AuthenticationRequired,
     BadRequest,
@@ -465,3 +470,93 @@ def test_every_server_is_reached_with_its_own_token(serving, tmp_path: Path):
     # gone, and not something restarting a machine would fix.
     assert [member.status for member in swapped.silent] == [401, 401]
     assert all("token" in (member.error or "") for member in swapped.silent)
+
+
+# -- what a call is allowed to cost ---------------------------------------
+
+
+def test_the_cheap_calls_and_the_expensive_one_get_different_budgets(serving):
+    """`/workers` reads files; `/stack` stops a process to be read.
+
+    One number for both would either cut a stack read off or let a host that
+    is not answering hold a fleet poll for as long as a stack is worth
+    waiting for.
+    """
+    assert DEFAULT_TIMEOUT < STACK_TIMEOUT
+    # And connecting is bounded well inside either: a host that is gone
+    # refuses at once, and one behind a dropped route never answers at all.
+    assert CONNECT_TIMEOUT < DEFAULT_TIMEOUT
+
+    service = serving()
+    client = connected(service)
+    assert client._timeout == DEFAULT_TIMEOUT
+    assert client._stack_timeout == STACK_TIMEOUT
+    run(client.aclose())
+
+
+def test_a_host_that_never_answers_costs_its_timeout_and_no_more(serving, tmp_path: Path):
+    """A dropped route, rather than a refused connection.
+
+    The socket that nothing is listening on is refused immediately and tests
+    nothing about the budget; this one is opened and then never spoken to, so
+    the client has to give up on its own.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)  # accepted by the OS backlog, answered by nobody
+    silent = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    alive = serving(directory=run_directory(tmp_path))
+
+    started = time.monotonic()
+    try:
+        fleet = run(
+            read_fleet([reachable(alive), LiveStackServer(url=silent)], timeout=1.0)
+        )
+    finally:
+        listener.close()
+    elapsed = time.monotonic() - started
+
+    # The one that answered still did, and the silent one cost its budget
+    # rather than the fleet.
+    assert [member.url for member in fleet.answered] == [alive.url]
+    assert fleet.silent[0].url == silent
+    assert elapsed < 10, f"the fleet took {elapsed:.1f}s for a 1s timeout"
+
+
+def test_one_server_answering_nonsense_does_not_lose_the_fleet(serving, tmp_path: Path):
+    """The promise is that a host costs only itself.
+
+    A payload malformed enough to fail validation is still that host's
+    problem, and a fleet lost to one server's bad JSON would break the
+    promise at exactly the moment something was already wrong.
+    """
+    alive = serving(directory=run_directory(tmp_path))
+
+    class Nonsense(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
+            body = b'{"runs": "not a list at all"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_unused):
+            pass
+
+    liar = HTTPServer(("127.0.0.1", 0), Nonsense)
+    threading.Thread(target=liar.serve_forever, daemon=True).start()
+    try:
+        fleet = run(
+            read_fleet([
+                reachable(alive),
+                LiveStackServer(url=f"http://127.0.0.1:{liar.server_port}"),
+            ])
+        )
+    finally:
+        liar.shutdown()
+
+    assert [member.url for member in fleet.answered] == [alive.url]
+    broken = fleet.silent[0]
+    # Recorded by type, so it stays diagnosable rather than swallowed.
+    assert broken.error and "ValidationError" in broken.error

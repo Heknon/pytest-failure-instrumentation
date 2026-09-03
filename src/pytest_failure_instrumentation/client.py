@@ -41,11 +41,29 @@ except ModuleNotFoundError as missing:  # pragma: no cover - same
     ) from missing
 
 
-#: Long enough that a stack read is not cut off by the client that asked for
-#: it. Reading a process stops it while py-spy walks its memory, and the server
-#: queues past eight in flight, so a busy fleet answers in seconds rather than
-#: milliseconds. `/workers` and `/identity` touch no process and return at once.
-DEFAULT_TIMEOUT = 30.0
+#: What ``/workers`` and ``/identity`` get, which is short on purpose. Neither
+#: touches a process: they are assembled from files the run was already writing,
+#: so a server that is up answers in milliseconds. The number is therefore a
+#: bound on how long a host that is *not* up may cost - and a fleet polling
+#: several of them cannot afford that to be tens of seconds, because a host
+#: whose packets are dropped rather than refused takes the whole of it.
+DEFAULT_TIMEOUT = 5.0
+
+#: What a stack read gets instead. This one stops the target while py-spy walks
+#: its memory, and the server queues a read past eight already in flight, so
+#: seconds are ordinary here rather than a symptom.
+STACK_TIMEOUT = 30.0
+
+#: Connecting is not answering. A host that is gone refuses at once and a host
+#: behind a dropped route never answers at all, so the connect leg is bounded
+#: well inside either budget: waiting the full read timeout to find out nothing
+#: is listening is the slowest way to learn the cheapest fact.
+CONNECT_TIMEOUT = 2.0
+
+
+def _timeout(seconds: float) -> httpx.Timeout:
+    """One budget, with connecting held to its own shorter one."""
+    return httpx.Timeout(seconds, connect=min(CONNECT_TIMEOUT, seconds))
 
 
 # --- what comes back ---------------------------------------------------
@@ -336,6 +354,7 @@ class FailureServerClient:
         url: str = "",
         token: str = "",
         timeout: float = DEFAULT_TIMEOUT,
+        stack_timeout: float = STACK_TIMEOUT,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         if server is None and not url:
@@ -347,7 +366,9 @@ class FailureServerClient:
         self._url = (server.url if server is not None else url).rstrip("/")
         self._headers = server.headers() if server is not None else _bearer(token)
         self._timeout = timeout
-        self._client = client or httpx.AsyncClient(timeout=timeout)
+        #: A stack read is the one call worth waiting on - see STACK_TIMEOUT.
+        self._stack_timeout = stack_timeout
+        self._client = client or httpx.AsyncClient(timeout=_timeout(timeout))
         self._owns_client = client is None
 
     async def __aenter__(self) -> FailureServerClient:
@@ -439,7 +460,13 @@ class FailureServerClient:
         ):
             if switched_on:
                 params[name] = "true"
-        return Callstack.model_validate(await self._get("/stack", params=params, timeout=timeout))
+        return Callstack.model_validate(
+            await self._get(
+                "/stack",
+                params=params,
+                timeout=self._stack_timeout if timeout is None else timeout,
+            )
+        )
 
     async def _get(
         self,
@@ -455,7 +482,7 @@ class FailureServerClient:
                 url,
                 params=params or None,
                 headers=self._headers if authenticated else None,
-                timeout=self._timeout if timeout is None else timeout,
+                timeout=_timeout(self._timeout if timeout is None else timeout),
             )
         except httpx.HTTPError as unreachable:
             raise ServerUnreachable(url, unreachable) from unreachable
@@ -630,7 +657,20 @@ async def read_fleet(
             # Nothing answered. The message names the address, which is the
             # only thing there is to say about it.
             member.error = str(failed)
+        except Exception as unexpected:  # noqa: BLE001 - deliberate, see below
+            # Anything else this member could raise - a payload malformed
+            # enough to fail validation, most likely - and it stops here
+            # rather than at the gather. The promise of this function is that
+            # one host costs only itself, and a fleet lost to one server's bad
+            # JSON would break exactly that promise at exactly the moment
+            # something was already wrong. Named by type, so it is still
+            # diagnosable rather than swallowed.
+            member.error = f"{type(unexpected).__name__}: {unexpected}"
         return member
 
+    # Plain, deliberately. Every failure a member can have is caught inside
+    # `ask`, so there is nothing here for `return_exceptions` to collect - and
+    # keeping it plain means a cancelled caller still cancels these, which
+    # `return_exceptions=True` would turn into a result to be tabulated.
     gathered = await asyncio.gather(*(ask(server) for server in servers))
     return Fleet(observed_at=round(time.time(), 3), members=list(gathered))
