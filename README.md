@@ -1398,6 +1398,7 @@ an unelevated one needs `SeDebugPrivilege`.
 
 ```
 .pytest-failures/
+  .gitignore           <- so the directory never reaches a commit
   run-70a514cc7a93/    <- this pytest process's own name for itself
     owner.json         <- the controller's pid, and the only thing that makes
     gw0.state             this directory ours to delete
@@ -1459,6 +1460,24 @@ run at once. A directory without that marker is not ours and is left alone
 whatever it looks like, which includes the flat files an older version of this
 plugin left behind: they cannot be mistaken for a current run's evidence,
 because a current run does not look there for any.
+
+### The directory keeps itself out of git
+
+The default directory is inside somebody's checkout, and what lands in it is
+one run's scratch that a later run deletes — so the first run to make it writes
+a `.gitignore` of `*` at the top, and nothing here ever turns up in a `git
+status` or in an unlucky `git add -A`. Nothing has to be added to the
+repository's own `.gitignore`, which means the second checkout, the CI image
+and the colleague who just installed the plugin all behave the same.
+
+It is written only into a directory holding nothing but run directories of
+ours, and an existing `.gitignore` is never rewritten. `failure_directory` is a
+natural thing to point at an artifacts directory somebody else also writes to,
+and `*` dropped in there would quietly stop git from seeing *their* files —
+a change to their repository that this plugin has no business making. The same
+rule is what makes `failure_directory = .` harmless: the checkout is full of
+files that are not ours, so it gets no ignore file rather than one that hides
+the whole repository.
 
 ## Cost
 
@@ -1570,6 +1589,9 @@ Cleanup prunes *whole directories whose owner is no longer running* rather than
 a list of file suffixes, so a live run's evidence is never what a starting run
 deletes, and a coverage report that happens to live there is never touched at
 all.
+A directory the plugin has to itself also carries a `.gitignore`, so the
+evidence never reaches a commit; one it shares with somebody else does not, for
+the same reason the cleanup leaves their files alone.
 
 Two things back that up rather than repeating it. Every record carries the run
 that wrote it, and a reader refuses one naming a different run — so even a
