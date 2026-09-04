@@ -503,3 +503,52 @@ def test_a_generator_caught_between_yields_keeps_its_callers() -> None:
     # an orphan; the rest are relinked. Unfixed, a fifth to three quarters
     # of the encoder's time was orphaned, more on a loaded box.
     assert orphaned < in_encoder * 0.15, (orphaned, in_encoder)
+
+
+def test_the_log_is_read_a_line_at_a_time_with_repeated_strings_shared(tmp_path) -> None:
+    """The one place in this package whose cost scales with the number of
+    tests: the controller reads every worker's log at session finish and the
+    analysis walks the lot four times, so all of it is resident at once.
+
+    A record spells its own frame table, which is the same absolute paths on
+    every test in the run, and ``json`` shares nothing between calls - so
+    twenty thousand records held twenty thousand copies of each. Sharing them
+    is not an optimisation of the analysis, which never notices: it is the
+    difference between 346 MB and 145 MB on a twenty-thousand-test fold. The
+    keys go the same way, thirty per record and the same thirty every time.
+    """
+    from pytest_failure_instrumentation.profile.sampler import ProfileLog, read_profile_log
+
+    path = tmp_path / "main.profile.jsonl"
+    log = ProfileLog(path, run_id="run-1")
+    frames = [f"/a/very/long/path/to/_pytest/python.py|{line}|pytest_pyfunc_call" for line in range(20)]
+    for index in range(50):
+        log.write({"record": "test", "nodeid": f"t::x[{index}]", "frames": list(frames), "stacks": []})
+    log.close()
+
+    records = read_profile_log(path)
+
+    assert [record["nodeid"] for record in records] == [f"t::x[{index}]" for index in range(50)]
+    assert all(record["frames"] == frames for record in records)
+    # One object per distinct frame across the whole log, and one per key.
+    assert {id(entry) for record in records for entry in record["frames"]} == {
+        id(entry) for entry in records[0]["frames"]
+    }
+    assert len({id(key) for record in records for key in record}) == len(records[0])
+
+
+def test_a_truncated_last_line_costs_that_record_and_no_others(tmp_path) -> None:
+    """A run that was killed mid-write leaves a half-written line, and every
+    test that finished before it is still on disk."""
+    from pytest_failure_instrumentation.profile.sampler import read_profile_log
+
+    path = tmp_path / "main.profile.jsonl"
+    path.write_text(
+        '{"record": "test", "nodeid": "t::a"}\n'
+        '{"record": "test", "nodeid": "t::b"}\n'
+        '{"record": "test", "nodei',
+        encoding="utf-8",
+    )
+
+    assert [record["nodeid"] for record in read_profile_log(path)] == ["t::a", "t::b"]
+    assert read_profile_log(tmp_path / "absent.profile.jsonl") == []

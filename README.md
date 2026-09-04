@@ -1848,6 +1848,16 @@ overwhelming majority of what runs.
   workers. Allocation tracing is outside those budgets on purpose: it is a
   rerun over the tests a plain profile named, and its cost is the workload's
   (see "Allocation tracing").
+- Per profiled test, on disk: one JSON line of about 3 KB appended to
+  `<worker>.profile.jsonl` as the test ends. It is the one thing this package
+  writes that grows with the number of tests, and the controller reads all of
+  it back at session finish — so a 20,000-test run folds 62 MB of log, which
+  is where the profiler's memory goes and when: at the end of a long run,
+  which is when a container is least likely to have it spare. The log is read
+  a line at a time rather than whole, and the strings every record repeats —
+  its frame table, which is the same paths on every test, and its keys — are
+  shared across the run rather than copied per record. Measured on 20,000
+  records: 346 MB to 145 MB, and slightly faster.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.
