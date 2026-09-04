@@ -385,11 +385,19 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         ]
 
     if status is not None:
-        if incident.matched_timeout is not None and status in (1, -1):
+        if incident.matched_timeout is not None and incident.phase and status in (1, -1):
             # pytest-timeout's thread method and faulthandler's
             # exit_on_timeout both os._exit(1) a hung worker, which is
             # otherwise indistinguishable from any other self-exit. The test
             # having reached a configured timeout is what tells them apart.
+            #
+            # A phase has to be open for that reading to mean anything: an
+            # enforcer ends a test that is *running*, so a worker that died
+            # with nothing in flight did not reach a timeout however long the
+            # clock says. The recorder clears the clocks with the test for
+            # this reason; the guard is here because a verdict of TIMED_OUT
+            # names a test and blames its owner, and must not rest on one
+            # slot being cleared somewhere else.
             return "TIMED_OUT", "high", evidence + [_timeout_line(incident)]
         # Zero included. A worker that left the run without being asked to has
         # gone wrong whatever number it exited with, and os._exit(0) inside a

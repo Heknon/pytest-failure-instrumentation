@@ -380,9 +380,16 @@ class WorkerRecorder:
         # which the incident is then attributed, with an owner and a severity.
         # What that test was is still worth knowing, so the slot keeps it in
         # `last_nodeid`, where nothing can mistake it for the present.
+        #
+        # The two clocks go with it, and for the same reason. They are read on
+        # the controller as "how long the test had been running when this
+        # worker died" and matched against the run's timeouts - so a clock
+        # left running between tests makes an idle worker's `os._exit(1)`
+        # reach any timeout you like, and the death is reported as TIMED_OUT
+        # against a test that had already passed.
         if self.heartbeat is not None:
             self.heartbeat.nodeid = None
-        self.state.update(phase=None, nodeid=None)
+        self.state.update(phase=None, nodeid=None, phase_started=None, test_started=None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_internalerror(self, excrepr: object) -> None:

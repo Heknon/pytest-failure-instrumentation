@@ -372,7 +372,7 @@ reports what the incident found rather than what a `-9` looks like.
 
 | Verdict | Told apart by |
 |---|---|
-| `TIMED_OUT` | a self-exit or SIGALRM while the test had run to a configured `timeout` / `faulthandler_timeout` |
+| `TIMED_OUT` | a self-exit or SIGALRM with a test *in flight* that had run to a configured `timeout` / `faulthandler_timeout`. A worker that died between tests reached no timeout, whatever the clock says |
 | `OOM_KILLED` | `-9` **and** the kernel log names this pid as the OOM killer's victim, or the cgroup OOM counter moved |
 | `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process outside the run send it — the sender is named |
 | `KILLED_BY_RUN` | `-9` sent by another process of this run: the controller (execnet terminating a worker that would not exit) or a sibling worker |

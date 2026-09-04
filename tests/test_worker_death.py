@@ -623,6 +623,12 @@ def test_a_death_between_tests_is_not_blamed_on_the_test_that_passed(distributed
     assert death.tests_started == death.tests_finished == 2
     assert any("died between tests" in line for line in death.evidence)
     assert any("test_gap.py::test_finishes" in line for line in death.evidence)
+    # The test's clock is cleared with the test. Left running it measures the
+    # gap since a test that already passed, and the controller matches that
+    # against the run's timeouts - so an idle worker's exit is reported as
+    # TIMED_OUT, against a test that was never killed.
+    assert death.test_seconds is None and death.phase_seconds is None
+    assert death.matched_timeout is None and death.verdict != "TIMED_OUT"
     # The lead is still offered - it is the best one there is - but it says
     # which kind of guess it is rather than claiming the test was running.
     assert "no test in flight" in str(death)
