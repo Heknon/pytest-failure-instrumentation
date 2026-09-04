@@ -2,6 +2,26 @@
 
 from __future__ import annotations
 
+#: The verdicts that mean somebody outside the run stopped it, and a witness
+#: saw who. No test is at fault, so no test is suspected and nobody is paged.
+#:
+#: It lives here, in the module with no imports of its own, because the two
+#: consequences are drawn in two places - :func:`of` below scores them
+#: informational, and ``WorkerDeathIncident.suspect_nodeid`` declines to name
+#: a test - and a verdict added to one list and not the other gets half of
+#: each. :mod:`.classify` re-exports it for that second reader.
+DELIBERATE_STOPS = frozenset(
+    {
+        "KILLED_BY_PROCESS",
+        "KILLED_AFTER_SIGTERM",
+        # A run found dead afterwards whose controller had been told to stop.
+        # The same cancellation as the two above, witnessed from the other
+        # side: the SIGTERM is on the controller's log rather than on this
+        # process, and the process ended with the run.
+        "RUN_STOPPED",
+    }
+)
+
 BY_OWNER = {
     "product": "critical",
     "third-party": "high",
@@ -28,7 +48,7 @@ def of(
         # A deliberate stop signal, already identified as such. No owner to
         # find and nothing for anyone to do.
         return "informational", None
-    if verdict in ("KILLED_BY_PROCESS", "KILLED_AFTER_SIGTERM"):
+    if verdict in DELIBERATE_STOPS:
         # Somebody outside the run stopped it, and a witness saw who. That is
         # a cancellation or a timeout, not a defect in anybody's code - the
         # sender is on the incident for whoever wants to take it up with them.

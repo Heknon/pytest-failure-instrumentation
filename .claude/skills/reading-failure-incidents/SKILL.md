@@ -83,11 +83,14 @@ The reverse reading matters just as much: `suspect_owner: null` together with a
 can state flatly.
 
 **`severity`** — derived from `owner`: `product`→critical, `third-party`→high,
-`customer-code`/`runtime`→informational, `unknown`→needs-triage. Two overrides:
-a `run_summary`, and a `SIGNAL_*` identified with high confidence, are
-informational; a framework defect that ended the run is raised to high, because
-no test is at fault and nothing else will ever surface it. `needs-triage` means
-"somebody has to look", not "this is bad".
+`customer-code`/`runtime`→informational, `unknown`→needs-triage. Three
+overrides are informational: a `run_summary`; a `SIGNAL_*` identified with high
+confidence; and a run somebody deliberately stopped - `KILLED_BY_PROCESS`,
+`KILLED_AFTER_SIGTERM`, `RUN_STOPPED` - where the same list also stops any test
+being suspected, since a cancellation is nobody's defect. A framework defect
+that ended the run is raised the other way, to high, because no test is at
+fault and nothing else will ever surface it. `needs-triage` means "somebody has
+to look", not "this is bad".
 
 So `severity` answers *who acts*, and `run_ending` is the closest thing to a
 blast-radius field: it says the session had no path to completion. Anyone

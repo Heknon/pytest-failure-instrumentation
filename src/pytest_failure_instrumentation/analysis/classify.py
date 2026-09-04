@@ -17,14 +17,16 @@ from typing import TYPE_CHECKING, Optional
 
 from ..capture import crash_stack
 from . import exit_status as status_table
+from .severity import DELIBERATE_STOPS  # noqa: F401 - re-exported, see below
 
 if TYPE_CHECKING:  # importing it for real would close a cycle: death -> classify
     from ..incidents.death import WorkerDeathIncident
     from ..incidents.killer import SignalRecord
 
-#: The verdicts that mean somebody outside the run stopped it, and a witness
-#: saw who. No test is at fault, so no test is suspected.
-DELIBERATE_STOPS = frozenset({"KILLED_BY_PROCESS", "KILLED_AFTER_SIGTERM"})
+# ``DELIBERATE_STOPS`` is defined in :mod:`.severity` and re-exported here,
+# where its other reader - ``WorkerDeathIncident.suspect_nodeid``, which reads
+# it as ``classify.DELIBERATE_STOPS`` - looks for it. One list, because a
+# verdict that belongs in it has to reach both consequences or neither.
 
 
 def memory_evidence(incident: WorkerDeathIncident) -> list[str]:

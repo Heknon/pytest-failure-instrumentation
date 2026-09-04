@@ -252,3 +252,45 @@ def test_a_native_crash_at_the_timeout_is_still_a_crash():
         matched_timeout=30.0, timeout_source="pytest-timeout",
     )
     assert verdict == "NATIVE_CRASH"
+
+
+@posix_only
+def test_a_timeout_is_never_matched_against_a_worker_with_nothing_in_flight():
+    """A clock left running is not a test still running.
+
+    The recorder clears the test's clock at teardown along with its node id,
+    so a worker that exits between tests carries no duration at all. This is
+    the second half of that: with no phase open there is no test for an
+    enforcer to have ended, whatever a duration says - and TIMED_OUT names a
+    test and blames its owner, so it may not rest on one slot being cleared.
+    """
+    verdict, _, evidence = verdict_of(
+        exit_status=1, test_in_flight=None, phase=None,
+        test_seconds=901.0, matched_timeout=900.0, timeout_source="faulthandler_timeout",
+    )
+    assert verdict == "SELF_EXIT"
+    assert not any("timeout enforcer" in line for line in evidence)
+
+
+# -- a run somebody stopped --------------------------------------------------
+
+
+def test_a_stopped_run_is_scored_and_suspected_like_the_kills_it_matches():
+    """RUN_STOPPED is a cancellation seen from the other side.
+
+    The SIGTERM is on the controller's log rather than on this process, but
+    the conclusion is the one KILLED_BY_PROCESS and KILLED_AFTER_SIGTERM
+    reach: nobody's test is at fault. Both consequences follow from one list,
+    so a verdict cannot be in it for scoring and out of it for suspicion.
+    """
+    from pytest_failure_instrumentation.analysis import severity
+
+    assert "RUN_STOPPED" in classify.DELIBERATE_STOPS
+    assert severity.of("worker_death", "unknown", "RUN_STOPPED", "medium", False) == (
+        "informational",
+        None,
+    )
+    stopped = death(verdict="RUN_STOPPED", test_in_flight="test_api.py::test_thing")
+    # The test that happened to be running when the job was cancelled is not
+    # a lead, and naming it would put an owner on somebody's Ctrl-C.
+    assert stopped.suspect_nodeid() is None
