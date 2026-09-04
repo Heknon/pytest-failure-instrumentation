@@ -507,6 +507,66 @@ def test_the_tracepoint_names_the_sender_of_a_kill(tmp_path):
         assert f"{signal_trace.INSTANCE_PREFIX}{os.getpid()}" not in os.listdir(instances)
 
 
+@needs_tracepoint
+def test_a_sidecar_outlives_its_owner_only_long_enough_to_record_the_kill(tmp_path):
+    """The run that started the sidecar is SIGKILLed. The sidecar sees EOF on
+    the pipe only its owner could write to, keeps reading the trace for a
+    moment so the owner's own kill line lands, removes its instance and
+    exits - with nothing for anybody to clean up after."""
+    output = tmp_path / signal_trace.TRACE_FILE
+    owner_source = f"""
+import sys, time
+from pathlib import Path
+from pytest_failure_instrumentation.probes import signal_trace
+tracer = signal_trace.SignalTracer(Path({str(output)!r}), elevate=True)
+print(tracer.start(), tracer.process.pid, flush=True)
+time.sleep(60)
+"""
+    owner = subprocess.Popen([sys.executable, "-c", owner_source], stdout=subprocess.PIPE, text=True)
+    assert owner.stdout is not None
+    how, sidecar = owner.stdout.readline().split()
+    assert how.endswith("tracefs"), how
+    time.sleep(0.5)
+    os.kill(owner.pid, signal.SIGKILL)
+    assert owner.wait(timeout=10) == -signal.SIGKILL
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and _running(int(sidecar)):
+        time.sleep(0.1)
+    assert not _running(int(sidecar)), "the sidecar must not outlive the run that started it"
+    instances = Path(signal_trace.tracefs_root() or "/nonexistent") / "instances"
+    if os.access(instances, os.R_OK):
+        assert f"{signal_trace.INSTANCE_PREFIX}{owner.pid}" not in os.listdir(instances)
+    (kill,) = signal_trace.sent_to(output, owner.pid, signal=9)
+    assert kill.sender_pid == os.getpid(), "the owner's own kill is the line that matters most"
+
+
+@needs_tracepoint
+def test_an_instance_left_by_a_killed_sidecar_is_swept_by_the_next(tmp_path):
+    root = Path(signal_trace.tracefs_root() or "/nonexistent")
+    stale = root / "instances" / f"{signal_trace.INSTANCE_PREFIX}999999"
+    if os.geteuid() != 0:
+        pytest.skip("making a stale instance to sweep takes root")
+    stale.mkdir(exist_ok=True)
+    assert stale.is_dir()
+    tracer = signal_trace.SignalTracer(tmp_path / signal_trace.TRACE_FILE, elevate=True)
+    try:
+        assert tracer.start().endswith("tracefs")
+    finally:
+        tracer.stop()
+    assert not stale.exists(), "an instance whose owner pid is gone is nobody's"
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 SLEEPER = """
 import os, time
 

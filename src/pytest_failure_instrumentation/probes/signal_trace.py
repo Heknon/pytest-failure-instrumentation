@@ -189,7 +189,25 @@ def proc(pid, name):
 root = next((r for r in ROOTS if os.path.isdir(os.path.join(r, "events"))), None)
 if root is None:
     sys.exit(3)
-here = os.path.join(root, "instances", instance)
+instances = os.path.join(root, "instances")
+# Sweep what a sidecar that was itself killed left behind: an instance named
+# for a pid that is no longer running, still tracing for nobody. Ours are the
+# only ones touched, and only those whose owner is gone.
+prefix = instance.rsplit("-", 1)[0] + "-"
+for name in os.listdir(instances):
+    owner_pid = name[len(prefix):] if name.startswith(prefix) else ""
+    if not owner_pid.isdigit() or os.path.exists("/proc/" + owner_pid):
+        continue
+    stale = os.path.join(instances, name)
+    try:
+        write(os.path.join(stale, EVENT, "enable"), "0")
+    except OSError:
+        pass
+    try:
+        os.rmdir(stale)
+    except OSError:
+        pass
+here = os.path.join(instances, instance)
 try:
     os.mkdir(here)
 except FileExistsError:
@@ -219,14 +237,20 @@ signal.signal(signal.SIGINT, stop)
 pipe = os.open(os.path.join(here, "trace_pipe"), os.O_RDONLY | os.O_NONBLOCK)
 watched = [pipe, 0]
 pending = b""
+# Once stdin reaches EOF - the run that started this is gone, or asked it to
+# stop - the pipe is drained for a moment longer rather than dropped: the last
+# event in it may be the SIGKILL that ended the run, which is the one line a
+# later run needs to say who did it.
+closing_at = None
 try:
     while True:
-        ready, _, _ = select.select(watched, [], [], 1.0)
-        if 0 in ready:
+        if closing_at is not None and time.monotonic() >= closing_at:
+            break
+        ready, _, _ = select.select(watched, [], [], 0.1 if closing_at else 1.0)
+        if 0 in ready and closing_at is None:
             if not os.read(0, 4096):
-                break  # the run that started this is gone, or asked it to stop
-        if pipe not in ready:
-            continue
+                closing_at = time.monotonic() + 0.5
+                watched = [pipe]
         try:
             chunk = os.read(pipe, 65536)
         except BlockingIOError:
