@@ -163,6 +163,7 @@ import json, os, select, signal, sys, time
 instance, event_filter, output, owner = sys.argv[1:5]
 ROOTS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
 EVENT = "events/signal/signal_generate"
+BUFFER_KB = 64  # per CPU; an event is under 200 bytes and the pipe is read live
 
 
 class Stop(Exception):
@@ -212,6 +213,14 @@ try:
     os.mkdir(here)
 except FileExistsError:
     pass  # a previous sidecar of this run died without removing it
+# A fresh instance gets the kernel's default ring buffer, about 1.4 MB per
+# CPU - some 90 MB on a 64-core runner, for a stream of a few events that is
+# read as it arrives. Shrunk before the event is enabled; a kernel that
+# refuses keeps its default, which costs memory and nothing else.
+try:
+    write(os.path.join(here, "buffer_size_kb"), str(BUFFER_KB))
+except OSError:
+    pass
 event = os.path.join(here, EVENT)
 write(os.path.join(event, "filter"), event_filter)
 write(os.path.join(event, "enable"), "1")

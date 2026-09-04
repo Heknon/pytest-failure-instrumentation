@@ -484,6 +484,14 @@ def test_the_tracepoint_names_the_sender_of_a_kill(tmp_path):
     how = tracer.start()
     assert how in ("tracefs", "sudo tracefs"), how
     try:
+        # Its ring buffer is the one cost that scales with the machine rather
+        # than the run: the kernel's default is ~1.4 MB per CPU.
+        own = Path(signal_trace.tracefs_root() or "/nonexistent") / "instances" / (
+            f"{signal_trace.INSTANCE_PREFIX}{os.getpid()}"
+        )
+        if os.access(own / "buffer_size_kb", os.R_OK):
+            # Rounded up to pages by the kernel; the default it replaced is 1410.
+            assert int((own / "buffer_size_kb").read_text()) < 256
         victim = subprocess.Popen(["sleep", "30"])
         time.sleep(0.3)
         victim.kill()
