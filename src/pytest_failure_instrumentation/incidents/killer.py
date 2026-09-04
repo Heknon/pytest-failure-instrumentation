@@ -49,9 +49,9 @@ CONTROLLER_EVENTS = "controller.events"
 CONTROLLER = "the controller"
 
 #: How far before a death a SIGTERM is still taken as its explanation. Docker
-#: waits ten seconds between the two; kubelet thirty; systemd ninety; a CI
-#: runner somewhere in between. Beyond this the two are separate events.
-TERM_WINDOW_SECONDS = 180.0
+#: waits ten seconds between the two; kubelet thirty; systemd ninety; GitLab's
+#: shell executor a full ten minutes. Beyond this the two are separate events.
+TERM_WINDOW_SECONDS = 660.0
 #: Slack after the controller noticed a death, for a record that landed a
 #: moment later than the notice.
 AFTER_DEATH_SECONDS = 5.0
