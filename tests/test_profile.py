@@ -479,13 +479,28 @@ class TestMemory:
         assert any("MALLOC_ARENA_MAX limits how many thread arenas exist" in line for line in incident.evidence)
         assert str(incident).startswith("Memory held by the allocator: worker main has ")
         assert "[memory_profile ALLOCATOR_RETENTION, runtime, informational]" in str(incident).splitlines()[0]
-        # And none of the tests is raised for memory nothing is using: a
-        # step big enough to be HEAP_NOT_RETURNED alone is folded in here.
+        # Nothing here is called a leak, and nothing is called freed. Both
+        # verdicts that would assert the memory *is* one of those - a leak
+        # across tests, or a step the allocator kept - stay out of it.
         assert not [
             incident
             for incident in memory(incidents)
-            if incident.verdict in ("STEADY_GROWTH", "RETAINED_AFTER_TEST", "HEAP_NOT_RETURNED")
+            if incident.verdict in ("STEADY_GROWTH", "HEAP_NOT_RETURNED")
         ]
+        # A per-test finding may stand beside the worker's now, and where the
+        # readings cannot tell live memory from memory the allocator kept it
+        # has to say which it cannot tell rather than pick one. This used to
+        # assert that no per-test finding was raised at all, which was the
+        # inference "small mallinfo2 delta, therefore freed" being read back
+        # out of the suite.
+        for other in memory(incidents):
+            if other.verdict == "ALLOCATOR_RETENTION":
+                continue
+            assert other.verdict == "RETAINED_AFTER_TEST", str(other)
+            assert any(
+                "cannot distinguish live allocations from memory retained by the allocator" in line
+                for line in other.evidence
+            ), str(other)
 
 
 @needs_xdist
