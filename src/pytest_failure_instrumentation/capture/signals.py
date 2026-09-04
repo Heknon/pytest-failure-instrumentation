@@ -166,11 +166,17 @@ class SignalWitness:
                     return
                 self._stop.wait(0.2)
                 continue
+            refusals = 0  # they have to be consecutive to mean anything
             if info is None:
                 continue
             self._witness(info)
             self._let_through(info.si_signo)
-            return
+            # Still here, so the delivery did not end the process: a handler
+            # somebody installed after the block took it. Keep waiting rather
+            # than returning. The block is process-wide, so a witness that
+            # stops after one signal leaves the next stop request pending
+            # with nobody to receive it - undeliverable, unwitnessed, and a
+            # run that can no longer be stopped.
 
     def _witness(self, info: Any) -> None:
         sender = int(info.si_pid)
@@ -197,10 +203,18 @@ class SignalWitness:
         action for SIGTERM ends the whole process - which is what would have
         happened without us. A handler somebody installed since the block is
         honoured by the same delivery.
+
+        Returning from this means the process survived the delivery, and the
+        block goes straight back on: it is unblocked in this thread only, so
+        leaving it off would have the *next* one delivered here instead of
+        waited for, and the witness would miss the signal it exists to name.
         """
         try:
             signal.pthread_sigmask(signal.SIG_UNBLOCK, {number})
-            signal.raise_signal(number)
+            try:
+                signal.raise_signal(number)
+            finally:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {number})
         except (OSError, ValueError):
             os.kill(os.getpid(), number)
 
