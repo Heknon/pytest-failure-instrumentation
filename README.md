@@ -819,8 +819,14 @@ back to pytest's file at the phase's end, before pytest reads it — so pytest's
 captured-output-on-failure is unchanged. It is the one facility here that takes
 over a process-wide descriptor, which is why it is opt-in and guarded at every
 step: an fd operation that fails leaves fd 2 as it was and records that output
-was not captured, rather than raising. POSIX only. An absent tail reads as "not
-captured", never as silence: the alert says which.
+was not captured, rather than raising. It stands down for a test that captures
+its own fd output — one that asks for the `capfd` or `capfdbinary` fixture —
+because taking fd 2 out from under such a fixture would make its `readouterr()`
+miss what the test wrote, and changing a passing test is the one thing this may
+never do; `capsys` and `capsysbinary` are sys-level and untouched. Tested
+alongside `-s`, `--capture=sys` and pytest-cov, each of which keeps its own
+output and its coverage while a crash is still caught. POSIX only. An absent
+tail reads as "not captured", never as silence: the alert says which.
 
 ## Who killed it
 

@@ -134,6 +134,10 @@ class WorkerRecorder:
                 self._track(tee)
                 self.stderr_tee = tee
             self.events.record("output_capture", status=tee.reason)
+        #: Set when the tee did not take fd 2 for the current phase - see
+        #: _tee_take. Read by _tee_hand_back, so it never restores a
+        #: descriptor it did not take.
+        self._tee_stood_down = False
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
@@ -261,26 +265,45 @@ class WorkerRecorder:
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
-        yield from self._phase("setup", item.nodeid)
+        yield from self._phase("setup", item.nodeid, item)
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_call(self, item: pytest.Item) -> Any:
-        yield from self._phase("call", item.nodeid)
+        yield from self._phase("call", item.nodeid, item)
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_teardown(self, item: pytest.Item) -> Any:
-        yield from self._phase("teardown", item.nodeid)
+        yield from self._phase("teardown", item.nodeid, item)
 
-    def _tee_take(self) -> None:
-        """Point fd 2 at the capture file, if the tee is on. pytest points fd 2
-        at its own file at the start of every phase; this takes it just after,
-        and _tee_hand_back gives it back at the phase's end with the phase's
-        bytes copied into pytest's file, so both keep the output."""
-        if self.stderr_tee is not None:
-            self.stderr_tee.take()
+    #: Fixtures that take fd 1/2 over for the test themselves. Taking fd 2 out
+    #: from under one of them makes its readouterr() miss what the test wrote,
+    #: which is a change to a passing test's behaviour - the one thing this may
+    #: never do. A test that captures its own fd output is also watching its
+    #: own crash, so the tee stands down for it and loses nothing worth having.
+    #: capsys / capsysbinary are sys-level and untouched, so they are not here.
+    _FD_CAPTURE_FIXTURES = frozenset({"capfd", "capfdbinary"})
+
+    def _tee_take(self, item: pytest.Item | None = None) -> None:
+        """Point fd 2 at the capture file, if the tee is on and no fd-capture
+        fixture owns it for this test. pytest points fd 2 at its own file at
+        the start of every phase; this takes it just after, and _tee_hand_back
+        gives it back at the phase's end with the phase's bytes copied into
+        pytest's file, so both keep the output."""
+        if self.stderr_tee is None:
+            return
+        if item is not None and self._FD_CAPTURE_FIXTURES.intersection(
+            getattr(item, "fixturenames", ())
+        ):
+            self._tee_stood_down = True
+            return
+        self._tee_stood_down = False
+        self.stderr_tee.take()
 
     def _tee_hand_back(self) -> None:
-        if self.stderr_tee is not None:
+        # Only hand back what was taken: a phase the tee stood down for never
+        # touched fd 2, and calling hand_back then would restore a descriptor
+        # it does not own.
+        if self.stderr_tee is not None and not self._tee_stood_down:
             self.stderr_tee.hand_back()
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
@@ -307,11 +330,11 @@ class WorkerRecorder:
         finally:
             self._tee_hand_back()
 
-    def _phase(self, phase: str, nodeid: str) -> Any:
+    def _phase(self, phase: str, nodeid: str, item: pytest.Item | None = None) -> Any:
         """Which phase is open is what separates "died in teardown" from
         "died mid-call": pytest's own logfinish fires only after the whole
         protocol, so it cannot tell them apart."""
-        self._tee_take()
+        self._tee_take(item)
         now = time.time()
         if phase == "setup":
             self.state.tests_started += 1

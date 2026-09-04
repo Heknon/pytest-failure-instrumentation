@@ -217,6 +217,60 @@ def test_a_collection_error_is_still_reported(distributed):
     result.stdout.fnmatch_lines(["*boom at import*"])
 
 
+@posix_only
+@needs_xdist
+def test_the_tee_stands_down_for_a_test_that_captures_fd_output_itself(distributed):
+    """capfd and capfdbinary take fd 1/2 over for the test to read them back.
+    The tee must not take fd 2 out from under them - that would make their
+    readouterr() miss what the test wrote, which is a change to a passing
+    test. It stands down for such a test, and still captures a crash in a
+    plain test in the same run: the stand-down is per test, not per run.
+    """
+    (distributed.pytester.path / "test_fdfix.py").write_text(
+        "import ctypes, os, sys\n"
+        "def test_capfd_still_reads_fd_level(capfd):\n"
+        "    os.write(1, b'native-out\\n')\n"
+        "    os.write(2, b'native-err\\n')\n"
+        "    sys.stderr.write('py-err\\n')\n"
+        "    out, err = capfd.readouterr()\n"
+        "    assert 'native-out' in out, repr(out)\n"
+        "    assert 'native-err' in err and 'py-err' in err, repr(err)\n"
+        "def test_capfdbinary_reads_bytes(capfdbinary):\n"
+        "    os.write(2, b'raw-native-bytes\\n')\n"
+        "    _out, err = capfdbinary.readouterr()\n"
+        "    assert b'raw-native-bytes' in err, err\n"
+        "def test_a_plain_test_still_crashes_captured():\n"
+        "    os.write(2, b'OpenBLAS pthread_create failed\\n')\n"
+        "    ctypes.CDLL(None).abort()\n",
+        encoding="utf-8",
+    )
+    incidents = distributed.run(
+        "-n", "2", "-o", "failure_capture_output=true", "test_fdfix.py", timeout=180
+    )
+    # The two fd-fixture tests passed (their asserts held because the tee stood
+    # down), and the plain test's crash was still captured.
+    death = distributed.only(incidents, "worker_death")
+    assert any("pthread_create failed" in line for line in death.recent_output), death.recent_output
+
+
+@posix_only
+@needs_xdist
+def test_capsys_is_untouched_being_sys_level(distributed):
+    (distributed.pytester.path / "test_capsys.py").write_text(
+        "import sys\n"
+        "def test_capsys(capsys):\n"
+        "    print('hello'); sys.stderr.write('world\\n')\n"
+        "    out, err = capsys.readouterr()\n"
+        "    assert out == 'hello\\n' and err == 'world\\n', (repr(out), repr(err))\n",
+        encoding="utf-8",
+    )
+    result = distributed.pytester.runpytest_subprocess(
+        "--failure-instrumentation", "-n", "2", "-o", "failure_capture_output=true",
+        "test_capsys.py", timeout=180,
+    )
+    result.assert_outcomes(passed=1)
+
+
 @needs_xdist
 def test_capture_off_by_default_keeps_no_file(distributed):
     distributed.pytester.makepyfile(
