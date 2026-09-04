@@ -927,3 +927,198 @@ def test_a_run_told_to_stop_is_recovered_with_the_senders_name(distributed):
     assert controller.killer.sender_role == "outside this run"
     assert any("without reaching session finish" in line for line in controller.evidence)
     assert any("SIGTERM was sent by" in line for line in controller.evidence)
+
+
+# -- the ladder, and what ends it -------------------------------------------
+
+
+@linux_only
+def test_a_kmsg_that_reads_as_empty_does_not_end_the_ladder(monkeypatch):
+    """/dev/kmsg bound to /dev/null is what systemd-nspawn and a few container
+    runtimes do, and it opens and reads cleanly.
+
+    A fresh open of the real device starts at the oldest record the kernel
+    still holds, so a running kernel never reads as empty: nothing is not an
+    answer. Taken for one, the journal and dmesg are never tried and an OOM
+    kill goes unfound while the incident reports that the log was read.
+    """
+    monkeypatch.setattr(kernel_log, "KMSG", "/dev/null")
+    lines_read, why = kernel_log._read_kmsg()
+    assert lines_read is None and why
+
+    reading = kernel_log.read(elevate=False)
+    assert reading.source != "kmsg"
+    if reading.source == "unavailable":
+        assert "kmsg:" in reading.detail and "journal:" in reading.detail
+
+
+# -- the fleet arithmetic over a table the reader never sees ----------------
+
+
+def wide_oom(rows: int, victim: int, ours: dict[int, int]) -> str:
+    """A global OOM whose table is longer than KEPT_TASKS.
+
+    ``ours`` maps a pid of the run to its RSS in pages. They are deliberately
+    small: a run's workers are what falls off the end of a table trimmed to
+    the heaviest rows, which is the case this exists to cover.
+    """
+    header = [
+        "[ 1201.101000] python3 invoked oom-killer: gfp_mask=0x140dca, order=0, oom_score_adj=0",
+        "[ 1201.102000] Tasks state (memory values in pages):",
+        "[ 1201.102000] [  pid  ]   uid  tgid total_vm      rss pgtables_bytes swapents oom_score_adj name",
+    ]
+    table = []
+    for index in range(rows):
+        pid = 10000 + index
+        table.append(
+            f"[ 1201.102000] [  {pid}]  1000  {pid}   900000   900000  3276800        0             0 bystander"
+        )
+    for pid, pages in ours.items():
+        table.append(
+            f"[ 1201.102000] [   {pid}]  1000  {pid}   {pages * 2}   {pages}  3276800        0             0 python3"
+        )
+    return "\n".join(
+        header + table + [
+            "[ 1201.103000] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,"
+            f"global_oom,task_memcg=/x,task=python3,pid={victim},uid=1000",
+            f"[ 1201.103000] Out of memory: Killed process {victim} (python3) total-vm:8000kB, "
+            "anon-rss:4000kB, file-rss:0kB, shmem-rss:0kB, UID:1000 pgtables:3200kB oom_score_adj:0",
+        ]
+    ) + "\n"
+
+
+def test_the_fleet_figures_are_over_the_whole_table_not_the_kept_rows():
+    """``tasks_considered`` comes from the whole table, so the run's figures
+    have to as well: two numbers drawn from different populations cannot be
+    set beside each other and read as a proportion.
+
+    The rows that fall off a table trimmed to the heaviest few are the small
+    ones - which is exactly where a run's workers sit under a global OOM on a
+    busy host. Dropped, the run reads as both smaller and heavier than it was.
+    """
+    ours = {4240: 1000, 4241: 1100, 4242: 1200}
+    (kill,) = kernel_log.parse(lines(wide_oom(kernel_log.KEPT_TASKS + 50, 4242, ours)))
+    assert kill.tasks_considered == kernel_log.KEPT_TASKS + 53
+    assert len(kill.tasks) == kernel_log.KEPT_TASKS, "the reader's view is still trimmed"
+    assert not any(task.pid in ours for task in kill.tasks), "ours are the small ones"
+
+    record = killer._oom_record(kill, "pid", roles(), 4242, "kmsg", None)
+    assert record.run_tasks == 3, "every worker the kernel weighed, kept or not"
+    assert record.victim_rank == kernel_log.KEPT_TASKS + 51, "over the whole table"
+    assert record.run_median_rss_mb is not None
+    # An ordinary member of its run, which is the population the reader is
+    # shown. Over the kept rows alone there is no run left to compare it to,
+    # and the question "was this one process or the fleet" goes unanswered.
+    assert record.pressure == "fleet"
+
+
+def test_a_trimmed_table_still_gives_the_reader_the_heaviest_rows():
+    (kill,) = kernel_log.parse(lines(wide_oom(kernel_log.KEPT_TASKS + 50, 4242, {4242: 10})))
+    record = killer._oom_record(kill, "pid", roles(), 4242, "kmsg", None)
+    assert len(record.largest) == 3
+    assert all(entry["rss_mb"] > 0 for entry in record.largest)
+
+
+# -- one reading for a cascade ----------------------------------------------
+
+
+def test_the_kernel_log_is_read_once_for_deaths_it_already_covers(tmp_path, monkeypatch):
+    """An OOM kill takes a worker, the memory is still short, and the next
+    goes. Each death forks journalctl or dmesg and parses everything it
+    prints, in pytest_testnodedown, with the run waiting.
+
+    A reading taken after a death, and opened no later than the window asked
+    for, already contains everything that death could be explained by.
+    """
+    reads: list[float | None] = []
+
+    def counted(since=None, elevate=False):
+        reads.append(since)
+        return kernel_log.KernelLogReading([], "dmesg", "0 lines")
+
+    monkeypatch.setattr(kernel_log, "read", counted)
+    sources = killer.Sources(directory=tmp_path, live=False)
+    started, died = time.time() - 100, time.time()
+
+    for _ in range(5):
+        sources.kernel_log_reading(started, died)
+    assert len(reads) == 1, reads
+
+    # A death after the reading is not covered by it, and is read afresh.
+    sources.kernel_log_reading(started, time.time() + 60)
+    assert len(reads) == 2
+
+    # Nor is one whose window opens earlier than the reading's did.
+    sources.kernel_log_reading(started - 3600, died)
+    assert len(reads) == 3
+
+
+def test_a_narrowed_reading_keeps_only_the_kills_in_the_later_window():
+    (kill,) = kernel_log.parse(lines(GLOBAL_OOM))
+    reading = kernel_log.KernelLogReading([kill], "dmesg", "4 lines")
+    assert kernel_log.narrowed(reading, kill.at - 10).kills == [kill]
+    assert kernel_log.narrowed(reading, kill.at + 10).kills == []
+    # The rung that answered travels with it: a narrowed reading is the same
+    # reading, and the incident says which source it came from.
+    assert kernel_log.narrowed(reading, None).source == "dmesg"
+
+
+def test_the_trace_is_reparsed_only_when_it_has_grown(tmp_path, monkeypatch):
+    """Waiting for a line to land polls twenty times a second, and the file is
+    read to a 16 MB tail. Nothing new can have arrived while the size is
+    unchanged, so parsing it again only costs."""
+    trace = tmp_path / signal_trace.TRACE_FILE
+    trace.write_text("")
+    parses = []
+
+    def counted(path):
+        parses.append(path)
+        return []
+
+    monkeypatch.setattr(signal_trace, "witnessed", counted)
+    monkeypatch.setattr(killer, "TRACE_SETTLE_SECONDS", 0.25)
+    killer._settled(killer.Sources(directory=tmp_path, live=True), 4242)
+    assert len(parses) == 1, "the file never grew, so once is all it is worth"
+
+
+# -- a witness that has to outlast the signal it survived --------------------
+
+
+@linux_only
+def test_the_witness_keeps_waiting_after_a_signal_the_process_survived():
+    """A handler installed after the block means the process does not die of
+    the SIGTERM it was sent.
+
+    The block is process-wide, so a witness that stops after one leaves the
+    next stop request pending with nobody to receive it - undeliverable,
+    unwitnessed, and a run that can no longer be stopped.
+    """
+    script = """
+import json, signal, sys, time
+from pytest_failure_instrumentation.capture import signals
+blocked = signals.block()
+# Installed *after* the block, which is the only way to get here: block()
+# refuses to take a signal somebody already has a handler for.
+signal.signal(signal.SIGTERM, lambda *_: None)
+print(json.dumps(sorted(blocked)), flush=True)
+def record(event, **fields):
+    print(json.dumps({"event": event, "sender_pid": fields.get("sender_pid")}), flush=True)
+signals.SignalWitness(record, blocked, poll_seconds=0.05).start()
+time.sleep(30)
+"""
+    child = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    assert child.stdout is not None
+    try:
+        assert json.loads(child.stdout.readline()) == [int(signal.SIGTERM)]
+        time.sleep(0.3)  # the waiting thread has to be inside sigtimedwait
+        seen = []
+        for _ in range(3):
+            os.kill(child.pid, signal.SIGTERM)
+            seen.append(json.loads(child.stdout.readline()))
+            time.sleep(0.2)
+        assert child.poll() is None, "the handler took it, so it is still running"
+        assert [record["event"] for record in seen] == ["signal_received"] * 3
+        assert {record["sender_pid"] for record in seen} == {os.getpid()}
+    finally:
+        child.kill()
+        child.wait(timeout=10)
