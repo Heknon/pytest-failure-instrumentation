@@ -28,7 +28,7 @@ and for memory:
 
 ======================= =====================================================
 ``RETAINED_AFTER_TEST`` the worker was left holding more than it started with
-``HEAP_NOT_RETURNED``   left holding more, none of it in use: pages the allocator kept
+``HEAP_NOT_RETURNED``   legacy verdict; incomplete heap counters cannot establish this
 ``TRANSIENT_PEAK``      a test climbed and came back down
 ``STEADY_GROWTH``       a run of tests each left a little behind
 ``WORKER_IMBALANCE``    one worker holds far more than its siblings
@@ -766,37 +766,12 @@ def _memory_findings(
                 measured = _measured(
                     record, before, after, traced, parts=live_parts, understated=retained > after - before
                 )
-                if live is False:
-                    findings.append(
-                        Finding(
-                            kind="memory_profile",
-                            verdict="HEAP_NOT_RETURNED",
-                            evidence=[
-                                "The objects were freed. The C allocator kept the pages mapped, "
-                                "which is normal allocator behaviour."
-                            ]
-                            + evidence
-                            + [
-                                "Look at: nothing in Python holds this. See ALLOCATOR_RETENTION if "
-                                "the whole worker grows this way.",
-                                measured,
-                            ]
-                            + traced_note,
-                            nodeid=record["nodeid"],
-                            worker=worker,
-                            phase=phase,
-                            before_mb=before,
-                            after_mb=after,
-                            peak_mb=peak,
-                            delta_mb=retained,
-                            frame=frame,
-                            stack=stack,
-                            climb_mb=climb,
-                            climb_total_mb=climb_total,
-                        )
+                if live is None:
+                    evidence.append(
+                        "Process memory remained elevated after teardown. These readings cannot "
+                        "distinguish live allocations from memory retained by the allocator."
                     )
-                    continue
-                if phase == "setup":
+                elif phase == "setup":
                     evidence.append(
                         "The increase happened during setup, so a fixture allocated it, and it "
                         "was still in use after teardown."
@@ -813,7 +788,9 @@ def _memory_findings(
                 else:
                     evidence.append("It was still in use after teardown.")
                 if frame is not None:
-                    evidence.append(f"Look at: {_place(frame)} and what holds its result after the test.")
+                    evidence.append(
+                        f"Look at: {_place(frame)} and the allocations made along this call path."
+                    )
                 elif not traced:
                     evidence.append(
                         "Look at: rerun with --failure-profile-allocations to see which lines "
@@ -872,30 +849,7 @@ def _memory_findings(
         findings.extend(_drift(worker, tests, limits, session_holders.get(worker), attributor))
 
     findings.extend(_imbalance(by_worker, limits))
-    retention = _allocator_retention(by_worker, limits)
-    if retention:
-        # The same memory, seen per test: a test that left a threshold's
-        # worth of it at once was HEAP_NOT_RETURNED on its own. Under the
-        # worker's finding those are its biggest steps, not findings of
-        # their own - one thing to fix should be one row.
-        (whole,) = retention
-        steps = [
-            finding
-            for finding in findings
-            if finding.verdict == "HEAP_NOT_RETURNED" and finding.worker in whole.worker_rss
-        ]
-        if steps:
-            steps.sort(key=lambda finding: -(finding.delta_mb or 0))
-            whole.evidence.insert(
-                2,
-                "Biggest single steps: "
-                + ", ".join(f"{step.nodeid} ({step.delta_mb} MB on {step.worker})" for step in steps[:3])
-                + ".",
-            )
-            # By identity: two findings with the same fields are still two.
-            folded = {id(step) for step in steps}
-            findings = [finding for finding in findings if id(finding) not in folded]
-        findings.extend(retention)
+    findings.extend(_allocator_retention(by_worker, limits))
     return findings
 
 
@@ -905,12 +859,9 @@ def _allocator_retention(
     """The worker grew over its run and nothing is using the growth: the
     allocator was handed the memory back and kept it mapped.
 
-    The per-test rules leave this alone on purpose - drift counts what is in
-    use, and a single test's fragmentation is HEAP_NOT_RETURNED only when it
-    is a threshold's worth at once. A few megabytes of freed-but-mapped
-    memory per test over a long worker is neither, and it is the worker at
-    four gigabytes that nobody can find a leak in. The rule is over the
-    whole worker: resident memory grew by the threshold more than the live
+    Per-test retention remains separate: worker-wide allocator evidence
+    cannot establish whether an individual test left live objects behind.
+    The rule is over the whole worker: resident memory grew by the threshold more than the live
     heap and the object count did, and the allocator's own free figure
     accounts for most of that gap.
 
@@ -1103,14 +1054,12 @@ BYTES_PER_BLOCK = 64
 def _still_in_use(record: dict[str, Any], retained_mb: int) -> tuple[Optional[bool], list[str]]:
     """Whether the memory a test left behind is alive, from the live-heap
     readings, and the labelled figures that say so, for the measured line.
-    None where nothing was read - or where only the object count was, and
-    it does not settle it.
+    None when the readings do not establish live allocation growth.
 
-    The heap figure is Linux-only. Elsewhere the blocks are all there is,
-    and blocks at their rough size are a floor, not a measure: one numpy
-    array holding two hundred megabytes is one block. A floor that clears
-    the bar says the memory is in use; one that does not says nothing, and
-    is never taken for "freed".
+    The Linux heap reading does not cover all allocation domains, including
+    Python small-object arenas. Block counts have no reliable byte size.
+    Neither a small heap delta nor a small block estimate proves objects
+    were freed, even when both counters are available.
     """
     if _figures(record)[3]:
         return True, [f"Live Python allocations +{retained_mb} MB (tracemalloc)"]
@@ -1128,13 +1077,12 @@ def _still_in_use(record: dict[str, Any], retained_mb: int) -> tuple[Optional[bo
     if blocks_before is not None and blocks_after is not None:
         blocks_read = True
         grew_blocks = int(blocks_after) - int(blocks_before)
-        live_mb += max(0, grew_blocks * BYTES_PER_BLOCK // 1048576)
-        parts.append(f"{grew_blocks:+,d} Python objects")
+        parts.append(f"{grew_blocks:+,d} Python allocation blocks")
     if not heap_read and not blocks_read:
         return None, parts
     if live_mb >= retained_mb // 2:
         return True, parts
-    return False if heap_read else None, parts
+    return None, parts
 
 
 def _phase_of_step(rss_at: dict[str, Any], threshold_mb: int) -> Optional[str]:
