@@ -960,8 +960,11 @@ class IncidentEngine:
         # phase that is guaranteed. This is the whole per-test cost of the
         # schedule: what a worker still owes is read off the scheduler when
         # the record is written, and the two added together are its total.
+        # Once per *attempt*, strictly: a rerun plugin tears the same test
+        # down again, and the node id is what lets the tracker tell that from
+        # the next test - see ScheduleTracker.saw_a_test_finish.
         if getattr(report, "when", None) == "teardown":
-            self.schedule.saw_a_test_finish(worker)
+            self.schedule.saw_a_test_finish(worker, getattr(report, "nodeid", None))
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_xdist_node_collection_finished(self, node: Any, ids: Any) -> None:

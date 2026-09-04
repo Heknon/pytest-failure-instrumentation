@@ -1049,6 +1049,18 @@ of a test rather than the end of one keeps that worker out of its own window;
 what is left is the rarer case of another worker's two messages straddling this
 one's, and it lasts until the next test starts somewhere.
 
+**A rerun is the same test, not another one.** pytest-rerunfailures, flaky
+and every plugin written the same way run a failed test's phases again inside
+the same protocol, so setup and teardown happen once per attempt while the
+test, its node id and its slot in the scheduler's queue are one. Both counters
+count the test: the worker counts a start at the first setup of a protocol and
+not at a second, and takes back the finish it counted at the end of the attempt
+that turned out not to be the last, so a rerun in flight reads as one running;
+the controller counts a teardown report that names the test the worker has just
+finished as that test again. Before that, a run of 368 tests with six rerun once
+was reported as 374 — every attempt a test, and the total floored at the
+worker's count so that an attempt became a test nobody was given.
+
 **A crashed worker keeps its row, so the rows can add up to more than the run.**
 xdist drops a dead worker's queue back into the global one and starts a
 replacement under a new id, and the test it died *in* is reported failed rather

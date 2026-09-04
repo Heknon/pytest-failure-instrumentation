@@ -38,6 +38,38 @@ def pytest_failure_incident(incident):
         handle.write(incident.model_dump_json() + "\\n")
 """
 
+#: pytest-rerunfailures and flaky, in a dozen lines. A rerun plugin implements
+#: ``pytest_runtest_protocol`` and runs a failed test's phases again inside it,
+#: and every attempt's reports reach the controller - which is the shape the
+#: counters have to hold up under, and one no dependency of this package
+#: provides. A test fails on its first attempt by raising the first time it
+#: runs; how it remembers that is the suite's business.
+RERUN_CONFTEST = INNER_CONFTEST + '''
+import pytest
+from _pytest.runner import runtestprotocol
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item, nextitem):
+    item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+    for attempt in range(2):
+        reports = runtestprotocol(item, nextitem=nextitem, log=False)
+        again = attempt == 0 and any(report.failed for report in reports)
+        for report in reports:
+            if again:
+                report.outcome = "rerun"
+            item.ihook.pytest_runtest_logreport(report=report)
+        if not again:
+            break
+    item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
+
+
+def pytest_report_teststatus(report):
+    if report.outcome == "rerun":
+        return "rerun", "R", "RERUN"
+'''
+
 VICTIM_MODULE = '''
 import ctypes
 import os
