@@ -189,13 +189,20 @@ class ThreadClock:
                 return {}
         return {}
 
-    def discover(self) -> list[int]:
+    def discover(self, known: Optional[dict[int, int]] = None) -> list[int]:
         """Every thread the kernel knows in this process, Python's or not.
 
         On Linux the one procfs read left, and it releases the GIL - so it
         is called once a second rather than once a tick. A native thread that
         starts and dies within that second goes unseen, which is the trade.
-        The other readers list every thread on every read anyway.
+
+        The other two readers list every thread on every read anyway, so
+        ``known`` - the clocks read a moment ago on this same tick - is
+        already the answer and is used rather than asking again. It matters
+        most where it costs most: psutil's ``Process.threads()`` on Windows
+        goes through ``NtQuerySystemInformation``, which enumerates every
+        thread on the machine, and a discovery tick was paying for two or
+        three of those.
         """
         if self.source == "thread-clock":
             try:
@@ -203,7 +210,7 @@ class ThreadClock:
             except (OSError, ValueError):
                 return []
         if self.source in ("mach", "psutil"):
-            return list(self.read(()))
+            return list(known if known is not None else self.read(()))
         return []
 
 
@@ -770,7 +777,7 @@ class Sampler:
         # those, or on the schedule that finds a C extension's pool.
         unknown = changed and any(ident not in self._threads for ident in idents)
         if unknown or self._ticks % DISCOVER_EVERY == 0:
-            self._all_tids = self.clock.discover()
+            self._all_tids = self.clock.discover(clocks)
             missing = [tid for tid in self._all_tids if tid not in clocks]
             if missing:
                 clocks.update(self.clock.read(missing))

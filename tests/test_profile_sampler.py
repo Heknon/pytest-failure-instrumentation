@@ -700,3 +700,34 @@ def test_a_function_that_cannot_be_found_keeps_its_bare_name(
     code = namespace["made_up"].__code__
     assert _qualified_name(code) == "made_up"
     assert code in sampling._qualnames
+
+
+def test_a_discovery_reuses_the_clocks_it_was_just_handed() -> None:
+    """Where a reader lists every thread on every read - mach and psutil -
+    the clocks read a moment ago on the same tick already *are* the thread
+    list, and asking again costs what the read costs.
+
+    It matters most where it costs most. psutil's ``Process.threads()`` on
+    Windows goes through ``NtQuerySystemInformation``, which enumerates every
+    thread on the machine, and a discovery tick was paying for two or three
+    of those at fifty ticks a second.
+    """
+    clock = ThreadClock()
+    if clock.source == "thread-clock":
+        pytest.skip("Linux reads a thread's clock by id, so discovery is its own procfs read")
+    if not clock.available:
+        pytest.skip("no per-thread CPU clock on this platform")
+
+    reads = 0
+    real = clock.read
+
+    def counted(tids: Any) -> dict:
+        nonlocal reads
+        reads += 1
+        return real(tids)
+
+    clock.read = counted  # type: ignore[method-assign]
+    handed = real(())
+    assert clock.discover(handed) == list(handed)
+    assert reads == 0, "the clocks it was handed were enough"
+    assert clock.discover() and reads == 1, "and without them it still answers"

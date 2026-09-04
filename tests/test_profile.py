@@ -33,7 +33,7 @@ needs_thread_cpu = pytest.mark.skipif(
 HAS_LIVE_HEAP = probes.heap_in_use_megabytes()[0] is not None
 
 
-def a_core_of_its_own(wanted: float = 0.7, over: float = 0.3) -> None:
+def a_core_of_its_own(wanted: float = 0.7, over: float = 0.15) -> None:
     """Skip unless this machine will give one busy thread most of a core.
 
     A burst is defined as a *rate* - `failure_profile_burst_cores` of a core,
@@ -44,11 +44,18 @@ def a_core_of_its_own(wanted: float = 0.7, over: float = 0.3) -> None:
     the run rather than at collection, because what a CI runner will give
     varies minute to minute.
     """
-    started, cpu = time.perf_counter(), time.process_time()
-    deadline = started + over
-    while time.perf_counter() < deadline:
-        sum(range(2000))
-    cores = (time.process_time() - cpu) / max(1e-9, time.perf_counter() - started)
+    def probe() -> float:
+        started, cpu = time.perf_counter(), time.process_time()
+        deadline = started + over
+        while time.perf_counter() < deadline:
+            sum(range(2000))
+        return (time.process_time() - cpu) / max(1e-9, time.perf_counter() - started)
+
+    # The best of three short probes rather than one longer one: a single dip
+    # - another worker of this suite starting a subprocess, say - would skip a
+    # test that the machine can in fact run, and a skip that should not have
+    # happened is the failure mode to avoid here.
+    cores = max(probe() for _ in range(3))
     if cores < wanted:
         pytest.skip(
             f"this machine gave one busy thread {cores:.2f} cores just now, and a "
