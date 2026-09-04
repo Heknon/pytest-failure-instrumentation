@@ -838,7 +838,20 @@ class IncidentEngine:
         here and repeated on every incident that would have used it, so a
         ``SIGKILLED`` names the witness this machine withheld rather than
         leaving an absence.
+
+        Nothing in here may end the run. A witness that fails to start is a
+        status string; the block it would have watched is released, so the
+        one thing a failed witness could cost - a SIGTERM nobody delivers -
+        cannot happen.
         """
+        try:
+            self._start_kill_witnesses_or_fail()
+        except Exception as failure:  # noqa: BLE001 - see the docstring
+            self.witness_status = f"off: failed ({failure!r})"
+            self.witness = None
+            self._release_signals()
+
+    def _start_kill_witnesses_or_fail(self) -> None:
         if not self.settings.kill_trace:
             self.witness_status = "off: failure_kill_trace is off"
             self._release_signals()
@@ -892,26 +905,40 @@ class IncidentEngine:
         if self.witnesses_announced or self.controller_events is None:
             return
         self.witnesses_announced = True
-        self._record(
-            "kill_witnesses",
-            controller_witness=self.witness_status,
-            signal_trace=self.tracer.how if self.tracer is not None else "off: not started",
-            elevate=self.settings.elevate,
-        )
+        try:
+            self._record(
+                "kill_witnesses",
+                controller_witness=self.witness_status,
+                signal_trace=self.tracer.how if self.tracer is not None else "off: not started",
+                elevate=self.settings.elevate,
+            )
+        except Exception:  # noqa: BLE001 - a line that cannot be written
+            pass  # is not a run that cannot proceed
 
     def _stop_kill_witnesses(self) -> None:
-        if self.tracer is not None:
-            self.tracer.stop()
-        if self.witness is not None:
-            self.witness.stop()
-        self._release_signals()
-        if self.controller_events is not None:
-            self.controller_events.close()
+        for step in (
+            lambda: self.tracer.stop() if self.tracer is not None else None,
+            lambda: self.witness.stop() if self.witness is not None else None,
+            self._release_signals,
+            lambda: self.controller_events.close() if self.controller_events is not None else None,
+        ):
+            try:
+                step()
+            except Exception:  # noqa: BLE001 - session finish must not fail here
+                continue
 
     def _release_signals(self) -> None:
         """Give SIGTERM back its default delivery, from the main thread."""
-        controller_signals.unblock(self.blocked_signals)
-        self.blocked_signals = set()
+        try:
+            controller_signals.unblock(self.blocked_signals)
+        finally:
+            self.blocked_signals = set()
+
+    def _check_the_witness_is_listening(self) -> None:
+        """A blocked SIGTERM with nobody waiting for it is a run that cannot
+        be stopped. Cheap enough to ask on every test report."""
+        if self.witness is not None and self.witness.failed and self.blocked_signals:
+            self._release_signals()
 
     def _record(self, event: str, **fields: Any) -> None:
         """A line in the controller's own log, stamped with the run id as it
@@ -1078,6 +1105,7 @@ class IncidentEngine:
         self._record_schedule()
 
     def pytest_runtest_logreport(self, report: Any) -> None:
+        self._check_the_witness_is_listening()
         node = getattr(report, "node", None)
         if node is None:
             # No node means the report was produced here rather than relayed

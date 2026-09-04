@@ -152,7 +152,11 @@ worker or to the controller in the minutes before, above all a SIGTERM.
 `kill_sources` says what each witness could do on this machine; a `SIGKILLED`
 or `UNKNOWN` verdict is only as unknown as that record says, and the remedy is
 usually there (`failure_elevate` on a runner with sudo; a readable
-`/dev/kmsg`).
+`/dev/kmsg`; administrator rights on Windows). On Windows `killer.name` is
+`TerminateProcess` rather than a signal, `killer.signal` is 0, and
+`killer.exit_code` is the code the caller passed - `1` is `taskkill /F` or a
+Go program such as the GitLab runner, `-1` (4294967295) is .NET's
+`Process.Kill`, `15` is Python's `os.kill`.
 
 Two absences carry information here. No `of a N MB cgroup limit` clause means
 no container limit was discovered, so raising one may change nothing. And no

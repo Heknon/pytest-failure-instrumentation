@@ -212,6 +212,31 @@ def _killed(incident: WorkerDeathIncident, evidence: list[str]) -> tuple[str, st
     ] + sources_consulted(incident)
 
 
+def _terminated(incident: WorkerDeathIncident, evidence: list[str]) -> tuple[str, str, list[str]]:
+    """A Windows ``TerminateProcess``, with the caller the audit event named."""
+    killer = incident.killer
+    assert killer is not None
+    code = f" with exit code {killer.exit_code}" if killer.exit_code is not None else ""
+    if killer.origin == "self":
+        return "SELF_KILLED", "high", evidence + [
+            f"the worker called TerminateProcess on itself{code}"
+        ]
+    if killer.sender_role and killer.sender_role != "outside this run":
+        return "KILLED_BY_RUN", "high", evidence + [
+            f"TerminateProcess was called on it by {killer.who()}{code}"
+        ] + (
+            ["execnet terminates a worker that has not exited within its timeout, which "
+             "is what a termination from the controller usually is"]
+            if killer.sender_role == "this run's controller"
+            else []
+        )
+    return "KILLED_BY_PROCESS", "high", evidence + [
+        f"TerminateProcess was called on it by {killer.who()}{code}: something outside "
+        "this run stopped it - a job cancellation, taskkill, an orchestrator, or a hand on "
+        "the keyboard"
+    ]
+
+
 def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
     """Returns (verdict, confidence, evidence)."""
     status = incident.exit_status
@@ -285,8 +310,9 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             + " - it is context, not evidence of a crash"
         )
 
+    terminated = incident.killer is not None and incident.killer.name == "TerminateProcess"
     received = -status if status is not None and status < 0 else None
-    if received is None and status is None and incident.killer is not None:
+    if received is None and status is None and incident.killer is not None and not terminated:
         # No status to read - but a witness saw the signal that ended it,
         # which for a run found dead afterwards is the one thing that can
         # stand in for the number nobody was left to read.
@@ -314,6 +340,12 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
     if status in status_table.WINDOWS_STATUS:
         verdict, description = status_table.WINDOWS_STATUS[status]
         return verdict, "high", evidence + [description]
+
+    if terminated:
+        # After the NTSTATUS table on purpose: a fault ends a process through
+        # the same kernel call, and a crash the exit code already names must
+        # not be re-described as somebody's TerminateProcess.
+        return _terminated(incident, evidence)
 
     if fatal_dump:
         # On Windows abort() exits with 3, exactly as a deliberate os._exit(3)

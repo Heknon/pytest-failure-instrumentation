@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .platform_flags import IS_LINUX
+from .platform_flags import IS_LINUX, IS_WINDOWS
 
 TRACEFS_ROOTS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
 EVENT = "events/signal/signal_generate"
@@ -91,10 +91,15 @@ class Witness:
     target_comm: str
     to_group: bool
     delivered: bool
+    #: ``signal`` for a Linux tracepoint line; ``TerminateProcess`` for a
+    #: Windows termination, where ``signal`` is 0 and ``exit_code`` is what
+    #: the caller chose - see :mod:`.etw_trace`.
+    via: str = "signal"
+    exit_code: Optional[int] = None
 
     @property
     def from_kernel(self) -> bool:
-        return self.si_code == SI_KERNEL
+        return self.via == "signal" and self.si_code == SI_KERNEL
 
 
 # -- can this machine do it -------------------------------------------------
@@ -135,6 +140,12 @@ def availability(elevate: bool) -> tuple[bool, str]:
     ``SIGKILLED`` sees which source was withheld and by what, rather than an
     absence.
     """
+    if IS_WINDOWS:
+        # Windows keeps the same record through ETW, and an ETW session needs
+        # administrator rights or Performance Log Users; there is no sudo to
+        # elevate with, so the run either has it or it does not. Whether it
+        # does is learned by starting, and said then.
+        return True, "etw"
     if not IS_LINUX:
         return False, "tracepoints are a Linux source"
     root = tracefs_root()
@@ -318,23 +329,48 @@ class SignalTracer:
         self.how = "off"
 
     def start(self) -> str:
-        """Start watching; returns how, or a reason it could not."""
+        """Start watching; returns how, or a reason it could not.
+
+        Never raises: this runs at session start, and a witness that cannot
+        be started is a line on the incident, not the end of the run.
+        """
+        try:
+            return self._start()
+        except Exception as failure:  # noqa: BLE001 - see the docstring
+            self.how = f"off: failed ({failure!r})"
+            self.stop()
+            return self.how
+
+    def _start(self) -> str:
         usable, how = availability(self.elevate)
         if not usable:
             self.how = f"off: {how}"
             return self.how
-        instance = f"{INSTANCE_PREFIX}{os.getpid()}"
-        event_filter = "||".join(f"sig=={number}" for number in self.signals)
-        owner = f"{os.getuid()}:{os.getgid()}"
-        command = (["sudo", "-n"] if how == "sudo tracefs" else []) + [
-            sys.executable, "-c", SIDECAR, instance, event_filter, str(self.output), owner,
-        ]
+        creation: dict[str, Any] = {}
+        if how == "etw":
+            session = f"{INSTANCE_PREFIX}{os.getpid()}"
+            command = [
+                sys.executable, "-c",
+                "from pytest_failure_instrumentation.probes.etw_trace import main; main()",
+                session, str(self.output),
+            ]
+            # No console window of its own, and no share in this one's
+            # Ctrl-C: the sidecar ends when its stdin does.
+            creation["creationflags"] = 0x08000000 | 0x00000200
+        else:
+            instance = f"{INSTANCE_PREFIX}{os.getpid()}"
+            event_filter = "||".join(f"sig=={number}" for number in self.signals)
+            owner = f"{os.getuid()}:{os.getgid()}"
+            command = (["sudo", "-n"] if how == "sudo tracefs" else []) + [
+                sys.executable, "-c", SIDECAR, instance, event_filter, str(self.output), owner,
+            ]
         try:
             self.process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                **creation,
             )
         except OSError as failure:
             self.how = f"off: the sidecar could not be started ({failure!r})"
@@ -342,7 +378,7 @@ class SignalTracer:
         if not self._came_up():
             code = self.process.poll()
             self.how = (
-                f"off: the sidecar exited with status {code} before tracing"
+                _exit_meaning(code, how)
                 if code is not None
                 else "off: the sidecar did not start tracing in time"
             )
@@ -363,6 +399,12 @@ class SignalTracer:
         return False
 
     def stop(self) -> None:
+        try:
+            self._stop()
+        except Exception:  # noqa: BLE001 - session finish must not fail here
+            pass
+
+    def _stop(self) -> None:
         process = self.process
         if process is None:
             return
@@ -396,6 +438,22 @@ class SignalTracer:
 # -- reading what it wrote --------------------------------------------------
 
 
+def _exit_meaning(code: int, how: str) -> str:
+    if how == "etw" and code == 5:
+        return (
+            "off: the ETW session was refused (needs administrator rights, or "
+            "membership of Performance Log Users)"
+        )
+    return f"off: the sidecar exited with status {code} before tracing"
+
+
+#: How much of a trace file is read when a death is being explained. One line
+#: per SIGKILL or SIGTERM on the whole machine, so a busy host running many
+#: short-lived containers can write a great deal of it; the kill that ended a
+#: process of this run is at the end.
+TAIL_BYTES = 16 * 1024 * 1024
+
+
 def header(path: Path) -> Optional[dict[str, Any]]:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -410,26 +468,62 @@ def header(path: Path) -> Optional[dict[str, Any]]:
 
 
 def witnessed(path: Path) -> list[Witness]:
-    """Every signal the sidecar saw, in order."""
+    """Every signal the sidecar saw, in order - Linux lines and Windows ones."""
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - TAIL_BYTES))
+            raw = handle.read()
     except OSError:
         return []
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if size > TAIL_BYTES and lines:
+        lines = lines[1:]  # the seek landed inside it
     found: list[Witness] = []
-    for raw in lines:
+    for line in lines:
         try:
-            record = json.loads(raw)
+            record = json.loads(line)
         except ValueError:
             continue
         if not isinstance(record, dict) or record.get("header"):
             continue
-        witness = parse_line(str(record.get("line", "")), record.get("wall"))
-        if witness is None:
-            continue
-        witness.sender_cmdline = record.get("sender_cmdline")
-        witness.sender_exe = record.get("sender_exe")
-        found.append(witness)
+        witness = parse_record(record)
+        if witness is not None:
+            found.append(witness)
     return found
+
+
+def parse_record(record: dict[str, Any]) -> Optional[Witness]:
+    """One of the sidecar's JSON lines, whichever sidecar wrote it."""
+    if record.get("via") == "TerminateProcess":
+        try:
+            sender, target = int(record["sender_pid"]), int(record["target_pid"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        at = record.get("wall") if isinstance(record.get("wall"), (int, float)) else None
+        return Witness(
+            at=float(at) if at is not None else None,
+            trace_seconds=0.0,
+            signal=0,
+            si_code=SI_USER,
+            sender_pid=sender,
+            sender_comm=str(record.get("sender_comm") or ""),
+            sender_cmdline=None,
+            sender_exe=record.get("sender_exe"),
+            target_pid=target,
+            target_comm="",
+            to_group=False,
+            delivered=True,
+            via="TerminateProcess",
+            exit_code=record.get("exit_code") if isinstance(record.get("exit_code"), int) else None,
+        )
+    witness = parse_line(str(record.get("line", "")), record.get("wall"))
+    if witness is None:
+        return None
+    witness.sender_cmdline = record.get("sender_cmdline")
+    witness.sender_exe = record.get("sender_exe")
+    return witness
 
 
 def parse_line(line: str, at: Optional[float] = None) -> Optional[Witness]:

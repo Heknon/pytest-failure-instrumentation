@@ -80,6 +80,17 @@ def block(signals: tuple[int, ...] = WITNESSED) -> set[int]:
         signal.pthread_sigmask(signal.SIG_BLOCK, wanted)
     except (OSError, ValueError):
         return set()
+    # A fork()ed child inherits the mask - multiprocessing's default start
+    # method on Linux, a test's os.fork - and must not be born deaf to
+    # SIGTERM. Undone in the child, at the one point Python offers for it.
+    # (subprocess children are exec()ed and skip these hooks; a worker undoes
+    # the block itself - see unblock_inherited.)
+    register = getattr(os, "register_at_fork", None)
+    if register is not None:
+        try:
+            register(after_in_child=lambda: unblock(set(wanted)))
+        except (OSError, ValueError, TypeError):
+            pass
     return wanted
 
 
@@ -122,6 +133,10 @@ class SignalWitness:
         self.poll_seconds = poll_seconds
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        #: Set if the waiting thread gave up. A blocked signal with nobody
+        #: waiting for it is a run that cannot be stopped, so whoever owns
+        #: the block checks this and releases it - see the engine.
+        self.failed = False
 
     def start(self) -> None:
         if not self.signals or not supported():
@@ -137,11 +152,20 @@ class SignalWitness:
             self._thread.join(timeout=self.poll_seconds * 3)
 
     def _wait(self) -> None:
+        refusals = 0
         while not self._stop.is_set():
             try:
                 info = signal.sigtimedwait(self.signals, self.poll_seconds)
             except (OSError, ValueError):
-                return
+                # EINTR is ordinary and retried; anything persistent means
+                # this thread cannot do its job, and it says so rather than
+                # leaving the signal blocked with nobody listening.
+                refusals += 1
+                if refusals >= 3:
+                    self.failed = True
+                    return
+                self._stop.wait(0.2)
+                continue
             if info is None:
                 continue
             self._witness(info)

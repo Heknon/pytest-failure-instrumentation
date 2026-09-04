@@ -889,10 +889,30 @@ by what — which is the difference between a guess and a finding that happens
 to be negative. On a runner that has root or sudo, set `failure_elevate` and
 the residue closes.
 
-The whole of it is Linux. macOS can be asked whether a process died of memory
-pressure through `kqueue`'s process filter, and Windows has no OOM killer and
-records a crash's faulting module in the Application event log; neither is
-read yet.
+**Windows keeps the same record through ETW.** There are no signals; a kill
+is one process calling `TerminateProcess` on another, with whatever exit code
+the caller chose — `1` from `taskkill /F` and from the GitLab runner, `-1`
+from .NET's `Process.Kill`, `15` from Python's `os.kill`. The kernel logs the
+call through the `Microsoft-Windows-Kernel-Audit-API-Calls` provider: event 2
+carries the target's pid and the code, and the event header carries the pid of
+the process it was written in, which is the caller. A sidecar of the same shape
+as the Linux one consumes a real-time session on that provider, sweeps the
+sessions a killed sidecar would have left (a machine holds at most 64), and
+writes the same JSON lines; the verdict is `KILLED_BY_PROCESS` with the
+caller's executable, or `SELF_KILLED` and `KILLED_BY_RUN` as on Linux. An ETW
+session needs administrator rights or membership of Performance Log Users, and
+there is no `sudo` to elevate with — `failure_elevate` does nothing there. Two
+things differ from Linux: there is no OOM killer, so the memory case never
+produces a kill (allocation fails inside the process as a `MemoryError`, which
+is reported normally); and there is no warning shot, GitLab's own docs say the
+kill is simply sent twice, so the unprivileged controller witness has nothing
+to catch and ETW is the only source. A `taskkill /T` takes the sidecar with
+the tree, so the kill of the controller itself may go unrecorded there; the
+workers' kills before it are on disk.
+
+macOS is the one platform still without a witness: it can be asked whether a
+process died of memory pressure through `kqueue`'s process filter, which is
+not read yet.
 
 ## Live stacks over HTTP
 
@@ -1759,9 +1779,10 @@ its directory says so.
 | On-demand stack from a stalled worker | yes | yes | no |
 | Live stack of a running process (py-spy) | yes | root only | yes |
 | Stack from a worker that stopped running Python | yes | yes | yes |
-| Who sent the SIGKILL (signal tracepoint, root or sudo) | yes | no | no |
-| The OOM killer's own record of the victim and the fleet (kernel log) | yes | n/a | n/a |
-| Who sent the SIGTERM that came first (controller siginfo) | yes | no | no |
+| Who sent the SIGKILL (signal tracepoint, root or sudo) | yes | no | — |
+| Who called `TerminateProcess` (ETW audit event, administrator) | — | — | yes |
+| The OOM killer's own record of the victim and the fleet (kernel log) | yes | n/a | n/a — no OOM killer |
+| Who sent the SIGTERM that came first (controller siginfo) | yes | no | n/a — no warning shot |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a
 *setting* takes away on every platform rather than a platform taking away: where

@@ -11,6 +11,7 @@ demand still has to read the log of one that was.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
@@ -29,9 +30,9 @@ from pytest_failure_instrumentation.incidents.killer import (
     OomKillRecord,
     SignalRecord,
 )
-from pytest_failure_instrumentation.probes import kernel_log, signal_trace
+from pytest_failure_instrumentation.probes import etw_trace, kernel_log, signal_trace
 
-from .conftest import needs_xdist
+from .conftest import ENABLE_FLAG, INNER_CONFTEST, needs_xdist
 
 linux_only = pytest.mark.skipif(sys.platform != "linux", reason="these witnesses are Linux sources")
 
@@ -573,6 +574,229 @@ def _running(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+# -- Windows: TerminateProcess, witnessed through ETW -----------------------
+
+
+@pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="the SDK sizes asserted are x64's")
+def test_the_etw_structures_measure_what_the_windows_sdk_says():
+    """The one check a Windows-only code path can get everywhere.
+
+    ETW writes into these structures by the sizes in its own headers. One
+    that measures differently here is one it writes past the end of, and the
+    consumer that finds out is the sidecar, on a machine this suite may not
+    have run on. ctypes lays them out the same on every x64 platform, so the
+    measurement is made on all of them.
+    """
+    measured = {name: ctypes.sizeof(kind) for name, kind in etw_trace.STRUCTURES.items()}
+    assert measured == etw_trace.EXPECTED_SIZES_X64
+
+
+def test_the_provider_guid_is_laid_out_the_way_the_kernel_writes_it():
+    # Mixed-endian: the first three fields little-endian, the rest as bytes.
+    assert etw_trace.PROVIDER_BYTES.hex() == "1c842ae0a375a74fafc8ae09cf9b7f23"
+
+
+def test_a_filetime_is_placed_on_the_wall_clock():
+    # 2020-01-01T00:00:00Z as a FILETIME.
+    assert etw_trace.filetime_to_epoch(132223104000000000) == pytest.approx(1577836800.0)
+
+
+def test_a_windows_termination_is_read_as_a_witness(tmp_path):
+    path = _trace_file(
+        tmp_path,
+        {
+            "via": "TerminateProcess", "sender_pid": 5120, "target_pid": 4242,
+            "exit_code": 1, "wall": 1000.0,
+            "sender_exe": "C:\\GitLab-Runner\\gitlab-runner.exe", "sender_comm": "gitlab-runner.exe",
+        },
+    )
+    (seen,) = signal_trace.witnessed(path)
+    assert seen.via == "TerminateProcess" and seen.exit_code == 1
+    assert (seen.sender_pid, seen.sender_comm, seen.target_pid) == (5120, "gitlab-runner.exe", 4242)
+    assert seen.signal == 0 and not seen.from_kernel
+
+    found = killer.attribute(
+        killer.Sources(tmp_path, trace_status="etw", run_pids=roles),
+        pid=4242, exit_status=1, started_at=900.0, died_at=1000.5,
+    )
+    assert found.killer is not None
+    assert found.killer.name == "TerminateProcess" and found.killer.exit_code == 1
+    assert found.killer.sender_role == "outside this run"
+
+    verdict, confidence, evidence = classify.of(
+        death(exit_status=1, killer=found.killer, kill_sources=found.sources)
+    )
+    assert (verdict, confidence) == ("KILLED_BY_PROCESS", "high")
+    assert any(
+        "TerminateProcess was called on it by gitlab-runner.exe (pid 5120), outside this run with exit code 1"
+        in line
+        for line in evidence
+    )
+
+
+def test_a_termination_whose_code_does_not_match_is_not_borrowed(tmp_path):
+    _trace_file(
+        tmp_path,
+        {"via": "TerminateProcess", "sender_pid": 5120, "target_pid": 4242, "exit_code": 1, "wall": 1000.0},
+    )
+    found = killer.attribute(
+        killer.Sources(tmp_path, run_pids=roles),
+        pid=4242, exit_status=3, started_at=900.0, died_at=1000.5,
+    )
+    assert found.killer is None, "exit code 3 is not the termination that passed 1"
+
+
+def test_an_ntstatus_crash_outranks_a_termination_witness():
+    verdict, _, _ = classify.of(
+        death(exit_status=3221225477, killer=outside(signal=0, name="TerminateProcess", exit_code=3221225477))
+    )
+    assert verdict == "NATIVE_CRASH"
+
+
+def test_a_recovered_windows_controller_is_explained_by_its_terminator():
+    verdict, _, evidence = classify.of(
+        death(exit_status=None, recovered_from_run="run-dead", worker="controller",
+              killer=outside(signal=0, name="TerminateProcess", exit_code=1))
+    )
+    assert verdict == "KILLED_BY_PROCESS"
+    assert any("TerminateProcess was called on it by gitlab-runner" in line for line in evidence)
+
+
+def _is_windows_admin() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ETW is a Windows source")
+def test_the_etw_sidecar_witnesses_a_termination(tmp_path):
+    """The real thing, where the machine allows it: an ETW session on the
+    audit provider, a process terminated by this one, and the line that
+    names this process as the caller."""
+    if not _is_windows_admin():
+        pytest.skip("an ETW session needs administrator rights")
+    output = tmp_path / signal_trace.TRACE_FILE
+    tracer = signal_trace.SignalTracer(output)
+    how = tracer.start()
+    assert how == "etw", how
+    try:
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        time.sleep(1.0)
+        victim.terminate()  # TerminateProcess(handle, 1)
+        victim.wait()
+        deadline = time.monotonic() + 10
+        seen: list[signal_trace.Witness] = []
+        while time.monotonic() < deadline and not seen:
+            seen = signal_trace.sent_to(output, victim.pid)
+            time.sleep(0.1)
+    finally:
+        tracer.stop()
+    assert seen, output.read_text(encoding="utf-8")
+    kill = seen[-1]
+    assert kill.via == "TerminateProcess"
+    assert kill.sender_pid == os.getpid()
+    assert kill.exit_code == 1
+    assert kill.sender_exe and kill.sender_exe.lower().endswith(".exe")
+    assert not tracer.active
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ETW is a Windows source")
+@needs_xdist
+def test_a_worker_terminated_from_outside_names_its_killer_on_windows(distributed):
+    if not _is_windows_admin():
+        pytest.skip("an ETW session needs administrator rights")
+    distributed.pytester.makepyfile(test_sleep=SLEEPER)
+    command = [
+        sys.executable, "-m", "pytest", "--failure-instrumentation", "-n", "2",
+        "test_sleep.py", "-p", "no:cacheprovider",
+    ]
+    inner = subprocess.Popen(
+        command, cwd=distributed.pytester.path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    try:
+        victim = _worker_in(distributed, "test_sleeps")
+        time.sleep(1.0)
+        os.kill(victim, signal.SIGTERM)  # TerminateProcess(handle, 15) on Windows
+        output, _ = inner.communicate(timeout=180)
+    finally:
+        if inner.poll() is None:
+            inner.kill()
+    death = distributed.only(distributed.incidents(), "worker_death")
+    assert death.verdict == "KILLED_BY_PROCESS", output.decode("utf-8", "replace")
+    assert death.killer is not None and death.killer.name == "TerminateProcess"
+    assert death.killer.sender_pid == os.getpid()
+    assert death.killer.exit_code == int(signal.SIGTERM)
+    assert death.severity == "informational" and death.suspect_owner is None
+    assert death.kill_sources is not None and death.kill_sources.signal_trace == "etw"
+
+
+# -- the plugin must never be the thing that ends a run ----------------------
+
+
+@needs_xdist
+def test_a_witness_that_fails_to_start_costs_the_run_nothing(runner):
+    """Every witness raising out of its start, in the controller of a real
+    run: the run passes, the failure is a status string on the controller's
+    log, and SIGTERM is not left blocked with nobody to deliver it."""
+    runner.pytester.makeconftest(
+        INNER_CONFTEST
+        + """
+
+import signal
+
+from pytest_failure_instrumentation.capture import signals as witnesses
+from pytest_failure_instrumentation.probes import signal_trace
+
+
+def _refuse(*_args, **_kwargs):
+    raise RuntimeError("no witnessing today")
+
+
+signal_trace.SignalTracer.start = _refuse
+witnesses.SignalWitness.start = _refuse
+
+
+def pytest_sessionfinish(session):
+    # The controller's own mask, after the engine has given up on the
+    # witness: nothing may still be blocked.
+    if hasattr(signal, "pthread_sigmask") and not hasattr(session.config, "workerinput"):
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        assert signal.SIGTERM not in blocked, blocked
+"""
+    )
+    runner.pytester.makepyfile(test_suite="def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n")
+    result = runner.pytester.runpytest_subprocess(ENABLE_FLAG, "-n", "2", "test_suite.py", timeout=180)
+    result.assert_outcomes(passed=2)
+    (log,) = list((runner.pytester.path / ".pytest-failures").glob("*/controller.events"))
+    announced = [json.loads(line) for line in log.read_text().splitlines() if '"kill_witnesses"' in line]
+    assert announced and "off: failed" in announced[0]["controller_witness"]
+
+
+@linux_only
+def test_a_waiting_thread_that_gives_up_says_so():
+    """The engine releases the block when the witness reports failure; this
+    is the report. A sigtimedwait that keeps refusing is simulated."""
+    from pytest_failure_instrumentation.capture import signals as witnesses
+
+    calls = []
+
+    def refusing(*_args):
+        calls.append(1)
+        raise OSError("simulated")
+
+    witness = witnesses.SignalWitness(lambda *a, **k: None, {int(signal.SIGTERM)}, poll_seconds=0.01)
+    original = signal.sigtimedwait
+    signal.sigtimedwait = refusing  # type: ignore[assignment]
+    try:
+        witness._wait()
+    finally:
+        signal.sigtimedwait = original  # type: ignore[assignment]
+    assert witness.failed and len(calls) == 3
 
 
 SLEEPER = """

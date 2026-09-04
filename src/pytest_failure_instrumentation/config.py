@@ -570,7 +570,8 @@ def add_options(parser: pytest.Parser) -> None:
         help="Allow sudo -n for the witnesses that need root: the kernel log "
         "(dmesg) where /dev/kmsg and the journal are closed to this user, and "
         "the signal tracepoint. Off by default. -n means a sudo that would "
-        "prompt fails rather than hangs.",
+        "prompt fails rather than hangs. Linux only: on Windows the ETW "
+        "session needs the run itself to hold administrator rights.",
         default="false",
     )
     parser.addini(

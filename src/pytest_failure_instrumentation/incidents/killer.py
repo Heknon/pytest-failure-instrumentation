@@ -62,8 +62,11 @@ class SignalRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: The signal number, or 0 for a Windows ``TerminateProcess``, whose
+    #: ``name`` says so and whose ``exit_code`` is what the caller chose.
     signal: int
     name: str = ""
+    exit_code: Optional[int] = None
     at: Optional[float] = None
     #: Measured from when the controller learned of the death, so it is a
     #: lower bound on how long before the process actually ended.
@@ -288,7 +291,18 @@ def _from_trace(
     fatal = -exit_status if exit_status is not None and exit_status < 0 else None
     killer: Optional[SignalRecord] = None
     for record in reversed(mine):
-        if fatal is None or record.signal == fatal:
+        if record.name == "TerminateProcess":
+            # The status a terminated Windows process reports is the code
+            # the caller passed, so a witness whose code matches is the one;
+            # with no status to match, the latest is.
+            if (
+                exit_status is None
+                or record.exit_code is None
+                or record.exit_code == exit_status & 0xFFFFFFFF
+            ):
+                killer = record
+                break
+        elif fatal is None or record.signal == fatal:
             killer = record
             break
     before = [record for record in records if record is not killer]
@@ -310,7 +324,8 @@ def _record(
         origin = "process"
     return SignalRecord(
         signal=witness.signal,
-        name=_name(witness.signal),
+        name="TerminateProcess" if witness.via == "TerminateProcess" else _name(witness.signal),
+        exit_code=witness.exit_code,
         at=witness.at,
         seconds_before_death=_before(witness.at, died_at),
         si_code=witness.si_code,
