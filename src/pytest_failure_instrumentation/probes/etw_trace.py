@@ -542,8 +542,83 @@ def close(handle: int) -> None:
 # -- the sidecar ------------------------------------------------------------
 
 
-def serve(session: str, output: str) -> int:
-    """The sidecar's whole life: sweep, start, consume until stdin closes, stop."""
+REPORTER = "from pytest_failure_instrumentation.incidents.reporter import main; main()"
+REPORTER_TIMEOUT = 300.0
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _report(payload: dict[str, Any], output: str) -> None:
+    """The run that started this died without saying goodbye: hand what it
+    left to the reporter, in a child, with the run's own environment."""
+    import subprocess
+
+    directory = os.path.dirname(os.path.abspath(output))
+    with open(os.path.join(directory, "reporter.log"), "ab") as log:
+        try:
+            child = subprocess.Popen(
+                [payload.get("python") or sys.executable, "-c", REPORTER],
+                stdin=subprocess.PIPE, stdout=log, stderr=log,
+                cwd=payload.get("rootdir") or None, env=payload.get("env") or None,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            assert child.stdin is not None
+            child.stdin.write(json.dumps(payload).encode("utf-8"))
+            child.stdin.close()
+            child.wait(timeout=REPORTER_TIMEOUT)
+        except Exception as failure:  # noqa: BLE001 - the log is the only reader
+            log.write(f"the reporter could not be run: {failure!r}\n".encode())
+
+
+def _listen(on_message: Callable[[dict[str, Any]], None]) -> bool:
+    """Read the run's messages off stdin until EOF. True if told to stop."""
+    told_to_stop = False
+    inbound = b""
+    while True:
+        try:
+            chunk = os.read(0, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break  # the run that started this is gone, or asked it to stop
+        inbound += chunk
+        lines = inbound.split(b"\n")
+        inbound = lines.pop()
+        for raw in lines:
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            if message.get("stop"):
+                told_to_stop = True
+            on_message(message)
+    return told_to_stop
+
+
+def serve(session: str, output: str, mode: str = "trace") -> int:
+    """The sidecar's whole life: sweep, start, consume until stdin closes, stop.
+
+    ``watch`` mode traces nothing: it exists so that a run with a reporter
+    configured has a survivor even where no ETW session can be had.
+    """
+    payload: dict[str, Any] = {}
+
+    def remember(message: dict[str, Any]) -> None:
+        if isinstance(message.get("reporter"), dict):
+            payload.update(message["reporter"])
+
+    if mode != "trace":
+        with open(output, "a", buffering=1, encoding="utf-8") as out:
+            out.write(json.dumps({
+                "header": True, "pid": os.getpid(), "mode": mode, "wall": time.time(),
+                "monotonic": time.monotonic(), "platform": sys.platform,
+            }) + "\n")
+        told_to_stop = _listen(remember)
+        if payload and not told_to_stop:
+            _report(payload, output)
+        return EXIT_OK
+
     if sys.platform != "win32":
         return EXIT_NO_TRACE
     try:
@@ -577,20 +652,19 @@ def serve(session: str, output: str) -> int:
         return EXIT_NO_CONSUMER
 
     out.write(json.dumps({
-        "header": True, "pid": os.getpid(), "session": session, "wall": time.time(),
-        "monotonic": time.monotonic(), "platform": "win32",
+        "header": True, "pid": os.getpid(), "mode": mode, "session": session,
+        "wall": time.time(), "monotonic": time.monotonic(), "platform": "win32",
     }) + "\n")
 
     worker = threading.Thread(target=process, args=(consumer,), name="etw", daemon=True)
     worker.start()
+    told_to_stop = False
     try:
-        while True:
-            try:
-                chunk = os.read(0, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break  # the run that started this is gone, or asked it to stop
+        told_to_stop = _listen(remember)
+        # EOF: give the events already queued a moment to be flushed and
+        # written, the run's own termination among them, before the session
+        # is torn down.
+        time.sleep(1.5)
     finally:
         try:
             close(consumer)
@@ -603,11 +677,14 @@ def serve(session: str, output: str) -> int:
         worker.join(timeout=5.0)
         del keep_alive
         out.close()
+    if payload and not told_to_stop:
+        _report(payload, output)
     return EXIT_OK
 
 
 def main() -> None:
-    sys.exit(serve(sys.argv[1], sys.argv[2]))
+    mode = sys.argv[3] if len(sys.argv) > 3 else "trace"
+    sys.exit(serve(sys.argv[1], sys.argv[2], mode))
 
 
 if __name__ == "__main__":

@@ -879,6 +879,68 @@ first thing at its own start, and a run with no workers — whose children are a
 test's own subprocesses — does not block at all. A SIGTERM somebody has
 already installed a handler for is left to them.
 
+### Reporting a killed run from the sidecar
+
+Every incident above is raised by a process that survived to raise it, and a
+run whose controller is killed has none. The next run over the same evidence
+directory recovers it — but on a runner with a fresh workspace per job there
+is no next run, and a cancelled or OOM-killed job was a job about which
+nothing was ever said.
+
+The sidecar is the survivor. It holds the read end of a pipe only the
+controller can write, so the controller dying — whatever killed it — is EOF
+on that pipe; a controller that reaches session finish writes `stop` first.
+EOF without it is a death, and the sidecar then starts a *reporter*: a child
+that builds the same incidents the next run would have recovered, the
+controller's own death above all, and calls the callable you configured with
+each one, the way the hook would be:
+
+```python
+# ci/alerts.py
+def report_killed_run(channel, incident):
+    from ourcorp.alerting import Client        # loaded in the reporter, not at pickle time
+    Client.from_env().post(channel, str(incident), payload=incident.model_dump())
+```
+
+```python
+# conftest.py
+import functools
+from ci.alerts import report_killed_run
+from pytest_failure_instrumentation import install
+
+def pytest_configure(config):
+    install(config, on_run_death=functools.partial(report_killed_run, "#ci-deaths"))
+```
+
+or, from ini, as a dotted path with no bound arguments:
+
+```ini
+[pytest]
+failure_on_run_death = ci.alerts:report_killed_run
+```
+
+**The callable travels as a pickle, and that sets the rules.** A module-level
+function, or a `functools.partial` of one with picklable bound arguments;
+lambdas, closures and anything holding the pytest config will not pickle, and
+the run says so at session start and proceeds without a reporter. What pickle
+records is the function's module and name plus the bound arguments, so
+anything the function imports inside its body — your SDK — is loaded only in
+the reporter, which runs with the same interpreter, the run's import path and
+working directory, and the run's environment, which is where an alerting token
+lives. The environment travels down the two pipes and never touches disk.
+
+**Nothing of yours runs as root.** The Linux sidecar may be root. It unpickles
+nothing; it starts the reporter as the user that started the run, with that
+user's groups and environment. Its output goes to `reporter.log` in the run's
+directory, and nothing it does can reach a run that is already over. Once
+reported, the run's marker is stamped so a later run over the directory —
+a retried job with the same `PYTEST_RUN_ID` — does not raise it a second time.
+
+**It needs no privilege.** Where nothing can be traced the sidecar still
+starts, in a watch-only mode that exists for the reporter alone; the incident
+then carries whatever the unprivileged witnesses saw, which for a cancellation
+is the controller's own record of who sent SIGTERM.
+
 **What stays unknown is small, and named.** A SIGKILL with no SIGTERM before
 it, no OOM record, and no tracepoint is a direct kill of one process by
 something running as your uid or root — and the incident's `kill witnesses:`
@@ -1708,6 +1770,7 @@ accepted and inert.
 | `failure_crash_stack` | `false` | Keep the fatal stack of a run that has *no workers*, instead of leaving it on the stderr pytest points it at. A worker keeps its own either way |
 | `failure_kill_trace` | `true` | Witness who signals this run's processes: the controller records the sender of a SIGTERM it receives, and where the run is root (or may sudo) a sidecar on the kernel's `signal_generate` tracepoint names the sender of every SIGKILL and SIGTERM. See [Who killed it](#who-killed-it) |
 | `failure_elevate` | `false` | Allow `sudo -n` for the witnesses that need root: `dmesg` where `/dev/kmsg` and the journal are closed, and the tracepoint above |
+| `failure_on_run_death` | — | A dotted path `package.module:attribute` to a callable the sidecar calls with each incident of a run whose controller was killed, so a killed run is reported at once. From Python, `install(config, on_run_death=functools.partial(...))`. See [Reporting a killed run from the sidecar](#reporting-a-killed-run-from-the-sidecar) |
 | `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |

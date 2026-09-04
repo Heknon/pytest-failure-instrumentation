@@ -50,6 +50,7 @@ DEFAULTS = {
     "failure_crash_stack": "false",
     "failure_kill_trace": "true",
     "failure_elevate": "false",
+    "failure_on_run_death": "",
     "failure_tracer": "parent",
     "failure_sample_seconds": "0",
     "failure_stack_server": "false",

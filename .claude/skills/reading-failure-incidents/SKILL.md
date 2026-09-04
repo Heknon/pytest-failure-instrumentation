@@ -172,6 +172,12 @@ SIGINT, and this is the one incident such a run produces. `killer` names who
 sent it; the verdict is `SIGNAL_15` when a witness saw the signal and
 `UNKNOWN` when none did, with `kill_sources` saying why.
 
+An incident like that may also arrive through `failure_on_run_death` rather
+than the hook: the sidecar that outlived the killed run reports it at once,
+with the same fields, and stamps the run's marker `reported_at` so no later
+run raises it again. `raised_at` is then within a minute of the death rather
+than whenever the next run happened.
+
 **`recovered_from_run` means this is about a different run from the one that
 reported it.** A run whose own process was killed has no survivor to report it,
 so the next run over the same evidence directory does. When that field is set:

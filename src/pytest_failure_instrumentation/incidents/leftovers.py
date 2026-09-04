@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -52,6 +53,10 @@ OWNER_FILE = "owner.json"
 #: the finding - see the module docstring - which is why it is spelled once
 #: here rather than at each of the two ends.
 FINISHED_KEY = "finished_at"
+#: The key the sidecar's reporter stamps once it has raised a killed run's
+#: incidents itself - see :mod:`.reporter`. A directory carrying it has been
+#: reported, and a later run must not raise it a second time.
+REPORTED_KEY = "reported_at"
 
 
 def marker(directory: Path) -> Optional[dict[str, Any]]:
@@ -68,6 +73,19 @@ def owner_of(directory: Path) -> Optional[int]:
     record = marker(directory)
     pid = record.get("pid") if record else None
     return int(pid) if isinstance(pid, int) else None
+
+
+def stamp(directory: Path, key: str) -> bool:
+    """Add ``key`` (the time, now) to this directory's marker."""
+    record = marker(directory)
+    if record is None:
+        return False
+    record[key] = time.time()
+    try:
+        (directory / OWNER_FILE).write_text(json.dumps(record), encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def run_directories(root: Path) -> list[Path]:
@@ -130,6 +148,16 @@ def deaths_left_behind(
     return found
 
 
+def deaths_of(directory: Path, elevate: bool = False) -> list[WorkerDeathIncident]:
+    """Every death in one run directory that is over and never reported.
+
+    The same reading :func:`deaths_left_behind` makes for each directory,
+    offered on its own for the sidecar's reporter, which knows which
+    directory it is asking about.
+    """
+    return _deaths_in(directory, elevate)
+
+
 def _deaths_in(directory: Path, elevate: bool = False) -> list[WorkerDeathIncident]:
     record = marker(directory)
     if record is None:
@@ -139,6 +167,8 @@ def _deaths_in(directory: Path, elevate: bool = False) -> list[WorkerDeathIncide
         return []  # still going, so not yet anybody's to report
     if record.get(FINISHED_KEY):
         return []  # it reached its own session finish and reported for itself
+    if record.get(REPORTED_KEY):
+        return []  # the sidecar's reporter raised its incidents already
 
     # The run is over, so every process in it is over: nothing needs asking
     # about the individual pids, and asking would make it worse. A pid the

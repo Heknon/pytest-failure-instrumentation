@@ -199,6 +199,20 @@ class Settings:
     #: ``-n`` means a sudo that would prompt fails instead, so an unattended
     #: run is never left waiting for a password.
     elevate: bool = False
+    #: What to call when this run is killed - see :mod:`.incidents.reporter`.
+    #: A run whose controller dies has nobody left to raise its incidents,
+    #: and on a runner with a fresh workspace per job there is no next run
+    #: to recover them; the sidecar that outlives the controller reports them
+    #: instead, by calling this with each incident the way the hook would be.
+    #:
+    #: It travels to a different process as a pickle, which sets the rules: a
+    #: module-level function, or a ``functools.partial`` of one with picklable
+    #: bound arguments, or a dotted path ``package.module:attribute`` (the
+    #: only form ini can express). A lambda or a closure is warned about at
+    #: session start and the run proceeds without a reporter. It runs as the
+    #: user that started the run, with that user's environment, never as
+    #: root - the sidecar itself unpickles nothing.
+    on_run_death: Any = None
     #: Which declaration a worker makes on Linux, where Yama restricts who may
     #: read a process. "parent" nominates the controller and covers a session
     #: reading its own workers, which is how the live view is used by default;
@@ -575,6 +589,17 @@ def add_options(parser: pytest.Parser) -> None:
         default="false",
     )
     parser.addini(
+        "failure_on_run_death",
+        help="A dotted path, package.module:attribute, to a callable the "
+        "sidecar calls with each incident of a run whose controller was "
+        "killed - a cancelled job, an OOM kill - so a killed run is reported "
+        "at once rather than by the next run over the same directory, which "
+        "on a fresh-workspace runner never comes. From Python, "
+        "install(config, on_run_death=functools.partial(...)) takes a "
+        "callable directly. Runs as the user that started the run.",
+        default="",
+    )
+    parser.addini(
         "failure_stack_server",
         help="Serve the live stack of any local process over HTTP, for a UI "
         "watching a run. Each session serves its own on a port drawn for it, "
@@ -923,6 +948,7 @@ def resolve(config: pytest.Config) -> Settings:
         crash_stack=_flag(config, "failure_crash_stack", False),
         kill_trace=_flag(config, "failure_kill_trace", True),
         elevate=_flag(config, "failure_elevate", False),
+        on_run_death=str(_ini(config, "failure_on_run_death", "") or "").strip() or None,
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
         stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,
