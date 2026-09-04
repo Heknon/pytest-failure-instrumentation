@@ -427,20 +427,7 @@ def recover(
         crash_stack_age_seconds=_age_of(directory / f"{worker}.crash") if dump else None,
         high_water=event_log.high_water_marks(events)[-1:] or None,
     )
-    trace = directory / signal_trace.TRACE_FILE
-    witness = directory / killer.CONTROLLER_EVENTS
-    sources = killer.Sources(
-        directory=directory,
-        elevate=elevate,
-        trace_status=(
-            "the dead run's trace file" if trace.exists() else "off: the dead run left no trace file"
-        ),
-        witness_status=(
-            "the dead run's controller log"
-            if witness.exists()
-            else "off: the dead run left no controller log"
-        ),
-    )
+    sources = _dead_runs_sources(directory, elevate)
     # The death is somewhere after the last beat and before the next one
     # would have been due; a generous window, because the beat interval is
     # the dead run's setting and not this one's to know.
@@ -505,9 +492,21 @@ def recover_controller(
         exit_status_source="unavailable",
         exit_status_meaning="unknown",
     )
+    sources = _dead_runs_sources(directory, elevate)
+    died_by = (last_seen + RECOVERED_DEATH_WINDOW_SECONDS) if last_seen else time.time()
+    _attach_witnesses(incident, sources, pid, None, started_at, died_by)
+    incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
+    return incident
+
+
+def _dead_runs_sources(directory: Path, elevate: bool) -> killer.Sources:
+    """What a run that is over left for its witnesses to be read from.
+
+    Nothing is still writing here, so nothing is waited for.
+    """
     trace = directory / signal_trace.TRACE_FILE
     witness = directory / killer.CONTROLLER_EVENTS
-    sources = killer.Sources(
+    return killer.Sources(
         directory=directory,
         elevate=elevate,
         trace_status=(
@@ -518,11 +517,8 @@ def recover_controller(
             if witness.exists()
             else "off: the dead run left no controller log"
         ),
+        live=False,
     )
-    died_by = (last_seen + RECOVERED_DEATH_WINDOW_SECONDS) if last_seen else time.time()
-    _attach_witnesses(incident, sources, pid, None, started_at, died_by)
-    incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
-    return incident
 
 
 def _last_seen(directory: Path) -> Optional[float]:

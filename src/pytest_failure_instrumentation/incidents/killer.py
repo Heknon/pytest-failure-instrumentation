@@ -29,6 +29,8 @@ import json
 import os
 import signal as signal_module
 import statistics
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -55,6 +57,14 @@ TERM_WINDOW_SECONDS = 660.0
 #: Slack after the controller noticed a death, for a record that landed a
 #: moment later than the notice.
 AFTER_DEATH_SECONDS = 5.0
+#: How long a *live* death waits for its line to reach the trace file. The
+#: controller learns of a death within milliseconds of it; the Linux sidecar
+#: writes within a few more, and ETW flushes its real-time buffers on a
+#: one-second timer. Waited only while nothing for this pid is there yet,
+#: and never for a death found afterwards - its file is as complete as it
+#: will ever be.
+TRACE_SETTLE_SECONDS = 2.0 if sys.platform == "win32" else 0.5
+TRACE_POLL_SECONDS = 0.05
 
 
 class SignalRecord(BaseModel):
@@ -184,6 +194,9 @@ class Sources:
     trace_status: str = "off"
     witness_status: str = "off"
     run_pids: Optional[Callable[[], dict[int, str]]] = None
+    #: Whether the sidecar is still writing: a death noticed live may have
+    #: to wait a moment for its line, one found afterwards never does.
+    live: bool = True
 
     @property
     def trace_path(self) -> Path:
@@ -277,7 +290,7 @@ def _from_trace(
     if pid is None or not sources.trace_path.exists():
         return None, []
     records: list[SignalRecord] = []
-    for witness in signal_trace.witnessed(sources.trace_path):
+    for witness in _settled(sources, pid):
         if witness.at is not None and (witness.at > until or (since and witness.at < since)):
             continue
         if witness.target_pid == pid:
@@ -307,6 +320,18 @@ def _from_trace(
             break
     before = [record for record in records if record is not killer]
     return killer, before
+
+
+def _settled(sources: Sources, pid: int) -> list[signal_trace.Witness]:
+    """The trace, once the line for this pid has had time to land."""
+    found = signal_trace.witnessed(sources.trace_path)
+    if not sources.live:
+        return found
+    deadline = time.monotonic() + TRACE_SETTLE_SECONDS
+    while not any(witness.target_pid == pid for witness in found) and time.monotonic() < deadline:
+        time.sleep(TRACE_POLL_SECONDS)
+        found = signal_trace.witnessed(sources.trace_path)
+    return found
 
 
 def _record(

@@ -342,10 +342,9 @@ def _properties(name: str = "", query: bool = False) -> tuple[Any, Any]:
     properties.Wnode.ClientContext = 2
     properties.LogFileMode = EVENT_TRACE_REAL_TIME_MODE
     # Small buffers, flushed every second: a handful of events a minute, read
-    # as they arrive. The kernel's defaults are sized for a firehose.
+    # as they arrive. The buffer *counts* are left to the kernel, whose rules
+    # for them vary by version and answer a wrong pair with a refusal.
     properties.BufferSize = 32
-    properties.MinimumBuffers = 2
-    properties.MaximumBuffers = 8
     properties.FlushTimer = 1
     properties.LoggerNameOffset = ctypes.sizeof(EVENT_TRACE_PROPERTIES)
     properties.LogFileNameOffset = (
