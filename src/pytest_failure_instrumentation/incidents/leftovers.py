@@ -100,9 +100,14 @@ def prune_finished_runs(root: Path) -> None:
 
 
 def deaths_left_behind(
-    root: Path, mine: Optional[Path] = None
+    root: Path, mine: Optional[Path] = None, elevate: bool = False
 ) -> list[WorkerDeathIncident]:
     """One incident per process of a run that ended without reporting.
+
+    ``elevate`` is the reporting run's own permission to spend ``sudo`` on
+    the kernel log, which is the one witness a dead run can still be asked
+    about: the log is machine-wide and timestamped, so a kill from the dead
+    run's window is the dead run's.
 
     ``mine`` is this run's own directory, skipped whatever state it is in.
     Nothing else would match it - a live run's marker names a live pid, and at
@@ -119,13 +124,13 @@ def deaths_left_behind(
         if mine is not None and directory == mine:
             continue
         try:
-            found.extend(_deaths_in(directory))
+            found.extend(_deaths_in(directory, elevate))
         except Exception:  # noqa: BLE001 - see the docstring
             continue
     return found
 
 
-def _deaths_in(directory: Path) -> list[WorkerDeathIncident]:
+def _deaths_in(directory: Path, elevate: bool = False) -> list[WorkerDeathIncident]:
     record = marker(directory)
     if record is None:
         return []  # not ours
@@ -142,7 +147,15 @@ def _deaths_in(directory: Path) -> list[WorkerDeathIncident]:
     # the one incident they were waiting for.
     incidents = []
     for events in sorted(directory.glob("*.events")):
-        incident = death.recover(events, session=directory.name)
+        incident = death.recover(events, session=directory.name, elevate=elevate)
         if incident is not None:
             incidents.append(incident)
+    # The controller last, and separately: it keeps no event log of the
+    # shape above, and a cancelled job is a controller that died while its
+    # workers went on to finish cleanly - see death.recover_controller.
+    controller = death.recover_controller(
+        directory, session=directory.name, marker=record, elevate=elevate
+    )
+    if controller is not None:
+        incidents.append(controller)
     return incidents

@@ -48,10 +48,13 @@ from ..analysis import fingerprint as fingerprint_of
 from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
+from ..capture import signals as controller_signals
+from ..capture.events import EventLog
 from ..config import SOLE_WORKER, Settings, advise
+from ..probes import signal_trace
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
-from . import collection, death, internal_error, leftovers, stall, summary
+from . import collection, death, internal_error, killer, leftovers, stall, summary
 from .base import UNSET_RUN_ID, Capabilities, Incident, frame_from
 from .leftovers import OWNER_FILE, prune_finished_runs
 
@@ -273,6 +276,21 @@ class IncidentEngine:
         #: anything - but session start and finish are here, and giving it a
         #: plugin of its own would be two objects with one lifetime.
         self.stacks: Any = None
+        #: The witnesses to who kills a process of this run - see
+        #: :mod:`.killer`. The SIGTERM block is taken *here*, at configure,
+        #: because a thread created after it inherits it and one created
+        #: before does not, and xdist's gateway threads are created at
+        #: session start. Only a run with workers takes it: a run with none
+        #: runs tests in this process, and a test's subprocesses must not be
+        #: born with SIGTERM blocked. The threads and the sidecar start once
+        #: the directory they write into exists.
+        self.blocked_signals: set[int] = set()
+        self.witness: controller_signals.SignalWitness | None = None
+        self.witness_status = "off"
+        self.tracer: signal_trace.SignalTracer | None = None
+        self.controller_events: EventLog | None = None
+        if settings.kill_trace and self.distributed:
+            self.blocked_signals = controller_signals.block()
 
     # -- where this run's evidence goes ----------------------------------
 
@@ -463,7 +481,9 @@ class IncidentEngine:
         run reports what it finds before it has anything of its own to say.
         """
         try:
-            found = leftovers.deaths_left_behind(self.settings.directory, self.directory)
+            found = leftovers.deaths_left_behind(
+                self.settings.directory, self.directory, elevate=self.settings.elevate
+            )
         except Exception as failure:  # noqa: BLE001 - never break a starting run
             advise(f"the previous runs' evidence could not be read: {failure!r}")
             return
@@ -726,6 +746,7 @@ class IncidentEngine:
         # later, so one read settles it for the run.
         self.records_here = self.recorder is not None
         self._prepare_directory()
+        self._start_kill_witnesses()
 
         # Whether or not this is distributed: a single-process run has a stack
         # worth serving too, and it is the one this process can read for free.
@@ -799,6 +820,96 @@ class IncidentEngine:
                 daemon=True,
             )
             self.watcher.start()
+
+    # -- who killed it -----------------------------------------------------
+
+    def _start_kill_witnesses(self) -> None:
+        """Start what will say who kills a process of this run.
+
+        Two witnesses - see :mod:`.killer`. The controller's own SIGTERM
+        witness needs the block taken at configure and a file to write into;
+        the tracepoint sidecar needs root, or the permission to become root.
+        Whichever cannot start says why, and that reason is written down
+        here and repeated on every incident that would have used it, so a
+        ``SIGKILLED`` names the witness this machine withheld rather than
+        leaving an absence.
+        """
+        if not self.settings.kill_trace:
+            self.witness_status = "off: failure_kill_trace is off"
+            self._release_signals()
+            return
+        if not self._anything_records() or not self.directory.is_dir():
+            self.witness_status = "off: nothing in this run records, so there is nowhere to write"
+            self._release_signals()
+            return
+        try:
+            self.controller_events = EventLog(self.directory / killer.CONTROLLER_EVENTS)
+        except OSError as failure:
+            self.controller_events = None
+            self.witness_status = f"off: the controller's log could not be opened ({failure!r})"
+        if self.controller_events is not None:
+            if self.blocked_signals:
+                self.witness = controller_signals.SignalWitness(
+                    self._record, self.blocked_signals
+                )
+                self.witness.start()
+                self.witness_status = "on"
+            elif not self.distributed:
+                self.witness_status = (
+                    "off: a run with no workers runs its tests here, and a blocked "
+                    "SIGTERM would be inherited by every subprocess they start"
+                )
+            elif not controller_signals.supported():
+                self.witness_status = "off: this platform has no sigtimedwait"
+            else:
+                self.witness_status = "off: SIGTERM already had a handler when this run configured"
+        if not self.witness:
+            self._release_signals()
+        self.tracer = signal_trace.SignalTracer(
+            self.directory / signal_trace.TRACE_FILE, elevate=self.settings.elevate
+        )
+        how = self.tracer.start()
+        self._record(
+            "kill_witnesses",
+            controller_witness=self.witness_status,
+            signal_trace=how,
+            elevate=self.settings.elevate,
+        )
+
+    def _stop_kill_witnesses(self) -> None:
+        if self.tracer is not None:
+            self.tracer.stop()
+        if self.witness is not None:
+            self.witness.stop()
+        self._release_signals()
+        if self.controller_events is not None:
+            self.controller_events.close()
+
+    def _release_signals(self) -> None:
+        """Give SIGTERM back its default delivery, from the main thread."""
+        controller_signals.unblock(self.blocked_signals)
+        self.blocked_signals = set()
+
+    def _record(self, event: str, **fields: Any) -> None:
+        """A line in the controller's own log, stamped with the run id as it
+        is known *now* - which at configure time it was not."""
+        log = self.controller_events
+        if log is None:
+            return
+        try:
+            log.run_id = self.run_id
+        except Exception:  # noqa: BLE001 - an id that cannot be settled yet
+            pass  # leaves the line unstamped rather than unwritten
+        log.record(event, **fields)
+
+    def _kill_sources(self) -> killer.Sources:
+        return killer.Sources(
+            directory=self.directory,
+            elevate=self.settings.elevate,
+            trace_status=self.tracer.how if self.tracer is not None else "off: not started",
+            witness_status=self.witness_status,
+            run_pids=lambda: {os.getpid(): killer.CONTROLLER, **killer.roles_in(self.directory)},
+        )
 
     def _anything_records(self) -> bool:
         """Whether any process in this run is writing down what it is doing.
@@ -1105,7 +1216,12 @@ class IncidentEngine:
             return  # a clean shutdown is not an incident
         try:
             incident: Incident = death.build(
-                node, error, self.directory, self.baseline_oom_kills, self.run_id
+                node,
+                error,
+                self.directory,
+                self.baseline_oom_kills,
+                self.run_id,
+                sources=self._kill_sources(),
             )
         except Exception as failure:  # noqa: BLE001
             incident = death.WorkerDeathIncident.degraded(
@@ -1165,6 +1281,10 @@ class IncidentEngine:
             )
         )
         self.schedule.close()
+        # After the summary: nothing of this run's dies after it that anybody
+        # would report, and a witness still up while the summary was being
+        # raised is a witness for a death the summary could still count.
+        self._stop_kill_witnesses()
         # Said after the summary rather than before it, and it is the last
         # thing this run does that a later one can read: from here on, this
         # directory says it reached its end and has nothing left to report.

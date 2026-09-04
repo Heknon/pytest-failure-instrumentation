@@ -1,20 +1,30 @@
 """Verdicts, from evidence rather than from the fact that something died.
 
 Every branch says what it can prove. An exit status of -9 is identical for the
-OOM killer, a cancelled CI job and a stray kill, so only the cgroup counter
-licenses the OOM verdict; without it the honest answer is that it was killed.
+OOM killer, a cancelled CI job and a stray kill, so only something that
+witnessed the kill licenses a verdict beyond "it was killed": the kernel log
+naming the victim, the cgroup counter moving, the signal tracepoint naming the
+sender, or the SIGTERM the controller was sent just before. Without any of
+them the honest answer is still that it was killed - and the incident then
+says which of those witnesses this machine withheld, and why, so the reader
+knows what was denied rather than merely absent.
 """
 
 from __future__ import annotations
 
 import signal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from ..capture import crash_stack
 from . import exit_status as status_table
 
 if TYPE_CHECKING:  # importing it for real would close a cycle: death -> classify
     from ..incidents.death import WorkerDeathIncident
+    from ..incidents.killer import SignalRecord
+
+#: The verdicts that mean somebody outside the run stopped it, and a witness
+#: saw who. No test is at fault, so no test is suspected.
+DELIBERATE_STOPS = frozenset({"KILLED_BY_PROCESS", "KILLED_AFTER_SIGTERM"})
 
 
 def memory_evidence(incident: WorkerDeathIncident) -> list[str]:
@@ -38,6 +48,110 @@ def memory_evidence(incident: WorkerDeathIncident) -> list[str]:
     return evidence
 
 
+def oom_evidence(incident: WorkerDeathIncident) -> list[str]:
+    """What the kernel itself printed when it chose this process."""
+    oom = incident.oom
+    if oom is None:
+        return []
+    where = {
+        "CONSTRAINT_MEMCG": f"the limit of cgroup {oom.memcg or oom.task_memcg or '(unnamed)'}",
+        "CONSTRAINT_NONE": "the machine's own memory",
+        "CONSTRAINT_CPUSET": "a NUMA node's memory (cpuset)",
+        "CONSTRAINT_MEMORY_POLICY": "a NUMA node's memory (memory policy)",
+    }.get(oom.constraint or "", "a limit this kernel did not name")
+    resident = f" at {oom.anon_rss_mb} MB anonymous resident" if oom.anon_rss_mb is not None else ""
+    matched = (
+        "matched by pid"
+        if oom.matched_by == "pid"
+        else "matched by cgroup and time - the pid the kernel printed belongs to another namespace"
+    )
+    lines = [
+        f"the kernel log ({oom.source}) records the OOM killer choosing pid "
+        f"{oom.victim_pid} ({oom.victim_comm}){resident}, having hit {where}; {matched}"
+    ]
+    if oom.tasks_considered:
+        weighed = (
+            f"it weighed {oom.tasks_considered} tasks holding {oom.tasks_rss_mb} MB; "
+            f"{oom.run_tasks} of them were this run's, holding {oom.run_rss_mb} MB together"
+        )
+        if oom.victim_rank:
+            weighed += f"; the victim was the {_ordinal(oom.victim_rank)} largest"
+        lines.append(weighed)
+        if oom.largest:
+            lines.append(
+                "largest: "
+                + ", ".join(
+                    f"{task.get('name')} pid {task.get('pid')}"
+                    + (f" [{task['role']}]" if task.get("role") else "")
+                    + f" {task.get('rss_mb')} MB"
+                    for task in oom.largest
+                )
+            )
+    if oom.pressure == "fleet":
+        lines.append(
+            f"fleet pressure: the victim was an ordinary member of the run (median "
+            f"{oom.run_median_rss_mb} MB), so the run's {oom.run_tasks} processes exceeded "
+            "the limit together - fewer workers or more memory, not one test"
+        )
+    elif oom.pressure == "own weight" and oom.run_median_rss_mb:
+        ratio = (oom.anon_rss_mb or 0) / max(1, oom.run_median_rss_mb)
+        lines.append(
+            f"its own weight: {ratio:.1f}x the run's median of {oom.run_median_rss_mb} MB, "
+            "so the test in flight is a fair suspect"
+        )
+    if oom.triggered_by_pid is not None:
+        role = f", {oom.triggered_by_role}" if oom.triggered_by_role else ""
+        lines.append(
+            f"the kill was made in the context of {oom.triggered_by_comm} "
+            f"(pid {oom.triggered_by_pid}{role}), whose allocation is what hit the limit"
+        )
+    return lines
+
+
+def sources_consulted(incident: WorkerDeathIncident) -> list[str]:
+    """Which witnesses this machine offered, on the verdicts that had none.
+
+    Said only where it matters - a verdict that could not be reached - so the
+    reader learns what was withheld and by what, rather than being left to
+    wonder whether anything was asked at all.
+    """
+    sources = incident.kill_sources
+    if sources is None:
+        return []
+    return [
+        f"kill witnesses: kernel log {sources.kernel_log}; signal tracepoint "
+        f"{sources.signal_trace}; controller SIGTERM witness {sources.controller_witness}"
+    ]
+
+
+def sender_evidence(incident: WorkerDeathIncident) -> list[str]:
+    """Who sent the signal that ended it, when a witness saw."""
+    killer = incident.killer
+    if killer is None:
+        return []
+    if killer.origin == "self":
+        return [f"{killer.name} was sent by the worker to itself (os.kill from inside the process)"]
+    if killer.origin == "kernel":
+        return [
+            f"{killer.name} came from the kernel itself (si_code SI_KERNEL), generated in the "
+            f"context of {killer.who()}"
+        ]
+    return [f"{killer.name} was sent by {killer.who()}"]
+
+
+def _latest_term(incident: WorkerDeathIncident) -> Optional[SignalRecord]:
+    term = getattr(signal, "SIGTERM", None)
+    for record in reversed(incident.signals_before_death):
+        if record.signal == term:
+            return record
+    return None
+
+
+def _ordinal(number: int) -> str:
+    suffix = "th" if 10 <= number % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
 def _written_ago(age: float | None) -> str:
     """A stack is evidence about a moment, so say which moment."""
     if age is None:
@@ -45,12 +159,71 @@ def _written_ago(age: float | None) -> str:
     return f", {age:.0f}s before this report" if age >= 1 else ", moments before"
 
 
+def _killed(incident: WorkerDeathIncident, evidence: list[str]) -> tuple[str, str, list[str]]:
+    """SIGKILL, and everything that can be said about who sent it.
+
+    In order of how much each witness proves. The kernel log names the
+    victim outright; the cgroup counter says the OOM killer took something in
+    the cgroup at the time; the tracepoint names a sender; the controller's
+    own SIGTERM says the run was being stopped. Each verdict below is licensed
+    by exactly one of those, and the last one by none.
+    """
+    if incident.oom is not None:
+        return "OOM_KILLED", "high", evidence + oom_evidence(incident)
+    if incident.cgroup_oom_kills_since_start:
+        return "OOM_KILLED", "high", evidence
+    killer = incident.killer
+    if killer is not None:
+        if killer.origin == "kernel":
+            return "KILLED_BY_KERNEL", "medium", evidence + [
+                "SIGKILL came from the kernel itself (si_code SI_KERNEL), not from any "
+                "process: the OOM killer, whose log this run could not read, or a cgroup "
+                f"kill; it was generated in the context of {killer.who()}"
+            ] + sources_consulted(incident)
+        if killer.origin == "self":
+            return "SELF_KILLED", "high", evidence + sender_evidence(incident)
+        if killer.sender_role and killer.sender_role != "outside this run":
+            return "KILLED_BY_RUN", "high", evidence + [
+                f"SIGKILL was sent by {killer.who()}"
+            ] + (
+                ["execnet kills a worker that has not exited within its timeout, which is "
+                 "what a SIGKILL from the controller usually is"]
+                if killer.sender_role == "this run's controller"
+                else []
+            )
+        return "KILLED_BY_PROCESS", "high", evidence + [
+            f"SIGKILL was sent by {killer.who()}: something outside this run stopped it - "
+            "a job cancellation, a timeout enforcer, an orchestrator, or a hand on the keyboard"
+        ]
+    term = _latest_term(incident)
+    if term is not None:
+        ago = (
+            f"{term.seconds_before_death:.0f}s before this kill"
+            if term.seconds_before_death is not None
+            else "shortly before this kill"
+        )
+        return "KILLED_AFTER_SIGTERM", "medium", evidence + [
+            f"{term.target} received SIGTERM from {term.who()} {ago}: the run was being "
+            "stopped, and SIGKILL is what follows a SIGTERM that is not answered in time"
+        ]
+    return "SIGKILLED", "medium", evidence + [
+        "SIGKILL with no cgroup OOM event: a host-level OOM killer, a "
+        "container or CI cancellation, or an external kill"
+    ] + sources_consulted(incident)
+
+
 def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
     """Returns (verdict, confidence, evidence)."""
     status = incident.exit_status
     evidence: list[str] = []
 
-    if incident.test_in_flight:
+    if incident.worker == "controller" and incident.recovered_from_run:
+        # It runs no tests, so neither of the phrasings below is about it.
+        evidence.append(
+            "the controller ended without reaching session finish; its workers "
+            "were left to finish on their own"
+        )
+    elif incident.test_in_flight:
         phase = f" ({incident.phase})" if incident.phase else ""
         evidence.append(f"died while running {incident.test_in_flight}{phase}")
     elif incident.tests_finished:
@@ -70,19 +243,26 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             f"exit status {status} - {status_table.describe(status)} "
             f"(pid {incident.worker_pid}, via {incident.exit_status_source})"
         )
-    elif incident.recovered_from_run:
+    elif incident.recovered_from_run and incident.killer is None and incident.oom is None:
         # Two ways to have no status and they have different remedies, so they
         # are not allowed to read the same. This one is not a gateway that
         # could not be asked: it is a process whose parent was the run that
         # died, found afterwards by somebody who was never entitled to its
         # status. Nothing can recover it, which is worth saying plainly rather
-        # than leaving a reader to look for a configuration that would.
+        # than leaving a reader to look for a configuration that would - and
+        # said only when no witness stands in for it, because "cannot be told
+        # apart" beside a line that tells them apart is a contradiction.
         evidence.append(
             f"exit status unavailable (pid {incident.worker_pid}): nothing was "
             "left to read it. Only a parent may, the parent was the run that "
             "died, and by the time this evidence was found the process was "
             "gone - so an OOM kill, a segfault and an os._exit cannot be told "
             "apart here"
+        )
+    elif incident.recovered_from_run:
+        evidence.append(
+            f"exit status unavailable (pid {incident.worker_pid}): the parent was the run "
+            "that died; what follows is from a witness instead"
         )
     else:
         evidence.append(
@@ -105,26 +285,31 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             + " - it is context, not evidence of a crash"
         )
 
-    if status is not None and status < 0:
-        received = -status
+    received = -status if status is not None and status < 0 else None
+    if received is None and status is None and incident.killer is not None:
+        # No status to read - but a witness saw the signal that ended it,
+        # which for a run found dead afterwards is the one thing that can
+        # stand in for the number nobody was left to read.
+        received = incident.killer.signal
+        evidence.append(
+            f"no exit status, but the kernel's signal trace saw "
+            f"{incident.killer.name} sent to pid {incident.worker_pid}"
+        )
+
+    if received is not None:
         if hasattr(signal, "SIGKILL") and received == signal.SIGKILL:
-            evidence = evidence + memory_evidence(incident)
-            if incident.cgroup_oom_kills_since_start:
-                return "OOM_KILLED", "high", evidence
-            return "SIGKILLED", "medium", evidence + [
-                "SIGKILL with no cgroup OOM event: a host-level OOM killer, a "
-                "container or CI cancellation, or an external kill"
-            ]
+            return _killed(incident, evidence + memory_evidence(incident))
         if received in status_table.FATAL_SIGNALS:
             return "NATIVE_CRASH", "high", evidence + [
                 status_table.FATAL_SIGNALS[received]
-            ]
+            ] + sender_evidence(incident)
         if received in status_table.DELIBERATE_SIGNALS:
             return f"SIGNAL_{received}", "high", evidence + [
                 status_table.DELIBERATE_SIGNALS[received],
+            ] + sender_evidence(incident) + [
                 "nothing to triage unless the run was not meant to be stopped",
             ]
-        return f"SIGNAL_{received}", "medium", evidence
+        return f"SIGNAL_{received}", "medium", evidence + sender_evidence(incident)
 
     if status in status_table.WINDOWS_STATUS:
         verdict, description = status_table.WINDOWS_STATUS[status]
@@ -154,5 +339,21 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         ]
 
     # No status at all - a remote gateway, or a run found after the fact with
-    # nothing left that was entitled to read one.
-    return "UNKNOWN", "low", evidence + memory_evidence(incident)
+    # nothing left that was entitled to read one. The kernel log is the one
+    # witness that still answers for a run found afterwards: it is
+    # machine-wide and timestamped, and a kill in the dead run's window is
+    # the dead run's.
+    if incident.oom is not None:
+        return "OOM_KILLED", "high", evidence + memory_evidence(incident) + oom_evidence(incident)
+    term = _latest_term(incident)
+    if term is not None and incident.recovered_from_run:
+        ago = (
+            f"{term.seconds_before_death:.0f}s before its last heartbeat"
+            if term.seconds_before_death is not None
+            else "shortly before its last heartbeat"
+        )
+        return "RUN_STOPPED", "medium", evidence + memory_evidence(incident) + [
+            f"{term.target} received SIGTERM from {term.who()} {ago}: the run was told to "
+            "stop and this process ended with it rather than on its own"
+        ]
+    return "UNKNOWN", "low", evidence + memory_evidence(incident) + sources_consulted(incident)

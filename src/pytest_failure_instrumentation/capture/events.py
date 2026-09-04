@@ -110,6 +110,14 @@ def worker_pid(events: list[dict[str, Any]]) -> int | None:
     return None
 
 
+def started_at(events: list[dict[str, Any]]) -> float | None:
+    """When this process started its session, from its own first record."""
+    for event in events:
+        if event.get("event") == "worker_start" and isinstance(event.get("time"), (int, float)):
+            return float(event["time"])
+    return None
+
+
 #: How much of an event log to read when only the recent past matters. Beats
 #: accumulate with wall-clock rather than with the suite - roughly twelve lines
 #: per worker per minute - so a long run's log is large while the part worth

@@ -120,23 +120,53 @@ replaces it:
 
 | Verdict | Means | Points at |
 |---|---|---|
-| `OOM_KILLED` | `-9` **and** the cgroup OOM counter moved during this run | memory: the workload, the limit, or worker count |
-| `SIGKILLED` | `-9`, counter flat | something outside the container: host-level OOM, CI/container cancellation, runner preemption, an external kill |
+| `OOM_KILLED` | `-9` **and** the kernel log names this pid as the victim, or the cgroup OOM counter moved during this run | memory. Read `oom.pressure`: `fleet` means the run's processes exceeded the limit together (fewer workers or more memory); `own weight` means this one was far above its peers (the test in flight) |
+| `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process *outside the run* send it | nobody's code. `killer` names the sender - a CI runner cancelling, a timeout enforcer, a hand on the keyboard. Informational, and no test is suspected |
+| `KILLED_BY_RUN` | `-9` from another process of this run | the controller (execnet terminating a worker that did not exit in time) or a sibling worker - a test that kills processes |
+| `SELF_KILLED` | `-9` the worker sent to itself | the test in flight: an `os.kill(os.getpid(), SIGKILL)` or a library doing the same |
+| `KILLED_BY_KERNEL` | `-9` with `si_code` `SI_KERNEL`, and no readable OOM log | the OOM killer, most likely; `kill_sources.kernel_log` says why the log could not be read |
+| `KILLED_AFTER_SIGTERM` | `-9`, and the controller had been sent SIGTERM shortly before | the run was being stopped; `signals_before_death` names who asked. Informational, no test suspected |
+| `RUN_STOPPED` | a recovered run whose controller was sent SIGTERM before this process's last heartbeat | the same - the process ended with the run rather than on its own |
+| `SIGKILLED` | `-9` and no witness answered | something outside the container: host-level OOM, CI/container cancellation, runner preemption, an external kill. The `kill witnesses:` evidence line says which source was withheld and why - that is what to fix before guessing |
 | `NATIVE_CRASH` | fatal signal, or a Windows NTSTATUS | the blamed frame — a C extension or a ctypes call |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP | nothing, unless the run was not meant to be stopped |
 | `SELF_EXIT` | an exit status and no signal — **including 0** | `sys.exit()`, `os._exit()`, or a plugin aborting. A worker that left without being asked to has gone wrong whatever number it exited with, so a clean 0 here is a finding, not an all-clear |
 | `PROBABLY_SIGNALLED` | exit code 128–191 | a wrapper that ate the signal; the true one did not survive |
 | `UNKNOWN` | no status obtainable — a remote gateway, or a run recovered after the fact | nothing — do not guess one |
 
-`-9` alone never licenses "we ran out of memory"; only the cgroup counter does,
-and only when `capabilities.cgroup_oom_counter` says it was readable. That
-distinction is the reason both verdicts exist.
+`-9` alone never licenses "we ran out of memory"; only a witness does - the
+kernel log naming the pid, or the cgroup counter moving while
+`capabilities.cgroup_oom_counter` says it was readable. That distinction is
+the reason the verdicts above exist rather than one.
+
+**`killer`, `oom`, `signals_before_death` and `kill_sources`** are the
+witnesses. `killer` is the signal that ended the process with its sender's
+pid, uid, comm, command line and `sender_role` (`itself`, `this run's
+controller`, `gw3, another process of this run`, `outside this run`). `oom`
+is the kernel's own record: the constraint (`CONSTRAINT_MEMCG` is a cgroup's
+limit, `CONSTRAINT_NONE` the machine's), the cgroup, and the table it weighed
+- `run_tasks`/`run_rss_mb` are this run's share of it, `victim_rank` where the
+victim stood, and `triggered_by_*` the process whose allocation hit the limit,
+which is often not the victim. `signals_before_death` is what was sent to this
+worker or to the controller in the minutes before, above all a SIGTERM.
+`kill_sources` says what each witness could do on this machine; a `SIGKILLED`
+or `UNKNOWN` verdict is only as unknown as that record says, and the remedy is
+usually there (`failure_elevate` on a runner with sudo; a readable
+`/dev/kmsg`).
 
 Two absences carry information here. No `of a N MB cgroup limit` clause means
 no container limit was discovered, so raising one may change nothing. And no
 `system had N MB free` line means no high-water snapshot ever fired — the
 worker never came near a ceiling — which is evidence against memory in its own
 right.
+
+**`worker=controller` with `recovered_from_run` is a cancelled or killed run.**
+The controller runs no tests and keeps no heartbeat, so it is recovered from
+its marker and its own log rather than from an event log: a job cancellation
+is a controller sent SIGTERM while its workers finish cleanly on execnet's
+SIGINT, and this is the one incident such a run produces. `killer` names who
+sent it; the verdict is `SIGNAL_15` when a witness saw the signal and
+`UNKNOWN` when none did, with `kill_sources` saying why.
 
 **`recovered_from_run` means this is about a different run from the one that
 reported it.** A run whose own process was killed has no survivor to report it,

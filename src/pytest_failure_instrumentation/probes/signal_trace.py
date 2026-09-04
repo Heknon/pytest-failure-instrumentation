@@ -1,0 +1,428 @@
+"""Who sent the signal: the kernel's ``signal_generate`` tracepoint, watched
+from a sidecar with the privilege it needs.
+
+The wait status says a process died of SIGKILL and nothing else. The one
+place the sender is recorded is the kernel, at the moment it queues the signal:
+the ``signal:signal_generate`` tracepoint fires in the *sender's* context, so
+its line carries the sender's comm and pid in front and the target's after,
+together with ``si_code`` - ``0`` (``SI_USER``) for a ``kill(2)`` from a
+process, ``128`` (``SI_KERNEL``) for the kernel's own kills, the OOM killer
+included. That is the difference between "SIGKILL, could be anything" and
+"SIGKILL from ``containerd-shim`` pid 812" or "SIGKILL from the kernel, in the
+context of gw7 allocating"::
+
+    python-1771  [000] d..1.  401.375501: signal_generate: sig=9 errno=0 code=0 comm=sleep pid=1772 grp=1 res=0
+
+Reading tracepoints needs root: tracefs is ``0700`` and ``perf_event_paranoid``
+gates the alternative. So it is done by a *sidecar* - a second interpreter
+running only the stdlib script below, started directly where this process is
+already root and through ``sudo -n`` where it is not and
+``failure_elevate`` allows it. ``-n`` means a sudo that would prompt fails
+instead of hanging an unattended run.
+
+It never touches the machine's tracer. Tracefs has *instances* - a directory
+made under ``instances/`` is a whole separate tracer with its own buffer and
+its own event switches - so the sidecar makes one named for this run, enables
+one event in it with a filter on the two signals that matter, and removes it
+on the way out. Somebody's ``perf`` or ``trace-cmd`` on the same machine is
+untouched, and a sidecar that dies uncleanly leaves an empty instance
+directory rather than a global tracer left running.
+
+What the sidecar writes is one JSON line per event to a file in the run's
+directory, stamped with the wall clock as it read it: it is reading the pipe
+live, so that stamp is the event's time to within a millisecond and needs no
+conversion from the kernel's clock. The sender's command line and executable
+are read out of ``/proc`` in the same instant, because the sender of a
+``kill -9`` is very often a process that exists for that one syscall and is
+gone by the time anybody else looks.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+from .platform_flags import IS_LINUX
+
+TRACEFS_ROOTS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
+EVENT = "events/signal/signal_generate"
+INSTANCE_PREFIX = "pytest-failure-"
+#: The file the sidecar writes in the run's directory.
+TRACE_FILE = "signals.log"
+#: What is traced. SIGKILL is the one that cannot be witnessed any other way;
+#: SIGTERM is the warning shot every orchestrator sends first, and knowing who
+#: sent it explains the SIGKILL that follows.
+TRACED_SIGNALS = (9, 15)
+
+SI_USER = 0
+SI_KERNEL = 128
+SI_QUEUE = -1
+SI_TKILL = -6
+
+#: One line of ``trace_pipe``. The sender's comm may hold a space; it ends at
+#: the last ``-<pid>`` before the CPU column.
+TRACE_LINE = re.compile(
+    r"^\s*(?P<sender_comm>.*?)-(?P<sender_pid>\d+)\s+\[\d+\]\s+\S+\s+(?P<ts>\d+\.\d+):\s+"
+    r"signal_generate:\s+sig=(?P<sig>\d+)\s+errno=-?\d+\s+code=(?P<code>-?\d+)\s+"
+    r"comm=(?P<comm>.*?)\s+pid=(?P<pid>\d+)\s+grp=(?P<grp>\d+)\s+res=(?P<res>\d+)"
+)
+
+
+@dataclass
+class Witness:
+    """One signal the kernel generated, and who asked it to."""
+
+    at: Optional[float]
+    trace_seconds: float
+    signal: int
+    si_code: int
+    sender_pid: int
+    sender_comm: str
+    sender_cmdline: Optional[str]
+    sender_exe: Optional[str]
+    target_pid: int
+    target_comm: str
+    to_group: bool
+    delivered: bool
+
+    @property
+    def from_kernel(self) -> bool:
+        return self.si_code == SI_KERNEL
+
+
+# -- can this machine do it -------------------------------------------------
+
+
+def tracefs_root() -> Optional[str]:
+    for root in TRACEFS_ROOTS:
+        if os.path.isdir(os.path.join(root, "events")):
+            return root
+    return None
+
+
+_sudo_verdict: Optional[bool] = None
+
+
+def sudo_works() -> bool:
+    """Whether ``sudo -n`` grants root here without asking anything.
+
+    Asked once per process: the answer does not change mid-run, and the
+    question costs a fork.
+    """
+    global _sudo_verdict
+    if _sudo_verdict is None:
+        try:
+            done = subprocess.run(
+                ["sudo", "-n", "true"], capture_output=True, timeout=10
+            )
+            _sudo_verdict = done.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _sudo_verdict = False
+    return _sudo_verdict
+
+
+def availability(elevate: bool) -> tuple[bool, str]:
+    """Whether the tracepoint can be watched, and how - or why not.
+
+    The second value is recorded on incidents either way, so a reader of
+    ``SIGKILLED`` sees which source was withheld and by what, rather than an
+    absence.
+    """
+    if not IS_LINUX:
+        return False, "tracepoints are a Linux source"
+    root = tracefs_root()
+    if root is None:
+        return False, "tracefs is not mounted (mount -t tracefs tracefs /sys/kernel/tracing)"
+    if not os.path.exists(os.path.join(root, EVENT)):
+        return False, "this kernel has no signal_generate tracepoint"
+    if os.geteuid() == 0 and os.access(os.path.join(root, "instances"), os.W_OK):
+        return True, "tracefs"
+    if elevate:
+        if sudo_works():
+            return True, "sudo tracefs"
+        return False, "tracefs needs root and sudo -n was refused"
+    return False, "tracefs needs root; set failure_elevate to use sudo"
+
+
+# -- the sidecar ------------------------------------------------------------
+
+#: Stdlib only, and it must stay that way: it runs under sudo with a reset
+#: environment, in whatever interpreter ``sys.executable`` is, and must not
+#: need this package importable there. argv: instance name, filter, output
+#: path, ``uid:gid`` to hand the output file to.
+SIDECAR = r'''
+import json, os, select, signal, sys, time
+
+instance, event_filter, output, owner = sys.argv[1:5]
+ROOTS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
+EVENT = "events/signal/signal_generate"
+
+
+class Stop(Exception):
+    pass
+
+
+def stop(*_):
+    raise Stop
+
+
+def write(path, text):
+    with open(path, "w") as handle:
+        handle.write(text)
+
+
+def proc(pid, name):
+    try:
+        with open("/proc/%d/%s" % (pid, name), "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+root = next((r for r in ROOTS if os.path.isdir(os.path.join(r, "events"))), None)
+if root is None:
+    sys.exit(3)
+here = os.path.join(root, "instances", instance)
+try:
+    os.mkdir(here)
+except FileExistsError:
+    pass  # a previous sidecar of this run died without removing it
+event = os.path.join(here, EVENT)
+write(os.path.join(event, "filter"), event_filter)
+write(os.path.join(event, "enable"), "1")
+
+out = open(output, "a", buffering=1)
+try:
+    uid, gid = (int(part) for part in owner.split(":"))
+    os.chown(output, uid, gid)
+except (ValueError, OSError):
+    pass
+try:
+    boot_id = open("/proc/sys/kernel/random/boot_id").read().strip()
+except OSError:
+    boot_id = None
+out.write(json.dumps({
+    "header": True, "pid": os.getpid(), "instance": here, "boot_id": boot_id,
+    "wall": time.time(), "monotonic": time.clock_gettime(time.CLOCK_MONOTONIC),
+    "filter": event_filter,
+}) + "\n")
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+pipe = os.open(os.path.join(here, "trace_pipe"), os.O_RDONLY | os.O_NONBLOCK)
+watched = [pipe, 0]
+pending = b""
+try:
+    while True:
+        ready, _, _ = select.select(watched, [], [], 1.0)
+        if 0 in ready:
+            if not os.read(0, 4096):
+                break  # the run that started this is gone, or asked it to stop
+        if pipe not in ready:
+            continue
+        try:
+            chunk = os.read(pipe, 65536)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            continue
+        pending += chunk
+        lines = pending.split(b"\n")
+        pending = lines.pop()
+        for raw in lines:
+            line = raw.decode("utf-8", "replace")
+            record = {"line": line, "wall": round(time.time(), 6)}
+            head = line.split("[", 1)[0].rstrip()
+            sender = head.rsplit("-", 1)[-1]
+            if sender.isdigit():
+                cmdline = proc(int(sender), "cmdline")
+                if cmdline is not None:
+                    record["sender_cmdline"] = cmdline.decode("utf-8", "replace").replace("\0", " ").strip()
+                try:
+                    record["sender_exe"] = os.readlink("/proc/%s/exe" % sender)
+                except OSError:
+                    pass
+            out.write(json.dumps(record) + "\n")
+except Stop:
+    pass
+finally:
+    try:
+        write(os.path.join(event, "enable"), "0")
+    except OSError:
+        pass
+    try:
+        os.close(pipe)
+    except OSError:
+        pass
+    try:
+        os.rmdir(here)
+    except OSError:
+        pass
+    out.close()
+'''
+
+
+class SignalTracer:
+    """One sidecar for one run, writing to one file."""
+
+    def __init__(
+        self,
+        output: Path,
+        elevate: bool = False,
+        signals: tuple[int, ...] = TRACED_SIGNALS,
+    ) -> None:
+        self.output = output
+        self.elevate = elevate
+        self.signals = signals
+        self.process: Optional[subprocess.Popen[bytes]] = None
+        self.how = "off"
+
+    def start(self) -> str:
+        """Start watching; returns how, or a reason it could not."""
+        usable, how = availability(self.elevate)
+        if not usable:
+            self.how = f"off: {how}"
+            return self.how
+        instance = f"{INSTANCE_PREFIX}{os.getpid()}"
+        event_filter = "||".join(f"sig=={number}" for number in self.signals)
+        owner = f"{os.getuid()}:{os.getgid()}"
+        command = (["sudo", "-n"] if how == "sudo tracefs" else []) + [
+            sys.executable, "-c", SIDECAR, instance, event_filter, str(self.output), owner,
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as failure:
+            self.how = f"off: the sidecar could not be started ({failure!r})"
+            return self.how
+        if not self._came_up():
+            code = self.process.poll()
+            self.how = (
+                f"off: the sidecar exited with status {code} before tracing"
+                if code is not None
+                else "off: the sidecar did not start tracing in time"
+            )
+            self.stop()
+            return self.how
+        self.how = how
+        return how
+
+    def _came_up(self, timeout: float = 5.0) -> bool:
+        """The header line is the sidecar saying the event is enabled."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                return False
+            if header(self.output) is not None:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def stop(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        self.process = None
+        # Closing its stdin is the request; the sidecar polls for it. SIGTERM
+        # is the fallback, and would not reach a sudo child from a non-root
+        # parent on every configuration, which is why the request comes first.
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=3.0)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        for stopper in (process.terminate, process.kill):
+            try:
+                stopper()
+                process.wait(timeout=2.0)
+                return
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+
+    @property
+    def active(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+
+# -- reading what it wrote --------------------------------------------------
+
+
+def header(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return None
+    try:
+        record = json.loads(first)
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) and record.get("header") else None
+
+
+def witnessed(path: Path) -> list[Witness]:
+    """Every signal the sidecar saw, in order."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    found: list[Witness] = []
+    for raw in lines:
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("header"):
+            continue
+        witness = parse_line(str(record.get("line", "")), record.get("wall"))
+        if witness is None:
+            continue
+        witness.sender_cmdline = record.get("sender_cmdline")
+        witness.sender_exe = record.get("sender_exe")
+        found.append(witness)
+    return found
+
+
+def parse_line(line: str, at: Optional[float] = None) -> Optional[Witness]:
+    match = TRACE_LINE.match(line)
+    if match is None:
+        return None
+    return Witness(
+        at=at,
+        trace_seconds=float(match.group("ts")),
+        signal=int(match.group("sig")),
+        si_code=int(match.group("code")),
+        sender_pid=int(match.group("sender_pid")),
+        sender_comm=match.group("sender_comm").strip(),
+        sender_cmdline=None,
+        sender_exe=None,
+        target_pid=int(match.group("pid")),
+        target_comm=match.group("comm"),
+        to_group=match.group("grp") == "1",
+        delivered=match.group("res") == "0",
+    )
+
+
+def sent_to(path: Path, pid: int, signal: Optional[int] = None) -> list[Witness]:
+    """What was sent to one process, oldest first."""
+    return [
+        witness
+        for witness in witnessed(path)
+        if witness.target_pid == pid and (signal is None or witness.signal == signal)
+    ]

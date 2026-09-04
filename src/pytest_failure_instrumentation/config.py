@@ -182,6 +182,23 @@ class Settings:
     #: is a blamed frame. Turn it on where the incident is the artefact that
     #: gets read and the terminal is not, which is most of CI.
     crash_stack: bool = False
+    #: Whether this run witnesses who signals its processes - see
+    #: :mod:`.incidents.killer`. Two witnesses, and the setting covers both.
+    #: The controller blocks SIGTERM and reads the ``siginfo`` of the one it
+    #: receives, which names the orchestrator that is stopping the run and
+    #: needs no privilege. And where the run is root, or :attr:`elevate` lets
+    #: it become root, a sidecar watches the kernel's ``signal_generate``
+    #: tracepoint and names the sender of every SIGKILL and SIGTERM to any
+    #: process of the run - the only way a SIGKILL's sender can be known.
+    #: Controller-only: a worker's part in it is to undo the inherited block.
+    kill_trace: bool = True
+    #: Whether this run may spend ``sudo -n`` on the sources that need root:
+    #: the kernel log where ``/dev/kmsg`` and the journal are closed to this
+    #: user, and the tracepoint above. Off by default, because a plugin that
+    #: starts running sudo on everybody who upgrades it has overstepped;
+    #: ``-n`` means a sudo that would prompt fails instead, so an unattended
+    #: run is never left waiting for a password.
+    elevate: bool = False
     #: Which declaration a worker makes on Linux, where Yama restricts who may
     #: read a process. "parent" nominates the controller and covers a session
     #: reading its own workers, which is how the live view is used by default;
@@ -540,6 +557,23 @@ def add_options(parser: pytest.Parser) -> None:
         default="false",
     )
     parser.addini(
+        "failure_kill_trace",
+        help="Witness who signals this run's processes. The controller records "
+        "the sender of any SIGTERM it receives, which needs no privilege; and "
+        "where the run is root, or failure_elevate lets it sudo, a sidecar "
+        "watches the kernel's signal_generate tracepoint and names the sender "
+        "of every SIGKILL and SIGTERM to any process of the run. On by default.",
+        default="true",
+    )
+    parser.addini(
+        "failure_elevate",
+        help="Allow sudo -n for the witnesses that need root: the kernel log "
+        "(dmesg) where /dev/kmsg and the journal are closed to this user, and "
+        "the signal tracepoint. Off by default. -n means a sudo that would "
+        "prompt fails rather than hangs.",
+        default="false",
+    )
+    parser.addini(
         "failure_stack_server",
         help="Serve the live stack of any local process over HTTP, for a UI "
         "watching a run. Each session serves its own on a port drawn for it, "
@@ -886,6 +920,8 @@ def resolve(config: pytest.Config) -> Settings:
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe", True),
         crash_stack=_flag(config, "failure_crash_stack", False),
+        kill_trace=_flag(config, "failure_kill_trace", True),
+        elevate=_flag(config, "failure_elevate", False),
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
         stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,

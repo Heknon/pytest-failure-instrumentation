@@ -48,6 +48,8 @@ DEFAULTS = {
     "failure_stall_seconds": "300",
     "failure_stack_probe": "true",
     "failure_crash_stack": "false",
+    "failure_kill_trace": "true",
+    "failure_elevate": "false",
     "failure_tracer": "parent",
     "failure_sample_seconds": "0",
     "failure_stack_server": "false",

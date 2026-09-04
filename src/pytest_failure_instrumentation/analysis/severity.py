@@ -28,6 +28,11 @@ def of(
         # A deliberate stop signal, already identified as such. No owner to
         # find and nothing for anyone to do.
         return "informational", None
+    if verdict in ("KILLED_BY_PROCESS", "KILLED_AFTER_SIGTERM"):
+        # Somebody outside the run stopped it, and a witness saw who. That is
+        # a cancellation or a timeout, not a defect in anybody's code - the
+        # sender is on the incident for whoever wants to take it up with them.
+        return "informational", None
     if ends_run and owner == "runtime":
         return "high", (
             "raised above informational: a framework-owned defect that ended the "

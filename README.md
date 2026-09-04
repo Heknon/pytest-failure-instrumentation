@@ -372,13 +372,22 @@ reports what the incident found rather than what a `-9` looks like.
 
 | Verdict | Told apart by |
 |---|---|
-| `OOM_KILLED` | `-9` **and** the cgroup OOM counter moved |
-| `SIGKILLED` | `-9`, counter flat — host OOM, CI cancellation, external kill |
+| `OOM_KILLED` | `-9` **and** the kernel log names this pid as the OOM killer's victim, or the cgroup OOM counter moved |
+| `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process outside the run send it — the sender is named |
+| `KILLED_BY_RUN` | `-9` sent by another process of this run: the controller (execnet terminating a worker that would not exit) or a sibling worker |
+| `SELF_KILLED` | `-9` the worker sent to itself |
+| `KILLED_BY_KERNEL` | `-9` with `si_code` `SI_KERNEL` — the kernel's own kill, and no readable log to say which |
+| `KILLED_AFTER_SIGTERM` | `-9`, and the controller had been sent SIGTERM shortly before — the run was being stopped, and the sender is named |
+| `SIGKILLED` | `-9` and no witness answered; the incident says which witnesses this machine withheld, and why |
 | `NATIVE_CRASH` | SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, or a Windows NTSTATUS |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP — a request to stop, not a defect |
 | `SELF_EXIT` | any exit code with no signal, `0` included — a worker that left the run was not asked to |
 | `PROBABLY_SIGNALLED` | exit code 128–191, a wrapper ate the signal |
+| `RUN_STOPPED` | a run found dead afterwards whose controller had been sent SIGTERM before this process's last heartbeat |
 | `UNKNOWN` | no status obtainable (remote gateway) |
+
+See [Who killed it](#who-killed-it) for where each of those witnesses comes
+from and what it needs.
 
 ### A worker stalled
 
@@ -747,6 +756,143 @@ which phase, how many had run, the resident memory at the last beat, and — if
 the run kept one — the fatal stack, which is enough to reach `NATIVE_CRASH`
 with a blamed frame and no status at all. That is the same position Windows is
 in for a watched worker, and it is why the dump is evidence in its own right.
+
+## Who killed it
+
+A wait status of `-9` is the one number designed to say nothing about who sent
+the signal, and for a long time this plugin stopped there: `SIGKILLED`, with a
+list of what it might have been. Everything that actually ends a process keeps
+a record somewhere else, so it now goes and asks each of them — and where a
+machine refuses, the incident says which witness was withheld and by what,
+rather than leaving an absence to be read as "nothing to know".
+
+**The kernel's signal tracepoint names the sender of every SIGKILL.**
+`signal:signal_generate` fires in the *sender's* context when a signal is
+queued, so its line carries the sender's comm and pid in front and the target
+behind, with `si_code` — `0` for a `kill(2)` from a process, `128` for the
+kernel's own, the OOM killer included:
+
+```
+python-1771  [000] d..1.  401.375501: signal_generate: sig=9 errno=0 code=0 comm=sleep pid=1772 grp=1 res=0
+```
+
+That is the difference between "SIGKILL, could be anything" and:
+
+```
+[worker_death] KILLED_BY_PROCESS  severity=informational  owner=unknown
+    worker=gw1  in flight test_sleep.py::test_sleeps  phase=call  started=1 finished=0
+    · died while running test_sleep.py::test_sleeps (call)
+    · exit status -9 - SIGKILL: uncatchable kill (OOM killer or external kill) (pid 2011, via waitid)
+    · SIGKILL was sent by gitlab-runner (pid 2003, uid 998), outside this run - `gitlab-runner run`: something outside this run stopped it - a job cancellation, a timeout enforcer, an orchestrator, or a hand on the keyboard
+```
+
+No test is suspected, because no test did it; the severity is informational,
+because a cancellation is not a defect; and the sender's command line is on
+the incident for whoever wants to take it up with them. A worker that sent
+the signal to itself is `SELF_KILLED`; one killed by the controller — execnet
+terminating a worker that did not exit in time — or by a sibling worker is
+`KILLED_BY_RUN`, and those two *do* point at a test.
+
+Reading tracepoints needs root, so a **sidecar** does it: a second
+interpreter running a stdlib-only script, started directly where the run is
+already root and through `sudo -n` where it is not and `failure_elevate`
+allows it (`-n`: a sudo that would prompt fails rather than hangs). It makes a
+tracefs *instance* of its own under `/sys/kernel/tracing/instances/`, enables
+one event in it filtered to SIGKILL and SIGTERM, writes one JSON line per event
+into `signals.log` in the run's directory — stamped with the wall clock as it
+reads the pipe, and with the sender's command line read out of `/proc` in the
+same instant, because the sender of a `kill -9` is usually gone a moment later
+— and removes the instance on the way out. Nobody's `perf` or `trace-cmd` on
+the same machine is touched.
+
+**The kernel log names the OOM killer's victim, and prints the whole fleet.**
+The cgroup counter says *that* something in the cgroup was OOM-killed; the log
+says *what*. One `Out of memory: Killed process 4242 (python3) ... anon-rss:...`
+line per kill, an `oom-kill:constraint=CONSTRAINT_MEMCG,...,task_memcg=/docker/...,pid=4242`
+summary saying whether it was a cgroup's limit or the machine's, and — with
+`vm.oom_dump_tasks` on, which is the default — a table of every task the
+killer weighed with its RSS. For a run of a hundred workers that table is the
+fleet at the instant the decision was made, and the incident does the
+arithmetic:
+
+```
+    · the kernel log (kmsg) records the OOM killer choosing pid 4242 (python3) at 1680 MB anonymous resident, having hit the machine's own memory; matched by pid
+    · it weighed 214 tasks holding 31650 MB; 100 of them were this run's, holding 29800 MB together; the victim was the 3rd largest
+    · largest: python3 pid 4240 [gw17] 1720 MB, python3 pid 4241 [gw3] 1700 MB, python3 pid 4242 [gw52] 1680 MB
+    · fleet pressure: the victim was an ordinary member of the run (median 290 MB), so the run's 100 processes exceeded the limit together - fewer workers or more memory, not one test
+```
+
+`fleet pressure` against `its own weight` is the question a hundred-worker run
+needs answered: the killer takes whichever process is marginally the largest at
+that instant, so the victim's own size explains nothing on its own, and the
+in-flight test it happened to be running is the wrong suspect. Where the
+tracepoint was also watching, the record says in whose context the kernel made
+the kill — the process whose allocation hit the limit, which is often not the
+victim.
+
+Reading the log is the per-distro part, and every rung is tried in order with
+the one that answered recorded on the incident: `/dev/kmsg`, open to everyone
+where `kernel.dmesg_restrict` is 0 and only to `CAP_SYSLOG` where it is 1
+(Ubuntu since 20.04, Fedora); `journalctl -k`, for members of `adm` or
+`systemd-journal`; `dmesg`; and with `failure_elevate`, `sudo -n dmesg`.
+Inside a pid namespace the pid the kernel prints is the host's and matches
+nothing here, so the cgroup path and the moment are the second key, and the
+incident says it matched that way.
+
+**The controller witnesses the SIGTERM that came first, with no privilege at
+all.** `docker stop`, a kubelet eviction, `systemd stop`, `timeout(1)`,
+GitLab's and Jenkins' cancellation, `earlyoom` — all of them send SIGTERM
+before SIGKILL, and a SIGTERM is an ordinary catchable signal whose `siginfo`
+names the sender. Python's `signal.signal` handler is handed no siginfo, so the
+controller blocks SIGTERM at `pytest_configure` — before xdist spawns anything
+that would inherit it unblocked — and one thread waits on it with
+`sigtimedwait`, which returns the sender's pid and uid. It writes those down
+with the sender's comm and command line, then re-raises the signal with its
+default disposition, so the run dies exactly as it would have; one line in
+`controller.events` is the whole difference. A SIGKILL that lands ten seconds
+after "SIGTERM from `Runner.Listener`" is `KILLED_AFTER_SIGTERM`, and a worker
+found dead afterwards whose controller had been told to stop is `RUN_STOPPED`
+rather than `UNKNOWN`.
+
+The controller's own death is recovered too, which it was not before. A
+cancelled job is a controller sent SIGTERM while its workers go on to finish
+cleanly — execnet sends each of them SIGINT once the controller is gone — so
+there was no worker death to find and a cancelled run was a run about which
+nothing was ever said. The next run now reads the marker and the controller's
+log and raises one incident for it:
+
+```
+[worker_death] SIGNAL_15  severity=informational  owner=unknown
+    recovered from run-f166b8f37c43, which ended without reaching session finish
+    worker=controller  no test in flight  started=0 finished=0
+    · the controller ended without reaching session finish; its workers were left to finish on their own
+    · exit status unavailable (pid 2866): the parent was the run that died; what follows is from a witness instead
+    · no exit status, but the kernel's signal trace saw SIGTERM sent to pid 2866
+    · a shutdown request - CI cancellation, a timeout enforcer, or an orchestrator stopping the run
+    · SIGTERM was sent by gitlab-runner (pid 812), outside this run - `gitlab-runner run`
+    · nothing to triage unless the run was not meant to be stopped
+```
+
+Only the controller does this, because a blocked mask is inherited by
+children: the controller's children are the workers, each of which unblocks
+first thing at its own start, and a run with no workers — whose children are a
+test's own subprocesses — does not block at all. A SIGTERM somebody has
+already installed a handler for is left to them.
+
+**What stays unknown is small, and named.** A SIGKILL with no SIGTERM before
+it, no OOM record, and no tracepoint is a direct kill of one process by
+something running as your uid or root — and the incident's `kill witnesses:`
+line says which of the three sources was unavailable and why:
+`kernel log unavailable (kmsg: permission denied (kernel.dmesg_restrict=1); journal: No journal files were found; dmesg: ...; sudo dmesg: not tried, failure_elevate is off); signal tracepoint off: tracefs needs root; set failure_elevate to use sudo`.
+That is still an unknown, but it names exactly which truth was withheld and
+by what — which is the difference between a guess and a finding that happens
+to be negative. On a runner that has root or sudo, set `failure_elevate` and
+the residue closes.
+
+The whole of it is Linux. macOS can be asked whether a process died of memory
+pressure through `kqueue`'s process filter, and Windows has no OOM killer and
+records a crash's faulting module in the Application event log; neither is
+read yet.
 
 ## Live stacks over HTTP
 
@@ -1540,6 +1686,8 @@ accepted and inert.
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
 | `failure_crash_stack` | `false` | Keep the fatal stack of a run that has *no workers*, instead of leaving it on the stderr pytest points it at. A worker keeps its own either way |
+| `failure_kill_trace` | `true` | Witness who signals this run's processes: the controller records the sender of a SIGTERM it receives, and where the run is root (or may sudo) a sidecar on the kernel's `signal_generate` tracepoint names the sender of every SIGKILL and SIGTERM. See [Who killed it](#who-killed-it) |
+| `failure_elevate` | `false` | Allow `sudo -n` for the witnesses that need root: `dmesg` where `/dev/kmsg` and the journal are closed, and the tracepoint above |
 | `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
@@ -1611,6 +1759,9 @@ its directory says so.
 | On-demand stack from a stalled worker | yes | yes | no |
 | Live stack of a running process (py-spy) | yes | root only | yes |
 | Stack from a worker that stopped running Python | yes | yes | yes |
+| Who sent the SIGKILL (signal tracepoint, root or sudo) | yes | no | no |
+| The OOM killer's own record of the victim and the fleet (kernel log) | yes | n/a | n/a |
+| Who sent the SIGTERM that came first (controller siginfo) | yes | no | no |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a
 *setting* takes away on every platform rather than a platform taking away: where

@@ -93,6 +93,15 @@ def install(
     that has already opened its files; it warns if it was asked for something
     different, so a second framework quietly losing to the first is visible.
     """
+    if hasattr(config, "workerinput"):
+        # First, and whether or not anything below succeeds. A worker is born
+        # with the controller's signal mask, and the controller blocks SIGTERM
+        # so that it can witness who sends it (see capture.signals). A worker
+        # runs tests, and a test's subprocesses inherit *its* mask - so the
+        # block is undone here, before the recorder that might fail to build.
+        from .capture import signals as controller_signals
+
+        controller_signals.unblock_inherited()
     try:
         wanted = _resolve(config, settings, overrides)
     except TypeError:

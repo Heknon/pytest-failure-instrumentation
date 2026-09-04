@@ -80,11 +80,19 @@ def test_sigkill_does_not_claim_an_oom_it_cannot_prove(distributed):
     incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
 
     death = distributed.only(incidents, "worker_death")
-    # OOM_KILLED needs the cgroup counter to have moved. Without it the honest
-    # answer is that something killed it.
-    assert death.verdict == "SIGKILLED"
     assert death.exit_status == -signal.SIGKILL
-    assert any("no cgroup OOM event" in line for line in death.evidence)
+    if death.kill_sources is not None and death.kill_sources.signal_trace.endswith("tracefs"):
+        # Root, or a sudo this run may spend: the kernel's signal tracepoint
+        # saw the worker send the signal to itself, and says so.
+        assert death.verdict == "SELF_KILLED"
+        assert death.killer is not None and death.killer.origin == "self"
+    else:
+        # OOM_KILLED needs the cgroup counter to have moved. Without it, or a
+        # witness to the sender, the honest answer is that something killed it
+        # - and which witnesses this machine withheld is on the incident.
+        assert death.verdict == "SIGKILLED"
+        assert any("no cgroup OOM event" in line for line in death.evidence)
+        assert any(line.startswith("kill witnesses:") for line in death.evidence)
 
 
 @posix_only
@@ -440,7 +448,9 @@ def test_a_probe_stack_left_behind_is_dated_and_not_called_a_crash(distributed):
     )
 
     death = distributed.only(incidents, "worker_death")
-    assert death.verdict == "SIGKILLED"
+    # SELF_KILLED where the kernel's signal tracepoint could be watched (root,
+    # or a sudo this run may spend) and saw the worker signal itself.
+    assert death.verdict in ("SIGKILLED", "SELF_KILLED")
     assert death.crash_stack, "the probe answered, so there is a stack on file"
     assert death.crash_stack_age_seconds is not None
     assert any(
