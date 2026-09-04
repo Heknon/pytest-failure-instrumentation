@@ -201,28 +201,40 @@ def test_a_tight_loop_gets_its_line_even_where_the_frame_reports_none() -> None:
     assert all(first < line <= first + body for line in lines), lines
 
 
-def test_sampling_does_not_keep_a_functions_locals_alive() -> None:
+def test_a_tick_keeps_nothing_it_read_once_it_is_over() -> None:
     """The frames dict from sys._current_frames holds the sampler's own
-    frame, whose locals hold the dict: a cycle that kept every sampled
-    frame - and the test's locals with it - until a full collection."""
+    frame, whose locals hold the dict: a cycle that would keep every sampled
+    frame - and the test's locals with it - until a full collection.
+
+    The tick is taken by hand, on this thread, rather than by the sampling
+    thread. Against a running sampler what this asserts is partly *when* the
+    check happened: a tick holds the frames it read for as long as it is in
+    `_tick`, and one of those frames belongs to a function that has since
+    returned - so a check that lands mid-tick sees the blob alive and reports
+    the bug. Windows makes that window wide enough to hit, because psutil's
+    per-thread read there enumerates every thread on the machine, and the 3.9
+    cell failed on it. Synchronously there is no window and no weather: what
+    is left after a tick is over is the whole question.
+    """
 
     class Blob(list):
         pass
 
     holder: list[Any] = []
     records: list[dict[str, Any]] = []
-    sampler = Sampler(records.append, lambda: 1, interval=0.005, worker="x")
-    sampler.start()
+    sampler = Sampler(records.append, lambda: 1, interval=1.0, worker="x")
+    # What `start` would set, without starting the thread that would race this.
+    sampler._own_ident = threading.get_ident()
     sampler.begin_phase("t::a", "call")
 
     def allocate() -> None:
         blob = Blob(bytearray(100_000) for _ in range(50))
         holder.append(weakref.ref(blob))
-        time.sleep(0.2)
+        sampler._sample()  # a tick, taken while this frame is live
 
-    # Off before the allocation, not after: the sampler allocates on every
-    # tick, and a collection between the return and the check would clear a
-    # cycle the sampler had created, and pass this test with the bug present.
+    # Off before the allocation, not after: a collection between the return
+    # and the check would clear a cycle the tick had created, and pass this
+    # with the bug present.
     gc.disable()
     try:
         allocate()
@@ -232,7 +244,7 @@ def test_sampling_does_not_keep_a_functions_locals_alive() -> None:
     sampler.end_phase("call")
     sampler.end_test("t::a")
     sampler.stop()
-    assert not alive, "the sampled function's locals outlived its return"
+    assert not alive, "a tick kept the frames it read past its own return"
 
 
 def test_the_samplers_own_frames_are_stripped_whatever_the_separator() -> None:
