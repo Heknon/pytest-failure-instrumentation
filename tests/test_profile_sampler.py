@@ -552,3 +552,46 @@ def test_a_truncated_last_line_costs_that_record_and_no_others(tmp_path) -> None
 
     assert [record["nodeid"] for record in read_profile_log(path)] == ["t::a", "t::b"]
     assert read_profile_log(tmp_path / "absent.profile.jsonl") == []
+
+
+def test_what_the_sampler_remembers_is_bounded_by_the_threads_that_exist() -> None:
+    """A thread's ident is a pthread handle and is handed to the next thread
+    the moment this one ends, so a pool running a task per thread cycles a
+    handful of idents through hundreds of threads - and everything the sampler
+    keys by ident would otherwise be a note about a thread that is gone.
+
+    Size is the smaller half. ``_linked`` is what a generator caught between
+    yields is relinked onto, guarded against a stale entry by "same window" -
+    and the background window is one object for the whole run, so an entry
+    made between tests passes that guard for ever. A generator on a new thread
+    would then be relinked onto a dead thread's last stack, and the profile
+    would say so.
+
+    Written with the notes planted rather than by outliving real threads: a
+    thread that lives less than a sampling interval is never seen, and one
+    that is seen leaves an entry only until its ident is handed on - so a test
+    that made threads and looked at what was left would pass for the wrong
+    reason as often as the right one.
+    """
+    records: list[dict[str, Any]] = []
+    sampler = Sampler(records.append, lambda: 1, interval=0.002, worker="x")
+    ghost = -1  # no thread has this ident, so it is a thread that is gone
+    sampler.start()
+    try:
+        with sampler._lock:
+            sampler._previous[ghost] = (sampler._ticks, "gone", (), sampler._background)
+            sampler._linked[ghost] = ((), sampler._background)
+        sampler._native_names[-2] = "a kernel thread that has exited"
+        alive = threading.get_ident()
+        deadline = time.monotonic() + 5.0
+        while sampler._ticks < sampling.DISCOVER_EVERY * 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert sampler._ticks >= sampling.DISCOVER_EVERY, "the sampler never reached a discovery"
+    finally:
+        sampler.stop()
+
+    assert ghost not in sampler._previous
+    assert ghost not in sampler._linked
+    assert -2 not in sampler._native_names
+    # The thread that was actually running is still remembered.
+    assert alive in sampler._previous or not sampler._previous

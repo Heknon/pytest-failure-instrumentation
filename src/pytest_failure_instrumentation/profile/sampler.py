@@ -866,6 +866,8 @@ class Sampler:
                     entry[1] += delta
 
             self._ticks += 1
+            if self._ticks % DISCOVER_EVERY == 0:
+                self._forget_dead_threads(idents, clocks)
             window.threads_peak = max(
                 window.threads_peak, len(self._all_tids), len(frames) + 1, threading.active_count()
             )
@@ -964,6 +966,35 @@ class Sampler:
             window.snapshot_peak = _snapshot()
             window.snapshot_rss = rss
             window.snapshot_at = now
+
+    def _forget_dead_threads(self, idents: frozenset[int], clocks: dict[int, int]) -> None:
+        """Drop what is remembered about threads that are gone.
+
+        Correctness first, size second. A thread's ident is a pthread handle
+        and is reused the moment the thread ends, so a pool running a task per
+        thread hands the same ident to one thread after another - and
+        ``_linked`` is keyed by it, and guarded by ``linked[1] is window``
+        against a stale entry from another window. The background window is
+        one object for the whole run, so that guard passes for any entry made
+        between tests, however old: a generator on a new thread was relinked
+        onto a dead thread's last stack, and the profile said so.
+
+        ``_previous`` cannot go wrong the same way - it is stamped with the
+        tick and only read from the tick before - and ``_native_names`` is
+        only a name. Both are dropped here anyway, because neither is ever
+        read for a thread that no longer exists, and a run whose threads come
+        and go for an hour would otherwise carry every one of them to the end.
+
+        Called with the lock held, on the discovery schedule: the kernel's
+        thread list was just re-read, so this is the same answer that found
+        the live ones.
+        """
+        for ident in [ident for ident in self._previous if ident not in idents]:
+            del self._previous[ident]
+        for ident in [ident for ident in self._linked if ident not in idents]:
+            del self._linked[ident]
+        for tid in [tid for tid in self._native_names if tid not in clocks]:
+            del self._native_names[tid]
 
     def _cpu_delta(self, tid: int, clocks: dict[int, int]) -> Optional[int]:
         if tid not in clocks:
