@@ -1,10 +1,22 @@
+"""The example's hooks: where the findings go, and the poller fixture.
+
+``incidents.jsonl`` holds one run. It is emptied when the session starts and
+appended to as findings arrive, so it never carries a previous run's lines.
+"""
 
 import pytest
 from demo_product.poller import Poller
 
 
+def pytest_sessionstart(session):
+    # Once, in the process that receives the findings; under xdist that is
+    # the controller, and the workers leave the file alone.
+    if not hasattr(session.config, "workerinput"):
+        open("incidents.jsonl", "w", encoding="utf-8").close()
+
+
 def pytest_failure_incident(incident):
-    """Where the findings go: a JSON line each, beside the terminal output."""
+    """A JSON line per finding, beside the terminal output."""
     with open("incidents.jsonl", "a", encoding="utf-8") as handle:
         handle.write(incident.model_dump_json() + "\n")
 

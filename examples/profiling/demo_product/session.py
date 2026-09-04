@@ -16,7 +16,7 @@ import time
 
 
 class Session:
-    def __init__(self, tokens: int = 600_000) -> None:
+    def __init__(self, tokens: int = 350_000) -> None:
         self.tokens = {
             index: hashlib.sha256(b"token-%d" % index).hexdigest() for index in range(tokens)
         }

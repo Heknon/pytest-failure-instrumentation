@@ -6,11 +6,11 @@ from demo_product.reports import build_document, render_report
 
 
 def test_report_renders():
-    document = build_document(60_000)
+    document = build_document(150_000)
     rendered = render_report(document)
     assert rendered.startswith("{")
 
 
 def test_report_is_stable():
-    document = build_document(60_000)
+    document = build_document(150_000)
     assert render_report(document) == render_report(document)

@@ -1854,7 +1854,7 @@ accepted and inert.
 | `failure_profile_cpu_share` | `5` | Percent of the run's CPU one function must hold to be raised |
 | `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
 | `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
-| `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; several times slower, for a rerun (`--failure-profile-allocations` for one run, which implies `--failure-profile`) |
+| `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; tens of times slower on allocation-heavy pure-Python code, so for a rerun of the tests an untraced run named (`--failure-profile-allocations` for one run, which implies `--failure-profile`) |
 | `failure_profile_allocation_depth` | `12` | Frames kept per allocation when tracing |
 | `failure_profile_burst_cores` | `0.7` | Cores' worth of CPU a tenth-of-a-second window must hold to be part of a burst |
 | `failure_profile_burst_seconds` | `2` | Seconds a burst must last to be raised as one test's own; the same function bursting in five tests is raised whatever their length |
@@ -2067,7 +2067,7 @@ PyPI rejects a distribution carrying both.
 
 ## Status
 
-All five kinds and every verdict in the tables above are covered, on all three
+All nine kinds and every verdict in the tables above are covered, on all three
 platforms, with and without xdist — a run with no workers records, serves,
 watches and is recovered through the same code paths a distributed one uses,
 and the tests drive it the same way: a real run, wedged or killed for real,

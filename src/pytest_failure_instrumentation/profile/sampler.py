@@ -469,6 +469,10 @@ class Sampler:
         #: thread that idled for a minute from having its next work charged
         #: to whatever it was doing a minute ago.
         self._previous: dict[int, tuple[int, str, StackKey, Any]] = {}
+        #: The last stack each thread was seen in that reached the thread's
+        #: bottom frame, and its window: what a generator frame caught with
+        #: no caller is linked back onto. See _relinked.
+        self._linked: dict[int, tuple[StackKey, Any]] = {}
         #: When the background window was set aside for a test, so the time
         #: the test took is not also counted as the background's.
         self._paused: Optional[tuple[float, float]] = None
@@ -818,6 +822,15 @@ class Sampler:
                 if not stack:
                     continue
                 previous = prior[ident] = self._previous.get(ident)
+                if _is_generator(stack[-1][0]):
+                    # The chain ends at a generator: caught between yields,
+                    # with nothing linking it to whoever drives it. See
+                    # _relinked.
+                    linked = self._linked.get(ident)
+                    if linked is not None and linked[1] is window:
+                        stack = _relinked(stack, linked[0])
+                else:
+                    self._linked[ident] = (stack, window)
                 self._previous[ident] = (self._ticks, name, stack, window)
                 # Only from the tick before, and only within the same window:
                 # a late tick that straddles the end of one test and the start
@@ -1318,6 +1331,43 @@ def _stack_of(frame: Any) -> StackKey:
 #: pin every one of them for the life of the process, and the profiler is
 #: the thing meant to report memory that drifts up.
 _line_tables: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+#: CO_GENERATOR, CO_COROUTINE and CO_ASYNC_GENERATOR: a code object whose
+#: frame is suspended and resumed rather than called and returned from.
+_SUSPENDABLE = 0x20 | 0x80 | 0x200
+
+
+def _is_generator(code: Any) -> bool:
+    return bool(getattr(code, "co_flags", 0) & _SUSPENDABLE)
+
+
+def _relinked(stack: StackKey, linked: StackKey) -> StackKey:
+    """A generator's callers, from the last stack on its thread that had them.
+
+    A generator frame caught between suspending and resuming has no
+    ``f_back``: the interpreter links a generator's frame to its caller only
+    while it runs, and a sample can land in the gap. The chain then ends at
+    the generator, and the encoder ``json.dumps`` drives would be charged
+    to the runtime alone rather than to whoever called ``dumps`` - a few
+    percent of samples, weighted by the CPU they carry, and a fifth of the
+    encoder's time. The last stack on the same thread that reached the
+    thread's bottom says who drives the generators: the sampled frames are
+    kept as they are and, below them, the callers of that stack's generator
+    of the same code, or of its outermost generator when this one was not
+    in it - ``_iterencode_list`` and ``_iterencode_dict`` take turns, and
+    both run for whoever called ``encode``.
+    """
+    code = stack[-1][0]
+    outermost_generator = None
+    for index, (seen, _, _) in enumerate(linked):
+        if seen is code:
+            return tuple(stack) + tuple(linked[index + 1 :])
+        if _is_generator(seen):
+            outermost_generator = index
+    if outermost_generator is None:
+        return stack
+    return tuple(stack) + tuple(linked[outermost_generator + 1 :])
 
 
 def _line_of(code: Any, offset: int) -> int:

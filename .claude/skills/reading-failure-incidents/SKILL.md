@@ -415,7 +415,8 @@ and `raw_stack()` are the code that was running while the memory climbed,
 with `climb_mb` of the `climb_total_mb` seen charged to it, and `owner` is
 attributed from that stack as for a crash. That is the line to open: a loader
 that reads whole rather than streams, a fixture that builds the world. When no
-climb was seen — a step too fast for the sampler's tenth-of-a-second reading,
+climb was seen — a step too fast for the sampler's resident-memory reading,
+which is every second tick, 40 ms apart at the default interval,
 or a worker with no stack to read — there is no frame and `suspect_owner` is
 the owner of the test's module instead.
 

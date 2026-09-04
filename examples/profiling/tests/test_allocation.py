@@ -1,6 +1,10 @@
 """Scenario 4: allocation-heavy code that keeps the collector busy. Expected:
-cpu_hotspot GC_PRESSURE naming this test, alongside the PYTHON_CODE hotspot
-for the builder itself."""
+cpu_hotspot GC_PRESSURE naming these tests, alongside the PYTHON_CODE hotspot
+for the builder itself. Two graphs rather than one big one: every full
+collection walks everything alive, so the collector's cost is the same,
+and the peak is half."""
+
+import pytest
 
 
 def build_graph(nodes: int) -> list:
@@ -15,6 +19,7 @@ def build_graph(nodes: int) -> list:
     return graph
 
 
-def test_graph_builds():
-    graph = build_graph(700_000)
-    assert len(graph) == 700_000
+@pytest.mark.parametrize("nodes", [600_000, 700_000])
+def test_graph_builds(nodes):
+    graph = build_graph(nodes)
+    assert len(graph) == nodes

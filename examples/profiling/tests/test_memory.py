@@ -11,6 +11,10 @@
                          growth finding, which names both.
 * the whole module       WORKER_IMBALANCE under -n 2 --dist loadfile: the
                          worker that gets this file ends far above its sibling.
+                         The finding names the test that first pushed that
+                         worker past the other, which is whichever big test
+                         its share of the files put in front - this module's
+                         or test_loading.py's - not this module as such.
 """
 
 import time

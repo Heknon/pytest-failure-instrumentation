@@ -26,7 +26,7 @@ speedscope flame graph for every test a finding names is written under
 | `test_reports.py` | `cpu_hotspot` `LIBRARY_CALL`: the cost is under the json encoder |
 | `test_polling.py` | `cpu_hotspot` `BACKGROUND_THREAD`: a session fixture's poller |
 | `test_allocation.py` | `cpu_hotspot` `GC_PRESSURE`: millions of small objects |
-| `test_memory.py` | `memory_profile` `RETAINED_AFTER_TEST` (body and fixture), `TRANSIENT_PEAK`, and under `-n 2` `WORKER_IMBALANCE` |
+| `test_memory.py` | `memory_profile` `RETAINED_AFTER_TEST` (body and fixture), `TRANSIENT_PEAK`; under `-n 2` the worker holding this file's leaks stands clear of the other, and `WORKER_IMBALANCE` names whichever big test first pushed it there - one of these or `test_loading.py`'s |
 | `test_loading.py` | `memory_profile` `PEAK_OVER_CEILING`: a loader that does not stream |
 | `test_sessions.py` | `cpu_burst` `RECURRING_BURST`: an I/O suite whose fixture bursts on every test |
 | `test_index.py` | `cpu_burst` `LONG_BURST`: one CPU step inside a test that otherwise waits |

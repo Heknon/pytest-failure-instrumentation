@@ -153,7 +153,7 @@ def every_kind(tmp_path: Path) -> list[Incident]:
 
 def test_every_incident_renders_to_the_one_shape(every_kind: list[Incident]) -> None:
     kinds = {incident.kind for incident in every_kind}
-    assert kinds >= {"worker_death", "worker_stall", "collection_mismatch", "internal_error", "run_summary", "stack_server_unavailable", "cpu_hotspot", "memory_profile"}
+    assert kinds >= {"worker_death", "worker_stall", "collection_mismatch", "internal_error", "run_summary", "stack_server_unavailable", "cpu_hotspot", "cpu_burst", "memory_profile"}
     for incident in every_kind:
         text = str(incident)
         lines = text.splitlines()

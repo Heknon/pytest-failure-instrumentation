@@ -11,6 +11,7 @@ from __future__ import annotations
 
 
 def load_everything(records: int) -> int:
-    payload = b"".join(b"record %d\n" % index * 40 for index in range(records))
+    row = b",".join(b"field-%d" % column for column in range(30))
+    payload = b"".join(b"%d,%s\n" % (index, row) for index in range(records))
     decoded = payload.decode("ascii").splitlines()
     return len(decoded)

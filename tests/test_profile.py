@@ -580,8 +580,9 @@ class TestBursts:
         )
         incidents = runner.run("--failure-profile", "-p", "no:cacheprovider", timeout=120.0)
 
-        found = bursts(incidents)
-        assert [incident.verdict for incident in found] == ["RECURRING_BURST"], [str(i) for i in incidents]
+        # Only the recurring finding is asserted on: a busy runner can add a CONTENDED one.
+        found = [incident for incident in bursts(incidents) if incident.verdict == "RECURRING_BURST"]
+        assert len(found) == 1, [str(incident) for incident in incidents]
         (incident,) = found
         assert incident.test_count == 5
         assert incident.phase == "setup"

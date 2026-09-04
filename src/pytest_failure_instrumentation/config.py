@@ -705,10 +705,12 @@ def add_options(parser: pytest.Parser) -> None:
 
 
 def _add_command_line_options(parser: pytest.Parser) -> None:
-    """The three settings worth having off the ini file.
+    """The settings worth having off the ini file.
 
     Everything else about this plugin is a property of the project and belongs
-    in ini. These are properties of *where this run happens* - which port is
+    in ini. Three of these are switches for one run - the instrumentation, the
+    profile, the allocation trace - where the ini turns them on for every run.
+    The other three are properties of *where this run happens* - which port is
     free on this machine, which interface a container needs bound, which secret
     this deployment uses - and that is not something a repository can know on
     behalf of everybody running it.

@@ -426,3 +426,43 @@ def test_a_climb_between_two_readings_carries_the_last_sampled_stack() -> None:
     assert sum(entry["mb"] for entry in record["growth"]) >= 32, record["growth"]
     # Qualified where the interpreter qualifies (3.11+ writes <locals>.allocate).
     assert any(name.split(".")[-1] == "allocate" for name in names), (record["growth"], names)
+
+
+def test_a_generator_caught_between_yields_keeps_its_callers() -> None:
+    """A generator frame sampled between suspending and resuming has no
+    f_back, so the sample was one frame deep and json's encoder was charged
+    to the runtime alone, a few percent of the time and weighted by CPU.
+    The thread's last stack that had the generator linked supplies the
+    callers."""
+    import json
+
+    rows = [{"id": i, "name": f"n{i}", "tags": ["a", "b"], "v": i * 1.5} for i in range(20_000)]
+    records: list[dict[str, Any]] = []
+    sampler = Sampler(records.append, lambda: 1, interval=0.002, worker="x")
+    sampler.start()
+    sampler.begin_phase("t::a", "call")
+
+    def render() -> None:
+        end = time.perf_counter() + 0.6
+        while time.perf_counter() < end:
+            json.dumps(rows, indent=2)
+
+    render()
+    sampler.end_phase("call")
+    sampler.end_test("t::a")
+    sampler.stop()
+
+    (record,) = [entry for entry in records if entry["record"] == "test"]
+    names = [entry.split("|")[2] for entry in record["frames"]]
+    in_encoder = orphaned = 0
+    for stack in record["stacks"]:
+        functions = [names[index] for index in stack["frames"]]
+        if not any("_iterencode" in function for function in functions):
+            continue
+        in_encoder += stack["cpu_ns"]
+        if not any(function.endswith("render") for function in functions):
+            orphaned += stack["cpu_ns"]
+    assert in_encoder > 0
+    # The first sighting of a generator with nobody to relink it from stays
+    # an orphan; the rest are relinked.
+    assert orphaned < in_encoder * 0.1, (orphaned, in_encoder)

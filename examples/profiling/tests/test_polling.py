@@ -6,10 +6,10 @@ import time
 
 
 def test_with_the_poller_running(status_poller):
-    time.sleep(2.0)
+    time.sleep(3.0)
     assert status_poller.polls > 0
 
 
 def test_another_with_the_poller_running(status_poller):
-    time.sleep(2.0)
+    time.sleep(3.0)
     assert status_poller.polls > 0

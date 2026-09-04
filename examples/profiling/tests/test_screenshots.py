@@ -6,13 +6,13 @@ import random
 import pytest
 from demo_product.image_compare import is_images_different
 
-WIDTH, HEIGHT = 960, 540
+WIDTH, HEIGHT = 1600, 900
 
 
 @pytest.fixture(scope="module")
 def screenshots():
     random.seed(1)
-    before = bytes(random.getrandbits(8) for _ in range(WIDTH * HEIGHT * 3))
+    before = random.randbytes(WIDTH * HEIGHT * 3)
     after = bytearray(before)
     after[1000:1600] = bytes(600)  # a small change
     return before, bytes(after)

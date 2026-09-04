@@ -378,7 +378,7 @@ def test_malloc_info_is_read_per_arena_and_the_process_totals_are_not_double_cou
     assert memory.parse_malloc_info("<malloc version=\"1\">\n</malloc>\n") is None
 
 
-@pytest.mark.skipif(not probes.IS_LINUX if hasattr(probes, "IS_LINUX") else sys.platform != "linux", reason="glibc only")
+@pytest.mark.skipif(sys.platform != "linux", reason="glibc only")
 def test_the_allocator_figures_are_read_from_this_process_where_glibc_answers():
     figures, source = probes.allocator_figures()
     if source == "unavailable":
