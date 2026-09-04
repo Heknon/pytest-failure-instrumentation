@@ -348,3 +348,50 @@ def pytest_configure(config):
     (log,) = list((runner.pytester.path / ".pytest-failures").glob("*/controller.events"))
     announced = [json.loads(line) for line in log.read_text().splitlines() if '"kill_witnesses"' in line]
     assert announced and announced[0]["reporter"].startswith("off: failure_on_run_death cannot travel")
+
+
+#: Where the directory stood at the moment each incident was handed over.
+CLAIMED: list[bool] = []
+
+
+def note_the_claim(directory: Path, incident) -> None:
+    CLAIMED.append(bool(leftovers.marker(directory).get(leftovers.REPORTED_KEY)))
+
+
+def test_the_directory_is_claimed_before_a_single_incident_is_delivered(tmp_path):
+    """The key is what stops a second reporter - or the next run to sweep this
+    root - raising the same dead directory again, and delivery is the slow
+    part of this: enriching each incident, then a call out to whatever the
+    user configured, which may be a network hop.
+
+    Stamped afterwards, everything from the marker check through the
+    controller and worker grace periods is a window in which a second sweeper
+    reads an unclaimed marker and starts its own copy of the work, and the
+    dead run is reported twice.
+    """
+    directory = dead_run(tmp_path)
+    CLAIMED.clear()
+
+    reported = reporter.report(
+        payload_for(directory, functools.partial(note_the_claim, directory))
+    )
+
+    assert len(reported) == 1
+    assert CLAIMED == [True], "the claim is staked before the first delivery, not after"
+
+
+def test_a_half_written_marker_is_never_what_another_run_reads(tmp_path):
+    """Its readers are other runs, and ``marker`` on a truncated owner.json
+    returns None - a directory that reads as "not ours" is one whose
+    incidents are never raised at all."""
+    directory = dead_run(tmp_path)
+    before = leftovers.marker(directory)
+
+    assert leftovers.stamp(directory, leftovers.REPORTED_KEY)
+
+    after = leftovers.marker(directory)
+    assert after is not None and after[leftovers.REPORTED_KEY] > 0
+    assert {key: after[key] for key in before} == before, "nothing else was disturbed"
+    # The temporary it renames over the marker is not left behind, and is
+    # never itself mistaken for one.
+    assert [path.name for path in directory.glob("owner.json*")] == ["owner.json"]
