@@ -79,12 +79,25 @@ DISCOVER_EVERY = 50
 #: never charged to the frame that happened to come next.
 LATE_TICK_FACTOR = 3.0
 
-#: Ticks per timeline window. The timeline is the process's CPU and the
+#: Seconds per timeline window. The timeline is the process's CPU and the
 #: machine's, window by window, which is what a burst is read from: a test
 #: that is idle for ten seconds and then burns a core for two is a flat
 #: line with a step in it, and the step has a start, a length and a height.
-#: Five ticks is a tenth of a second at the default interval.
-WINDOW_TICKS = 5
+#:
+#: A length of *time*, and not a count of ticks, which is what this was.
+#: Five ticks is a tenth of a second only while the sampler is getting the
+#: CPU it asked for. Where it is not - a loaded machine, a platform whose
+#: per-thread read is expensive - the window stretched in proportion and the
+#: timeline's resolution went with it, silently: at ticks 150 ms apart a
+#: burst of 0.6 s became a single window, and a single window is under
+#: MIN_BURST_WINDOWS, so the finding was not raised at all rather than
+#: raised with less precision. Both macOS cells lost every one of seven
+#: bursts that way while a 2.5 s burst on the same runs came through.
+#: Closing on elapsed time holds the tenth of a second the README promises
+#: wherever the sampler can tick faster than that, and degrades to one
+#: window per tick where it cannot, which is the floor the sample rate sets
+#: and not five times it.
+WINDOW_SECONDS = 0.1
 
 #: What a test's record is called on disk, and the process-wide leftovers'.
 TEST_RECORD = "test"
@@ -447,6 +460,8 @@ class Sampler:
         self._window_cpu_ns = 0
         self._window_stacks: dict[tuple[str, StackKey], int] = {}
         self._window_ticks = 0
+        #: When the open timeline window started. See WINDOW_SECONDS.
+        self._window_opened = time.monotonic()
         self.clock = ThreadClock()
         self.nodeid: Optional[str] = None
         self.phase: Optional[str] = None
@@ -790,9 +805,12 @@ class Sampler:
         reading = self._ticks % RSS_EVERY == 0
         rss = self._rss() if reading else None
         heap = _heap_in_use() if reading else None
-        machine: Any = _NOT_READ
-        if self._window_ticks + 1 >= WINDOW_TICKS:
-            machine = self._machine.busy_permille()
+        # Whether this tick closes the timeline window, decided on elapsed
+        # time. Read before the lock, like every other reading that lets go
+        # of the GIL; the load is only wanted for a window that is closing,
+        # so this costs at most one reading per window either way.
+        closing = now - self._window_opened >= WINDOW_SECONDS
+        machine: Any = self._machine.busy_permille() if closing else _NOT_READ
 
         late = boundary or wall_ns > LATE_TICK_FACTOR * self.interval * 1e9
         process_cpu = time.process_time_ns()
@@ -881,7 +899,7 @@ class Sampler:
             )
             self._window_cpu_ns += process_delta
             self._window_ticks += 1
-            if self._window_ticks >= WINDOW_TICKS:
+            if closing:
                 self._close_window(window, machine)
             if reading:
                 if rss is not None and (window.rss_peak is None or rss > window.rss_peak):
@@ -952,6 +970,7 @@ class Sampler:
         self._window_cpu_ns = 0
         self._window_ticks = 0
         self._window_stacks = {}
+        self._window_opened = time.monotonic()
 
     def _snapshot_if_climbing(self, window: _Window, rss: int) -> None:
         """A tracemalloc snapshot as a test's memory climbs, throttled.

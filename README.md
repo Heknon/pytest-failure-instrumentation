@@ -1495,6 +1495,15 @@ a hundred — the hundredth that pins a core is invisible in it — and the
 timeline is where that hundredth shows as a step with a start, a length and a
 height.
 
+A tenth of a second of *wall time*, and a window never spans less than one
+sample — so where the sampler cannot tick that often, because the machine is
+loaded or the platform's per-thread read is expensive, the timeline is as fine
+as the sample rate allows and no coarser. It used to be five samples, which is
+a tenth of a second only while the sampler is getting the CPU it asked for: at
+ticks 150 ms apart a burst of 0.6 s became one window, one window is below the
+two a burst needs, and the finding was not raised at all rather than raised
+less precisely.
+
 ### What it raises
 
 Three kinds, all `severity=informational` whoever owns them, because nothing

@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+from pytest_failure_instrumentation.profile import analysis as burst_analysis
 from pytest_failure_instrumentation.profile import sampler as sampling
 from pytest_failure_instrumentation.profile.analysis import FrameRef, _without_the_instrumentation
 from pytest_failure_instrumentation.profile.sampler import Sampler, ThreadClock
@@ -199,6 +200,55 @@ def test_a_tight_loop_gets_its_line_even_where_the_frame_reports_none() -> None:
     first = hot.__code__.co_firstlineno
     body = len(textwrap.dedent(inspect.getsource(hot)).splitlines())
     assert all(first < line <= first + body for line in lines), lines
+
+
+def test_a_timeline_window_is_a_tenth_of_a_second_however_slowly_it_ticks() -> None:
+    """The timeline is what a burst is read from, and the README calls it a
+    tenth of a second. It was five ticks, which is a tenth of a second only
+    while the sampler is getting the CPU it asked for.
+
+    Where it is not - a loaded machine, or a platform whose per-thread read
+    is expensive - the window stretched in proportion and took the timeline's
+    resolution with it, without saying so. At ticks 150 ms apart a burst of
+    0.6 s became one window, one window is under MIN_BURST_WINDOWS, and the
+    finding was not raised at all rather than raised less precisely. Both
+    macOS cells lost all seven of a scenario's bursts that way while a 2.5 s
+    burst in the same runs came through, which is the shape this leaves.
+
+    Driven by hand at each rate, so what is measured is the rule and not this
+    machine's scheduler.
+    """
+    def burn(seconds: float) -> None:
+        clock = getattr(time, "thread_time", time.process_time)
+        deadline = clock() + seconds
+        while clock() < deadline:
+            sum(range(2000))
+
+    for gap in (0.02, 0.08, 0.2):
+        records: list[dict[str, Any]] = []
+        sampler = Sampler(records.append, lambda: 1, interval=0.02, worker="x")
+        sampler.begin_phase("t::a", "setup")
+        deadline = time.monotonic() + 0.6
+        while time.monotonic() < deadline:
+            burn(gap * 0.9)
+            sampler._sample()
+        sampler.end_phase("setup")
+        sampler.end_test("t::a")
+
+        (record,) = [entry for entry in records if entry["record"] == "test"]
+        timeline = record["timeline"]
+        # A window per tick is the floor - the sample rate sets it and no
+        # window can be shorter - so a gap over the window length gives one
+        # window per tick and nothing smaller. Under it, a tenth of a second.
+        assert len(timeline) >= 3, (gap, timeline)
+        longest = max(
+            after[0] - before[0] for before, after in zip(timeline, timeline[1:])
+        ) if len(timeline) > 1 else timeline[0][0]
+        assert longest <= max(gap, sampling.WINDOW_SECONDS) * 1000 * 2.5, (gap, longest)
+        # And the burst survives the rate, which is the point of all of it.
+        bursts = burst_analysis._bursts(record, burst_analysis.Thresholds(burst_cores=0.5))
+        assert len(bursts) == 1, (gap, len(timeline), bursts)
+
 
 
 def test_a_tick_keeps_nothing_it_read_once_it_is_over() -> None:

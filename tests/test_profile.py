@@ -394,7 +394,15 @@ class TestMemory:
         assert incident.peak_mb >= incident.before_mb + 100
 
     def test_a_climb_over_the_ceiling_is_blamed_on_the_code_that_climbed(self, runner: Runner) -> None:
-        runner.pytester.makeini(PROFILE_INI + "failure_profile_peak_mb = 300\n")
+        # The ceiling is this test's to choose, so it is set under what the
+        # weakest platform measures rather than the scenario grown until it
+        # clears a number picked on Linux. `load_everything` builds a big
+        # bytes object, decodes it and splits it, and how much of that is
+        # resident at once is the interpreter's business: 1450 MB here, 279 MB
+        # on the Windows 3.9 cell, which sat under a 300 MB ceiling and got
+        # TRANSIENT_PEAK instead. What the test is about - a climb over the
+        # ceiling, blamed on the code that climbed - is the same at 150.
+        runner.pytester.makeini(PROFILE_INI + "failure_profile_peak_mb = 150\n")
         (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE + LOADER_MODULE, encoding="utf-8")
         runner.pytester.makepyfile(
             test_loading="""
@@ -410,7 +418,7 @@ class TestMemory:
         assert len(ceiling) == 1
         (incident,) = ceiling
         assert incident.nodeid == "test_loading.py::test_loads_the_export"
-        assert incident.peak_mb >= 300
+        assert incident.peak_mb >= 150
         # It climbed to get there rather than starting high. Whether the pages
         # come back to the OS afterwards is the allocator's business and the
         # platform's - see the live-heap row of the platform table - so what is
