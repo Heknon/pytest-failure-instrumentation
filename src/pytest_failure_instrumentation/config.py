@@ -652,7 +652,7 @@ def add_options(parser: pytest.Parser) -> None:
         help="Sample every thread's stack and CPU for the whole run and raise "
         "the functions that burnt the CPU and the tests that kept the memory "
         "as cpu_hotspot and memory_profile incidents. Off by default; "
-        "--profile switches it on for one run.",
+        "--failure-profile switches it on for one run.",
         default="false",
     )
     parser.addini(
@@ -682,8 +682,8 @@ def add_options(parser: pytest.Parser) -> None:
         help="Trace allocations with tracemalloc while profiling, so a memory "
         "finding names the lines holding the memory and a memory flame graph "
         "is written. Several times slower on allocation-heavy code; for a "
-        "rerun of the tests an untraced run named. --profile-allocations "
-        "does the same for one run.",
+        "rerun of the tests an untraced run named. Implies failure_profile. "
+        "--failure-profile-allocations does the same for one run.",
         default="false",
     )
     parser.addini(
@@ -753,7 +753,7 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         "every run ask.",
     )
     group.addoption(
-        "--profile",
+        "--failure-profile",
         action="store_true",
         default=False,
         dest=PROFILE_OPTION,
@@ -764,15 +764,15 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         "the same for every run.",
     )
     group.addoption(
-        "--profile-allocations",
+        "--failure-profile-allocations",
         action="store_true",
         default=False,
         dest=PROFILE_ALLOCATIONS_OPTION,
         help="Profile this run with allocation tracing as well: every memory "
         "finding names the lines holding the memory, and a memory flame graph "
         "is written beside the CPU one. Several times slower on "
-        "allocation-heavy code, so for a rerun of the tests a plain --profile "
-        "named. Implies --profile.",
+        "allocation-heavy code, so for a rerun of the tests a plain --failure-profile "
+        "named. Implies --failure-profile.",
     )
     group.addoption(
         "--callstack-port",
@@ -806,9 +806,9 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
 
 #: The ``dest`` of ``--failure-instrumentation``: what ``getoption`` is asked for.
 ENABLE_OPTION = "failure_instrumentation"
-#: The ``dest`` of ``--profile``.
+#: The ``dest`` of ``--failure-profile``.
 PROFILE_OPTION = "failure_profile_this_run"
-#: The ``dest`` of ``--profile-allocations``.
+#: The ``dest`` of ``--failure-profile-allocations``.
 PROFILE_ALLOCATIONS_OPTION = "failure_profile_allocations_this_run"
 #: Faster than this and the sampler is most of what it measures.
 MIN_PROFILE_INTERVAL = 0.002
@@ -1042,7 +1042,10 @@ def resolve(config: pytest.Config) -> Settings:
         stack_server_token=chosen_token or "",
         worker_count=worker_count,
         run_id=run_id,
+        # Asking for allocation tracing is asking for the profile it traces
+        # under, from the ini as from the command line.
         profile=_flag(config, "failure_profile", False)
+        or _flag(config, "failure_profile_allocations", False)
         or bool(_option(config, PROFILE_OPTION))
         or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
         profile_interval=_number(config, "failure_profile_interval", 0.02),

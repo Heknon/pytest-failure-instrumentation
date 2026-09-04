@@ -28,6 +28,7 @@ and for memory:
 
 ======================= =====================================================
 ``RETAINED_AFTER_TEST`` the worker was left holding more than it started with
+``HEAP_NOT_RETURNED``   left holding more, none of it in use: pages the allocator kept
 ``TRANSIENT_PEAK``      a test climbed and came back down
 ``STEADY_GROWTH``       a run of tests each left a little behind
 ``WORKER_IMBALANCE``    one worker holds far more than its siblings
@@ -123,6 +124,9 @@ class FunctionCost:
     wall_ns: int = 0
     samples: int = 0
     tests: Counter = field(default_factory=Counter)
+    #: CPU charged with no test in flight - collection, the gaps between
+    #: tests - which is nobody's test and is not counted as one.
+    gap_cpu_ns: int = 0
     lines: Counter = field(default_factory=Counter)
     #: (file, owner) -> cpu, for what this function's cost is *under*.
     below: Counter = field(default_factory=Counter)
@@ -219,13 +223,19 @@ class Report:
 # -- reading records ------------------------------------------------------------
 
 
-def _frame(entry: str, attributor: Attributor) -> FrameRef:
+def _parse_frame(entry: str) -> tuple[str, int, str]:
+    """``file|line|function`` as the sampler writes it, back into its parts."""
     file, _, rest = entry.partition("|")
     line, _, function = rest.partition("|")
     try:
         number = int(line)
     except ValueError:
         number = 0
+    return file, number, function
+
+
+def _frame(entry: str, attributor: Attributor) -> FrameRef:
+    file, number, function = _parse_frame(entry)
     return FrameRef(file, number, _enclosing(function) or "?", attributor.owner_of(file))
 
 
@@ -255,12 +265,20 @@ def _without_the_instrumentation(frames: list[FrameRef]) -> list[FrameRef]:
     return frames[index:]
 
 
-def _blame_index(frames: list[FrameRef]) -> int:
+def _owned_index(frames: list[FrameRef]) -> Optional[int]:
+    """The first frame that belongs to somebody - product or customer code
+    first, a dependency failing that - or None when the whole stack is the
+    runtime's."""
     for owners in (OWNED, ("third-party",)):
         for index, frame in enumerate(frames):
             if frame.owner in owners:
                 return index
-    return 0
+    return None
+
+
+def _blame_index(frames: list[FrameRef]) -> int:
+    index = _owned_index(frames)
+    return 0 if index is None else index
 
 
 def _faulthandler_lines(frames: list[FrameRef]) -> list[str]:
@@ -320,7 +338,7 @@ def analyse(
             native_by_name[str(thread.get("name"))] += int(thread.get("cpu_ns") or 0)
 
         table = [_frame(entry, attributor) for entry in record.get("frames") or []]
-        nodeid = record.get("nodeid") or f"({BACKGROUND_RECORD} on {worker or 'this process'})"
+        nodeid = record.get("nodeid")
         for stack in record.get("stacks") or []:
             cpu_ns = int(stack.get("cpu_ns") or 0)
             if cpu_ns <= 0:
@@ -343,7 +361,10 @@ def analyse(
             cost.cpu_ns += cpu_ns
             cost.wall_ns += int(stack.get("wall_ns") or 0)
             cost.samples += int(stack.get("samples") or 0)
-            cost.tests[nodeid] += cpu_ns
+            if nodeid:
+                cost.tests[nodeid] += cpu_ns
+            else:
+                cost.gap_cpu_ns += cpu_ns
             cost.threads[str(stack.get("thread"))] += cpu_ns
             if stack.get("background"):
                 cost.background_cpu_ns += cpu_ns
@@ -402,9 +423,11 @@ def _cpu_findings(ranked: list[FunctionCost], total_ns: int, limits: Thresholds)
         below_share = 100.0 - self_share
         thread = cost.threads.most_common(1)[0][0] if cost.threads else None
         below_frame: Optional[FrameRef] = None
+        where = f"across {len(cost.tests)} test(s)"
+        if cost.gap_cpu_ns:
+            where = f"{where} and between tests" if cost.tests else "between tests, with none in flight"
         evidence = [
-            f"{share:g}% of the run's CPU ({seconds:.1f} s) across "
-            f"{len(cost.tests)} test(s), on thread {thread!r}",
+            f"{share:g}% of the run's CPU ({seconds:.1f} s) {where}, on thread {thread!r}",
         ]
         if background >= 50.0:
             verdict = "BACKGROUND_THREAD"
@@ -522,8 +545,13 @@ def _climb(
 
     The growth entries are charged to a frame like CPU stacks are - the first
     that belongs to somebody, walking out from the innermost - and the heaviest
-    wins. Returns the frame, its stack as faulthandler lines, the megabytes
-    charged to it, the megabytes charged in total, and the evidence sentence.
+    wins. Unlike CPU, a climb is never charged to the runtime alone: a
+    reading taken just after a test body returned finds pytest's own frames
+    running, and naming them would send the reader to the wrong place. The
+    stack the thread was in a tick earlier is tried instead, and a climb
+    with nobody's code on either is counted as unplaced. Returns the frame,
+    its stack as faulthandler lines, the megabytes charged to it, the
+    megabytes charged in total, and the evidence sentence.
     """
     table = [_frame(entry, attributor) for entry in record.get("frames") or []]
     charged: dict[tuple[str, str], int] = defaultdict(int)
@@ -534,23 +562,31 @@ def _climb(
         megabytes = int(entry.get("mb") or 0)
         if megabytes <= 0:
             continue
-        try:
-            frames = _without_the_instrumentation([table[index] for index in entry["frames"]])
-        except (IndexError, KeyError, TypeError):
-            continue
+        placed: Optional[tuple[list[FrameRef], int]] = None
+        for indexes in (entry.get("frames"), entry.get("fallback")):
+            if not indexes:
+                continue
+            try:
+                frames = _without_the_instrumentation([table[index] for index in indexes])
+            except (IndexError, TypeError):
+                continue
+            owned_at = _owned_index(frames)
+            if owned_at is not None:
+                placed = (frames, owned_at)
+                break
         total += megabytes
-        if not frames:
+        if placed is None:
             unplaced += megabytes
             continue
-        blamed_at = _blame_index(frames)
+        frames, blamed_at = placed
         blamed = frames[blamed_at]
         key = (blamed.file, blamed.function)
         charged[key] += megabytes
         if key not in heaviest or megabytes > heaviest[key][0]:
             heaviest[key] = (megabytes, frames[blamed_at:])
     too_quick = (
-        f"{unplaced} MB of the {total} MB climb happened between two readings and "
-        "could not be placed under a stack"
+        f"{unplaced} MB of the {total} MB climb happened between two readings, or under "
+        "the runtime alone, and could not be placed under anybody's code"
     )
     if not charged:
         return None, [], 0, total, [too_quick] if unplaced else []
@@ -954,7 +990,7 @@ def _drift(
         evidence.extend(held)
     else:
         evidence.append(
-            "rerun these tests with --profile-allocations to see the lines that hold it"
+            "rerun these tests with --failure-profile-allocations to see the lines that hold it"
         )
     return [
         Finding(
@@ -1483,9 +1519,8 @@ def speedscope(record: dict[str, Any], name: str) -> dict[str, Any]:
     that format."""
     frames = []
     for entry in record.get("frames") or []:
-        file, _, rest = entry.partition("|")
-        line, _, function = rest.partition("|")
-        frames.append({"name": function, "file": file, "line": int(line or 0)})
+        file, line, function = _parse_frame(entry)
+        frames.append({"name": function, "file": file, "line": line})
     by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for stack in record.get("stacks") or []:
         by_thread[str(stack.get("thread"))].append(stack)
@@ -1516,11 +1551,8 @@ def memory_speedscope(record: dict[str, Any], name: str) -> Optional[dict[str, A
         return None
     frames = []
     for entry in record.get("frames") or []:
-        file, _, rest = entry.partition("|")
-        line, _, function = rest.partition("|")
-        frames.append(
-            {"name": function or f"{Path(file).name}:{line}", "file": file, "line": int(line or 0)}
-        )
+        file, line, function = _parse_frame(entry)
+        frames.append({"name": function or f"{Path(file).name}:{line}", "file": file, "line": line})
     # A tracemalloc traceback is oldest frame first, which is the order
     # speedscope wants: the root at the front.
     samples = [list(stack["frames"]) for stack in stacks]

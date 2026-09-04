@@ -124,8 +124,24 @@ class MemoryMonitor:
 
 
 def enable_tracemalloc(depth: int) -> bool:
-    if depth <= 0 or tracemalloc.is_tracing():
+    """Trace allocations with at least ``depth`` frames each.
+
+    A tracer already running with that many is left alone. One running with
+    fewer - the watchdog's, started at ``failure_tracemalloc_depth`` before
+    the profiler asked for its own - is restarted deeper: what it had traced
+    so far is forgotten, and every traceback from here on has the frames
+    that were asked for, rather than the holders' lines coming back one
+    frame deep with nothing to say why.
+    """
+    if depth <= 0:
         return tracemalloc.is_tracing()
+    if tracemalloc.is_tracing():
+        if tracemalloc.get_traceback_limit() >= depth:
+            return True
+        try:
+            tracemalloc.stop()
+        except Exception:
+            return True
     try:
         tracemalloc.start(depth)
         return True

@@ -192,6 +192,35 @@ class TestThreads:
         assert report.native_cpu_s == 8.0
 
 
+class TestBetweenTests:
+    def test_cpu_between_tests_is_not_counted_as_a_test(self) -> None:
+        # A background record has no node id. Its CPU is real and is
+        # charged, but it is nobody's test: not counted as one, not offered
+        # to the engine as the test to attribute the finding to.
+        frames = [frame(PRODUCT, 30, "Poller.run")]
+        gap = record(None, [stack([0], 1.0, thread="status-poller")], frames)
+        test = record("t::a", [stack([0], 4.0, thread="status-poller", background=True)], frames)
+        report = analyse([gap, test], attributor)
+
+        (finding,) = findings_of(report, "BACKGROUND_THREAD")
+        assert finding.tests == ["t::a"]
+        assert finding.test_count == 1
+        assert not any("background on" in nodeid for nodeid in finding.tests)
+        assert any("across 1 test(s) and between tests" in line for line in finding.evidence)
+        (cost,) = report.functions
+        assert cost.gap_cpu_ns == int(1.0 * 1e9)
+        assert list(cost.tests) == ["t::a"]
+
+    def test_cpu_with_no_test_in_flight_at_all_says_so(self) -> None:
+        frames = [frame(PRODUCT, 30, "Poller.run")]
+        report = analyse([record(None, [stack([0], 4.0, thread="status-poller")], frames)], attributor)
+
+        (finding,) = findings_of(report, "PYTHON_CODE")
+        assert finding.tests == []
+        assert finding.test_count == 0
+        assert any("between tests, with none in flight" in line for line in finding.evidence)
+
+
 class TestGarbageCollection:
     def test_the_collectors_share_is_a_finding_naming_the_tests(self) -> None:
         frames = [frame(TEST, 5, "test_x")]
@@ -289,6 +318,37 @@ class TestPeak:
             "(product), called from test_screens.py:30 in test_export"
         )
         assert any(expected in line for line in finding.evidence)
+
+    def test_a_climb_seen_under_the_runtime_alone_is_unplaced_rather_than_blamed_on_it(self) -> None:
+        # The reading landed after the body returned, with pytest's own
+        # frames on the stack. Naming them would send the reader to the
+        # wrong place, so the climb is unplaced and the suspect owner stands.
+        frames = [frame(RUNTIME, 167, "pytest_pyfunc_call"), frame(RUNTIME, 595, "FDCapture.snap")]
+        growth = [{"thread": "MainThread", "frames": [1, 0], "mb": 300}]
+        report = analyse([record("t::a", [], frames, rss=(100, 420, 110), growth=growth)], attributor)
+
+        (finding,) = findings_of(report, "TRANSIENT_PEAK")
+        assert finding.frame is None
+        assert finding.stack == []
+        assert finding.climb_mb == 0
+        assert finding.climb_total_mb == 300
+        assert any("300 MB of the 300 MB climb" in line and "anybody's code" in line for line in finding.evidence)
+
+    def test_a_climb_under_the_runtime_falls_back_to_the_stack_a_tick_earlier(self) -> None:
+        frames = [
+            frame(RUNTIME, 595, "FDCapture.snap"),
+            frame(PRODUCT, 9, "remember"),
+            frame(TEST, 22, "test_keeps_results"),
+        ]
+        growth = [{"thread": "MainThread", "frames": [0], "fallback": [1, 2], "mb": 300}]
+        report = analyse([record("t::a", [], frames, rss=(100, 420, 110), growth=growth)], attributor)
+
+        (finding,) = findings_of(report, "TRANSIENT_PEAK")
+        assert finding.frame is not None
+        assert finding.frame.function == "remember"
+        assert finding.frame.owner == "product"
+        assert finding.climb_mb == 300
+        assert finding.stack[0].startswith(f'  File "{PRODUCT}", line 9')
 
     def test_the_ceiling_is_a_finding_whatever_the_test_started_from(self) -> None:
         report = analyse(
@@ -658,7 +718,7 @@ class TestDrift:
         assert finding.delta_mb == 150
         assert finding.growth_objects_per_test == 300
         assert any(line.startswith("most of it in: t::cached (120 MB over 6 tests), t::noisy (30 MB over 3 tests)") for line in finding.evidence)
-        assert any("--profile-allocations" in line for line in finding.evidence)
+        assert any("--failure-profile-allocations" in line for line in finding.evidence)
 
     def test_drift_with_tracing_on_names_the_lines_holding_it(self) -> None:
         frames = [frame(TEST, 30, ""), frame(PRODUCT, 9, ""), frame(LIBRARY, 5, "")]
@@ -678,7 +738,7 @@ class TestDrift:
         assert finding.frame is not None
         assert finding.frame.file == PRODUCT and finding.frame.owner == "product"
         assert finding.stack[0] == f'  File "{PRODUCT}", line 9 in ?'
-        assert not any("--profile-allocations" in line for line in finding.evidence)
+        assert not any("--failure-profile-allocations" in line for line in finding.evidence)
 
 
 class TestAllocationTracing:

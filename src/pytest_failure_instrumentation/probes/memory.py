@@ -128,13 +128,38 @@ def heap_in_use_megabytes() -> tuple[int | None, str]:
     return round((info.uordblks + info.hblkhd) / 1048576), "mallinfo2"
 
 
+#: The libc handle once ``mallinfo2`` has been found in it, and False once it
+#: has been looked for and is not there. The negative answer is kept because
+#: looking is not free: ``find_library`` spawns a subprocess, and this is
+#: read twenty-five times a second from the profiler's sampling thread. On a
+#: glibc before 2.33, or on musl, every call used to pay that.
 _libc: Any = None
 
 
 def _mallinfo2() -> Any:
     global _libc
+    if _libc is None:
+        _libc = _load_mallinfo2() or False
+    if _libc is False:
+        return None
+    return _libc.mallinfo2()
+
+
+def _load_mallinfo2() -> Any:
     import ctypes
     import ctypes.util
+
+    name = ctypes.util.find_library("c")
+    if not name:
+        return None
+    # PyDLL, not CDLL: a CDLL call releases the GIL around the call, and
+    # this is read from the profiler's sampling thread beside a busy test
+    # thread, where every release costs a whole switch interval to get
+    # the GIL back. mallinfo2 walks the allocator's own bookkeeping and
+    # blocks on nothing, so it is safe to call holding it.
+    library = ctypes.PyDLL(name)
+    if not hasattr(library, "mallinfo2"):
+        return None
 
     class MallInfo2(ctypes.Structure):
         _fields_ = [
@@ -145,22 +170,9 @@ def _mallinfo2() -> Any:
             )
         ]
 
-    if _libc is None:
-        name = ctypes.util.find_library("c")
-        if not name:
-            return None
-        # PyDLL, not CDLL: a CDLL call releases the GIL around the call, and
-        # this is read from the profiler's sampling thread beside a busy test
-        # thread, where every release costs a whole switch interval to get
-        # the GIL back. mallinfo2 walks the allocator's own bookkeeping and
-        # blocks on nothing, so it is safe to call holding it.
-        library = ctypes.PyDLL(name)
-        if not hasattr(library, "mallinfo2"):
-            return None
-        library.mallinfo2.restype = MallInfo2
-        library.mallinfo2.argtypes = ()
-        _libc = library
-    return _libc.mallinfo2()
+    library.mallinfo2.restype = MallInfo2
+    library.mallinfo2.argtypes = ()
+    return library
 
 
 def system_available_megabytes() -> tuple[int | None, str]:

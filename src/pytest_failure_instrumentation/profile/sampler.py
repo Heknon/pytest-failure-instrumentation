@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import tracemalloc
+import weakref
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -369,9 +370,12 @@ class _Window:
         )
         #: Threads with a CPU counter and no Python frames: tid -> [name, cpu_ns]
         self.native: dict[int, list[Any]] = {}
-        #: (thread name, stack) -> megabytes resident memory climbed while
-        #: that stack was running. The memory profile's answer to "who".
-        self.growth: dict[tuple[str, StackKey], int] = defaultdict(int)
+        #: (thread name, stack, stack a tick earlier) -> megabytes resident
+        #: memory climbed while that stack was running. The memory profile's
+        #: answer to "who". The earlier stack is there for the analysis to
+        #: fall back on: a climb read just after a test body returned lands
+        #: on pytest's own frames, and the tick before it is the body.
+        self.growth: dict[tuple[str, StackKey, StackKey], int] = defaultdict(int)
         self.gc_seconds = 0.0
         self.gc_collections = [0, 0, 0]
         self.phase_cpu: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
@@ -433,8 +437,11 @@ class Sampler:
         #: of the ones Python has no thread object for.
         self._all_tids: list[int] = []
         self._native_names: dict[int, str] = {}
-        #: The stack each thread was in at the previous tick - see LATE_TICK_FACTOR.
-        self._previous: dict[int, tuple[str, StackKey]] = {}
+        #: The stack each thread was last seen busy in, stamped with the tick
+        #: it was seen on - see LATE_TICK_FACTOR. The stamp is what keeps a
+        #: thread that idled for a minute from having its next work charged
+        #: to whatever it was doing a minute ago.
+        self._previous: dict[int, tuple[int, str, StackKey]] = {}
         #: When the background window was set aside for a test, so the time
         #: the test took is not also counted as the background's.
         self._paused: Optional[tuple[float, float]] = None
@@ -448,6 +455,7 @@ class Sampler:
         self._window = _Window(None, self._rss())
         self._background = self._window
         self._gc_started = 0.0
+        self._stopped = False
         self.samples_taken = 0
         self.session_started = time.monotonic()
         self.session_cpu_started = time.process_time()
@@ -465,8 +473,12 @@ class Sampler:
         self._thread.start()
 
     def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         self._stop.set()
-        self._thread.join(timeout=2.0)
+        if self._thread.ident is not None:  # started; a half-built worker's may not be
+            self._thread.join(timeout=2.0)
         try:
             gc.callbacks.remove(self._on_gc)
         except ValueError:
@@ -477,6 +489,12 @@ class Sampler:
                 self._flush(self._window, TEST_RECORD)
             self._background.holders_session = self._session_holders()
             self._flush(self._background, BACKGROUND_RECORD)
+
+    def close(self) -> None:
+        """What the recorder's resource list calls when a worker's setup
+        fails part-way: the sampling thread and the collector callback must
+        not outlive the plugin that started them."""
+        self.stop()
 
     def _session_holders(self) -> list[tuple[float, Any]]:
         """What tracemalloc sees holding memory now that it did not before the
@@ -548,7 +566,7 @@ class Sampler:
         if heap is not None and self._last_heap is not None:
             climb = max(climb, heap - self._last_heap)
         if climb > 0:
-            window.growth[("", ())] += climb
+            window.growth[("", (), ())] += climb
         if rss is not None:
             self._last_rss = rss
         if heap is not None:
@@ -628,6 +646,9 @@ class Sampler:
             # The sampler's own thread is nobody's cost: not a stack, and
             # not a native thread either.
             seen_tids.add(self._threads.get(self._own_ident or 0, (0, ""))[0])
+            #: What each busy thread was in before this tick overwrote it,
+            #: for the memory charge below.
+            prior: dict[int, Optional[tuple[int, str, StackKey]]] = {}
             for ident, frame in frames.items():
                 if ident == self._own_ident:
                     continue
@@ -646,10 +667,10 @@ class Sampler:
                 stack = _stack_of(frame)
                 if not stack:
                     continue
-                previous = self._previous.get(ident)
-                self._previous[ident] = (name, stack)
-                if late and previous is not None:
-                    name, stack = previous
+                previous = prior[ident] = self._previous.get(ident)
+                self._previous[ident] = (self._ticks, name, stack)
+                if late and previous is not None and previous[0] == self._ticks - 1:
+                    _, name, stack = previous
                 background = window.test_thread is not None and ident != window.test_thread
                 entry = window.stacks[(phase, name, background, stack)]
                 entry[0] += cpu_ns
@@ -702,7 +723,18 @@ class Sampler:
                         stack = _stack_of(frames[culprit])
                         if stack:
                             _, name = self._threads.get(culprit, (0, f"thread {culprit}"))
-                            window.growth[(name, stack)] += climb
+                            # The climb happened since the last reading, and
+                            # the stack now is the end of that span. A test
+                            # body that allocated and returned within it has
+                            # pytest's frames on the stack now and its own a
+                            # tick earlier, so the earlier stack goes with the
+                            # charge, for the analysis to prefer when the
+                            # current one is nobody's code.
+                            earlier = prior[culprit] if culprit in prior else self._previous.get(culprit)
+                            fallback: StackKey = ()
+                            if earlier is not None and earlier[0] >= self._ticks - RSS_EVERY and earlier[2] != stack:
+                                fallback = earlier[2]
+                            window.growth[(name, stack, fallback)] += climb
                 if rss is not None:
                     self._last_rss = rss
 
@@ -819,16 +851,19 @@ class Sampler:
                 index = frames[key] = len(frames)
             return index
 
+        def indexes_of(stack: StackKey) -> list[int]:
+            return [
+                index_of(code.co_filename, line or _line_of(code, offset), getattr(code, "co_qualname", code.co_name))
+                for code, line, offset in stack
+            ]
+
         timeline = []
         for offset_ms, cpu_ns, machine, phase, top in window.windows:
             indexes = None
             thread = None
             if top is not None:
                 thread, stack = top
-                indexes = [
-                    index_of(code.co_filename, line or _line_of(code, offset), getattr(code, "co_qualname", code.co_name))
-                    for code, line, offset in stack
-                ]
+                indexes = indexes_of(stack)
             timeline.append([offset_ms, cpu_ns, machine, phase, thread, indexes])
 
         allocations = self._allocation_report(window, kind, index_of)
@@ -842,38 +877,23 @@ class Sampler:
             ]
         stacks = []
         for (phase, thread, background, stack), (cpu_ns, wall_ns, samples) in window.stacks.items():
-            indexes = []
-            for code, line, offset in stack:
-                if not line:
-                    line = _line_of(code, offset)
-                key = (code.co_filename, line, getattr(code, "co_qualname", code.co_name))
-                index = frames.get(key)
-                if index is None:
-                    index = frames[key] = len(frames)
-                indexes.append(index)
             stacks.append(
                 {
                     "phase": phase,
                     "thread": thread,
                     "background": background,
-                    "frames": indexes,
+                    "frames": indexes_of(stack),
                     "cpu_ns": cpu_ns,
                     "wall_ns": wall_ns,
                     "samples": samples,
                 }
             )
         growth = []
-        for (thread, stack), megabytes in window.growth.items():
-            indexes = []
-            for code, line, offset in stack:
-                if not line:
-                    line = _line_of(code, offset)
-                key = (code.co_filename, line, getattr(code, "co_qualname", code.co_name))
-                index = frames.get(key)
-                if index is None:
-                    index = frames[key] = len(frames)
-                indexes.append(index)
-            growth.append({"thread": thread, "frames": indexes, "mb": megabytes})
+        for (thread, stack, fallback), megabytes in window.growth.items():
+            entry: dict[str, Any] = {"thread": thread, "frames": indexes_of(stack), "mb": megabytes}
+            if fallback:
+                entry["fallback"] = indexes_of(fallback)
+            growth.append(entry)
         record = {
             "record": kind,
             "worker": self.worker,
@@ -1076,7 +1096,10 @@ def _stack_of(frame: Any) -> StackKey:
 
 
 #: Per code object, the (start offset, line) table its lines resolve from.
-_line_tables: dict[Any, list[tuple[int, int]]] = {}
+#: Weakly keyed: a suite that builds code objects as it runs would otherwise
+#: pin every one of them for the life of the process, and the profiler is
+#: the thing meant to report memory that drifts up.
+_line_tables: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _line_of(code: Any, offset: int) -> int:

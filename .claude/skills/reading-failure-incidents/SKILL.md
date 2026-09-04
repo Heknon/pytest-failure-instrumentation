@@ -276,7 +276,7 @@ always means a stranger or a bad address, never a colleague.
 
 ### `cpu_hotspot` — a function that burnt a share of the run's CPU
 
-Raised only when profiling is on (`--profile` or `failure_profile`), and a
+Raised only when profiling is on (`--failure-profile` or `failure_profile`), and a
 finding rather than a failure: nothing broke, and it is `severity=informational`
 whoever owns it. `owner` is still worth reading — it says whether the function
 is yours to fix, a dependency's, or the customer's own test code.
@@ -368,7 +368,7 @@ one; see below.
   and no single step half of the total. Two megabytes a test is what a leak
   looks like from outside, and the one thing a per-test check never sees;
   `nodeid` is only the first of them. The evidence says when every one is a
-  parametrisation of the same test, and — with `--profile-allocations` —
+  parametrisation of the same test, and — with `--failure-profile-allocations` —
   which lines held what the worker accumulated; without it, it says to rerun
   with that flag.
 - `WORKER_IMBALANCE`: `worker` peaked at `peak_mb` against a median of
@@ -389,7 +389,7 @@ climb was seen — a step too fast for the sampler's tenth-of-a-second reading,
 or a worker with no stack to read — there is no frame and `suspect_owner` is
 the owner of the test's module instead.
 
-With `--profile-allocations` the evidence also carries what tracemalloc saw:
+With `--failure-profile-allocations` the evidence also carries what tracemalloc saw:
 "at the peak: 57.2 MB allocated at loader.py:12 <- reports.py:40" (allocation
 site first) and "still held afterwards: …" for what the test kept. These name
 the *holder* where the sampled stack names the *runner*, and they differ
@@ -416,7 +416,7 @@ The incident usually settles it, and saying so is most of the value.
 | `stack_server_unavailable` | the run finished normally and nobody could watch it live | reconfigure rather than retry — the same port will be taken again. Nothing about the tests is in question, so it argues for a settings change and never for a rerun |
 | `cpu_hotspot` | the run finished; this is where its CPU went | a look, not a rerun. Route by `owner`; a `BACKGROUND_THREAD` or `NATIVE_THREADS` verdict is the answer to a worker sitting at a steady percentage with nothing to blame |
 | `cpu_burst` | the run finished; this is where its CPU went *in time* | `RECURRING_BURST` in `setup` is the fixture to make session-scoped or cache; `LONG_BURST` is one test's step to open; `BACKGROUND_BURST` is the thread to find; `CONTENDED` argues for fewer workers, not for touching any test |
-| `memory_profile` | the run finished; this is what a test did to the worker's memory | `STEADY_GROWTH` and `RETAINED_AFTER_TEST` in `call` are worth a leak hunt, and `--profile-allocations` on the same tests is the next run; `HEAP_NOT_RETURNED` and `TRANSIENT_PEAK` are sizing questions, not code defects; `WORKER_IMBALANCE` argues for isolating the heavy module |
+| `memory_profile` | the run finished; this is what a test did to the worker's memory | `STEADY_GROWTH` and `RETAINED_AFTER_TEST` in `call` are worth a leak hunt, and `--failure-profile-allocations` on the same tests is the next run; `HEAP_NOT_RETURNED` and `TRANSIENT_PEAK` are sizing questions, not code defects; `WORKER_IMBALANCE` argues for isolating the heavy module |
 
 `run_ending` is the field to automate on. An incident raised at detection can
 beat a CI timeout by the better part of an hour, and that lead time is only

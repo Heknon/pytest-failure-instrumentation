@@ -30,7 +30,7 @@ hooks are, so none of them can collide with anyone else's.
 ``memory_profile``        ``incidents.profile.MemoryProfileIncident``           profiling on
 ========================= ==================================================== =============
 
-The last three are findings rather than failures. With ``--profile`` or
+The last three are findings rather than failures. With ``--failure-profile`` or
 ``failure_profile`` on, the process running the tests samples every thread's
 stack and CPU for the whole run, and at the end the functions that burnt the
 CPU, the stretches where a core was held, and the tests that kept the memory

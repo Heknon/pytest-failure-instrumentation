@@ -32,6 +32,7 @@ instrumentation had done more damage than the failure it came to explain.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -440,7 +441,9 @@ class IncidentEngine:
 
     # -- raising ---------------------------------------------------------
 
-    def raise_incident(self, incident: Incident) -> None:
+    def raise_incident(self, incident: Incident) -> bool:
+        """Enrich, dedupe and deliver. True when the hook was handed it;
+        False when it was suppressed as a recurrence, or the run had closed."""
         try:
             self._enrich(incident)
         except Exception as failure:  # noqa: BLE001 - a partial incident beats none
@@ -450,7 +453,7 @@ class IncidentEngine:
         # the dedupe table are shared state.
         with self.lock:
             if self.closed:
-                return
+                return False
             count = self.seen.get(incident.fingerprint, 0) + 1
             self.seen[incident.fingerprint] = count
             if count == 1:
@@ -459,11 +462,12 @@ class IncidentEngine:
             else:
                 self.suppressed += 1
         if count > 1:
-            return
+            return False
         try:
             self.config.hook.pytest_failure_incident(incident=incident)
         except Exception as failure:  # noqa: BLE001
             print(f"[failure-instrumentation] incident hook raised: {failure!r}", flush=True)
+        return True
 
     def _enrich(self, incident: Incident) -> None:
         """Everything that is the same whatever kind this is."""
@@ -1089,10 +1093,12 @@ class IncidentEngine:
         worker = "controller" if self.distributed else SOLE_WORKER
         for finding in report.findings:
             incident = profile_incident.build(finding, worker)
-            self.raise_incident(incident)
             # Enriched in place by raise_incident, so the terminal prints the
-            # owner and severity the hook was handed.
-            self.profile_incidents.append(incident)
+            # owner and severity the hook was handed - and only what the hook
+            # was handed: two parametrisations with one fingerprint are one
+            # finding to the hook and the run summary, so one here too.
+            if self.raise_incident(incident):
+                self.profile_incidents.append(incident)
 
         # A flame graph for every test a finding names, and for the gaps
         # between tests, so the flag comes with the picture behind it. With
@@ -1113,7 +1119,11 @@ class IncidentEngine:
         folder.mkdir(exist_ok=True)
         for record in wanted:
             nodeid = record.get("nodeid") or f"background-{record.get('worker') or 'main'}"
-            name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(nodeid))[:120]
+            # Readable, and unique: sanitising alone maps test_x[a/b] and
+            # test_x[a_b] to one name, and the second would overwrite the
+            # first. A hash of the full name and the worker tells them apart.
+            digest = hashlib.sha1(f"{record.get('worker')}|{nodeid}".encode()).hexdigest()[:8]
+            name = f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', str(nodeid))[:110]}-{digest}"
             documents = {
                 f"{name}.speedscope.json": analysis.speedscope(record, str(nodeid)),
                 f"{name}.memory.speedscope.json": analysis.memory_speedscope(record, str(nodeid)),
@@ -1173,9 +1183,12 @@ class IncidentEngine:
             for cost in report.functions[:8]:
                 seconds = cost.cpu_ns / 1e9
                 share = 100.0 * seconds / total if total else 0.0
+                where = f"in {len(cost.tests)} test(s)"
+                if cost.gap_cpu_ns:
+                    where = f"{where} and between tests" if cost.tests else "between tests"
                 write(
                     f"  {share:5.1f}%  {seconds:7.2f} s  {Path(cost.file).name}:{cost.function}"
-                    f"  [{cost.owner}]  in {len(cost.tests)} test(s)"
+                    f"  [{cost.owner}]  {where}"
                 )
         findings = list(self.profile_incidents)
         if not findings:

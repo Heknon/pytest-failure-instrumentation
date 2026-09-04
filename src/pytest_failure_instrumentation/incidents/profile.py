@@ -270,7 +270,7 @@ def build(finding: Finding, worker: str) -> Incident:
                 file=finding.below.file,
                 line=finding.below.line,
                 function=finding.below.function,
-                module=finding.below.file.rsplit("/", 1)[-1].rsplit(".", 1)[0],
+                module=Path(finding.below.file).stem,
                 owner=finding.below.owner,
             )
             if finding.below is not None

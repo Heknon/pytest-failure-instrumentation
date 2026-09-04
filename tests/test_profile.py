@@ -1,7 +1,7 @@
 """The profiler against real runs.
 
 Each scenario is a suite written the way the problem is usually written the
-first time, run under ``--profile`` in a subprocess through the shared runner,
+first time, run under ``--failure-profile`` in a subprocess through the shared runner,
 and read back as the incidents it raised. The thresholds are lowered so that
 a scenario can prove its point in a second or two rather than a minute.
 """
@@ -9,6 +9,7 @@ a scenario can prove its point in a second or two rather than a minute.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -76,7 +77,7 @@ def load_everything(records):
 def profiled(runner: Runner, *arguments: str, timeout: float = 120.0) -> list[Any]:
     runner.pytester.makeini(PROFILE_INI)
     (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE, encoding="utf-8")
-    return runner.run("--profile", "-p", "no:cacheprovider", *arguments, timeout=timeout)
+    return runner.run("--failure-profile", "-p", "no:cacheprovider", *arguments, timeout=timeout)
 
 
 def hotspots(incidents: list[Any]) -> list[Any]:
@@ -208,9 +209,9 @@ class TestCpu:
         runner.pytester.makeini(PROFILE_INI)
         (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE, encoding="utf-8")
 
-        # Deliberately without --failure-instrumentation: --profile is a request
+        # Deliberately without --failure-instrumentation: --failure-profile is a request
         # for the plugin that takes the profile, like --callstack-port.
-        result = runner.pytester.runpytest_subprocess("--profile", "-p", "no:cacheprovider")
+        result = runner.pytester.runpytest_subprocess("--failure-profile", "-p", "no:cacheprovider")
 
         result.stdout.fnmatch_lines(["*failure-instrumentation profile*", "*no findings*"])
         assert Runner.of_kind(runner.incidents(), "run_summary")
@@ -290,7 +291,7 @@ class TestMemory:
                 assert load_everything(450_000) == 18_000_000
             """
         )
-        incidents = runner.run("--profile", "-p", "no:cacheprovider", timeout=120.0)
+        incidents = runner.run("--failure-profile", "-p", "no:cacheprovider", timeout=120.0)
 
         ceiling = [incident for incident in memory(incidents) if incident.verdict == "PEAK_OVER_CEILING"]
         assert len(ceiling) == 1
@@ -406,11 +407,13 @@ class TestArtifacts:
 
         named(incidents, "compare_pixels")
         profiles = sorted(path.name for path in (runner.pytester.path / ".pytest-failures").glob("run-*/profiles/*"))
-        assert "test_screens.py_test_hot.speedscope.json" in profiles
-        assert "background-main.speedscope.json" in profiles
+        # Named for the test, with a hash of the full node id so that two
+        # names that sanitise alike cannot overwrite each other.
+        assert any(re.fullmatch(r"test_screens\.py_test_hot-[0-9a-f]{8}\.speedscope\.json", name) for name in profiles)
+        assert any(re.fullmatch(r"background-main-[0-9a-f]{8}\.speedscope\.json", name) for name in profiles)
         assert not any("test_cold" in name for name in profiles)
         document = json.loads(
-            next((runner.pytester.path / ".pytest-failures").glob("run-*/profiles/test_screens.py_test_hot.speedscope.json")).read_text()
+            next((runner.pytester.path / ".pytest-failures").glob("run-*/profiles/test_screens.py_test_hot-*.speedscope.json")).read_text()
         )
         main = next(profile for profile in document["profiles"] if profile["name"].startswith("MainThread"))
         assert main["unit"] == "nanoseconds"
@@ -492,7 +495,7 @@ class TestBursts:
                 time.sleep(0.5)
             """
         )
-        incidents = runner.run("--profile", "-p", "no:cacheprovider", timeout=120.0)
+        incidents = runner.run("--failure-profile", "-p", "no:cacheprovider", timeout=120.0)
 
         long = [incident for incident in bursts(incidents) if incident.verdict == "LONG_BURST"]
         assert len(long) == 1, [str(incident) for incident in incidents]
@@ -525,7 +528,7 @@ class TestBursts:
                 time.sleep(0.15)
             """
         )
-        incidents = runner.run("--profile", "-p", "no:cacheprovider", timeout=120.0)
+        incidents = runner.run("--failure-profile", "-p", "no:cacheprovider", timeout=120.0)
 
         found = bursts(incidents)
         assert [incident.verdict for incident in found] == ["RECURRING_BURST"], [str(i) for i in incidents]
@@ -558,8 +561,8 @@ class TestAllocationTracing:
                 KEPT.extend(hold(60))
             """
         )
-        # --profile-allocations implies --profile.
-        incidents = runner.run("--profile-allocations", "-p", "no:cacheprovider", timeout=120.0)
+        # --failure-profile-allocations implies --failure-profile.
+        incidents = runner.run("--failure-profile-allocations", "-p", "no:cacheprovider", timeout=120.0)
 
         by_test = {incident.nodeid: incident for incident in memory(incidents)}
         peak = by_test["test_alloc.py::test_peak"]
@@ -571,10 +574,10 @@ class TestAllocationTracing:
         assert kept.verdict == "RETAINED_AFTER_TEST"
         assert any(line.startswith("still held afterwards:") and "test_alloc.py:6" in line for line in kept.evidence)
         profiles = sorted(path.name for path in (runner.pytester.path / ".pytest-failures").glob("run-*/profiles/*"))
-        assert "test_alloc.py_test_peak.memory.speedscope.json" in profiles
-        assert "test_alloc.py_test_peak.speedscope.json" in profiles
+        assert any(re.fullmatch(r"test_alloc\.py_test_peak-[0-9a-f]{8}\.memory\.speedscope\.json", name) for name in profiles)
+        assert any(re.fullmatch(r"test_alloc\.py_test_peak-[0-9a-f]{8}\.speedscope\.json", name) for name in profiles)
         document = json.loads(
-            next((runner.pytester.path / ".pytest-failures").glob("run-*/profiles/test_alloc.py_test_peak.memory.speedscope.json")).read_text()
+            next((runner.pytester.path / ".pytest-failures").glob("run-*/profiles/test_alloc.py_test_peak-*.memory.speedscope.json")).read_text()
         )
         (profile,) = document["profiles"]
         assert profile["unit"] == "bytes"

@@ -206,13 +206,19 @@ class WorkerRecorder:
             # Before the sampler, and before any test allocates: tracemalloc
             # knows only the allocations made after it started.
             memory_capture.enable_tracemalloc(settings.profile_allocation_depth)
-        self.profiler = Sampler(
-            log.write,
-            lambda: probes.resident_megabytes()[0],
-            interval=settings.profile_interval,
-            worker=worker_id,
-            allocations=settings.profile_allocations,
-            retained_mb=settings.profile_retained_mb,
+        # Tracked after the log, so a setup that fails past this point stops
+        # the sampling thread and unhooks its collector callback before the
+        # log it writes to is closed - rather than leaving both running for
+        # the whole run under a plugin that has said it is off.
+        self.profiler = self._track(
+            Sampler(
+                log.write,
+                lambda: probes.resident_megabytes()[0],
+                interval=settings.profile_interval,
+                worker=worker_id,
+                allocations=settings.profile_allocations,
+                retained_mb=settings.profile_retained_mb,
+            )
         )
         self.profiler.start()
         self.events.record("profiler_started", **self.profiler.describe())

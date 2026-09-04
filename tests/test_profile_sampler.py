@@ -225,3 +225,30 @@ def test_the_samplers_own_frames_are_stripped_whatever_the_separator() -> None:
 
 def test_the_late_tick_factor_is_a_number_of_intervals() -> None:
     assert sampling.LATE_TICK_FACTOR > 1
+
+
+def test_allocation_tracing_deepens_a_tracer_somebody_started_shallower():
+    """The watchdog starts tracemalloc at failure_tracemalloc_depth before the
+    profiler asks for its own depth. Left alone, every holder's traceback and
+    memory flame graph would be one frame deep and say nothing about why."""
+    import tracemalloc
+
+    from pytest_failure_instrumentation.capture.memory import enable_tracemalloc
+
+    was_tracing = tracemalloc.is_tracing()
+    if was_tracing:
+        tracemalloc.stop()
+    try:
+        assert enable_tracemalloc(1)
+        assert tracemalloc.get_traceback_limit() == 1
+        assert enable_tracemalloc(12)
+        assert tracemalloc.get_traceback_limit() == 12
+        # And never shallower: a deeper tracer already running is left as it is.
+        assert enable_tracemalloc(3)
+        assert tracemalloc.get_traceback_limit() == 12
+        assert enable_tracemalloc(0)
+        assert tracemalloc.get_traceback_limit() == 12
+    finally:
+        tracemalloc.stop()
+        if was_tracing:
+            tracemalloc.start()

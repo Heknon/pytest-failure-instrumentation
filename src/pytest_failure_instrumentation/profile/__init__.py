@@ -24,7 +24,7 @@ Two halves, in two processes, the way the rest of the plugin is split:
   finding. Nothing in it reads a clock or a file, so it is tested against
   records built by hand.
 
-Off by default. Nothing here runs until ``--profile`` or ``failure_profile``
+Off by default. Nothing here runs until ``--failure-profile`` or ``failure_profile``
 asks for it, because it is the one thing in this package with a running cost
 on a healthy run - about one percent of a core per worker.
 """

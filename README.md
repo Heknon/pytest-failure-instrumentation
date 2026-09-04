@@ -1396,14 +1396,14 @@ an unelevated one needs `SeDebugPrivilege`.
 
 ## Profiling
 
-Everything above waits for something to go wrong. `--profile` waits for
+Everything above waits for something to go wrong. `--failure-profile` waits for
 nothing: it samples the process running the tests for the whole run and, at
 the end, names the functions that burnt the CPU and the tests that kept the
 memory — as incidents, through the same hook, because "your image comparison
 is 38% of the run" is a finding you want flagged the way a segfault is.
 
 ```console
-pytest --profile
+pytest --failure-profile
 ```
 
 or `failure_profile = true` in ini for every run. Off by default: it is the
@@ -1490,8 +1490,12 @@ the burst, blamed like a hotspot:
 A memory finding about one test also carries **the code that was running
 while the memory climbed**, blamed and attributed the way a crash is. The
 sampler charges every rise it sees in resident memory to the test thread's
-stack at that moment, so a test that reads a file whole instead of streaming
-it comes back as:
+stack at that moment — or to the stack it was in a tick earlier, when the
+code running at the reading is the runtime's own, which is what a test body
+that allocated and returned within one reading looks like from outside. A
+climb with nobody's code on either stack is reported as unplaced rather than
+blamed on pytest. So a test that reads a file whole instead of streaming it
+comes back as:
 
 ```
 [memory_profile] PEAK_OVER_CEILING  severity=informational  owner=product
@@ -1515,7 +1519,7 @@ cache is running when the memory arrives and is not what holds it. For that
 rerun the tests the plain profile named with
 
 ```console
-pytest --profile-allocations tests/test_loading.py
+pytest --failure-profile-allocations tests/test_loading.py
 ```
 
 which switches tracemalloc on for the run — every platform, no attaching, no
@@ -1588,7 +1592,7 @@ This is what the example suite under
     · 66 tests on main kept 289 MB between them that is still in use: about 4.4 MB per test and 188 live objects, the biggest single step 24 MB; resident memory was 49 MB before tests/test_allocation.py::test_graph_builds and 732 MB after tests/test_sessions.py::test_request_answers[5], and these tests grew it 446 MB in all, the other 157 MB pages the allocator kept after they freed
     · no single test crossed the threshold, so a per-test check would never flag this; spread over 62 of the 66 tests, it is the shape of a leak
     · most of it in: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests)
-    · rerun these tests with --profile-allocations to see the lines that hold it
+    · rerun these tests with --failure-profile-allocations to see the lines that hold it
 ```
 
 And the I/O-bound suite under [`examples/profiling/tests/test_polling.py`](examples/profiling/tests/test_polling.py)
@@ -1618,9 +1622,10 @@ The same run prints a summary at the end of the terminal output — the run's
 CPU against its wall time, what each worker peaked at, and the top functions —
 and writes a [speedscope](https://www.speedscope.app/) flame graph for every
 test a finding names, and for the gaps between tests, under
-`<run directory>/profiles/` (`<test>.speedscope.json` for CPU, and with
-allocation tracing on `<test>.memory.speedscope.json` for the allocations at
-its peak). The raw per-test records are in `<worker>.profile.jsonl` beside
+`<run directory>/profiles/` (`<test>-<hash>.speedscope.json` for CPU, and
+with allocation tracing on `<test>-<hash>.memory.speedscope.json` for the
+allocations at its peak; the hash is of the full node id, so two names that
+sanitise alike cannot overwrite each other). The raw per-test records are in `<worker>.profile.jsonl` beside
 the rest of the evidence, timeline included.
 
 ### What it cannot see
@@ -1772,12 +1777,12 @@ accepted and inert.
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
 | `failure_stack_server_locals` | `true` | Whether `/stack?locals` answers with each frame's variables |
-| `failure_profile` | `false` | Sample every thread's stack and CPU for the whole run and raise what crosses the thresholds below (`--profile` for one run) |
+| `failure_profile` | `false` | Sample every thread's stack and CPU for the whole run and raise what crosses the thresholds below (`--failure-profile` for one run) |
 | `failure_profile_interval` | `0.02` | Seconds between profile samples (floor 0.002) |
 | `failure_profile_cpu_share` | `5` | Percent of the run's CPU one function must hold to be raised |
 | `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
 | `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
-| `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; several times slower, for a rerun (`--profile-allocations` for one run, which implies `--profile`) |
+| `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; several times slower, for a rerun (`--failure-profile-allocations` for one run, which implies `--failure-profile`) |
 | `failure_profile_allocation_depth` | `12` | Frames kept per allocation when tracing |
 | `failure_profile_burst_cores` | `0.7` | Cores' worth of CPU a tenth-of-a-second window must hold to be part of a burst |
 | `failure_profile_burst_seconds` | `2` | Seconds a burst must last to be raised as one test's own; the same function bursting in five tests is raised whatever their length |

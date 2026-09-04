@@ -9,7 +9,7 @@ carry `owner=product` the way they would for yours.
 cd examples/profiling
 pytest                        # one process
 pytest -n 2 --dist loadfile   # two workers: adds the imbalance finding
-pytest --profile-allocations tests/test_drift.py tests/test_memory.py
+pytest --failure-profile-allocations tests/test_drift.py tests/test_memory.py
                               # the rerun a growth finding asks for: the
                               # lines holding the memory, and memory flame
                               # graphs beside the CPU ones

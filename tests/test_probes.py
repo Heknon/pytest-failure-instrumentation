@@ -320,3 +320,20 @@ def test_the_two_liveness_questions_disagree_about_a_stranger():
     """
     assert probes.is_running(os.getpid()) is True
     assert probes.is_own_child(os.getpid()) is False
+
+
+def test_a_libc_without_mallinfo2_is_looked_up_once_not_on_every_sample(monkeypatch):
+    """find_library spawns a subprocess. The profiler reads the heap twenty-five
+    times a second, so a libc that has no mallinfo2 - glibc before 2.33, musl -
+    must be asked once and remembered, not paid for on every tick."""
+    import ctypes.util
+
+    calls = []
+    monkeypatch.setattr(memory, "_libc", None)
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: calls.append(name) or None)
+
+    assert memory._mallinfo2() is None
+    assert memory._mallinfo2() is None
+    assert memory._mallinfo2() is None
+    assert calls == ["c"]
+    assert memory._libc is False

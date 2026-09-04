@@ -182,8 +182,8 @@ def test_every_setting_in_the_readme_table_is_registered():
         "--callstack-port",
         "--callstack-token",
         "--failure-instrumentation",
-        "--profile",
-        "--profile-allocations",
+        "--failure-profile",
+        "--failure-profile-allocations",
     ]
     assert sorted(parser.ini) == sorted(DEFAULTS)
     assert sorted(parser.ini) == sorted(_settings_named_in_the_readme_table())

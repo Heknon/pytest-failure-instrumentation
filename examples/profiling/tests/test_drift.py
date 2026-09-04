@@ -2,7 +2,7 @@
 megabytes - a response cached by node id, never evicted - which is under
 every per-test threshold there is. Expected: it is counted into the worker's
 memory_profile STEADY_GROWTH finding, which names this test among what the
-worker accumulated and, with --profile-allocations, the line that holds it."""
+worker accumulated and, with --failure-profile-allocations, the line that holds it."""
 
 import pytest
 from demo_product import cache
