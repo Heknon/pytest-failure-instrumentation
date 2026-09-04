@@ -29,6 +29,7 @@ PROFILE_INI = """
 [pytest]
 failure_packages = victim, product
 failure_profile_cpu_share = 5
+failure_profile_cpu_floor_seconds = 0.25
 failure_profile_retained_mb = 40
 """
 
@@ -474,13 +475,19 @@ class TestSettings:
         from pytest_failure_instrumentation.config import Settings
 
         settings = Settings(
-            profile=True, profile_interval=0.05, profile_cpu_share=2.5, profile_retained_mb=64, profile_peak_mb=4096
+            profile=True,
+            profile_interval=0.05,
+            profile_cpu_share=2.5,
+            profile_cpu_floor_seconds=0.25,
+            profile_retained_mb=64,
+            profile_peak_mb=4096,
         )
         copied = Settings.from_payload(settings.as_payload(), worker_count=4)
 
         assert copied.profile is True
         assert copied.profile_interval == 0.05
         assert copied.profile_cpu_share == 2.5
+        assert copied.profile_cpu_floor_seconds == 0.25
         assert copied.profile_retained_mb == 64
         assert copied.profile_peak_mb == 4096
 
@@ -488,6 +495,7 @@ class TestSettings:
         from pytest_failure_instrumentation.config import MIN_PROFILE_INTERVAL, Settings
 
         assert Settings(profile_interval=0.0).profile_interval == MIN_PROFILE_INTERVAL
+        assert Settings(profile_cpu_floor_seconds=-1).profile_cpu_floor_seconds == 0
         assert Settings(profile_retained_mb=0).profile_retained_mb == 1
 
     def test_the_new_incidents_are_in_the_registry(self) -> None:
@@ -593,6 +601,23 @@ class TestBursts:
 
 
 class TestAllocationTracing:
+    def test_an_existing_tracer_is_a_configuration_error(
+        self, runner: Runner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PYTHONTRACEMALLOC", "3")
+        runner.pytester.makepyfile("def test_must_not_run():\n    assert False\n")
+
+        runner.run("--failure-profile-allocations", "-p", "no:xdist")
+
+        assert runner.result.ret == pytest.ExitCode.USAGE_ERROR
+        runner.result.stderr.fnmatch_lines(
+            [
+                "*--failure-profile-allocations requires exclusive ownership of "
+                "tracemalloc, but it is already active with depth 3*"
+            ]
+        )
+        assert "test_must_not_run" not in runner.result.stdout.str()
+
     def test_tracing_names_the_holders_and_writes_a_memory_flame_graph(self, runner: Runner) -> None:
         runner.pytester.makeini(PROFILE_INI)
         runner.pytester.makepyfile(

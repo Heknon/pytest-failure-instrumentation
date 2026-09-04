@@ -26,5 +26,5 @@ Two halves, in two processes, the way the rest of the plugin is split:
 
 Off by default. Nothing here runs until ``--failure-profile`` or ``failure_profile``
 asks for it, because it is the one thing in this package with a running cost
-on a healthy run - about one percent of a core per worker.
+on a healthy run, which is bounded by serial and xdist performance gates.
 """

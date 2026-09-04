@@ -256,12 +256,16 @@ class Settings:
     #: Sample every thread's stack and CPU for the whole run, and raise what
     #: crosses the thresholds below as ``cpu_hotspot`` and ``memory_profile``
     #: incidents - see :mod:`.profile`. Off: it is the one thing here with a
-    #: running cost on a healthy run, about a percent of a core per worker.
+    #: continuous running cost on a healthy run, bounded by the profiler's
+    #: serial and xdist performance gates.
     profile: bool = False
     #: Seconds between samples.
     profile_interval: float = 0.02
     #: Percent of the run's CPU a function must hold to be raised.
     profile_cpu_share: float = 5.0
+    #: Seconds of CPU a function must use before its share can be raised.
+    #: Prevents noise on tiny runs while remaining tunable for short profiles.
+    profile_cpu_floor_seconds: float = 0.5
     #: Megabytes a test may keep, or climb by, before it is raised.
     profile_retained_mb: int = 100
     #: Resident megabytes no test may reach, whatever it started from. 0 is
@@ -311,6 +315,9 @@ class Settings:
             self, "profile_interval", max(MIN_PROFILE_INTERVAL, float(self.profile_interval))
         )
         object.__setattr__(self, "profile_cpu_share", max(0.0, float(self.profile_cpu_share)))
+        object.__setattr__(
+            self, "profile_cpu_floor_seconds", max(0.0, float(self.profile_cpu_floor_seconds))
+        )
         object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
         object.__setattr__(self, "profile_peak_mb", max(0, int(self.profile_peak_mb)))
         object.__setattr__(self, "profile_allocations", bool(self.profile_allocations))
@@ -508,6 +515,7 @@ class Settings:
             "profile": self.profile,
             "profile_interval": self.profile_interval,
             "profile_cpu_share": self.profile_cpu_share,
+            "profile_cpu_floor_seconds": self.profile_cpu_floor_seconds,
             "profile_retained_mb": self.profile_retained_mb,
             "profile_peak_mb": self.profile_peak_mb,
             "profile_allocations": self.profile_allocations,
@@ -666,6 +674,12 @@ def add_options(parser: pytest.Parser) -> None:
         default="5",
     )
     parser.addini(
+        "failure_profile_cpu_floor_seconds",
+        help="Seconds of CPU a function must use before its share can be raised. "
+        "Lower this for short diagnostic runs.",
+        default="0.5",
+    )
+    parser.addini(
         "failure_profile_retained_mb",
         help="Megabytes a test may keep, or climb by, before it is raised.",
         default="100",
@@ -683,6 +697,7 @@ def add_options(parser: pytest.Parser) -> None:
         "finding names the lines holding the memory and a memory flame graph "
         "is written. Several times slower on allocation-heavy code; for a "
         "rerun of the tests an untraced run named. Implies failure_profile. "
+        "Requires exclusive ownership of tracemalloc. "
         "--failure-profile-allocations does the same for one run.",
         default="false",
     )
@@ -774,7 +789,8 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         "finding names the lines holding the memory, and a memory flame graph "
         "is written beside the CPU one. Several times slower on "
         "allocation-heavy code, so for a rerun of the tests a plain --failure-profile "
-        "named. Implies --failure-profile.",
+        "named. Requires exclusive ownership of tracemalloc. Implies "
+        "--failure-profile.",
     )
     group.addoption(
         "--callstack-port",
@@ -1052,6 +1068,7 @@ def resolve(config: pytest.Config) -> Settings:
         or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
         profile_interval=_number(config, "failure_profile_interval", 0.02),
         profile_cpu_share=_number(config, "failure_profile_cpu_share", 5.0),
+        profile_cpu_floor_seconds=_number(config, "failure_profile_cpu_floor_seconds", 0.5),
         profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
         profile_peak_mb=int(_number(config, "failure_profile_peak_mb", 0)),
         profile_allocations=_flag(config, "failure_profile_allocations", False)

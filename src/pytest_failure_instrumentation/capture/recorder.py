@@ -55,6 +55,7 @@ class WorkerRecorder:
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
         self.profiler: Any = None
+        self._allocation_tracer: memory_capture.TracemallocSession | None = None
         # Filled as each resource is opened, so close() works on a recorder
         # that never finished being built.
         self._open_resources: list[Any] = []
@@ -119,6 +120,16 @@ class WorkerRecorder:
             )
 
         self._apply_memory_limit(settings)
+        if settings.profile_allocations:
+            # Allocation profiling resets the process-wide peak for every
+            # test, so it cannot safely share a tracer with another consumer.
+            # Start once for both profiler and watchdog, at the deeper of the
+            # two requested tracebacks, before either takes a snapshot.
+            self._allocation_tracer = self._track(
+                memory_capture.TracemallocSession(
+                    max(settings.profile_allocation_depth, settings.tracemalloc_depth)
+                )
+            )
         self._start_monitors(settings)
         self._start_profiler(directory, worker_id, settings)
 
@@ -202,10 +213,6 @@ class WorkerRecorder:
         from ..profile.sampler import ProfileLog, Sampler
 
         log = self._track(ProfileLog(directory / f"{worker_id}.profile.jsonl", settings.run_id))
-        if settings.profile_allocations:
-            # Before the sampler, and before any test allocates: tracemalloc
-            # knows only the allocations made after it started.
-            memory_capture.enable_tracemalloc(settings.profile_allocation_depth)
         # Tracked after the log, so a setup that fails past this point stops
         # the sampling thread and unhooks its collector callback before the
         # log it writes to is closed - rather than leaving both running for
@@ -381,3 +388,5 @@ class WorkerRecorder:
         self._profile("stop")
         self.events.record("worker_finish", exitstatus=int(exitstatus))
         self.state.update(phase=None, nodeid=None)
+        if self._allocation_tracer is not None:
+            self._allocation_tracer.close()

@@ -235,10 +235,7 @@ def test_the_late_tick_factor_is_a_number_of_intervals() -> None:
     assert sampling.LATE_TICK_FACTOR > 1
 
 
-def test_allocation_tracing_deepens_a_tracer_somebody_started_shallower():
-    """The watchdog starts tracemalloc at failure_tracemalloc_depth before the
-    profiler asks for its own depth. Left alone, every holder's traceback and
-    memory flame graph would be one frame deep and say nothing about why."""
+def test_watchdog_tracing_never_replaces_somebody_elses_tracer():
     import tracemalloc
 
     from pytest_failure_instrumentation.capture.memory import enable_tracemalloc
@@ -250,14 +247,51 @@ def test_allocation_tracing_deepens_a_tracer_somebody_started_shallower():
         assert enable_tracemalloc(1)
         assert tracemalloc.get_traceback_limit() == 1
         assert enable_tracemalloc(12)
-        assert tracemalloc.get_traceback_limit() == 12
-        # And never shallower: a deeper tracer already running is left as it is.
+        assert tracemalloc.get_traceback_limit() == 1
         assert enable_tracemalloc(3)
-        assert tracemalloc.get_traceback_limit() == 12
+        assert tracemalloc.get_traceback_limit() == 1
         assert enable_tracemalloc(0)
-        assert tracemalloc.get_traceback_limit() == 12
+        assert tracemalloc.get_traceback_limit() == 1
     finally:
         tracemalloc.stop()
+        if was_tracing:
+            tracemalloc.start()
+
+
+def test_allocation_profiler_refuses_an_existing_tracer() -> None:
+    from pytest_failure_instrumentation.capture.memory import TracemallocSession
+    from pytest_failure_instrumentation.errors import TracemallocConflict
+
+    was_tracing = tracemalloc.is_tracing()
+    if was_tracing:
+        tracemalloc.stop()
+    tracemalloc.start(3)
+    try:
+        with pytest.raises(TracemallocConflict, match="already active with depth 3"):
+            TracemallocSession(12)
+        assert tracemalloc.is_tracing()
+        assert tracemalloc.get_traceback_limit() == 3
+    finally:
+        tracemalloc.stop()
+        if was_tracing:
+            tracemalloc.start()
+
+
+def test_allocation_profiler_stops_the_tracer_it_started() -> None:
+    from pytest_failure_instrumentation.capture.memory import TracemallocSession
+
+    was_tracing = tracemalloc.is_tracing()
+    if was_tracing:
+        tracemalloc.stop()
+    try:
+        session = TracemallocSession(7)
+        assert tracemalloc.get_traceback_limit() == 7
+        session.close()
+        assert not tracemalloc.is_tracing()
+        session.close()
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
         if was_tracing:
             tracemalloc.start()
 

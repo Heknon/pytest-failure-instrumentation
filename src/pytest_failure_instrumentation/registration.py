@@ -56,6 +56,7 @@ from .config import (
     pytest_faulthandler_timeout,
     resolve,
 )
+from .errors import TracemallocConflict
 
 #: Where the settings in force are kept, so a later caller can see them and
 #: the entry point can tell "already installed" from "nobody has yet".
@@ -87,7 +88,9 @@ def install(
     settings actually in force, or None if the plugin could not be installed
     at all - which is reported as a warning, never an exception, because a
     reporting tool that ends the run has cost more than any failure it might
-    have explained.
+    have explained. The deliberate exception is allocation profiling: it
+    raises a usage error when another process-wide tracemalloc profiler is
+    already active, because sharing it would make both profilers inaccurate.
 
     Calling this twice is safe. The second call does not rebuild a recorder
     that has already opened its files; it warns if it was asked for something
@@ -264,6 +267,9 @@ def _ensure_hookspecs(config: pytest.Config) -> None:
 def _built(build: Any, what: str) -> Any:
     """Whatever ``build`` returns, or None and a warning.
 
+    An allocation-profile request that conflicts with an already active
+    tracemalloc profiler becomes a pytest usage error instead.
+
     Registration is the one place this plugin touches the filesystem before
     anything has gone wrong, and it is allowed to fail: a read-only image, a
     vanished mount, a name already taken by a file.
@@ -274,6 +280,8 @@ def _built(build: Any, what: str) -> Any:
     """
     try:
         return build()
+    except TracemallocConflict as failure:
+        raise pytest.UsageError(str(failure)) from failure
     except Exception as failure:  # noqa: BLE001 - see the module docstring
         _warn(f"failure instrumentation is off for this {what}: {failure!r}")
         return None

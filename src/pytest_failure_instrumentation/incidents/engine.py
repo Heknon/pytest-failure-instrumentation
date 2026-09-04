@@ -1152,6 +1152,7 @@ class IncidentEngine:
             return
         thresholds = analysis.Thresholds(
             cpu_share_percent=self.settings.profile_cpu_share,
+            cpu_floor_seconds=self.settings.profile_cpu_floor_seconds,
             retained_mb=self.settings.profile_retained_mb,
             peak_mb=self.settings.profile_peak_mb,
             burst_cores=self.settings.profile_burst_cores,
