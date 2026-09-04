@@ -106,7 +106,11 @@ def test_the_sampler_charges_cpu_to_the_thread_that_burnt_it(source: str) -> Non
     sampler.start()
     sampler.begin_phase("t::a", "call")
     with Spinner():
-        time.sleep(0.5)
+        # The psutil reader pays a GIL round trip per thread beside a busy
+        # one, so its ticks land a quarter of a second apart here and the
+        # first sighting of a thread charges nothing: half a second holds
+        # one usable tick on a good day and none on a loaded box.
+        time.sleep(0.5 if source != "psutil" else 1.5)
     sampler.end_phase("call")
     sampler.end_test("t::a")
     sampler.stop()

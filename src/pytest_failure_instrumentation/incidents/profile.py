@@ -1,13 +1,17 @@
 """What the profiler found, as incidents.
 
-Two kinds. A CPU hotspot has a frame and is attributed like a crash - the
+Three kinds. A CPU hotspot has a frame and is attributed like a crash - the
 engine reads its stack and names the owner - so "your ``is_images_different``
 is 38% of the run" arrives through ``pytest_failure_incident`` with the same
-``owner``, ``severity`` and ``fingerprint`` a segfault would carry. A memory
-finding has no frame: a resident-memory step is a fact about a test, not a
-line, so it names the test and leaves attribution to ``suspect_owner``.
+``owner``, ``severity`` and ``fingerprint`` a segfault would carry. A CPU
+burst is a hotspot in time rather than in share: a test, a fixture or a
+background thread that held a core for a stretch of a run that otherwise
+waited, with the stack that was there for most of it. A memory finding names
+the test the memory arrived in, and carries the stack that was running while
+it climbed - or, with allocation tracing on, the lines holding it - when one
+was seen, and leaves attribution to ``suspect_owner`` otherwise.
 
-Both are informational whatever the owner, because nothing failed. They are
+All are informational whatever the owner, because nothing failed. They are
 flags for a reader to look at, and severity says so - see
 :mod:`..analysis.severity`.
 """
@@ -94,11 +98,93 @@ class CpuHotspotIncident(Incident):
         return lines
 
 
+class CpuBurstIncident(Incident):
+    model_config = ConfigDict(extra="forbid")
+
+    ends_run: ClassVar[bool] = False
+
+    kind: Literal["cpu_burst"] = "cpu_burst"
+
+    #: The test the burst was in, or None for one between tests or for the
+    #: whole-run CONTENDED verdict.
+    nodeid: Optional[str] = None
+    phase: Optional[str] = None
+    thread: Optional[str] = None
+    #: How long the burst held the cores; for RECURRING_BURST the typical
+    #: length of one; for CONTENDED the seconds the machine was pinned.
+    burst_seconds: float = 0.0
+    #: Cores' worth of CPU over that time.
+    cores: float = 0.0
+    #: Seconds of CPU in the burst (all of them, for a recurring one).
+    cpu_seconds: float = 0.0
+    #: Seconds into the test, or the gap, that it started.
+    started_s: float = 0.0
+    #: How busy the whole machine was meanwhile, in percent, when it could
+    #: be read; for CONTENDED the share of the run it was pinned for.
+    machine_busy_percent: Optional[float] = None
+    cpus: Optional[int] = None
+    workers: int = 0
+    #: How many tests burst here, and the three that burnt most.
+    test_count: int = 0
+    tests: list[str] = Field(default_factory=list)
+    #: The stack that was there for most of the burst, deepest first.
+    stack: list[str] = Field(default_factory=list)
+
+    def raw_stack(self) -> list[str]:
+        return list(self.stack)
+
+    def blame_stack(self) -> tuple[list[str], bool]:
+        return list(self.stack), False
+
+    def suspect_nodeid(self) -> Optional[str]:
+        return self.nodeid or (self.tests[0] if self.tests else None)
+
+    def suspect_basis_for(self, path: str) -> str:
+        return f"owner of the test the burst was in ({path})"
+
+    def owner_when_unattributable(self) -> Optional[str]:
+        # The machine being full is nobody's frame and nobody's test.
+        return "runtime" if self.verdict == "CONTENDED" else None
+
+    def fingerprint_parts(self) -> list[str]:
+        # A recurring burst is one row however many tests it recurs in, and
+        # is told apart by the frame the engine attributes; a long burst is
+        # its test's, whichever parametrisation and whichever worker.
+        if self.verdict == "RECURRING_BURST":
+            return [self.kind, self.verdict]
+        return [self.kind, self.verdict, (self.nodeid or "").split("[")[0]]
+
+    def details(self) -> list[str]:
+        lines = []
+        if self.nodeid:
+            lines.append(f"test {self.nodeid}" + (f"  worker={self.worker}" if self.worker else ""))
+        if self.verdict == "RECURRING_BURST":
+            lines.append(
+                f"{self.cpu_seconds:.1f} s of CPU in bursts across {self.test_count} tests, "
+                f"typically {self.burst_seconds:g} s at {self.cores:g} cores"
+                + (f" in {self.phase}" if self.phase else "")
+            )
+        elif self.verdict == "CONTENDED":
+            lines.append(
+                f"machine pinned for {self.burst_seconds:g} s, {self.cores:g} cores per worker"
+                + (f", {self.workers} workers on {self.cpus} cores" if self.cpus else "")
+            )
+        else:
+            lines.append(
+                f"{self.burst_seconds:g} s at {self.cores:g} cores, {self.started_s:g} s in"
+                + (f", in {self.phase}" if self.phase else "")
+                + (f", on thread {self.thread!r}" if self.thread and self.verdict == "BACKGROUND_BURST" else "")
+            )
+        return lines
+
+
 class MemoryGrowth(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tests: int
     per_test_mb: float
+    #: Live objects added per test, when the count was read.
+    objects_per_test: Optional[int] = None
 
 
 class MemoryProfileIncident(Incident):
@@ -153,7 +239,7 @@ class MemoryProfileIncident(Incident):
 
     def details(self) -> list[str]:
         lines = []
-        if self.nodeid:
+        if self.nodeid and self.verdict != "STEADY_GROWTH":
             lines.append(f"test {self.nodeid}" + (f"  worker={self.worker}" if self.worker else ""))
         if self.verdict == "RETAINED_AFTER_TEST" and self.delta_mb is not None:
             lines.append(f"kept {self.delta_mb} MB" + (f" in {self.phase}" if self.phase else ""))
@@ -165,8 +251,9 @@ class MemoryProfileIncident(Incident):
             lines.append(f"reached {self.peak_mb} MB")
         elif self.verdict == "STEADY_GROWTH" and self.growth is not None:
             lines.append(
-                f"{self.delta_mb} MB over {self.growth.tests} tests, "
+                f"{self.delta_mb} MB over {self.growth.tests} tests on {self.worker}, "
                 f"{self.growth.per_test_mb:g} MB each"
+                + (f" and {self.growth.objects_per_test:,d} objects" if self.growth.objects_per_test else "")
             )
         elif self.verdict == "WORKER_IMBALANCE":
             lines.append(
@@ -205,6 +292,26 @@ def build(finding: Finding, worker: str) -> Incident:
             below=below,
             stack=list(finding.stack),
         )
+    if finding.kind == "cpu_burst":
+        return CpuBurstIncident(
+            worker=finding.worker or worker,
+            verdict=finding.verdict,
+            confidence="high" if finding.stack or finding.verdict == "CONTENDED" else "medium",
+            evidence=list(finding.evidence),
+            nodeid=finding.nodeid,
+            phase=finding.phase,
+            thread=finding.thread,
+            burst_seconds=finding.burst_seconds,
+            cores=finding.cores,
+            cpu_seconds=finding.cpu_seconds,
+            started_s=finding.started_s,
+            machine_busy_percent=finding.machine_busy_percent,
+            cpus=finding.cpus,
+            workers=finding.worker_count,
+            test_count=finding.test_count,
+            tests=list(finding.tests),
+            stack=list(finding.stack),
+        )
     return MemoryProfileIncident(
         worker=finding.worker or worker,
         verdict=finding.verdict,
@@ -217,7 +324,11 @@ def build(finding: Finding, worker: str) -> Incident:
         peak_mb=finding.peak_mb,
         delta_mb=finding.delta_mb,
         growth=(
-            MemoryGrowth(tests=finding.growth_tests, per_test_mb=finding.growth_per_test_mb)
+            MemoryGrowth(
+                tests=finding.growth_tests,
+                per_test_mb=finding.growth_per_test_mb,
+                objects_per_test=finding.growth_objects_per_test,
+            )
             if finding.growth_tests
             else None
         ),

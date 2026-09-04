@@ -8,4 +8,4 @@ from demo_product.loader import load_everything
 
 
 def test_loads_the_export():
-    assert load_everything(800_000) == 32_000_000
+    assert load_everything(600_000) == 24_000_000

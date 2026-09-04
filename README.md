@@ -1436,13 +1436,20 @@ started — are counted by their kernel names, so CPU outside the interpreter is
 reported rather than quietly dropped.
 
 Per test it also records resident memory at every phase boundary, the peak
-between them, and — on glibc — how much of the heap is actually in use, so
-memory a test *freed* that the allocator kept mapped is told from memory that
-is still alive.
+between them, Python's live-object count, and — on glibc — how much of the
+heap is actually in use, so memory a test *freed* that the allocator kept
+mapped is told from memory that is still alive.
+
+And it keeps a **timeline**: every tenth of a second, the CPU the process
+burnt in that window and how busy the whole machine was. A share of the run's
+CPU is the wrong question for a suite that waits on I/O ninety-nine seconds in
+a hundred — the hundredth that pins a core is invisible in it — and the
+timeline is where that hundredth shows as a step with a start, a length and a
+height.
 
 ### What it raises
 
-Two kinds, both `severity=informational` whoever owns them, because nothing
+Three kinds, all `severity=informational` whoever owns them, because nothing
 failed.
 
 **`cpu_hotspot`** — one per function over `failure_profile_cpu_share` percent
@@ -1457,6 +1464,18 @@ of cost it is:
 | `GC_PRESSURE` | the collector took more than a tenth of the run, and here are the tests that drove it |
 | `NATIVE_THREADS` | CPU in threads Python has no stack for, by kernel thread name |
 
+**`cpu_burst`** — from the timeline. A window is busy when the process burnt
+`failure_profile_burst_cores` cores' worth of CPU over it, and a burst is a
+run of busy windows. Each finding carries the stack that was there for most of
+the burst, blamed like a hotspot:
+
+| Verdict | Means |
+|---|---|
+| `LONG_BURST` | one test held a core for `failure_profile_burst_seconds` or longer, with when it started, which phase, and how much of the test's CPU is in that one stretch |
+| `RECURRING_BURST` | the same function burst in five or more tests, whatever the length of each — a fixture, or a helper doing per call what it could do once. One finding, with the total |
+| `BACKGROUND_BURST` | a thread that is not running the test held a core — between tests or under one. What a worker at a steady percentage with nothing to blame is doing |
+| `CONTENDED` | the machine was over 90% busy for most of the run and the workers got slices of a core while it was. Twenty workers on four cores; nothing on any stack explains it and the machine's own figure does |
+
 **`memory_profile`** — per test, against `failure_profile_retained_mb`:
 
 | Verdict | Means |
@@ -1464,7 +1483,7 @@ of cost it is:
 | `RETAINED_AFTER_TEST` | the worker was left holding more than it started with, still in use, with the phase it arrived in — `setup` is a fixture |
 | `HEAP_NOT_RETURNED` | it was left holding more, but none of it is in use: the allocator kept freed pages mapped. Fragmentation, not a leak |
 | `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
-| `STEADY_GROWTH` | a run of tests each left a little behind, none enough to be raised alone — the shape of a leak |
+| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — two megabytes a test, which is the shape of a leak and the one no per-test check sees |
 | `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
 | `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
 
@@ -1487,6 +1506,52 @@ What a test *kept* is measured as the larger of the resident step and the
 live-heap step. Resident memory understates it whenever the test fills pages
 an earlier test freed and the allocator held on to, and the heap figure is not
 fooled by that.
+
+### Allocation tracing
+
+The sampler sees the stack that was *running* while memory climbed, which is
+usually the answer and sometimes is not: a loader that hands its result to a
+cache is running when the memory arrives and is not what holds it. For that
+rerun the tests the plain profile named with
+
+```console
+pytest --profile-allocations tests/test_loading.py
+```
+
+which switches tracemalloc on for the run — every platform, no attaching, no
+debugger — and adds to each finding the lines holding the memory at the peak
+and the lines holding what the test kept, and to a `STEADY_GROWTH` finding
+the lines holding what the worker accumulated over the whole session. The
+memory figures then come from tracemalloc itself (Python allocations only,
+the tracer's own tables left out), because the tracer churns the allocator
+enough to leave resident memory up after a test freed everything. Every test
+that climbed also gets a **memory flame graph**: its live allocations at the
+peak, by traceback, weighted in bytes, beside its CPU one.
+
+The growth finding above, rerun that way over the two modules it names:
+
+```
+[memory_profile] STEADY_GROWTH  severity=informational  owner=customer-code
+    blamed on test_memory.py:48 in ?
+    292 MB over 48 tests on main, 6.1 MB each and 15,906 objects
+    · 48 tests on main kept 292 MB between them that is still in use: about 6.1 MB per test and 15,906 live objects, the biggest single step 24 MB; traced memory was 1 MB before tests/test_drift.py::test_response_is_cached[0] and 579 MB after tests/test_memory.py::test_leaks_a_little[6]
+    · no single test crossed the threshold, so a per-test check would never flag this; spread over 48 of the 48 tests, it is the shape of a leak
+    · most of it in: tests/test_memory.py::test_leaks_a_little (168 MB over 7 tests), tests/test_drift.py::test_response_is_cached (124 MB over 40 tests)
+    · held at the end of the worker: 190.7 MB allocated at test_memory.py:48 <- python.py:167 <- _callers.py:121 <- _manager.py:120
+    · held at the end of the worker: 145.9 MB allocated at test_memory.py:24 <- python.py:167 <- _callers.py:121 <- _manager.py:120
+    · held at the end of the worker: 122.1 MB allocated at test_drift.py:13 <- python.py:167 <- _callers.py:121 <- _manager.py:120
+```
+
+Three lines, each an `append` to something module-level, which is the
+answer. The `?` is a tracemalloc frame: it knows the file and line and not
+the function.
+
+Tracing costs three to six times on allocation-heavy code and far more on a
+tight loop of small objects, which is why it is a rerun and not the nightly —
+and why a traced run raises **no CPU findings**: its CPU figures are the
+tracer's as much as the tests', and the summary says so. Memory is what it is
+for. `failure_profile_allocation_depth` is how many frames each allocation
+keeps.
 
 This is what the example suite under
 [`examples/profiling`](examples/profiling) prints, trimmed:
@@ -1518,18 +1583,45 @@ This is what the example suite under
     · the step happened during setup, so a fixture built it - a session or module fixture keeps it for the rest of the run
 
 [memory_profile] STEADY_GROWTH  severity=informational  owner=unknown
-    test tests/test_memory.py::test_leaks_a_little[0]  worker=main
-    165 MB over 7 tests, 23.6 MB each
-    · no single test crossed the threshold, so a per-test check would never flag this; the pattern is what a leak looks like
-    · every one of them is a parametrisation of tests/test_memory.py::test_leaks_a_little
+    no stack; suspect customer-code (owner of the test the memory arrived in (tests/test_allocation.py))
+    289 MB over 66 tests on main, 4.4 MB each and 188 objects
+    · 66 tests on main kept 289 MB between them that is still in use: about 4.4 MB per test and 188 live objects, the biggest single step 24 MB; resident memory was 49 MB before tests/test_allocation.py::test_graph_builds and 732 MB after tests/test_sessions.py::test_request_answers[5], and these tests grew it 446 MB in all, the other 157 MB pages the allocator kept after they freed
+    · no single test crossed the threshold, so a per-test check would never flag this; spread over 62 of the 66 tests, it is the shape of a leak
+    · most of it in: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests)
+    · rerun these tests with --profile-allocations to see the lines that hold it
+```
+
+And the I/O-bound suite under [`examples/profiling/tests/test_polling.py`](examples/profiling/tests/test_polling.py)
+and its neighbours, where nothing is over the CPU share and the timeline is
+what finds the fixture:
+
+```
+[cpu_burst] RECURRING_BURST  severity=informational  owner=product
+    blamed on session.py:21 in Session.__init__
+    2.1 s of CPU in bursts across 6 tests, typically 0.34 s at 1.03 cores in setup
+    · 6 bursts in 6 tests, 2.1 s of CPU between them at 1.0 cores, typically 0.3 s each, in setup
+    · under session.py:21 in Session.__init__ (product), called from test_sessions.py:13 in session
+    · in setup, so a fixture does this for every test that asks for it: what costs a second here costs a thousand tests a quarter of an hour of a core, and the workers pay it at the same moment when they start together
+    · the machine was 26.7% busy over these bursts
+
+[cpu_burst] LONG_BURST  severity=informational  owner=product
+    blamed on reports.py:42 in build_index
+    test tests/test_index.py::test_index_is_complete  worker=main
+    2.95 s at 0.99 cores, 1.05 s in, in call
+    · 2.9 s at 1.0 cores, starting 1.1 s into the test, in call
+    · 96.5% of the test's 3.0 s of CPU is in this one burst; the other 1.9 s of its 5.0 s is waiting
+    · under reports.py:42 in build_index (product), called from test_index.py:13 in test_index_is_complete
+    · the machine was 25.4% busy over the burst
 ```
 
 The same run prints a summary at the end of the terminal output — the run's
 CPU against its wall time, what each worker peaked at, and the top functions —
 and writes a [speedscope](https://www.speedscope.app/) flame graph for every
 test a finding names, and for the gaps between tests, under
-`<run directory>/profiles/`. The raw per-test records are in
-`<worker>.profile.jsonl` beside the rest of the evidence.
+`<run directory>/profiles/` (`<test>.speedscope.json` for CPU, and with
+allocation tracing on `<test>.memory.speedscope.json` for the allocations at
+its peak). The raw per-test records are in `<worker>.profile.jsonl` beside
+the rest of the evidence, timeline included.
 
 ### What it cannot see
 
@@ -1680,11 +1772,15 @@ accepted and inert.
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
 | `failure_stack_server_locals` | `true` | Whether `/stack?locals` answers with each frame's variables |
-| `failure_profile` | `false` | Sample every thread's stack and CPU for the whole run and raise what crosses the two thresholds below (`--profile` for one run) |
+| `failure_profile` | `false` | Sample every thread's stack and CPU for the whole run and raise what crosses the thresholds below (`--profile` for one run) |
 | `failure_profile_interval` | `0.02` | Seconds between profile samples (floor 0.002) |
 | `failure_profile_cpu_share` | `5` | Percent of the run's CPU one function must hold to be raised |
 | `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
 | `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
+| `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; several times slower, for a rerun (`--profile-allocations` for one run, which implies `--profile`) |
+| `failure_profile_allocation_depth` | `12` | Frames kept per allocation when tracing |
+| `failure_profile_burst_cores` | `0.7` | Cores' worth of CPU a tenth-of-a-second window must hold to be part of a burst |
+| `failure_profile_burst_seconds` | `2` | Seconds a burst must last to be raised as one test's own; the same function bursting in five tests is raised whatever their length |
 
 There is deliberately **no ini setting for the token**. It comes from
 `PYTEST_CALLSTACK_TOKEN` or `--callstack-token` and nowhere else: an ini file
@@ -1749,6 +1845,7 @@ its directory says so.
 | Stack from a worker that stopped running Python | yes | yes | yes |
 | Profiler: CPU per thread | thread clocks | mach `thread_info` | psutil (16 ms ticks) |
 | Profiler: live heap, to tell freed-but-mapped from kept | glibc `mallinfo2` | no | no |
+| Profiler: bursts, drift, allocation tracing, memory flame graphs | yes | yes | yes |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a
 *setting* takes away on every platform rather than a platform taking away: where

@@ -202,11 +202,17 @@ class WorkerRecorder:
         from ..profile.sampler import ProfileLog, Sampler
 
         log = self._track(ProfileLog(directory / f"{worker_id}.profile.jsonl", settings.run_id))
+        if settings.profile_allocations:
+            # Before the sampler, and before any test allocates: tracemalloc
+            # knows only the allocations made after it started.
+            memory_capture.enable_tracemalloc(settings.profile_allocation_depth)
         self.profiler = Sampler(
             log.write,
             lambda: probes.resident_megabytes()[0],
             interval=settings.profile_interval,
             worker=worker_id,
+            allocations=settings.profile_allocations,
+            retained_mb=settings.profile_retained_mb,
         )
         self.profiler.start()
         self.events.record("profiler_started", **self.profiler.describe())
@@ -277,6 +283,16 @@ class WorkerRecorder:
     def pytest_runtest_teardown(self, item: pytest.Item) -> Any:
         yield from self._phase("teardown", item.nodeid)
 
+    def pytest_runtest_logfinish(self, nodeid: str, location: Any) -> None:
+        """The test's profile record closes here rather than at the end of
+        teardown: pytest lets go of the item's fixture values only after the
+        teardown hooks have all returned, so a record written inside the
+        teardown wrapper would count every function-scoped fixture's value
+        as memory the test kept, and its release as the next gap's.
+        """
+        if self.profiler is not None:
+            self.profiler.end_test(nodeid)
+
     def _phase(self, phase: str, nodeid: str) -> Any:
         """Which phase is open is what separates "died in teardown" from
         "died mid-call": pytest's own logfinish fires only after the whole
@@ -312,10 +328,6 @@ class WorkerRecorder:
         if phase != "teardown":
             self.state.update(phase=None)
             return
-        if self.profiler is not None:
-            # After the phase closes, so teardown's own cost and the memory
-            # a finalizer gives back are in the test's record.
-            self.profiler.end_test(nodeid)
         self.slow_test.end_test()
         self.state.tests_finished += 1
         # The node id is cleared with the *test*, not with each phase. A worker

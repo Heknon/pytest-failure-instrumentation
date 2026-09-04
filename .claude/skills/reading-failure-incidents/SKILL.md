@@ -1,6 +1,6 @@
 ---
 name: reading-failure-incidents
-description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable) and the profiler's findings (cpu hotspot, memory profile). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error], [run_summary], [stack_server_unavailable], [cpu_hotspot] or [memory_profile] appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
+description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable) and the profiler's findings (cpu hotspot, cpu burst, memory profile). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error], [run_summary], [stack_server_unavailable], [cpu_hotspot], [cpu_burst] or [memory_profile] appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
 ---
 
 # Reading a failure incident
@@ -308,12 +308,49 @@ wrong:
 out from the innermost — so a C accessor called two million times is charged
 to the function that called it, and `raw_stack()` holds the rest of that stack.
 
+### `cpu_burst` — a stretch of the run where a core was held
+
+Also profiling-only and informational, and the complement of `cpu_hotspot`:
+a share of the run's CPU says nothing about a suite that waits on I/O for
+ninety-nine seconds in a hundred and pins a core for the hundredth. The
+profiler keeps a timeline — the process's CPU every tenth of a second against
+the machine's — and a burst is a run of windows at or over
+`failure_profile_burst_cores` cores. `burst_seconds` is how long it held them,
+`cores` how many, `started_s` how far into the test (or the gap between
+tests) it began, `phase` which phase, and `machine_busy_percent` how busy the
+whole machine was meanwhile. The stack is the one that was there for most of
+the burst, blamed like a hotspot.
+
+- `LONG_BURST`: `nodeid` held a core for `failure_profile_burst_seconds` or
+  longer. The evidence says how much of the test's CPU is in this one stretch
+  and how much of its duration was waiting — a test that is 96% one burst is
+  an I/O test with a CPU step in it, and the step is the line to open.
+- `RECURRING_BURST`: the same function burst in `test_count` tests (five or
+  more), whatever the length of each; `cpu_seconds` is the total, and
+  `burst_seconds` the typical one. In `setup` it is a fixture doing the same
+  work for every test that asks; in `call` a helper doing per call what it
+  could do once. One finding for all of them, fingerprinted on the frame.
+- `BACKGROUND_BURST`: `thread` is not the one running the test — between tests
+  when `nodeid` is null, under a test otherwise. A poller, a log shipper, a
+  client's keepalive: paid whatever test is in flight.
+- `CONTENDED`: the machine was over 90% busy for `machine_busy_percent` of
+  the sampled time and a worker got `cores` of a core while it was; `workers`
+  and `cpus` say whether this run did it to itself. No frame, `owner=runtime`:
+  every test's duration in such a run includes queueing for a core, and none
+  of them is slower for a reason on its own stack.
+
+A pinned machine is also noted on a `LONG_BURST` — "this got a slice of a
+core and took longer than its CPU cost" — because a two-second burst at a
+third of a core is six hundred milliseconds of work, not two seconds of it.
+
 ### `memory_profile` — a test that changed the worker's memory
 
 Also profiling-only and informational. `nodeid` is the test, `before_mb`,
 `after_mb` and `peak_mb` are resident memory around it, and `delta_mb` is what
 the verdict measures. There is no stack: a resident-memory step is a fact about
-a test, so `suspect_owner` is the owner of the test's module.
+a test, so `suspect_owner` is the owner of the test's module — unless the
+sampler saw the climb, or allocation tracing was on, in which case there is
+one; see below.
 
 - `RETAINED_AFTER_TEST`: the worker was left `delta_mb` bigger, and the memory
   is still in use — the evidence carries the live-heap readings that say so.
@@ -325,10 +362,15 @@ a test, so `suspect_owner` is the owner of the test's module.
   it costs the worker's footprint, and hunting the code will find nothing.
 - `TRANSIENT_PEAK`: climbed `delta_mb` and came back. Costs peak memory, which
   is what decides how many workers fit on a machine.
-- `STEADY_GROWTH`: `growth.tests` consecutive tests each left
-  `growth.per_test_mb` behind and none was enough to be raised alone. This is
-  the shape of a leak, and the evidence says when every one of them is a
-  parametrisation of the same test.
+- `STEADY_GROWTH`: `worker` drifted up by `delta_mb` over `growth.tests`
+  tests, `growth.per_test_mb` each (and `growth.objects_per_test` live
+  objects, where the count was read), none of them enough to be raised alone
+  and no single step half of the total. Two megabytes a test is what a leak
+  looks like from outside, and the one thing a per-test check never sees;
+  `nodeid` is only the first of them. The evidence says when every one is a
+  parametrisation of the same test, and — with `--profile-allocations` —
+  which lines held what the worker accumulated; without it, it says to rerun
+  with that flag.
 - `WORKER_IMBALANCE`: `worker` peaked at `peak_mb` against a median of
   `median_mb` among its siblings (`worker_rss` has all of them), and `nodeid`
   is the test after which it first stood clear. Under xdist the worker that
@@ -347,6 +389,18 @@ climb was seen — a step too fast for the sampler's tenth-of-a-second reading,
 or a worker with no stack to read — there is no frame and `suspect_owner` is
 the owner of the test's module instead.
 
+With `--profile-allocations` the evidence also carries what tracemalloc saw:
+"at the peak: 57.2 MB allocated at loader.py:12 <- reports.py:40" (allocation
+site first) and "still held afterwards: …" for what the test kept. These name
+the *holder* where the sampled stack names the *runner*, and they differ
+exactly when a leak is one function's result kept by another. The figures are
+then tracemalloc's own — Python allocations only, the tracer's tables left
+out — and the evidence says so, with the resident figures beside them. A
+`?` in a frame line is a tracemalloc frame, which carries no function name.
+A traced run raises no `cpu_hotspot` or `cpu_burst` at all, because the
+tracer's cost is in every CPU figure; their absence from such a run means
+nothing.
+
 ## The decision each kind forces
 
 Every one of these reaches a person who has to do something before morning.
@@ -361,7 +415,8 @@ The incident usually settles it, and saying so is most of the value.
 | `run_summary` | the run ended cleanly | nothing, except as the control: its absence next to another incident means the controller died too |
 | `stack_server_unavailable` | the run finished normally and nobody could watch it live | reconfigure rather than retry — the same port will be taken again. Nothing about the tests is in question, so it argues for a settings change and never for a rerun |
 | `cpu_hotspot` | the run finished; this is where its CPU went | a look, not a rerun. Route by `owner`; a `BACKGROUND_THREAD` or `NATIVE_THREADS` verdict is the answer to a worker sitting at a steady percentage with nothing to blame |
-| `memory_profile` | the run finished; this is what a test did to the worker's memory | `STEADY_GROWTH` and `RETAINED_AFTER_TEST` in `call` are worth a leak hunt; `HEAP_NOT_RETURNED` and `TRANSIENT_PEAK` are sizing questions, not code defects; `WORKER_IMBALANCE` argues for isolating the heavy module |
+| `cpu_burst` | the run finished; this is where its CPU went *in time* | `RECURRING_BURST` in `setup` is the fixture to make session-scoped or cache; `LONG_BURST` is one test's step to open; `BACKGROUND_BURST` is the thread to find; `CONTENDED` argues for fewer workers, not for touching any test |
+| `memory_profile` | the run finished; this is what a test did to the worker's memory | `STEADY_GROWTH` and `RETAINED_AFTER_TEST` in `call` are worth a leak hunt, and `--profile-allocations` on the same tests is the next run; `HEAP_NOT_RETURNED` and `TRANSIENT_PEAK` are sizing questions, not code defects; `WORKER_IMBALANCE` argues for isolating the heavy module |
 
 `run_ending` is the field to automate on. An incident raised at detection can
 beat a CI timeout by the better part of an hour, and that lead time is only

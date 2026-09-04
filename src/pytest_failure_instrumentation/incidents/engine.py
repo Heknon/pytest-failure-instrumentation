@@ -1081,6 +1081,8 @@ class IncidentEngine:
             cpu_share_percent=self.settings.profile_cpu_share,
             retained_mb=self.settings.profile_retained_mb,
             peak_mb=self.settings.profile_peak_mb,
+            burst_cores=self.settings.profile_burst_cores,
+            burst_seconds=self.settings.profile_burst_seconds,
         )
         report = analysis.analyse(records, self.attributor, thresholds)
         self.profile_report = report
@@ -1093,13 +1095,17 @@ class IncidentEngine:
             self.profile_incidents.append(incident)
 
         # A flame graph for every test a finding names, and for the gaps
-        # between tests, so the flag comes with the picture behind it.
+        # between tests, so the flag comes with the picture behind it. With
+        # allocation tracing on, a test that climbed also gets one of its
+        # live allocations at the peak, weighted in bytes.
         named = {nodeid for finding in report.findings for nodeid in finding.tests}
         named.update(finding.nodeid for finding in report.findings if finding.nodeid)
         wanted = [
             record
             for record in records
-            if record.get("record") != TEST_RECORD or record.get("nodeid") in named
+            if record.get("record") != TEST_RECORD
+            or record.get("nodeid") in named
+            or record.get("memory_stacks")
         ]
         if not wanted:
             return
@@ -1108,12 +1114,17 @@ class IncidentEngine:
         for record in wanted:
             nodeid = record.get("nodeid") or f"background-{record.get('worker') or 'main'}"
             name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(nodeid))[:120]
-            try:
-                (folder / f"{name}.speedscope.json").write_text(
-                    json.dumps(analysis.speedscope(record, str(nodeid))), encoding="utf-8"
-                )
-            except OSError:
-                continue
+            documents = {
+                f"{name}.speedscope.json": analysis.speedscope(record, str(nodeid)),
+                f"{name}.memory.speedscope.json": analysis.memory_speedscope(record, str(nodeid)),
+            }
+            for filename, document in documents.items():
+                if document is None:
+                    continue
+                try:
+                    (folder / filename).write_text(json.dumps(document), encoding="utf-8")
+                except OSError:
+                    continue
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:
         """What the profiler found, where a reader is already looking.
@@ -1144,6 +1155,11 @@ class IncidentEngine:
             + (f", {report.native_cpu_s:.1f} s in native threads" if report.native_cpu_s >= 0.1 else "")
             + (f", gc {report.gc_s:.1f} s" if report.gc_s >= 0.1 else "")
         )
+        if report.allocations:
+            write(
+                "allocation tracing was on: the CPU figures include the tracer's own cost, "
+                "and no CPU finding is raised from a traced run"
+            )
         for worker, facts in sorted(report.workers.items()):
             peak = f"{facts['peak_mb']} MB peak" if facts["peak_mb"] is not None else "peak unknown"
             end = f"{facts['end_mb']} MB at the end" if facts["end_mb"] is not None else ""

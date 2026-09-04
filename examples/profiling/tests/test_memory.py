@@ -6,7 +6,9 @@
                          builds 150 MB and keeps it for the module.
 * test_transient_peak    TRANSIENT_PEAK: 300 MB climbed and freed.
 * test_leaks_a_little    STEADY_GROWTH: eight parametrisations each keep
-                         25 MB, none of them enough to be flagged alone.
+                         25 MB, none of them enough to be flagged alone -
+                         counted, with test_drift.py's, into the worker's one
+                         growth finding, which names both.
 * the whole module       WORKER_IMBALANCE under -n 2 --dist loadfile: the
                          worker that gets this file ends far above its sibling.
 """

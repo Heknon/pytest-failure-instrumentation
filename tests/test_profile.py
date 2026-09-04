@@ -324,7 +324,7 @@ class TestMemory:
         assert len(growth) == 1
         assert growth[0].growth.tests >= 5
         assert 9 <= growth[0].growth.per_test_mb <= 15
-        assert "parametrisation of test_leak.py::test_leaks" in growth[0].evidence[-1]
+        assert any("parametrisation of test_leak.py::test_leaks" in line for line in growth[0].evidence)
         assert not [incident for incident in memory(incidents) if incident.verdict == "RETAINED_AFTER_TEST"]
 
 
@@ -456,3 +456,127 @@ def test_frameless_hotspots_belong_to_the_runtime(verdict: str) -> None:
     incident = CpuHotspotIncident(worker="controller", verdict=verdict)
     assert incident.owner_when_unattributable() == "runtime"
     assert incident.blame_stack() == ([], False)
+
+
+CHURN_MODULE = '''
+
+def churn(seconds):
+    """A stretch of a core: the CPU step in a test that otherwise waits."""
+    import time
+    deadline = time.perf_counter() + seconds
+    total = 0
+    while time.perf_counter() < deadline:
+        total += sum(range(2000))
+    return total
+'''
+
+BURST_INI = PROFILE_INI + "failure_profile_burst_cores = 0.5\n"
+
+
+def bursts(incidents: list[Any]) -> list[Any]:
+    return Runner.of_kind(incidents, "cpu_burst")
+
+
+class TestBursts:
+    def test_a_long_burst_in_a_waiting_test_is_named_with_when_it_started(self, runner: Runner) -> None:
+        runner.pytester.makeini(BURST_INI + "failure_profile_burst_seconds = 1\n")
+        (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE + CHURN_MODULE, encoding="utf-8")
+        runner.pytester.makepyfile(
+            test_index="""
+            import time
+            from product import churn
+
+            def test_index_is_complete():
+                time.sleep(0.8)
+                churn(1.6)
+                time.sleep(0.5)
+            """
+        )
+        incidents = runner.run("--profile", "-p", "no:cacheprovider", timeout=120.0)
+
+        long = [incident for incident in bursts(incidents) if incident.verdict == "LONG_BURST"]
+        assert len(long) == 1, [str(incident) for incident in incidents]
+        (incident,) = long
+        assert incident.nodeid == "test_index.py::test_index_is_complete"
+        assert incident.burst_seconds >= 1.0
+        assert incident.started_s >= 0.5
+        assert incident.phase == "call"
+        assert incident.blamed_frame is not None and incident.blamed_frame.function == "churn"
+        assert incident.owner == "product"
+        assert incident.severity == "informational"
+        assert any("is waiting" in line for line in incident.evidence)
+
+    def test_the_same_fixture_bursting_in_every_test_is_one_recurring_finding(self, runner: Runner) -> None:
+        # A burst too short to be raised on its own, five times over.
+        runner.pytester.makeini(BURST_INI + "failure_profile_burst_seconds = 30\n")
+        (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE + CHURN_MODULE, encoding="utf-8")
+        runner.pytester.makepyfile(
+            test_sessions="""
+            import time
+            import pytest
+            from product import churn
+
+            @pytest.fixture
+            def session():
+                return churn(0.4)
+
+            @pytest.mark.parametrize("case", range(5))
+            def test_request(session, case):
+                time.sleep(0.15)
+            """
+        )
+        incidents = runner.run("--profile", "-p", "no:cacheprovider", timeout=120.0)
+
+        found = bursts(incidents)
+        assert [incident.verdict for incident in found] == ["RECURRING_BURST"], [str(i) for i in incidents]
+        (incident,) = found
+        assert incident.test_count == 5
+        assert incident.phase == "setup"
+        assert incident.blamed_frame is not None and incident.blamed_frame.function == "churn"
+        assert incident.cpu_seconds >= 1.0
+        assert any("fixture" in line for line in incident.evidence)
+
+
+class TestAllocationTracing:
+    def test_tracing_names_the_holders_and_writes_a_memory_flame_graph(self, runner: Runner) -> None:
+        runner.pytester.makeini(PROFILE_INI)
+        runner.pytester.makepyfile(
+            test_alloc="""
+            import time
+
+            KEPT = []
+
+            def hold(count):
+                return [bytearray(1_000_000) for _ in range(count)]
+
+            def test_peak():
+                blob = hold(120)
+                time.sleep(1.0)
+                assert len(blob) == 120
+
+            def test_keeps():
+                KEPT.extend(hold(60))
+            """
+        )
+        # --profile-allocations implies --profile.
+        incidents = runner.run("--profile-allocations", "-p", "no:cacheprovider", timeout=120.0)
+
+        by_test = {incident.nodeid: incident for incident in memory(incidents)}
+        peak = by_test["test_alloc.py::test_peak"]
+        assert peak.verdict == "TRANSIENT_PEAK"
+        assert any(line.startswith("at the peak:") and "test_alloc.py:6" in line for line in peak.evidence)
+        assert any("figures are from tracemalloc" in line for line in peak.evidence)
+        assert peak.blamed_frame is not None and peak.blamed_frame.file.endswith("test_alloc.py")
+        kept = by_test["test_alloc.py::test_keeps"]
+        assert kept.verdict == "RETAINED_AFTER_TEST"
+        assert any(line.startswith("still held afterwards:") and "test_alloc.py:6" in line for line in kept.evidence)
+        profiles = sorted(path.name for path in (runner.pytester.path / ".pytest-failures").glob("run-*/profiles/*"))
+        assert "test_alloc.py_test_peak.memory.speedscope.json" in profiles
+        assert "test_alloc.py_test_peak.speedscope.json" in profiles
+        document = json.loads(
+            next((runner.pytester.path / ".pytest-failures").glob("run-*/profiles/test_alloc.py_test_peak.memory.speedscope.json")).read_text()
+        )
+        (profile,) = document["profiles"]
+        assert profile["unit"] == "bytes"
+        assert sum(profile["weights"]) >= 100 * 1_000_000
+        assert any(frame["file"].endswith("test_alloc.py") for frame in document["shared"]["frames"])

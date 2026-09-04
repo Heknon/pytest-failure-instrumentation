@@ -455,3 +455,308 @@ class TestReport:
         assert main["samples"] == [[1, 0]]  # speedscope wants the root first
         assert main["weights"] == [int(2e9)]
         assert document["shared"]["frames"][0] == {"name": "inner", "file": PRODUCT, "line": 14}
+
+
+# -- bursts ---------------------------------------------------------------------
+
+
+def timeline(*windows: tuple[float, int | None, str | None, str | None, list[int] | None]) -> list[list[Any]]:
+    """Timeline entries a tenth of a second apart from (cores, machine
+    permille, phase, thread, frame indexes)."""
+    entries = []
+    for number, (cores, machine, phase, thread, frames) in enumerate(windows, start=1):
+        entries.append([number * 100, int(cores * 1e8), machine, phase, thread, frames])
+    return entries
+
+
+def idle(count: int, phase: str | None = "call") -> list[tuple[Any, ...]]:
+    return [(0.02, 200, phase, None, None)] * count
+
+
+def busy(count: int, frames: list[int], *, phase: str = "call", thread: str = "MainThread", cores: float = 1.0, machine: int = 300) -> list[tuple[Any, ...]]:
+    return [(cores, machine, phase, thread, frames)] * count
+
+
+def bursts_of(report: analysis.Report) -> list[analysis.Finding]:
+    return [finding for finding in report.findings if finding.kind == "cpu_burst"]
+
+
+class TestBursts:
+    frames = [frame(PRODUCT, 31, "build_index"), frame(TEST, 12, "test_index"), frame(PRODUCT, 18, "Session.__init__")]
+
+    def test_a_long_burst_in_a_waiting_test_is_named_with_when_it_started(self) -> None:
+        entry = record("t::index", [stack([0, 1], 2.5)], self.frames, cpu_s=2.6)
+        entry["timeline"] = timeline(*idle(5), *busy(25, [0, 1]), *idle(5))
+        report = analyse([entry], attributor, Thresholds(burst_seconds=2.0, burst_cores=0.7))
+
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "LONG_BURST"
+        assert finding.nodeid == "t::index"
+        assert finding.started_s == 0.5
+        assert finding.burst_seconds == 2.5
+        assert finding.cores == 1.0
+        assert finding.phase == "call"
+        assert finding.frame is not None and finding.frame.function == "build_index"
+        assert finding.frame.owner == "product"
+        assert finding.stack[0].startswith(f'  File "{PRODUCT}", line 31')
+        assert any("starting 0.5 s into the test" in line for line in finding.evidence)
+        assert any("is waiting" in line for line in finding.evidence)
+
+    def test_a_burst_shorter_than_the_threshold_is_not_a_finding(self) -> None:
+        entry = record("t::index", [stack([0, 1], 1.0)], self.frames, cpu_s=1.0)
+        entry["timeline"] = timeline(*idle(5), *busy(10, [0, 1]), *idle(5))
+        report = analyse([entry], attributor, Thresholds(burst_seconds=2.0))
+
+        assert bursts_of(report) == []
+
+    def test_a_single_busy_window_is_noise_however_often_it_recurs(self) -> None:
+        records = []
+        for case in range(6):
+            entry = record(f"t::a[{case}]", [], self.frames, cpu_s=0.1)
+            entry["timeline"] = timeline(*busy(1, [2], phase="setup"), *idle(5))
+            records.append(entry)
+        report = analyse(records, attributor, Thresholds(burst_tests=5))
+
+        assert bursts_of(report) == []
+
+    def test_the_same_function_bursting_in_five_tests_is_one_recurring_finding(self) -> None:
+        records = []
+        for case in range(5):
+            entry = record(f"t::request[{case}]", [stack([2], 0.4)], self.frames, cpu_s=0.4)
+            entry["timeline"] = timeline(*busy(4, [2], phase="setup"), *idle(6))
+            records.append(entry)
+        report = analyse(records, attributor, Thresholds(burst_seconds=2.0, burst_tests=5))
+
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "RECURRING_BURST"
+        assert finding.test_count == 5
+        assert finding.phase == "setup"
+        assert finding.frame is not None and finding.frame.function == "Session.__init__"
+        assert finding.cpu_seconds == 2.0
+        assert finding.burst_seconds == 0.4
+        assert any("fixture" in line for line in finding.evidence)
+        assert len(finding.tests) == 3
+
+    def test_four_tests_bursting_is_not_yet_recurring(self) -> None:
+        records = []
+        for case in range(4):
+            entry = record(f"t::request[{case}]", [stack([2], 0.4)], self.frames, cpu_s=0.4)
+            entry["timeline"] = timeline(*busy(4, [2], phase="setup"), *idle(6))
+            records.append(entry)
+        report = analyse(records, attributor, Thresholds(burst_seconds=2.0, burst_tests=5))
+
+        assert bursts_of(report) == []
+
+    def test_a_burst_on_another_thread_is_background(self) -> None:
+        frames = [frame(PRODUCT, 30, "Poller._run"), frame(TEST, 5, "test_x")]
+        entry = record("t::a", [stack([1], 0.1), stack([0], 3.0, thread="status-poller", background=True)], frames)
+        entry["timeline"] = timeline(*busy(30, [0], thread="status-poller"))
+        gap = record(None, [stack([0], 3.0, thread="status-poller", background=True)], frames)
+        gap["timeline"] = timeline(*busy(30, [0], thread="status-poller", phase=None))
+        report = analyse([entry, gap], attributor, Thresholds(burst_seconds=2.0))
+
+        # One thread is one finding, however many bursts it had and whether
+        # they fell under a test or between two.
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "BACKGROUND_BURST"
+        assert finding.thread == "status-poller"
+        assert finding.frame is not None and finding.frame.function == "Poller._run"
+        assert any("2 bursts like it on this thread" in line for line in finding.evidence)
+
+    def test_a_burst_between_tests_says_so(self) -> None:
+        frames = [frame(PRODUCT, 30, "Poller._run")]
+        gap = record(None, [stack([0], 3.0, thread="status-poller", background=True)], frames)
+        gap["timeline"] = timeline(*busy(30, [0], thread="status-poller", phase=None))
+        report = analyse([gap], attributor, Thresholds(burst_seconds=2.0))
+
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "BACKGROUND_BURST"
+        assert finding.nodeid is None
+        assert any("between tests" in line for line in finding.evidence)
+
+    def test_a_pinned_machine_and_starved_workers_is_contended(self) -> None:
+        records = []
+        for case in range(3):
+            entry = record(f"t::slow[{case}]", [stack([1], 0.6)], self.frames, cpu_s=0.6)
+            entry["cpus"] = 4
+            entry["timeline"] = timeline(*busy(30, [1], cores=0.2, machine=960))
+            records.append(entry)
+        report = analyse(records, attributor, Thresholds(burst_seconds=2.0, burst_cores=0.7))
+
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "CONTENDED"
+        assert finding.frame is None
+        assert finding.cores == 0.2
+        assert finding.machine_busy_percent == 100.0
+        assert finding.cpus == 4
+        assert any("over 90% busy for 100%" in line for line in finding.evidence)
+
+    def test_a_machine_busy_for_a_moment_is_not_contended(self) -> None:
+        entry = record("t::a", [stack([1], 0.6)], self.frames, cpu_s=0.6)
+        entry["timeline"] = timeline(*busy(5, [1], cores=0.2, machine=960), *idle(30))
+        report = analyse([entry], attributor)
+
+        assert bursts_of(report) == []
+
+    def test_a_pinned_machine_is_noted_on_a_long_burst(self) -> None:
+        entry = record("t::index", [stack([0, 1], 1.0)], self.frames, cpu_s=1.0)
+        entry["timeline"] = timeline(*busy(30, [0, 1], cores=0.75, machine=980))
+        report = analyse([entry], attributor, Thresholds(burst_seconds=2.0, burst_cores=0.7))
+
+        (finding,) = [finding for finding in bursts_of(report) if finding.verdict == "LONG_BURST"]
+        assert finding.machine_busy_percent == 98.0
+        assert any("pinned" in line for line in finding.evidence)
+
+    def test_one_quiet_window_does_not_end_a_burst_but_two_do(self) -> None:
+        entry = record("t::index", [stack([0, 1], 2.5)], self.frames, cpu_s=2.6)
+        entry["timeline"] = timeline(*busy(12, [0, 1]), *idle(1), *busy(12, [0, 1]), *idle(2), *busy(12, [0, 1]))
+        report = analyse([entry], attributor, Thresholds(burst_seconds=2.0))
+
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "LONG_BURST"
+        assert finding.burst_seconds == 2.5
+
+
+# -- drift and allocation tracing ---------------------------------------------------
+
+
+class TestDrift:
+    def test_a_fixture_given_back_does_not_cancel_the_drift(self) -> None:
+        records = [
+            record(f"t::leaks[{case}]", [], [], rss=(100 + 30 * case, 130 + 30 * case, 130 + 30 * case), heap=(30 * case, 30 + 30 * case))
+            for case in range(6)
+        ]
+        records.append(record("t::last", [], [], rss=(280, 280, 130), heap=(180, 30)))
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 180
+        assert finding.growth_tests == 6
+
+    def test_pages_the_allocator_kept_are_not_drift(self) -> None:
+        # Resident memory climbs thirty a test and none of it is in use.
+        records = [
+            record(f"t::churn[{case}]", [], [], rss=(100 + 30 * case, 130 + 30 * case, 130 + 30 * case), heap=(50, 50), blocks=(1000, 1000))
+            for case in range(6)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        assert not findings_of(report, "STEADY_GROWTH")
+
+    def test_drift_names_the_tests_that_carry_it_and_the_objects(self) -> None:
+        records = [
+            record(f"t::cached[{case}]", [], [], rss=(100 + 20 * case, 120 + 20 * case, 120 + 20 * case), heap=(20 * case, 20 + 20 * case), blocks=(1000, 1400))
+            for case in range(6)
+        ]
+        records += [
+            record(f"t::noisy[{case}]", [], [], rss=(220 + 10 * case, 230 + 10 * case, 230 + 10 * case), heap=(120 + 10 * case, 130 + 10 * case), blocks=(1000, 1100))
+            for case in range(3)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 150
+        assert finding.growth_objects_per_test == 300
+        assert any(line.startswith("most of it in: t::cached (120 MB over 6 tests), t::noisy (30 MB over 3 tests)") for line in finding.evidence)
+        assert any("--profile-allocations" in line for line in finding.evidence)
+
+    def test_drift_with_tracing_on_names_the_lines_holding_it(self) -> None:
+        frames = [frame(TEST, 30, ""), frame(PRODUCT, 9, ""), frame(LIBRARY, 5, "")]
+        records = [
+            record(f"t::cached[{case}]", [], [], rss=(100 + 30 * case, 130 + 30 * case, 130 + 30 * case), heap=(30 * case, 30 + 30 * case))
+            for case in range(6)
+        ]
+        background = record(None, [], frames)
+        background["holders_session"] = [{"mb": 176.5, "frames": [0, 1, 2]}]
+        report = analyse(records + [background], attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert any(
+            line == "held at the end of the worker: 176.5 MB allocated at encoder.py:5 <- imaging.py:9 <- test_screens.py:30"
+            for line in finding.evidence
+        )
+        assert finding.frame is not None
+        assert finding.frame.file == PRODUCT and finding.frame.owner == "product"
+        assert finding.stack[0] == f'  File "{PRODUCT}", line 9 in ?'
+        assert not any("--profile-allocations" in line for line in finding.evidence)
+
+
+class TestAllocationTracing:
+    frames = [frame(TEST, 30, ""), frame(PRODUCT, 12, ""), frame(LIBRARY, 5, "")]
+
+    def test_the_holders_at_the_peak_are_evidence_and_the_frame(self) -> None:
+        entry = record("t::a", [], self.frames, rss=(100, 420, 110))
+        entry["holders_peak"] = [{"mb": 300.5, "frames": [0, 1, 2]}]
+        report = analyse([entry], attributor)
+
+        (finding,) = findings_of(report, "TRANSIENT_PEAK")
+        assert any(
+            line == "at the peak: 300.5 MB allocated at encoder.py:5 <- imaging.py:12 <- test_screens.py:30"
+            for line in finding.evidence
+        )
+        assert finding.frame is not None and finding.frame.owner == "product"
+
+    def test_a_sampled_stack_outranks_the_holders_for_the_frame(self) -> None:
+        frames = self.frames + [frame(PRODUCT, 40, "load_everything")]
+        entry = record("t::a", [], frames, rss=(100, 420, 110), growth=[{"thread": "MainThread", "frames": [3], "mb": 300}])
+        entry["holders_peak"] = [{"mb": 300.5, "frames": [0, 1, 2]}]
+        report = analyse([entry], attributor)
+
+        (finding,) = findings_of(report, "TRANSIENT_PEAK")
+        assert finding.frame is not None and finding.frame.function == "load_everything"
+        assert any(line.startswith("at the peak:") for line in finding.evidence)
+
+    def test_traced_figures_replace_the_resident_ones(self) -> None:
+        # Resident memory says 300 MB kept; the tracer says the test freed
+        # everything and its own tables are what stayed.
+        entry = record("t::a", [], [], rss=(100, 400, 400))
+        entry["traced"] = {"before_mb": 0, "after_mb": 5, "peak_mb": 210, "tracer_mb": 250}
+        report = analyse([entry], attributor)
+
+        (finding,) = report.findings
+        assert finding.verdict == "TRANSIENT_PEAK"
+        assert finding.peak_mb == 210 and finding.delta_mb == 210
+        assert any("figures are from tracemalloc" in line and "250 MB" in line for line in finding.evidence)
+
+    def test_traced_memory_kept_is_in_use_by_definition(self) -> None:
+        entry = record("t::a", [], self.frames, rss=(100, 400, 400), heap=(0, 0))
+        entry["traced"] = {"before_mb": 0, "after_mb": 150, "peak_mb": 150, "tracer_mb": 20}
+        entry["holders_kept"] = [{"mb": 149.0, "frames": [0, 1, 2]}]
+        report = analyse([entry], attributor)
+
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
+        assert finding.delta_mb == 150
+        assert any(line.startswith("still held afterwards: 149.0 MB allocated at encoder.py:5") for line in finding.evidence)
+        assert not findings_of(report, "HEAP_NOT_RETURNED")
+
+    def test_memory_speedscope_is_the_allocations_at_the_peak_in_bytes(self) -> None:
+        from pytest_failure_instrumentation.profile.analysis import memory_speedscope
+
+        entry = record("t::a", [], self.frames + [frame(TEST, 31, "test_x")])
+        entry["memory_stacks"] = [{"frames": [0, 1, 2], "bytes": 4096}, {"frames": [3], "bytes": 512}]
+
+        document = memory_speedscope(entry, "t::a")
+
+        assert document is not None
+        (profile,) = document["profiles"]
+        assert profile["unit"] == "bytes"
+        assert profile["samples"] == [[0, 1, 2], [3]]
+        assert profile["weights"] == [4096, 512]
+        assert profile["endValue"] == 4608
+        assert document["shared"]["frames"][1] == {"name": "imaging.py:12", "file": PRODUCT, "line": 12}
+        assert document["shared"]["frames"][3]["name"] == "test_x"
+        assert memory_speedscope(record("t::b", [], []), "t::b") is None
+
+
+class TestTracedRun:
+    def test_a_traced_run_raises_memory_findings_and_no_cpu_ones(self) -> None:
+        frames = [frame(PRODUCT, 14, "is_images_different")]
+        entry = record("t::a", [stack([0], 8.0)], frames, rss=(100, 420, 110))
+        entry["allocations"] = True
+        entry["timeline"] = timeline(*busy(30, [0]))
+        report = analyse([entry], attributor)
+
+        assert report.allocations is True
+        assert [finding.verdict for finding in report.findings] == ["TRANSIENT_PEAK"]
+        # The ranking is still there for the terminal, cost and all.
+        assert [cost.function for cost in report.functions] == ["is_images_different"]

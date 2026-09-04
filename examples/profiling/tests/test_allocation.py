@@ -16,5 +16,5 @@ def build_graph(nodes: int) -> list:
 
 
 def test_graph_builds():
-    graph = build_graph(400_000)
-    assert len(graph) == 400_000
+    graph = build_graph(700_000)
+    assert len(graph) == 700_000

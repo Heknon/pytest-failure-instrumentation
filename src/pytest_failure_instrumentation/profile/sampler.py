@@ -36,6 +36,7 @@ import os
 import sys
 import threading
 import time
+import tracemalloc
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -71,6 +72,13 @@ DISCOVER_EVERY = 50
 #: tick's CPU is charged to the stack seen before it. Late by one sample,
 #: never charged to the frame that happened to come next.
 LATE_TICK_FACTOR = 3.0
+
+#: Ticks per timeline window. The timeline is the process's CPU and the
+#: machine's, window by window, which is what a burst is read from: a test
+#: that is idle for ten seconds and then burns a core for two is a flat
+#: line with a step in it, and the step has a start, a length and a height.
+#: Five ticks is a tenth of a second at the default interval.
+WINDOW_TICKS = 5
 
 #: What a test's record is called on disk, and the process-wide leftovers'.
 TEST_RECORD = "test"
@@ -368,6 +376,19 @@ class _Window:
         self.gc_collections = [0, 0, 0]
         self.phase_cpu: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
         self.phase_started: Optional[tuple[str, float, float]] = None
+        #: The timeline: one entry per closed window, as
+        #: [offset_ms, cpu_ns, machine_permille, phase, (thread, stack) or None].
+        self.windows: list[list[Any]] = []
+        #: Allocation tracing, when it is on: the snapshots this window took.
+        self.snapshot_before: Any = None
+        self.snapshot_peak: Any = None
+        self.snapshot_at = 0.0
+        self.snapshot_rss = 0
+        self.traced_before = 0
+        self.traced_peak_reset = False
+        #: For the background window at the end of the session: what held
+        #: the memory the worker accumulated. See Sampler._session_holders.
+        self.holders_session: list[tuple[float, Any]] = []
 
 
 class Sampler:
@@ -378,11 +399,25 @@ class Sampler:
         *,
         interval: float = DEFAULT_INTERVAL,
         worker: str = "",
+        allocations: bool = False,
+        retained_mb: int = 100,
     ) -> None:
         self.record = record
         self.resident_megabytes = resident_megabytes
         self.interval = max(0.001, float(interval))
         self.worker = worker
+        #: Whether tracemalloc is on and snapshots are taken around a test
+        #: that climbs or keeps more than retained_mb. See _snapshot_if_climbing.
+        self.allocations = allocations and tracemalloc.is_tracing()
+        self.retained_mb = max(1, int(retained_mb))
+        #: With tracing on, a snapshot from before the first test, so what
+        #: the worker accumulated over the whole session can be diffed at
+        #: the end: the holders of a leak no single test shows.
+        self._session_snapshot: Any = None
+        self._machine = _MachineClock()
+        self._window_cpu_ns = 0
+        self._window_stacks: dict[tuple[str, StackKey], int] = {}
+        self._window_ticks = 0
         self.clock = ThreadClock()
         self.nodeid: Optional[str] = None
         self.phase: Optional[str] = None
@@ -440,7 +475,24 @@ class Sampler:
             if self._window.nodeid is not None:
                 # A test the run died inside: written as far as it got.
                 self._flush(self._window, TEST_RECORD)
+            self._background.holders_session = self._session_holders()
             self._flush(self._background, BACKGROUND_RECORD)
+
+    def _session_holders(self) -> list[tuple[float, Any]]:
+        """What tracemalloc sees holding memory now that it did not before the
+        first test: (megabytes, traceback) for the three biggest, from a
+        megabyte up. Empty when tracing was off or nothing accumulated."""
+        if not self.allocations or self._session_snapshot is None:
+            return []
+        try:
+            now = _snapshot()
+            return [
+                (round(stat.size_diff / 1048576, 1), stat.traceback)
+                for stat in now.compare_to(self._session_snapshot, "traceback")[:3]
+                if stat.size_diff >= 1048576
+            ]
+        except Exception:  # noqa: BLE001 - a lost diff beats a lost record
+            return []
 
     def describe(self) -> dict[str, Any]:
         return {"interval": self.interval, "thread_clock": self.clock.source}
@@ -451,8 +503,15 @@ class Sampler:
         """Called on the test's own thread, which is how that thread is known."""
         with self._lock:
             if self._window.nodeid != nodeid:
+                self._close_window(self._window)
                 self._window = _Window(nodeid, self._rss())
                 self._paused = (time.monotonic(), time.process_time())
+                if self.allocations:
+                    self._window.snapshot_before = _snapshot()
+                    self._window.traced_before = tracemalloc.get_traced_memory()[0]
+                    tracemalloc.reset_peak()
+                    if self._session_snapshot is None:
+                        self._session_snapshot = self._window.snapshot_before
             window = self._window
             window.test_thread = threading.get_ident()
             window.rss_at[f"{phase}_start"] = self._rss()
@@ -566,6 +625,9 @@ class Sampler:
                 if culprit is None:
                     culprit = next((ident for ident in frames if ident != self._own_ident), None)
                 frames = {culprit: frames[culprit]} if culprit is not None else {}
+            # The sampler's own thread is nobody's cost: not a stack, and
+            # not a native thread either.
+            seen_tids.add(self._threads.get(self._own_ident or 0, (0, ""))[0])
             for ident, frame in frames.items():
                 if ident == self._own_ident:
                     continue
@@ -594,6 +656,8 @@ class Sampler:
                 entry[1] += wall_ns
                 entry[2] += 1
                 self.samples_taken += 1
+                key = (name, stack)
+                self._window_stacks[key] = self._window_stacks.get(key, 0) + cpu_ns
 
             # Threads the kernel knows and Python does not.
             for tid in clocks:
@@ -608,6 +672,10 @@ class Sampler:
                     entry[1] += delta
 
             self._ticks += 1
+            self._window_cpu_ns += process_delta
+            self._window_ticks += 1
+            if self._window_ticks >= WINDOW_TICKS:
+                self._close_window(window)
             if self._ticks % RSS_EVERY == 0:
                 rss = self._rss()
                 if rss is not None and (window.rss_peak is None or rss > window.rss_peak):
@@ -620,6 +688,8 @@ class Sampler:
                     climb = max(climb, heap - self._last_heap)
                 if heap is not None:
                     self._last_heap = heap
+                if rss is not None and self.allocations:
+                    self._snapshot_if_climbing(window, rss)
                 if climb > 0:
                     # Charged to the test's own thread, or to whichever thread
                     # is running when there is no test: the one allocating is
@@ -638,6 +708,52 @@ class Sampler:
 
         self._last_clock = clocks
         del frames
+
+    def _close_window(self, window: _Window) -> None:
+        """One timeline entry from what the last few ticks accumulated.
+
+        Called with the lock held. The stack kept is the one that burnt the
+        most CPU in the window, on whichever thread; a burst's blame comes
+        from the stacks of its windows, and the thread name says whether it
+        was the test's own.
+        """
+        if self._window_ticks == 0:
+            return
+        top = max(self._window_stacks.items(), key=lambda item: item[1])[0] if self._window_stacks else None
+        window.windows.append(
+            [
+                int((time.monotonic() - window.started) * 1000),
+                self._window_cpu_ns,
+                self._machine.busy_permille(),
+                self.phase,
+                top,
+            ]
+        )
+        self._window_cpu_ns = 0
+        self._window_ticks = 0
+        self._window_stacks = {}
+
+    def _snapshot_if_climbing(self, window: _Window, rss: int) -> None:
+        """A tracemalloc snapshot as a test's memory climbs, throttled.
+
+        A snapshot copies every live trace - seconds, on a process holding
+        millions of objects - so one is taken when the climb since the test
+        began is worth reporting, has grown by another threshold since the
+        last snapshot, and at least a second has passed. The last one taken
+        is what held the memory nearest the peak.
+        """
+        if window.nodeid is None or window.rss_before is None:
+            return
+        climbed = rss - window.rss_before
+        now = time.monotonic()
+        if (
+            climbed >= self.retained_mb
+            and rss - window.snapshot_rss >= self.retained_mb
+            and now - window.snapshot_at >= 1.0
+        ):
+            window.snapshot_peak = _snapshot()
+            window.snapshot_rss = rss
+            window.snapshot_at = now
 
     def _cpu_delta(self, tid: int, clocks: dict[int, int]) -> Optional[int]:
         if tid not in clocks:
@@ -690,10 +806,40 @@ class Sampler:
         same forty frames does not spell each frame a thousand times.
         """
         now = time.monotonic()
+        self._close_window(window)
         rss_after = self._rss()
         heap_after = _heap_in_use()
         blocks_after = sys.getallocatedblocks()
         frames: dict[tuple[str, int, str], int] = {}
+
+        def index_of(file: str, line: int, function: str) -> int:
+            key = (file, line, function)
+            index = frames.get(key)
+            if index is None:
+                index = frames[key] = len(frames)
+            return index
+
+        timeline = []
+        for offset_ms, cpu_ns, machine, phase, top in window.windows:
+            indexes = None
+            thread = None
+            if top is not None:
+                thread, stack = top
+                indexes = [
+                    index_of(code.co_filename, line or _line_of(code, offset), getattr(code, "co_qualname", code.co_name))
+                    for code, line, offset in stack
+                ]
+            timeline.append([offset_ms, cpu_ns, machine, phase, thread, indexes])
+
+        allocations = self._allocation_report(window, kind, index_of)
+        if window.holders_session:
+            allocations["holders_session"] = [
+                {
+                    "mb": megabytes,
+                    "frames": [index_of(frame.filename, frame.lineno, "") for frame in traceback],
+                }
+                for megabytes, traceback in window.holders_session
+            ]
         stacks = []
         for (phase, thread, background, stack), (cpu_ns, wall_ns, samples) in window.stacks.items():
             indexes = []
@@ -732,6 +878,7 @@ class Sampler:
             "record": kind,
             "worker": self.worker,
             "nodeid": window.nodeid,
+            "cpus": os.cpu_count(),
             "wall_s": round(now - window.started, 4),
             "cpu_s": round(time.process_time() - window.cpu_started, 4),
             "rss_before_mb": window.rss_before,
@@ -759,10 +906,16 @@ class Sampler:
             # could be told apart per thread. See ThreadClock.
             "cpu_weighted": True,
             "per_thread": self.clock.available,
+            # With allocation tracing on, every CPU figure here carries the
+            # tracer's cost as well; the analysis raises no CPU findings
+            # from such a record.
+            "allocations": self.allocations,
             "thread_clock": self.clock.source if self.clock.available else "process",
             "frames": [f"{file}|{line}|{function}" for (file, line, function) in frames],
             "stacks": stacks,
             "growth": growth,
+            "timeline": timeline,
+            **allocations,
             "native_threads": [
                 {"tid": tid, "name": name, "cpu_ns": cpu_ns}
                 for tid, (name, cpu_ns) in window.native.items()
@@ -787,7 +940,111 @@ class Sampler:
         window.rss_at = {}
         window.heap_before = heap_after
         window.blocks_before = blocks_after
+        window.windows = []
+        window.snapshot_before = window.snapshot_peak = None
         window.phase_cpu.clear()
+
+
+    def _allocation_report(self, window: _Window, kind: str, index_of: Any) -> dict[str, Any]:
+        """What tracemalloc says about this test, when it was tracing.
+
+        Three things: the tracebacks holding the most at the peak, the ones
+        holding the most of what the test kept, and the peak's live
+        allocations as stacks weighted by bytes - a memory flame graph.
+        The tracer's own memory is reported so the analysis can discount it:
+        its tables grow with every allocation it records and churn the
+        allocator enough to leave resident memory up after the test freed
+        everything.
+        """
+        if not self.allocations or kind != TEST_RECORD or window.snapshot_before is None:
+            return {}
+        report: dict[str, Any] = {}
+        current, peak = tracemalloc.get_traced_memory()
+        report["traced"] = {
+            "before_mb": round(window.traced_before / 1048576),
+            "after_mb": round(current / 1048576),
+            "peak_mb": round(peak / 1048576),
+            "tracer_mb": round(tracemalloc.get_tracemalloc_memory() / 1048576),
+        }
+        before = window.snapshot_before
+        after = None
+        kept = current - window.traced_before
+        if kept >= self.retained_mb * 1048576:
+            after = _snapshot()
+
+        def holders(snapshot: Any) -> list[dict[str, Any]]:
+            found = []
+            for stat in snapshot.compare_to(before, "traceback")[:3]:
+                if stat.size_diff < 1048576:
+                    break
+                found.append(
+                    {
+                        "mb": round(stat.size_diff / 1048576, 1),
+                        "frames": [index_of(frame.filename, frame.lineno, "") for frame in stat.traceback],
+                    }
+                )
+            return found
+
+        top = window.snapshot_peak or after
+        if window.snapshot_peak is not None:
+            report["holders_peak"] = holders(window.snapshot_peak)
+        if after is not None:
+            report["holders_kept"] = holders(after)
+        if top is not None:
+            stacks = []
+            for statistic in top.statistics("traceback")[:400]:
+                stacks.append(
+                    {
+                        "frames": [index_of(frame.filename, frame.lineno, "") for frame in statistic.traceback],
+                        "bytes": statistic.size,
+                    }
+                )
+            report["memory_stacks"] = stacks
+        return report
+
+
+def _snapshot() -> Any:
+    """A tracemalloc snapshot without the tracer's or the sampler's own
+    allocations, which are what a naive diff blames first."""
+    return tracemalloc.take_snapshot().filter_traces(
+        (tracemalloc.Filter(False, tracemalloc.__file__), tracemalloc.Filter(False, __file__))
+    )
+
+
+class _MachineClock:
+    """How busy the whole machine is, per window, as a per-mille figure.
+
+    A burst that ran at a third of a core while the machine was pinned is
+    twenty workers sharing four cores, not a slow fixture; without this the
+    two are the same finding. psutil's cpu_times is one call, read every
+    window, and the busy share is everything but idle and iowait.
+    """
+
+    def __init__(self) -> None:
+        self._last: Any = None
+        try:
+            import psutil
+
+            self._psutil: Any = psutil
+            self._last = psutil.cpu_times()
+        except Exception:
+            self._psutil = None
+
+    def busy_permille(self) -> Optional[int]:
+        if self._psutil is None:
+            return None
+        try:
+            now = self._psutil.cpu_times()
+        except Exception:
+            return None
+        last, self._last = self._last, now
+        if last is None:
+            return None
+        total = sum(now) - sum(last)
+        if total <= 0:
+            return None
+        idle = (now.idle - last.idle) + (getattr(now, "iowait", 0.0) - getattr(last, "iowait", 0.0))
+        return max(0, min(1000, int(1000 * (total - idle) / total)))
 
 
 def _heap_in_use() -> Optional[int]:

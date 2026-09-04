@@ -267,6 +267,20 @@ class Settings:
     #: Resident megabytes no test may reach, whatever it started from. 0 is
     #: off. The retained threshold catches a climb; this catches a size.
     profile_peak_mb: int = 0
+    #: Trace allocations with tracemalloc as well, so a memory finding names
+    #: the lines holding the memory and a memory flame graph is written.
+    #: Several times slower on allocation-heavy code: for a rerun of the
+    #: tests the untraced run named, never the nightly.
+    profile_allocations: bool = False
+    #: Frames tracemalloc keeps per allocation when tracing. Deeper reaches
+    #: further up the stack and costs more per allocation.
+    profile_allocation_depth: int = 12
+    #: Cores the process must burn, over consecutive tenth-second windows,
+    #: for a stretch to be a burst.
+    profile_burst_cores: float = 0.7
+    #: Seconds a burst must last to be raised on its own. Shorter bursts
+    #: are raised only when the same code bursts across many tests.
+    profile_burst_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "directory", Path(self.directory))
@@ -299,6 +313,10 @@ class Settings:
         object.__setattr__(self, "profile_cpu_share", max(0.0, float(self.profile_cpu_share)))
         object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
         object.__setattr__(self, "profile_peak_mb", max(0, int(self.profile_peak_mb)))
+        object.__setattr__(self, "profile_allocations", bool(self.profile_allocations))
+        object.__setattr__(self, "profile_allocation_depth", max(1, int(self.profile_allocation_depth)))
+        object.__setattr__(self, "profile_burst_cores", max(0.05, float(self.profile_burst_cores)))
+        object.__setattr__(self, "profile_burst_seconds", max(0.1, float(self.profile_burst_seconds)))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
 
@@ -492,6 +510,10 @@ class Settings:
             "profile_cpu_share": self.profile_cpu_share,
             "profile_retained_mb": self.profile_retained_mb,
             "profile_peak_mb": self.profile_peak_mb,
+            "profile_allocations": self.profile_allocations,
+            "profile_allocation_depth": self.profile_allocation_depth,
+            "profile_burst_cores": self.profile_burst_cores,
+            "profile_burst_seconds": self.profile_burst_seconds,
             # crash_stack is absent, and for a reason of its own: it asks
             # whether a run with no workers should take the fatal dump off its
             # terminal, and a worker has no terminal and no choice. It always
@@ -655,6 +677,31 @@ def add_options(parser: pytest.Parser) -> None:
         "the memory climbed. 0 is off.",
         default="0",
     )
+    parser.addini(
+        "failure_profile_allocations",
+        help="Trace allocations with tracemalloc while profiling, so a memory "
+        "finding names the lines holding the memory and a memory flame graph "
+        "is written. Several times slower on allocation-heavy code; for a "
+        "rerun of the tests an untraced run named. --profile-allocations "
+        "does the same for one run.",
+        default="false",
+    )
+    parser.addini(
+        "failure_profile_allocation_depth",
+        help="Frames tracemalloc keeps per allocation when tracing.",
+        default="12",
+    )
+    parser.addini(
+        "failure_profile_burst_cores",
+        help="Cores the process must burn over consecutive tenth-second windows "
+        "for a stretch to count as a CPU burst.",
+        default="0.7",
+    )
+    parser.addini(
+        "failure_profile_burst_seconds",
+        help="Seconds a CPU burst must last to be raised on its own.",
+        default="2",
+    )
 
 
 def _add_command_line_options(parser: pytest.Parser) -> None:
@@ -717,6 +764,17 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         "the same for every run.",
     )
     group.addoption(
+        "--profile-allocations",
+        action="store_true",
+        default=False,
+        dest=PROFILE_ALLOCATIONS_OPTION,
+        help="Profile this run with allocation tracing as well: every memory "
+        "finding names the lines holding the memory, and a memory flame graph "
+        "is written beside the CPU one. Several times slower on "
+        "allocation-heavy code, so for a rerun of the tests a plain --profile "
+        "named. Implies --profile.",
+    )
+    group.addoption(
         "--callstack-port",
         type=int,
         default=None,
@@ -750,6 +808,8 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
 ENABLE_OPTION = "failure_instrumentation"
 #: The ``dest`` of ``--profile``.
 PROFILE_OPTION = "failure_profile_this_run"
+#: The ``dest`` of ``--profile-allocations``.
+PROFILE_ALLOCATIONS_OPTION = "failure_profile_allocations_this_run"
 #: Faster than this and the sampler is most of what it measures.
 MIN_PROFILE_INTERVAL = 0.002
 
@@ -788,7 +848,7 @@ def switched_on(config: pytest.Config) -> bool:
         return True
     if _option(config, "callstack_host") is not None:
         return True
-    if _option(config, PROFILE_OPTION):
+    if _option(config, PROFILE_OPTION) or _option(config, PROFILE_ALLOCATIONS_OPTION):
         # A request for a profile is a request for the plugin that takes it,
         # on the same grounds as the server options above.
         return True
@@ -982,9 +1042,16 @@ def resolve(config: pytest.Config) -> Settings:
         stack_server_token=chosen_token or "",
         worker_count=worker_count,
         run_id=run_id,
-        profile=_flag(config, "failure_profile", False) or bool(_option(config, PROFILE_OPTION)),
+        profile=_flag(config, "failure_profile", False)
+        or bool(_option(config, PROFILE_OPTION))
+        or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
         profile_interval=_number(config, "failure_profile_interval", 0.02),
         profile_cpu_share=_number(config, "failure_profile_cpu_share", 5.0),
         profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
         profile_peak_mb=int(_number(config, "failure_profile_peak_mb", 0)),
+        profile_allocations=_flag(config, "failure_profile_allocations", False)
+        or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
+        profile_allocation_depth=int(_number(config, "failure_profile_allocation_depth", 12)),
+        profile_burst_cores=_number(config, "failure_profile_burst_cores", 0.7),
+        profile_burst_seconds=_number(config, "failure_profile_burst_seconds", 2.0),
     )

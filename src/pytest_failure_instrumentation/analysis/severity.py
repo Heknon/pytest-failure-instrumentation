@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 #: Kinds the profiler raises. Findings rather than failures, and scored as such.
-PROFILE_KINDS = ("cpu_hotspot", "memory_profile")
+PROFILE_KINDS = ("cpu_hotspot", "cpu_burst", "memory_profile")
 
 BY_OWNER = {
     "product": "critical",

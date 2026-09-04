@@ -22,7 +22,7 @@ from .base import Capabilities, Frame, Incident
 from .collection import CollectionMismatchIncident, CollectionVariant
 from .death import WorkerDeathIncident
 from .internal_error import InternalErrorIncident
-from .profile import CpuHotspotIncident, MemoryProfileIncident
+from .profile import CpuBurstIncident, CpuHotspotIncident, MemoryProfileIncident
 from .stack_server import StackServerIncident
 from .stall import WorkerStallIncident
 from .summary import RunSummaryIncident
@@ -36,6 +36,7 @@ AnyIncident = Annotated[
         RunSummaryIncident,
         StackServerIncident,
         CpuHotspotIncident,
+        CpuBurstIncident,
         MemoryProfileIncident,
     ],
     Field(discriminator="kind"),
@@ -59,6 +60,7 @@ __all__ = [
     "Capabilities",
     "CollectionMismatchIncident",
     "CollectionVariant",
+    "CpuBurstIncident",
     "CpuHotspotIncident",
     "Frame",
     "Incident",

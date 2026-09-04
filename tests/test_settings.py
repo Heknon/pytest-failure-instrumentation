@@ -59,6 +59,10 @@ DEFAULTS = {
     "failure_profile_cpu_share": "5",
     "failure_profile_retained_mb": "100",
     "failure_profile_peak_mb": "0",
+    "failure_profile_allocations": "false",
+    "failure_profile_allocation_depth": "12",
+    "failure_profile_burst_cores": "0.7",
+    "failure_profile_burst_seconds": "2",
 }
 
 
@@ -179,6 +183,7 @@ def test_every_setting_in_the_readme_table_is_registered():
         "--callstack-token",
         "--failure-instrumentation",
         "--profile",
+        "--profile-allocations",
     ]
     assert sorted(parser.ini) == sorted(DEFAULTS)
     assert sorted(parser.ini) == sorted(_settings_named_in_the_readme_table())

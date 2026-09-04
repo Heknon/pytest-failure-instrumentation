@@ -38,7 +38,21 @@ A memory finding about one test also names the code that was running while
 the memory climbed. The sampler charges every rise in resident memory to the
 test thread's stack at that moment, and those stacks are blamed the same way
 CPU is - so "peaked 900 MB" comes with "under ``load_everything`` in
-``reports.py``", which is the difference between a number and a fix.
+``reports.py``", which is the difference between a number and a fix. With
+allocation tracing on, the record also carries what tracemalloc saw holding
+the memory, and those lines join the evidence.
+
+And for bursts, read from the timeline - the process's CPU window by window
+against the machine's - which is what a suite that waits on I/O for
+ninety-nine seconds in a hundred needs, since a share of the run's CPU says
+nothing about a hundredth of it that pins a core:
+
+======================= =====================================================
+``LONG_BURST``          one test held a core (or more) for longer than allowed
+``RECURRING_BURST``     the same function burst in test after test - a fixture
+``BACKGROUND_BURST``    a thread that is not running the test held a core
+``CONTENDED``          the machine was pinned and the workers got slices of it
+======================= =====================================================
 """
 
 from __future__ import annotations
@@ -76,6 +90,13 @@ class Thresholds:
     imbalance_ratio: float = 2.0
     #: Resident MB no test may reach whatever it started from. 0 is off.
     peak_mb: int = 0
+    #: Cores' worth of CPU a window must hold to be part of a burst.
+    burst_cores: float = 0.7
+    #: Seconds a burst must last to be raised on its own.
+    burst_seconds: float = 2.0
+    #: Tests the same function must burst in to be raised as recurring,
+    #: whatever the length of each burst.
+    burst_tests: int = 5
 
 
 @dataclass
@@ -155,6 +176,18 @@ class Finding:
     #: stack, out of how much was charged at all.
     climb_mb: int = 0
     climb_total_mb: int = 0
+    #: For steady growth: live objects added per test, when they were counted.
+    growth_objects_per_test: Optional[int] = None
+    # bursts
+    #: How long the burst held the cores, and how many of them.
+    burst_seconds: float = 0.0
+    cores: float = 0.0
+    #: Seconds into the test (or the gap between tests) that it started.
+    started_s: float = 0.0
+    #: How busy the whole machine was over the burst, in percent.
+    machine_busy_percent: Optional[float] = None
+    cpus: Optional[int] = None
+    worker_count: int = 0
 
 
 @dataclass
@@ -177,6 +210,10 @@ class Report:
     per_thread: bool
     workers: dict[str, dict[str, Any]]
     tests: int
+    #: Whether allocation tracing was on. A traced run's CPU is the tracer's
+    #: as much as the tests', so no CPU finding is raised from one; memory
+    #: findings are what it is for.
+    allocations: bool = False
 
 
 # -- reading records ------------------------------------------------------------
@@ -189,7 +226,7 @@ def _frame(entry: str, attributor: Attributor) -> FrameRef:
         number = int(line)
     except ValueError:
         number = 0
-    return FrameRef(file, number, _enclosing(function), attributor.owner_of(file))
+    return FrameRef(file, number, _enclosing(function) or "?", attributor.owner_of(file))
 
 
 def _enclosing(function: str) -> str:
@@ -253,6 +290,7 @@ def analyse(
     gc_by_test: dict[str, float] = defaultdict(float)
     native_by_name: Counter = Counter()
     tests = 0
+    allocations = False
 
     for record in records:
         worker = str(record.get("worker") or "")
@@ -272,6 +310,7 @@ def analyse(
         wall += float(record.get("wall_s") or 0.0)
         cpu_weighted = cpu_weighted and bool(record.get("cpu_weighted", True))
         per_thread = per_thread and bool(record.get("per_thread", True))
+        allocations = allocations or bool(record.get("allocations"))
         seconds = float((record.get("gc") or {}).get("seconds") or 0.0)
         gc_seconds += seconds
         if record.get("nodeid") and seconds:
@@ -322,10 +361,14 @@ def analyse(
     ranked = sorted(functions.values(), key=lambda cost: cost.cpu_ns, reverse=True)
     findings: list[Finding] = []
     total_cpu_ns = sampled_cpu + native_cpu
-    findings.extend(_cpu_findings(ranked, total_cpu_ns, limits))
-    findings.extend(_gc_finding(gc_seconds, total_cpu_ns, gc_by_test, limits))
-    findings.extend(_native_finding(native_cpu, native_by_name, total_cpu_ns, limits))
+    if not allocations:
+        findings.extend(_cpu_findings(ranked, total_cpu_ns, limits))
+        findings.extend(_gc_finding(gc_seconds, total_cpu_ns, gc_by_test, limits))
+        findings.extend(_native_finding(native_cpu, native_by_name, total_cpu_ns, limits))
     findings.extend(_memory_findings(records, limits, attributor))
+    if not allocations:
+        findings.extend(_burst_findings(records, limits, attributor))
+        findings.extend(_contention_finding(records, limits, len(workers)))
 
     return Report(
         findings=findings,
@@ -339,6 +382,7 @@ def analyse(
         per_thread=per_thread,
         workers=dict(workers),
         tests=tests,
+        allocations=allocations,
     )
 
 
@@ -517,8 +561,9 @@ def _climb(
         f"{megabytes} MB of the {total} MB climb happened under "
         f"{Path(frame.file).name}:{frame.line} in {frame.function} ({frame.owner})"
     ]
-    if len(stack) > 1:
-        evidence[0] += f", called from {Path(stack[1].file).name}:{stack[1].line} in {stack[1].function}"
+    caller = _caller(stack)
+    if caller is not None:
+        evidence[0] += f", called from {Path(caller.file).name}:{caller.line} in {caller.function}"
     if unplaced:
         evidence.append(too_quick)
     return frame, _faulthandler_lines(stack), megabytes, total, evidence
@@ -536,11 +581,20 @@ def _memory_findings(
             continue
         by_worker[str(record.get("worker") or "")].append(record)
 
+    # With allocation tracing on, the worker's last background record carries
+    # what tracemalloc saw holding the memory the whole session accumulated.
+    session_holders = {
+        str(record.get("worker") or ""): record
+        for record in records
+        if record.get("record") == BACKGROUND_RECORD and record.get("holders_session")
+    }
+
     for worker, tests in by_worker.items():
         for record in tests:
-            before, after = int(record["rss_before_mb"]), int(record["rss_after_mb"])
-            peak = int(record.get("rss_peak_mb") or max(before, after))
+            before, after, peak, traced = _figures(record)
             retained = _kept(record)
+            traced_note = _traced_note(record) if traced else []
+            figure = "traced memory" if traced else "resident memory"
             # A test is raised for the ceiling when it climbed to get there. A
             # worker already over it from what earlier tests kept is every
             # later test's problem, and the growth finding names the cause;
@@ -552,12 +606,13 @@ def _memory_findings(
             )
             if over_ceiling:
                 frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
+                frame, stack, held = _holders(record, "holders_peak", "at the peak", attributor, frame, stack)
                 findings.append(
                     Finding(
                         kind="memory_profile",
                         verdict="PEAK_OVER_CEILING",
                         evidence=[
-                            f"resident memory reached {peak} MB during the test, over the "
+                            f"{figure} reached {peak} MB during the test, over the "
                             f"{limits.peak_mb} MB ceiling; it started at {before} MB and "
                             f"ended at {after} MB",
                             "the size is the finding whatever happened to it afterwards: "
@@ -565,7 +620,9 @@ def _memory_findings(
                             "it, and a run with several of them is an OOM kill waiting "
                             "for the right schedule",
                         ]
+                        + traced_note
                         + climb_evidence
+                        + held
                         + (
                             [f"and {retained} MB of it was still there once the test was over"]
                             if retained >= limits.retained_mb
@@ -586,7 +643,7 @@ def _memory_findings(
             elif retained >= limits.retained_mb:
                 phase = _phase_of_step(record.get("rss_at") or {}, limits.retained_mb)
                 evidence = [
-                    f"resident memory {before} MB before, {after} MB after: "
+                    f"{figure} {before} MB before, {after} MB after: "
                     f"{after - before} MB kept once the test was over",
                 ]
                 if retained > after - before:
@@ -595,10 +652,13 @@ def _memory_findings(
                         f"live heap grew {retained} MB: the test filled pages an earlier "
                         "test had freed, so the resident figure understates what it kept"
                     )
+                evidence.extend(traced_note)
                 live, live_evidence = _still_in_use(record, retained)
                 evidence.extend(live_evidence)
                 frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
                 evidence.extend(climb_evidence)
+                frame, stack, held = _holders(record, "holders_kept", "still held afterwards", attributor, frame, stack)
+                evidence.extend(held)
                 if live is False:
                     findings.append(
                         Finding(
@@ -657,18 +717,21 @@ def _memory_findings(
                 )
             elif peak - max(before, after) >= limits.retained_mb:
                 frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
+                frame, stack, held = _holders(record, "holders_peak", "at the peak", attributor, frame, stack)
                 risen = peak - before
                 findings.append(
                     Finding(
                         kind="memory_profile",
                         verdict="TRANSIENT_PEAK",
                         evidence=[
-                            f"resident memory climbed {risen} MB to {peak} MB during the "
+                            f"{figure} climbed {risen} MB to {peak} MB during the "
                             f"test and came back to {after} MB",
                             "freed on return, so it costs peak memory rather than a leak: "
                             "it is what decides how many workers fit on the machine",
                         ]
-                        + climb_evidence,
+                        + traced_note
+                        + climb_evidence
+                        + held,
                         nodeid=record["nodeid"],
                         worker=worker,
                         before_mb=before,
@@ -681,10 +744,76 @@ def _memory_findings(
                         climb_total_mb=climb_total,
                     )
                 )
-        findings.extend(_growth(worker, tests, limits))
+        findings.extend(_drift(worker, tests, limits, session_holders.get(worker), attributor))
 
     findings.extend(_imbalance(by_worker, limits))
     return findings
+
+
+def _figures(record: dict[str, Any]) -> tuple[int, int, int, bool]:
+    """Before, after and peak, and whether they are tracemalloc's.
+
+    With allocation tracing on, resident memory is not the figure: the
+    tracer's tables grow with every allocation it records and churn the
+    allocator enough to leave pages mapped after the test freed everything.
+    tracemalloc's own count of traced bytes is exact, and its peak resets
+    per test, so a traced record is judged on those.
+    """
+    traced = record.get("traced") or {}
+    if all(traced.get(key) is not None for key in ("before_mb", "after_mb", "peak_mb")):
+        before, after, peak = int(traced["before_mb"]), int(traced["after_mb"]), int(traced["peak_mb"])
+        return before, after, max(peak, before, after), True
+    before, after = int(record["rss_before_mb"]), int(record["rss_after_mb"])
+    peak = int(record.get("rss_peak_mb") or max(before, after))
+    return before, after, max(peak, before, after), False
+
+
+def _traced_note(record: dict[str, Any]) -> list[str]:
+    traced = record.get("traced") or {}
+    return [
+        "figures are from tracemalloc: Python allocations only, with the tracer's own "
+        f"{int(traced.get('tracer_mb') or 0)} MB of tables left out; resident memory was "
+        f"{record.get('rss_before_mb')} MB before and {record.get('rss_after_mb')} MB after"
+    ]
+
+
+def _holders(
+    record: dict[str, Any],
+    key: str,
+    label: str,
+    attributor: Attributor,
+    frame: Optional[FrameRef],
+    stack: list[str],
+) -> tuple[Optional[FrameRef], list[str], list[str]]:
+    """The lines tracemalloc saw holding the memory, as evidence - and as the
+    finding's frame when the sampler saw nothing climbing.
+
+    A tracemalloc traceback is oldest frame first; a reader wants the
+    allocation site first, so it is turned round. The frames carry no
+    function name, and are blamed by file like any other.
+    """
+    table = [_frame(entry, attributor) for entry in record.get("frames") or []]
+    evidence: list[str] = []
+    for holder in record.get(key) or []:
+        try:
+            frames = _without_the_instrumentation([table[index] for index in reversed(holder["frames"])])
+        except (IndexError, KeyError, TypeError):
+            continue
+        if not frames:
+            continue
+        # A comprehension and the function it is in are one line to a reader.
+        places: list[str] = []
+        for entry in frames:
+            place = f"{Path(entry.file).name}:{entry.line}"
+            if not places or places[-1] != place:
+                places.append(place)
+        where = " <- ".join(places[:4])
+        evidence.append(f"{label}: {holder.get('mb')} MB allocated at {where}")
+        if frame is None:
+            blamed_at = _blame_index(frames)
+            frame = frames[blamed_at]
+            stack = _faulthandler_lines(frames[blamed_at:])
+    return frame, stack, evidence
 
 
 #: A rough size for one small-object block, to turn a block count into
@@ -696,6 +825,11 @@ BYTES_PER_BLOCK = 64
 def _still_in_use(record: dict[str, Any], retained_mb: int) -> tuple[Optional[bool], list[str]]:
     """Whether the memory a test left behind is alive, from the live-heap
     readings, and the sentence that says so. None where nothing was read."""
+    if _figures(record)[3]:
+        return True, [
+            f"tracemalloc counts {retained_mb} MB more live Python allocations than before "
+            "the test: in use, not pages the allocator kept"
+        ]
     heap_before, heap_after = record.get("heap_before_mb"), record.get("heap_after_mb")
     blocks_before, blocks_after = record.get("blocks_before"), record.get("blocks_after")
     evidence: list[str] = []
@@ -735,41 +869,93 @@ def _phase_of_step(rss_at: dict[str, Any], threshold_mb: int) -> Optional[str]:
     return best[1]
 
 
-def _growth(worker: str, tests: list[dict[str, Any]], limits: Thresholds) -> list[Finding]:
-    """A run of tests that each left a little: the shape of a leak.
+def _drift(
+    worker: str,
+    tests: list[dict[str, Any]],
+    limits: Thresholds,
+    session: Optional[dict[str, Any]],
+    attributor: Attributor,
+) -> list[Finding]:
+    """The worker drifted upward over its tests: the leak no single test shows.
 
-    A step has to be worth noticing on its own - a twentieth of the threshold
-    - so the megabyte a poller's buffers add to every test does not stitch
-    unrelated tests into one run. And the run is trimmed at both ends to the
-    steps that look like each other: a test that happened to leave five
-    megabytes just before the leaking ones started is not the first of them.
+    Two megabytes a test is nothing; over fifty tests it is a hundred, and
+    over a five-hour worker it is the OOM kill. The rule is over the whole
+    worker: what its tests kept *in use* between them, net, reaches the
+    threshold, no single step is half of it, and at least half of them grew.
+    In use, because resident memory drifts up on its own as the allocator
+    keeps pages a fixture's worth of freed objects fragmented - twenty
+    megabytes a test that no line holds. Where the live heap and the object
+    count were read, the step is what they say; elsewhere it is the resident
+    step, and the object count is the tiebreak. A test raised on its own is
+    left out, and so is the test that gave a fixture's worth back, or the
+    release of a module fixture would cancel the leak beside it.
     """
-    floor = max(2, limits.retained_mb // 20)
-    run: list[dict[str, Any]] = []
-    best: list[dict[str, Any]] = []
-    for record in tests:
-        step = _step(record)
-        if floor <= step < limits.retained_mb:
-            run.append(record)
-        else:
-            best = _better(best, _trimmed(run))
-            run = []
-    best = _better(best, _trimmed(run))
-    total = _growth_total(best)
-    if len(best) < limits.growth_tests or total < limits.retained_mb:
-        return []
-    first, last = best[0], best[-1]
-    names = {str(record["nodeid"]).split("[")[0] for record in best}
-    evidence = [
-        f"{len(best)} consecutive tests on {worker} each left memory behind: "
-        f"{int(first['rss_before_mb'])} MB before {first['nodeid']} to "
-        f"{int(last['rss_after_mb'])} MB after {last['nodeid']}, "
-        f"{total / len(best):.0f} MB per test",
-        "no single test crossed the threshold, so a per-test check would never flag this; "
-        "the pattern is what a leak looks like",
+    rows = [
+        record
+        for record in tests
+        if abs(_kept(record)) < limits.retained_mb and abs(_live_step(record)) < limits.retained_mb
     ]
-    if len(names) == 1:
-        evidence.append(f"every one of them is a parametrisation of {names.pop()}")
+    if len(rows) < limits.growth_tests:
+        return []
+    steps = [_live_step(record) for record in rows]
+    total = sum(steps)
+    biggest = max(steps)
+    blocks = [_blocks_kept(record) for record in rows]
+    growing = sum(
+        1 for step, kept in zip(steps, blocks) if step > 0 or (kept is not None and kept > 0)
+    )
+    if total < limits.retained_mb or biggest >= total / 2 or growing < len(rows) / 2:
+        return []
+    counted = [kept for kept in blocks if kept is not None]
+    objects = sum(counted) // len(rows) if counted else None
+    first, last = rows[0], rows[-1]
+    per_test = total / len(rows)
+    by_name: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for record, step in zip(rows, steps):
+        entry = by_name[str(record["nodeid"]).split("[")[0]]
+        entry[0] += step
+        entry[1] += 1
+    resident = sum(_figures(record)[1] - _figures(record)[0] for record in rows)
+    evidence = [
+        f"{len(rows)} tests on {worker} kept {total} MB between them that is still in use: "
+        f"about {per_test:.1f} MB per test"
+        + (f" and {objects:,d} live objects" if objects else "")
+        + f", the biggest single step {biggest} MB; "
+        + ("traced memory" if _figures(first)[3] else "resident memory")
+        + f" was {_figures(first)[0]} MB before {first['nodeid']} and {_figures(last)[1]} MB "
+        f"after {last['nodeid']}"
+        + (
+            f", and these tests grew it {resident} MB in all, the other {resident - total} MB "
+            "pages the allocator kept after they freed"
+            if resident > total + 1
+            else ""
+        ),
+        "no single test crossed the threshold, so a per-test check would never flag this; "
+        f"spread over {growing} of the {len(rows)} tests, it is the shape of a leak",
+    ]
+    if len(by_name) == 1:
+        evidence.append(f"every one of them is a parametrisation of {next(iter(by_name))}")
+    else:
+        heaviest = sorted(by_name.items(), key=lambda item: -item[1][0])[:3]
+        evidence.append(
+            "most of it in: "
+            + ", ".join(
+                f"{name} ({megabytes} MB over {count} test{'s' if count != 1 else ''})"
+                for name, (megabytes, count) in heaviest
+                if megabytes > 0
+            )
+        )
+    frame: Optional[FrameRef] = None
+    stack: list[str] = []
+    if session is not None:
+        frame, stack, held = _holders(
+            session, "holders_session", "held at the end of the worker", attributor, None, []
+        )
+        evidence.extend(held)
+    else:
+        evidence.append(
+            "rerun these tests with --profile-allocations to see the lines that hold it"
+        )
     return [
         Finding(
             kind="memory_profile",
@@ -777,24 +963,23 @@ def _growth(worker: str, tests: list[dict[str, Any]], limits: Thresholds) -> lis
             evidence=evidence,
             nodeid=str(first["nodeid"]),
             worker=worker,
-            before_mb=int(first["rss_before_mb"]),
-            after_mb=int(last["rss_after_mb"]),
+            before_mb=_figures(first)[0],
+            after_mb=_figures(last)[1],
             delta_mb=total,
-            growth_tests=len(best),
-            growth_per_test_mb=round(total / len(best), 1),
-            tests=[str(record["nodeid"]) for record in best[:3]],
-            test_count=len(best),
+            growth_tests=len(rows),
+            growth_per_test_mb=round(per_test, 1),
+            growth_objects_per_test=objects,
+            tests=[str(record["nodeid"]) for record in rows[:3]],
+            test_count=len(rows),
+            frame=frame,
+            stack=stack,
         )
     ]
 
 
-def _step(record: dict[str, Any]) -> int:
-    return _kept(record)
-
-
 def _kept(record: dict[str, Any]) -> int:
     """What a test left behind: the resident step, or the live-heap step
-    when that is larger.
+    when that is larger - or the traced step, when tracing was on.
 
     Resident memory understates what a test kept whenever the test reuses
     pages an earlier test freed and the allocator held on to. The cache test
@@ -803,32 +988,34 @@ def _kept(record: dict[str, Any]) -> int:
     in-use figure is not fooled by that, so the larger of the two is what a
     test is held to.
     """
-    resident = int(record["rss_after_mb"]) - int(record["rss_before_mb"])
+    before, after, _, traced = _figures(record)
+    resident = after - before
+    if traced:
+        return resident
     heap_before, heap_after = record.get("heap_before_mb"), record.get("heap_after_mb")
     if heap_before is None or heap_after is None:
         return resident
     return max(resident, int(heap_after) - int(heap_before))
 
 
-def _trimmed(run: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The run without the small steps at either end of it."""
-    if len(run) < 3:
-        return run
-    typical = median(_step(record) for record in run)
-    start, end = 0, len(run)
-    while start < end and _step(run[start]) < typical / 2:
-        start += 1
-    while end > start and _step(run[end - 1]) < typical / 2:
-        end -= 1
-    return run[start:end]
+def _live_step(record: dict[str, Any]) -> int:
+    """What a test added to memory that is in use, for the drift rule: the
+    C heap's step plus the small-object blocks' at their rough size, where
+    both were read; the resident step where neither was."""
+    if _figures(record)[3]:
+        return _kept(record)
+    heap_before, heap_after = record.get("heap_before_mb"), record.get("heap_after_mb")
+    blocks = _blocks_kept(record)
+    if heap_before is None or heap_after is None or blocks is None:
+        return _kept(record)
+    return int(heap_after) - int(heap_before) + int(blocks * BYTES_PER_BLOCK / 1048576)
 
 
-def _better(best: list[dict[str, Any]], candidate: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return candidate if _growth_total(candidate) > _growth_total(best) else best
-
-
-def _growth_total(run: list[dict[str, Any]]) -> int:
-    return sum(_kept(record) for record in run)
+def _blocks_kept(record: dict[str, Any]) -> Optional[int]:
+    before, after = record.get("blocks_before"), record.get("blocks_after")
+    if before is None or after is None:
+        return None
+    return int(after) - int(before)
 
 
 def _imbalance(by_worker: dict[str, list[dict[str, Any]]], limits: Thresholds) -> list[Finding]:
@@ -880,6 +1067,413 @@ def _imbalance(by_worker: dict[str, list[dict[str, Any]]], limits: Thresholds) -
     ]
 
 
+# -- bursts ----------------------------------------------------------------------
+
+#: A burst is at least this many consecutive busy windows: one window is a
+#: tick's worth of noise, two is a fifth of a second of a core.
+MIN_BURST_WINDOWS = 2
+#: Per mille of the machine busy for a window to count as pinned.
+PINNED_PERMILLE = 900
+
+
+@dataclass
+class _Burst:
+    """Consecutive timeline windows at or over the core threshold."""
+
+    nodeid: Optional[str]
+    worker: str
+    started_s: float
+    seconds: float = 0.0
+    cpu_ns: int = 0
+    windows: int = 0
+    phases: Counter = field(default_factory=Counter)
+    threads: Counter = field(default_factory=Counter)
+    machine: list[int] = field(default_factory=list)
+    #: (thread, frame indexes) -> cpu, for the stack that stands for it.
+    stacks: Counter = field(default_factory=Counter)
+
+    @property
+    def cores(self) -> float:
+        return self.cpu_ns / (self.seconds * 1e9) if self.seconds else 0.0
+
+    @property
+    def phase(self) -> Optional[str]:
+        return self.phases.most_common(1)[0][0] if self.phases else None
+
+    @property
+    def thread(self) -> Optional[str]:
+        return self.threads.most_common(1)[0][0] if self.threads else None
+
+    @property
+    def machine_busy_percent(self) -> Optional[float]:
+        if not self.machine:
+            return None
+        return round(sum(self.machine) / len(self.machine) / 10, 1)
+
+
+def _bursts(record: dict[str, Any], limits: Thresholds) -> list[_Burst]:
+    """The bursts in one record's timeline.
+
+    A window is busy when the process burnt ``burst_cores`` cores' worth of
+    CPU over it; a burst is a run of busy windows. The window's stack is
+    the one that burnt the most in it, and the burst keeps every window's,
+    so the blame is the stack that was there most of the time rather than
+    the one that happened to be there at the end.
+    """
+    nodeid = record.get("nodeid")
+    worker = str(record.get("worker") or "")
+    bursts: list[_Burst] = []
+    current: Optional[_Burst] = None
+    #: A quiet window inside a burst - a collection, a page fault storm, a
+    #: read - does not end it; two in a row do. Held back until the next
+    #: window says which it was.
+    pending: Optional[tuple[int, int, Any]] = None
+    previous = 0
+
+    def close() -> None:
+        nonlocal current, pending
+        if current is not None and current.windows >= MIN_BURST_WINDOWS:
+            bursts.append(current)
+        current = None
+        pending = None
+
+    for entry in record.get("timeline") or []:
+        try:
+            offset_ms, cpu_ns, machine, phase, thread, indexes = entry
+            offset_ms, cpu_ns = int(offset_ms), int(cpu_ns or 0)
+        except (TypeError, ValueError):
+            continue
+        wall_ms = offset_ms - previous
+        previous = offset_ms
+        if wall_ms <= 0:
+            continue
+        if cpu_ns / (wall_ms * 1e6) < limits.burst_cores:
+            if current is None or pending is not None:
+                close()
+            else:
+                pending = (wall_ms, cpu_ns, phase)
+            continue
+        if current is None:
+            current = _Burst(nodeid, worker, (offset_ms - wall_ms) / 1000)
+        elif pending is not None:
+            gap_ms, gap_cpu_ns, gap_phase = pending
+            current.seconds += gap_ms / 1000
+            current.cpu_ns += gap_cpu_ns
+            current.phases[gap_phase] += gap_ms
+            pending = None
+        current.seconds += wall_ms / 1000
+        current.cpu_ns += cpu_ns
+        current.windows += 1
+        current.phases[phase] += wall_ms
+        if thread is not None:
+            current.threads[str(thread)] += cpu_ns
+        if machine is not None:
+            current.machine.append(int(machine))
+        if indexes:
+            current.stacks[(str(thread), tuple(indexes))] += cpu_ns
+    close()
+    return bursts
+
+
+def _burst_blame(burst: _Burst, table: list[FrameRef]) -> tuple[Optional[FrameRef], list[FrameRef]]:
+    for (_, indexes), _ in burst.stacks.most_common():
+        try:
+            frames = _without_the_instrumentation([table[index] for index in indexes])
+        except (IndexError, TypeError):
+            continue
+        if frames:
+            blamed_at = _blame_index(frames)
+            return frames[blamed_at], frames[blamed_at:]
+    return None, []
+
+
+def _where(stack: list[FrameRef]) -> str:
+    if not stack:
+        return ""
+    frame = stack[0]
+    where = f"under {Path(frame.file).name}:{frame.line} in {frame.function} ({frame.owner})"
+    caller = _caller(stack)
+    if caller is not None:
+        where += f", called from {Path(caller.file).name}:{caller.line} in {caller.function}"
+    return where
+
+
+def _caller(stack: list[FrameRef]) -> Optional[FrameRef]:
+    """The first frame above the blamed one that is a different function:
+    a comprehension folded into its function is not called from itself."""
+    if not stack:
+        return None
+    blamed = stack[0]
+    return next(
+        (
+            frame
+            for frame in stack[1:]
+            if (frame.file, frame.function) != (blamed.file, blamed.function)
+        ),
+        None,
+    )
+
+
+def _machine_line(burst: _Burst) -> list[str]:
+    busy = burst.machine_busy_percent
+    if busy is None:
+        return []
+    line = f"the machine was {busy:g}% busy over the burst"
+    if busy * 10 >= PINNED_PERMILLE:
+        line += (
+            ": pinned, so this got a slice of a core and took longer than its CPU "
+            "cost - the other workers are in the burst too"
+        )
+    return [line]
+
+
+def _burst_findings(
+    records: list[dict[str, Any]], limits: Thresholds, attributor: Attributor
+) -> list[Finding]:
+    """Long bursts per test, recurring bursts per function, and bursts on
+    threads that are not running the test - one finding each, however many
+    bursts stand behind it."""
+    findings: list[Finding] = []
+    by_function: dict[tuple[str, str], list[tuple[_Burst, list[FrameRef], dict[str, Any]]]] = defaultdict(list)
+    per_test: dict[str, list[tuple[_Burst, list[FrameRef], dict[str, Any]]]] = defaultdict(list)
+    background: dict[tuple[str, str], list[tuple[_Burst, list[FrameRef], dict[str, Any]]]] = defaultdict(list)
+    for record in records:
+        bursts = _bursts(record, limits)
+        if not bursts:
+            continue
+        table = [_frame(entry, attributor) for entry in record.get("frames") or []]
+        test_thread = next(
+            (str(stack.get("thread")) for stack in record.get("stacks") or [] if not stack.get("background")),
+            None,
+        )
+        for burst in bursts:
+            frame, stack = _burst_blame(burst, table)
+            on_another_thread = (
+                test_thread is not None and burst.thread is not None and burst.thread != test_thread
+            )
+            if record.get("record") != TEST_RECORD or on_another_thread:
+                background[(burst.worker, burst.thread or "")].append((burst, stack, record))
+            elif frame is not None:
+                by_function[(frame.file, frame.function)].append((burst, stack, record))
+                per_test[str(burst.nodeid)].append((burst, stack, record))
+            else:
+                per_test[str(burst.nodeid)].append((burst, stack, record))
+
+    recurring: set[str] = set()
+    for group in by_function.values():
+        tests = {str(burst.nodeid) for burst, _, _ in group}
+        if len(tests) < limits.burst_tests:
+            continue
+        findings.append(_recurring_burst(group, limits))
+        recurring.update(tests)
+
+    for nodeid, group in per_test.items():
+        if nodeid in recurring:
+            continue
+        burst, stack, record = max(group, key=lambda item: item[0].seconds)
+        if burst.seconds >= limits.burst_seconds:
+            findings.append(_long_burst(burst, stack, record, limits))
+
+    for group in background.values():
+        burst, stack, record = max(group, key=lambda item: item[0].seconds)
+        if burst.seconds >= limits.burst_seconds:
+            findings.append(_background_burst(burst, stack, record, len(group)))
+    return findings
+
+
+def _long_burst(burst: _Burst, stack: list[FrameRef], record: dict[str, Any], limits: Thresholds) -> Finding:
+    wall = float(record.get("wall_s") or 0.0)
+    cpu = float(record.get("cpu_s") or 0.0)
+    evidence = [
+        f"{burst.seconds:.1f} s at {burst.cores:.1f} cores, starting {burst.started_s:.1f} s into "
+        f"the test, in {burst.phase or 'the test'}",
+    ]
+    if cpu > 0 and wall > 0:
+        share = min(100.0, _percent(burst.cpu_ns / 1e9, cpu))
+        waiting = max(0.0, wall - cpu)
+        if waiting >= max(1.0, burst.seconds / 3):
+            evidence.append(
+                f"{share:g}% of the test's {cpu:.1f} s of CPU is in this one burst; the other "
+                f"{waiting:.1f} s of its {wall:.1f} s is waiting"
+            )
+        else:
+            evidence.append(
+                f"{share:g}% of the test's {cpu:.1f} s of CPU is in this one burst, and the test "
+                f"is busy for most of its {wall:.1f} s: a hotspot as much as a burst"
+            )
+    evidence.extend([_where(stack)] if stack else [])
+    evidence.extend(_machine_line(burst))
+    return Finding(
+        kind="cpu_burst",
+        verdict="LONG_BURST",
+        evidence=evidence,
+        frame=stack[0] if stack else None,
+        stack=_faulthandler_lines(stack),
+        nodeid=burst.nodeid,
+        worker=burst.worker,
+        phase=burst.phase,
+        thread=burst.thread,
+        cpu_seconds=round(burst.cpu_ns / 1e9, 3),
+        burst_seconds=round(burst.seconds, 2),
+        cores=round(burst.cores, 2),
+        started_s=round(burst.started_s, 2),
+        machine_busy_percent=burst.machine_busy_percent,
+        tests=[str(burst.nodeid)],
+        test_count=1,
+    )
+
+
+def _recurring_burst(
+    group: list[tuple[_Burst, list[FrameRef], dict[str, Any]]], limits: Thresholds
+) -> Finding:
+    bursts = [burst for burst, _, _ in group]
+    tests: Counter = Counter()
+    for burst in bursts:
+        tests[str(burst.nodeid)] += burst.cpu_ns
+    total_cpu = sum(burst.cpu_ns for burst in bursts) / 1e9
+    total_seconds = sum(burst.seconds for burst in bursts)
+    typical = median(burst.seconds for burst in bursts)
+    phases: Counter = Counter()
+    for burst in bursts:
+        phases.update(burst.phases)
+    phase = phases.most_common(1)[0][0] if phases else None
+    _, stack, _ = max(group, key=lambda item: item[0].cpu_ns)
+    machine = [value for burst in bursts for value in burst.machine]
+    busy = round(sum(machine) / len(machine) / 10, 1) if machine else None
+    evidence = [
+        f"{len(bursts)} bursts in {len(tests)} tests, {total_cpu:.1f} s of CPU between them at "
+        f"{total_cpu / total_seconds if total_seconds else 0:.1f} cores, typically {typical:.1f} s "
+        f"each, in {phase or 'the test'}",
+        _where(stack),
+    ]
+    if phase == "setup":
+        evidence.append(
+            "in setup, so a fixture does this for every test that asks for it: what costs a "
+            "second here costs a thousand tests a quarter of an hour of a core, and the "
+            "workers pay it at the same moment when they start together"
+        )
+    elif phase == "call":
+        evidence.append(
+            "in the test bodies themselves: the same work in every one of them, the "
+            "shape of a helper doing per-call what it could do once"
+        )
+    if busy is not None:
+        evidence.append(f"the machine was {busy:g}% busy over these bursts")
+    longest = max(bursts, key=lambda burst: burst.seconds)
+    return Finding(
+        kind="cpu_burst",
+        verdict="RECURRING_BURST",
+        evidence=evidence,
+        frame=stack[0] if stack else None,
+        stack=_faulthandler_lines(stack),
+        worker=longest.worker,
+        phase=phase,
+        thread=longest.thread,
+        cpu_seconds=round(total_cpu, 3),
+        burst_seconds=round(typical, 2),
+        cores=round(total_cpu / total_seconds, 2) if total_seconds else 0.0,
+        started_s=round(longest.started_s, 2),
+        machine_busy_percent=busy,
+        tests=[nodeid for nodeid, _ in tests.most_common(3)],
+        test_count=len(tests),
+    )
+
+
+def _background_burst(burst: _Burst, stack: list[FrameRef], record: dict[str, Any], count: int) -> Finding:
+    evidence = [
+        f"{burst.seconds:.1f} s at {burst.cores:.1f} cores on thread {burst.thread!r}"
+        + (f" while {burst.nodeid} was running" if burst.nodeid else " between tests")
+        + (f"; {count} bursts like it on this thread" if count > 1 else ""),
+        "a thread that is not running the test: a poller, a log shipper, a client's "
+        "keepalive. Paid whatever test is in flight, which is what a worker at a steady "
+        "percentage with nothing to blame is doing",
+    ]
+    evidence.extend([_where(stack)] if stack else [])
+    evidence.extend(_machine_line(burst))
+    return Finding(
+        kind="cpu_burst",
+        verdict="BACKGROUND_BURST",
+        evidence=evidence,
+        frame=stack[0] if stack else None,
+        stack=_faulthandler_lines(stack),
+        nodeid=burst.nodeid,
+        worker=burst.worker,
+        phase=burst.phase,
+        thread=burst.thread,
+        cpu_seconds=round(burst.cpu_ns / 1e9, 3),
+        burst_seconds=round(burst.seconds, 2),
+        cores=round(burst.cores, 2),
+        started_s=round(burst.started_s, 2),
+        machine_busy_percent=burst.machine_busy_percent,
+        tests=[str(burst.nodeid)] if burst.nodeid else [],
+        test_count=1 if burst.nodeid else 0,
+    )
+
+
+def _contention_finding(
+    records: list[dict[str, Any]], limits: Thresholds, worker_count: int
+) -> list[Finding]:
+    """The machine was pinned for most of the run and the workers got slices.
+
+    Twenty workers on four cores read as twenty processes at a few percent
+    each, and every test takes longer than its CPU says it should. Nothing
+    on any stack explains it; the machine's own figure does.
+    """
+    busy_ms = total_ms = 0
+    busy_cpu_ns = 0
+    cpus: Optional[int] = None
+    for record in records:
+        cpus = int(record.get("cpus") or 0) or cpus
+        previous = 0
+        for entry in record.get("timeline") or []:
+            try:
+                offset_ms, cpu_ns, machine = int(entry[0]), int(entry[1] or 0), entry[2]
+            except (TypeError, ValueError, IndexError):
+                continue
+            wall_ms = offset_ms - previous
+            previous = offset_ms
+            if wall_ms <= 0:
+                continue
+            total_ms += wall_ms
+            if machine is not None and int(machine) >= PINNED_PERMILLE:
+                busy_ms += wall_ms
+                busy_cpu_ns += cpu_ns
+    if total_ms == 0 or busy_ms < limits.burst_seconds * 1000:
+        return []
+    share = busy_ms / total_ms
+    cores = busy_cpu_ns / (busy_ms * 1e6)
+    if share < 0.5 or cores >= limits.burst_cores:
+        return []
+    evidence = [
+        f"the machine was over {PINNED_PERMILLE / 10:g}% busy for {share:.0%} of the sampled "
+        f"worker time ({busy_ms / 1000:.0f} s), and a worker got {cores:.2f} cores while it was",
+        "a test's duration here is not its cost: the workers were waiting for a core as "
+        "well as for whatever they were waiting for",
+    ]
+    if cpus:
+        evidence.append(
+            f"{worker_count} worker(s) on {cpus} cores"
+            + (
+                ": more workers than cores, so they queue for them even when every "
+                "one of them is mostly waiting on I/O"
+                if worker_count > cpus
+                else "; what pinned it was not only this run's workers"
+            )
+        )
+    return [
+        Finding(
+            kind="cpu_burst",
+            verdict="CONTENDED",
+            evidence=evidence,
+            cores=round(cores, 2),
+            burst_seconds=round(busy_ms / 1000, 1),
+            machine_busy_percent=round(100 * share, 1),
+            cpus=cpus,
+            worker_count=worker_count,
+        )
+    ]
+
+
 # -- flame graph files -----------------------------------------------------------
 
 
@@ -910,6 +1504,42 @@ def speedscope(record: dict[str, Any], name: str) -> dict[str, Any]:
                 "weights": weights,
             }
         )
+    return _speedscope_document(name, frames, profiles)
+
+
+def memory_speedscope(record: dict[str, Any], name: str) -> Optional[dict[str, Any]]:
+    """One test's live allocations at its peak as a speedscope document,
+    weighted in bytes: a memory flame graph. None when the record has no
+    allocation stacks - tracing was off, or the test never climbed."""
+    stacks = record.get("memory_stacks") or []
+    if not stacks:
+        return None
+    frames = []
+    for entry in record.get("frames") or []:
+        file, _, rest = entry.partition("|")
+        line, _, function = rest.partition("|")
+        frames.append(
+            {"name": function or f"{Path(file).name}:{line}", "file": file, "line": int(line or 0)}
+        )
+    # A tracemalloc traceback is oldest frame first, which is the order
+    # speedscope wants: the root at the front.
+    samples = [list(stack["frames"]) for stack in stacks]
+    weights = [int(stack.get("bytes") or 0) for stack in stacks]
+    profile = {
+        "type": "sampled",
+        "name": "live allocations at the peak (bytes)",
+        "unit": "bytes",
+        "startValue": 0,
+        "endValue": sum(weights),
+        "samples": samples,
+        "weights": weights,
+    }
+    return _speedscope_document(name, frames, [profile])
+
+
+def _speedscope_document(
+    name: str, frames: list[dict[str, Any]], profiles: list[dict[str, Any]]
+) -> dict[str, Any]:
     return {
         "$schema": "https://www.speedscope.app/file-format-schema.json",
         "name": name,
