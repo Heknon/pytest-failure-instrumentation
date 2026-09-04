@@ -323,11 +323,14 @@ def _last_error() -> int:
     return int(getattr(ctypes, "get_last_error", lambda: 0)())
 
 
-def _properties(name: str) -> tuple[Any, Any]:
+def _properties(name: str = "", query: bool = False) -> tuple[Any, Any]:
     """An ``EVENT_TRACE_PROPERTIES`` with the name room behind it.
 
     Returned with the buffer that owns it, which the caller has to keep
-    alive for as long as the pointer is used.
+    alive for as long as the pointer is used. ``query`` is for ControlTrace
+    and QueryAllTraces, which *write* the session's names into the buffer at
+    the offsets given and need both to point inside it; StartTrace wants a
+    zero log-file offset for a session that logs to no file.
     """
     size = ctypes.sizeof(EVENT_TRACE_PROPERTIES) + NAME_ROOM
     buffer = ctypes.create_string_buffer(size)
@@ -345,7 +348,9 @@ def _properties(name: str) -> tuple[Any, Any]:
     properties.MaximumBuffers = 8
     properties.FlushTimer = 1
     properties.LoggerNameOffset = ctypes.sizeof(EVENT_TRACE_PROPERTIES)
-    properties.LogFileNameOffset = 0
+    properties.LogFileNameOffset = (
+        ctypes.sizeof(EVENT_TRACE_PROPERTIES) + NAME_ROOM // 2 if query else 0
+    )
     return buffer, properties
 
 
@@ -397,7 +402,7 @@ def start_session(name: str) -> tuple[int, Any, Any]:
 def stop_session(name: str) -> bool:
     advapi32 = _advapi32()
     advapi32.ControlTraceW.restype = ctypes.c_uint32
-    _buffer, properties = _properties(name)
+    _buffer, properties = _properties(name, query=True)
     status = advapi32.ControlTraceW(
         TRACEHANDLE(0), name, ctypes.byref(properties), EVENT_TRACE_CONTROL_STOP
     )
@@ -431,7 +436,7 @@ def sweep_stale_sessions(prefix: str = SESSION_PREFIX) -> list[str]:
     advapi32 = _advapi32()
     advapi32.QueryAllTracesW.restype = ctypes.c_uint32
     count = 64
-    buffers = [_properties("") for _ in range(count)]
+    buffers = [_properties(query=True) for _ in range(count)]
     array = (ctypes.POINTER(EVENT_TRACE_PROPERTIES) * count)(
         *(ctypes.pointer(properties) for _buffer, properties in buffers)
     )
