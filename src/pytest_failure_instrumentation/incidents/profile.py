@@ -260,7 +260,7 @@ class MemoryProfileIncident(Incident):
     def summary(self) -> str:
         on = _on(self.worker)
         if self.verdict == "RETAINED_AFTER_TEST":
-            return f"Memory kept after test: {self.nodeid} ended with {self.delta_mb} MB more in use than it started with{on}"
+            return f"Memory kept after test: {self.nodeid} ended with {self.delta_mb} MB more memory than it started with{on}"
         if self.verdict == "HEAP_NOT_RETURNED":
             return f"Memory freed but not returned: {self.nodeid} ended with the process {self.delta_mb} MB larger, and none of it in use{on}"
         if self.verdict == "TRANSIENT_PEAK":

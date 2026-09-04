@@ -321,15 +321,32 @@ class TestRetained:
         assert finding.phase == "setup"
         assert any("during setup, so a fixture allocated it" in line for line in finding.evidence)
 
-    def test_memory_kept_but_freed_is_the_allocator_not_a_leak(self) -> None:
+    def test_small_heap_growth_does_not_prove_objects_were_freed(self) -> None:
         report = analyse(
             [record("t::a", [], [], rss=(100, 400, 350), heap=(10, 12), blocks=(1000, 1200))],
             attributor,
         )
 
-        (finding,) = findings_of(report, "HEAP_NOT_RETURNED")
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
         assert finding.delta_mb == 250
-        assert not findings_of(report, "RETAINED_AFTER_TEST")
+        assert not findings_of(report, "HEAP_NOT_RETURNED")
+        assert any("cannot distinguish" in line for line in finding.evidence)
+
+    def test_live_small_objects_are_not_reported_as_freed(self) -> None:
+        # Measurements from 450,000 retained 400-character strings: pymalloc
+        # arenas account for the RSS increase, while mallinfo2 barely moves.
+        retained = record("t::a", [], [], rss=(26, 224, 224),
+                          heap=(6, 9), blocks=(137882, 587898),
+                          rss_at={"call_start": 26, "call_end": 224})
+        report = analyse([retained], attributor)
+
+        assert analysis._still_in_use(retained, 198)[0] is None
+        assert not findings_of(report, "HEAP_NOT_RETURNED")
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
+        assert finding.delta_mb == 198
+        assert finding.phase == "call"
+        assert any("cannot distinguish" in line for line in finding.evidence)
+        assert not any("were freed" in line or "still in use" in line for line in finding.evidence)
 
     def test_without_heap_readings_kept_memory_is_still_retained(self) -> None:
         report = analyse([record("t::a", [], [], rss=(100, 260, 260))], attributor)
@@ -347,15 +364,15 @@ class TestRetained:
         (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
         assert finding.delta_mb == 200
         assert not any("none of it" in line for line in finding.evidence)
-        assert any("+1 Python objects" in line for line in finding.evidence)
+        assert any("+1 Python allocation blocks" in line for line in finding.evidence)
 
-    def test_a_block_count_alone_that_clears_the_bar_says_the_memory_is_in_use(self) -> None:
-        # Two million small objects at 64 bytes is over 120 MB: enough on
-        # its own to say the memory is in use.
+    def test_large_block_count_does_not_establish_live_bytes(self) -> None:
+        # Allocation blocks have variable sizes; a count is not a byte measurement.
         report = analyse([record("t::a", [], [], rss=(100, 300, 300), blocks=(1000, 2_001_000))], attributor)
 
         (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
         assert finding.delta_mb == 200
+        assert any("cannot distinguish" in line for line in finding.evidence)
 
     def test_under_the_threshold_is_nothing(self) -> None:
         report = analyse([record("t::a", [], [], rss=(100, 150, 150), heap=(0, 50))], attributor, Thresholds(retained_mb=100))
@@ -757,10 +774,9 @@ class TestAllocatorRetention:
         assert finding.worker_rss == {"gw0": 180, "gw1": 150}
         assert any("The same on gw1 (150 MB)." == line for line in finding.evidence)
 
-    def test_a_test_that_left_a_step_of_it_at_once_is_folded_into_the_workers_finding(self) -> None:
+    def test_uncertain_test_retention_is_not_hidden_by_worker_allocator_evidence(self) -> None:
         rows = self.churn()
-        # One test leaves a threshold's worth in one go: HEAP_NOT_RETURNED on
-        # its own, and the same memory the worker's finding is about.
+        # Worker-wide free space does not establish what this individual test kept.
         rows[2]["rss_after_mb"] = rows[2]["rss_before_mb"] + 120
         for row in rows[3:]:
             row["rss_before_mb"] += 90
@@ -768,8 +784,10 @@ class TestAllocatorRetention:
         report = analyse(rows, attributor, Thresholds(retained_mb=100))
 
         assert not findings_of(report, "HEAP_NOT_RETURNED")
-        (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
-        assert any("Biggest single steps: t::churn[2] (120 MB on gw0)." == line for line in finding.evidence)
+        assert findings_of(report, "ALLOCATOR_RETENTION")
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
+        assert finding.nodeid == "t::churn[2]"
+        assert any("cannot distinguish" in line for line in finding.evidence)
 
     def test_a_traced_run_is_not_judged_on_its_allocator(self) -> None:
         rows = self.churn()
