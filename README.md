@@ -1486,6 +1486,7 @@ the burst, blamed like a hotspot:
 | `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — two megabytes a test, which is the shape of a leak and the one no per-test check sees |
 | `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
 | `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
+| `ALLOCATOR_RETENTION` | the worker grew by the threshold over its run and nothing is using the growth: memory the allocator was handed back and kept mapped. One finding for the run, saying which of the two causes it is — thread arenas each keeping what they freed, which `MALLOC_ARENA_MAX=2` fixes, or one main heap fragmented by small survivors, which `malloc_trim` fixes and the arena variable does not |
 
 A memory finding about one test also carries **the code that was running
 while the memory climbed**, blamed and attributed the way a crash is. The
@@ -1510,6 +1511,37 @@ What a test *kept* is measured as the larger of the resident step and the
 live-heap step. Resident memory understates it whenever the test fills pages
 an earlier test freed and the allocator held on to, and the heap figure is not
 fooled by that.
+
+The worker that "freed everything and still sits at four gigabytes" is the
+one case none of the per-test rules can name, because no test did it: a few
+megabytes of freed-but-mapped memory per test, over a long worker, is under
+every threshold and in use by nothing. `ALLOCATOR_RETENTION` is the rule over
+the whole worker. Every record carries glibc's own account of its arenas —
+how many, how much free memory sits in each, how much of that a
+`malloc_trim` would return — read through `malloc_info` at test boundaries,
+and when resident memory has grown by the threshold more than the live heap
+did and the allocator's free figure accounts for the gap, the finding says
+where the free memory is:
+
+```
+[memory_profile] ALLOCATOR_RETENTION  severity=informational  owner=runtime
+    124 MB freed and kept mapped on main, 11 arenas for 10 threads
+    · main ended 173 MB resident, up 131 MB over 6 tests, with only 7 MB more in use: 124 MB of the growth is memory the allocator was handed back and kept mapped, 125 MB of it at the end
+    · no test holds it: the memory is not in use, so a leak hunt finds nothing. It is the allocator's to give back, and it does not
+    · its biggest steps: tests/test_arenas.py::test_ingest_batch[0] (131 MB on main)
+    · 11 malloc arenas for up to 10 threads on 4 cores, and 125 MB of the 125 MB free is in the thread arenas: glibc gives every thread that allocates an arena of its own, up to eight per core, and each keeps what it frees. Set MALLOC_ARENA_MAX=2 in the workers' environment
+```
+
+A test that left a threshold's worth of it in one step would have been
+`HEAP_NOT_RETURNED` on its own; under the worker's finding it is one of the
+steps rather than a row of its own, since it is the same memory and the same
+fix.
+
+Free memory mostly in the main arena is the other cause — one heap
+fragmented by small survivors between the big allocations — and the finding
+says so instead, with what `malloc_trim(0)` would hand back right now, because
+`MALLOC_ARENA_MAX` does nothing for that one. glibc only, like the live-heap
+reading; elsewhere the finding is never raised.
 
 ### Allocation tracing
 
@@ -1850,6 +1882,7 @@ its directory says so.
 | Stack from a worker that stopped running Python | yes | yes | yes |
 | Profiler: CPU per thread | thread clocks | mach `thread_info` | psutil (16 ms ticks) |
 | Profiler: live heap, to tell freed-but-mapped from kept | glibc `mallinfo2` | no | no |
+| Profiler: arenas, to tell `MALLOC_ARENA_MAX` from fragmentation | glibc `malloc_info` | no | no |
 | Profiler: bursts, drift, allocation tracing, memory flame graphs | yes | yes | yes |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a

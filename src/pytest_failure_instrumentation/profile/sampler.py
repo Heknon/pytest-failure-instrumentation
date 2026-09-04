@@ -358,6 +358,15 @@ class _Window:
         #: use or merely still mapped.
         self.heap_before = _heap_in_use()
         self.blocks_before = sys.getallocatedblocks()
+        #: The allocator's own state: arenas, and the free memory it keeps
+        #: mapped in each. Read at boundaries only - it walks every arena
+        #: under its lock - and it is what tells a worker bloated by thread
+        #: arenas from one fragmenting its main heap. See probes.allocator_figures.
+        self.allocator_before = _allocator_figures()
+        #: The most threads the kernel listed while this window was open. A
+        #: pool's threads are gone by the time the record is written, and
+        #: the arenas they were given are not.
+        self.threads_peak = 0
         #: Resident memory at each phase boundary, so a step can be placed in
         #: setup (a fixture) rather than charged to the test's own body.
         self.rss_at: dict[str, Optional[int]] = {}
@@ -693,6 +702,9 @@ class Sampler:
                     entry[1] += delta
 
             self._ticks += 1
+            window.threads_peak = max(
+                window.threads_peak, len(self._all_tids), len(frames) + 1, threading.active_count()
+            )
             self._window_cpu_ns += process_delta
             self._window_ticks += 1
             if self._window_ticks >= WINDOW_TICKS:
@@ -842,6 +854,7 @@ class Sampler:
         rss_after = self._rss()
         heap_after = _heap_in_use()
         blocks_after = sys.getallocatedblocks()
+        allocator_after = _allocator_figures()
         frames: dict[tuple[str, int, str], int] = {}
 
         def index_of(file: str, line: int, function: str) -> int:
@@ -913,6 +926,11 @@ class Sampler:
             "heap_after_mb": heap_after,
             "blocks_before": window.blocks_before,
             "blocks_after": blocks_after,
+            "allocator_before": window.allocator_before,
+            "allocator_after": allocator_after,
+            #: The most threads alive at once while this window was open,
+            #: Python's and not: what the arena count is read against.
+            "threads": max(window.threads_peak, threading.active_count()),
             "phases": {
                 phase: {"cpu_s": round(cpu, 4), "wall_s": round(wall, 4)}
                 for phase, (cpu, wall) in window.phase_cpu.items()
@@ -960,6 +978,8 @@ class Sampler:
         window.rss_at = {}
         window.heap_before = heap_after
         window.blocks_before = blocks_after
+        window.allocator_before = allocator_after
+        window.threads_peak = 0
         window.windows = []
         window.snapshot_before = window.snapshot_peak = None
         window.phase_cpu.clear()
@@ -1072,6 +1092,15 @@ def _heap_in_use() -> Optional[int]:
 
     try:
         return probes.heap_in_use_megabytes()[0]
+    except Exception:
+        return None
+
+
+def _allocator_figures() -> Optional[dict[str, int]]:
+    from .. import probes
+
+    try:
+        return probes.allocator_figures()[0]
     except Exception:
         return None
 

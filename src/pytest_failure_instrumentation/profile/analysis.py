@@ -33,6 +33,10 @@ and for memory:
 ``STEADY_GROWTH``       a run of tests each left a little behind
 ``WORKER_IMBALANCE``    one worker holds far more than its siblings
 ``PEAK_OVER_CEILING``   a test reached the absolute size nothing may reach
+``ALLOCATOR_RETENTION`` the worker grew and nothing is using it: memory the
+                        allocator was handed back and kept, in thread
+                        arenas (``MALLOC_ARENA_MAX``) or one fragmented
+                        main heap (``malloc_trim``)
 ======================= =====================================================
 
 A memory finding about one test also names the code that was running while
@@ -182,6 +186,12 @@ class Finding:
     climb_total_mb: int = 0
     #: For steady growth: live objects added per test, when they were counted.
     growth_objects_per_test: Optional[int] = None
+    #: For allocator retention: the arenas at the end, the threads they serve,
+    #: the free memory the allocator keeps mapped, and what a trim would return.
+    arenas: Optional[int] = None
+    threads: Optional[int] = None
+    allocator_free_mb: Optional[int] = None
+    trim_mb: Optional[int] = None
     # bursts
     #: How long the burst held the cores, and how many of them.
     burst_seconds: float = 0.0
@@ -783,7 +793,141 @@ def _memory_findings(
         findings.extend(_drift(worker, tests, limits, session_holders.get(worker), attributor))
 
     findings.extend(_imbalance(by_worker, limits))
+    retention = _allocator_retention(by_worker, limits)
+    if retention:
+        # The same memory, seen per test: a test that left a threshold's
+        # worth of it at once was HEAP_NOT_RETURNED on its own. Under the
+        # worker's finding those are its biggest steps, not findings of
+        # their own - one thing to fix should be one row.
+        (whole,) = retention
+        steps = [
+            finding
+            for finding in findings
+            if finding.verdict == "HEAP_NOT_RETURNED" and finding.worker in whole.worker_rss
+        ]
+        if steps:
+            steps.sort(key=lambda finding: -(finding.delta_mb or 0))
+            whole.evidence.insert(
+                2,
+                "its biggest steps: "
+                + ", ".join(f"{step.nodeid} ({step.delta_mb} MB on {step.worker})" for step in steps[:3]),
+            )
+            findings = [finding for finding in findings if finding not in steps]
+        findings.extend(retention)
     return findings
+
+
+def _allocator_retention(
+    by_worker: dict[str, list[dict[str, Any]]], limits: Thresholds
+) -> list[Finding]:
+    """The worker grew over its run and nothing is using the growth: the
+    allocator was handed the memory back and kept it mapped.
+
+    The per-test rules leave this alone on purpose - drift counts what is in
+    use, and a single test's fragmentation is HEAP_NOT_RETURNED only when it
+    is a threshold's worth at once. A few megabytes of freed-but-mapped
+    memory per test over a long worker is neither, and it is the worker at
+    four gigabytes that nobody can find a leak in. The rule is over the
+    whole worker: resident memory grew by the threshold more than the live
+    heap and the object count did, and the allocator's own free figure
+    accounts for most of that gap.
+
+    Two causes, told apart by where the free memory sits, because they are
+    fixed by different things. glibc gives every thread that allocates an
+    arena of its own, up to eight per core, and each keeps what it frees:
+    that is ``MALLOC_ARENA_MAX``. Free space mostly in the main arena is one
+    heap fragmented by small survivors between the big allocations: that is
+    ``malloc_trim``, and the arena variable does nothing for it. One finding
+    for the run, on the worst worker, naming the others.
+    """
+    def rows_of(worker: str, by_worker: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in by_worker[worker]
+            if not _figures(record)[3]
+            and record.get("allocator_before")
+            and record.get("allocator_after")
+            and record.get("heap_before_mb") is not None
+            and record.get("heap_after_mb") is not None
+        ]
+
+    found: list[tuple[int, str, dict[str, Any], dict[str, Any], int, int, int]] = []
+    for worker in by_worker:
+        rows = rows_of(worker, by_worker)
+        if len(rows) < 2:
+            continue
+        first, last = rows[0], rows[-1]
+        resident = int(last["rss_after_mb"]) - int(first["rss_before_mb"])
+        live = max(0, int(last["heap_after_mb"]) - int(first["heap_before_mb"]))
+        blocks_before, blocks_after = first.get("blocks_before"), last.get("blocks_after")
+        if blocks_before is not None and blocks_after is not None:
+            live += max(0, (int(blocks_after) - int(blocks_before)) * BYTES_PER_BLOCK // 1048576)
+        mapped = resident - live
+        free_growth = int(last["allocator_after"].get("free_mb") or 0) - int(
+            first["allocator_before"].get("free_mb") or 0
+        )
+        if mapped < limits.retained_mb or free_growth < mapped / 2:
+            continue
+        found.append((free_growth, worker, first, last, resident, live, len(rows)))
+    if not found:
+        return []
+    found.sort(key=lambda item: -item[0])
+    free_growth, worker, first, last, resident, live, count = found[0]
+    after = last["allocator_after"]
+    free_mb = int(after.get("free_mb") or 0)
+    main_free = int(after.get("main_free_mb") or 0)
+    other_free = max(0, free_mb - main_free)
+    arenas = int(after.get("arenas") or 0)
+    # The most threads the worker had at once over its run: the arenas
+    # outlive the pool that earned them, so the last test's count is not it.
+    threads = max(int(record.get("threads") or 0) for record in rows_of(worker, by_worker))
+    cpus = int(last.get("cpus") or 0)
+    trim = int(after.get("trim_mb") or 0)
+    evidence = [
+        f"{worker} ended {last['rss_after_mb']} MB resident, up {resident} MB over {count} tests, "
+        f"with only {live} MB more in use: {free_growth} MB of the growth is memory the "
+        f"allocator was handed back and kept mapped, {free_mb} MB of it at the end",
+        "no test holds it: the memory is not in use, so a leak hunt finds nothing. It is "
+        "the allocator's to give back, and it does not",
+    ]
+    if arenas > 1 and other_free >= free_mb / 2:
+        evidence.append(
+            f"{arenas} malloc arenas for up to {threads} threads on {cpus} cores, and {other_free} MB "
+            f"of the {free_mb} MB free is in the thread arenas: glibc gives every thread that "
+            "allocates an arena of its own, up to eight per core, and each keeps what it "
+            "frees. Set MALLOC_ARENA_MAX=2 in the workers' environment"
+        )
+    else:
+        evidence.append(
+            f"{main_free} MB of the {free_mb} MB free is in the main arena, so MALLOC_ARENA_MAX "
+            "would not help: this is one heap fragmented by small survivors between the big "
+            "allocations. malloc_trim(0) after the heavy tests returns what sits above the "
+            f"last live chunk - {trim} MB right now - and MALLOC_TRIM_THRESHOLD_ makes the "
+            "allocator do that on its own"
+        )
+    others = [entry[1] for entry in found[1:]]
+    if others:
+        evidence.append(
+            "the same on " + ", ".join(f"{name} ({entry[0]} MB)" for name, entry in zip(others, found[1:]))
+        )
+    return [
+        Finding(
+            kind="memory_profile",
+            verdict="ALLOCATOR_RETENTION",
+            evidence=evidence,
+            worker=worker,
+            before_mb=int(first["rss_before_mb"]),
+            after_mb=int(last["rss_after_mb"]),
+            delta_mb=free_growth,
+            test_count=count,
+            worker_rss={entry[1]: entry[0] for entry in found},
+            arenas=arenas,
+            threads=threads,
+            cpus=cpus or None,
+            allocator_free_mb=free_mb,
+            trim_mb=trim,
+        )
+    ]
 
 
 def _figures(record: dict[str, Any]) -> tuple[int, int, int, bool]:

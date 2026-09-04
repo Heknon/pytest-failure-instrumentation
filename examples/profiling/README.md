@@ -31,4 +31,5 @@ speedscope flame graph for every test a finding names is written under
 | `test_sessions.py` | `cpu_burst` `RECURRING_BURST`: an I/O suite whose fixture bursts on every test |
 | `test_index.py` | `cpu_burst` `LONG_BURST`: one CPU step inside a test that otherwise waits |
 | `test_drift.py` | `memory_profile` `STEADY_GROWTH`, together with `test_memory.py`'s small leaks: the worker drifting up a few megabytes a test |
+| `test_arenas.py` | `memory_profile` `ALLOCATOR_RETENTION`: a thread pool whose arenas keep what they freed — the `MALLOC_ARENA_MAX` finding |
 | `test_healthy.py` | nothing — the control |

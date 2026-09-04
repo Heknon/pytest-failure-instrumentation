@@ -8,6 +8,7 @@ reporting that as a current one would be a lie the reader cannot detect.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -143,6 +144,123 @@ def _mallinfo2() -> Any:
     if _libc is False:
         return None
     return _libc.mallinfo2()
+
+
+def allocator_figures() -> tuple[dict[str, int] | None, str]:
+    """What the C allocator holds that nothing is using, and where.
+
+    From glibc's ``malloc_info``: how many arenas there are, how much free
+    memory sits in them, how much of that is in the main arena as against
+    the ones threads were given, and how much is mapped in all. ``trim_mb``
+    is ``mallinfo2``'s ``keepcost``: what ``malloc_trim(0)`` would hand back
+    right now. Together they are what tells the two causes of a worker
+    that "freed everything and still sits at four gigabytes" apart, which
+    matter because they are fixed by different things: many arenas each
+    keeping what they freed is ``MALLOC_ARENA_MAX``; one fragmented main
+    heap is ``malloc_trim`` or ``MALLOC_TRIM_THRESHOLD_``, and the arena
+    variable does nothing for it.
+
+    Walks every arena under its lock, so it is read at test boundaries and
+    never from the sampling thread. About a fifth of a millisecond.
+    """
+    if not IS_LINUX:
+        return None, "unavailable"
+    try:
+        text = _malloc_info()
+        info = _mallinfo2()
+    except Exception:
+        return None, "unavailable"
+    if text is None:
+        return None, "unavailable"
+    figures = parse_malloc_info(text)
+    if figures is None:
+        return None, "unavailable"
+    figures["trim_mb"] = round(info.keepcost / 1048576) if info is not None else 0
+    return figures, "malloc_info"
+
+
+def parse_malloc_info(text: str) -> dict[str, int] | None:
+    """``malloc_info`` XML into megabytes: one ``<heap nr=N>`` per arena,
+    each with its free space as ``<total type="fast">`` and ``type="rest"``
+    and its mapping as ``<system type="current">``. The totals after the
+    last heap are the process's and are not read: the heaps say the same
+    and say which arena as well."""
+    heaps = re.findall(r'<heap nr="(\d+)">(.*?)</heap>', text, re.DOTALL)
+    if not heaps:
+        return None
+    free = main_free = mapped = 0
+    for number, body in heaps:
+        held = sum(
+            int(size)
+            for size in re.findall(r'<total type="(?:fast|rest)" count="\d+" size="(\d+)"/>', body)
+        )
+        free += held
+        if number == "0":
+            main_free += held
+        current = re.search(r'<system type="current" size="(\d+)"/>', body)
+        if current:
+            mapped += int(current.group(1))
+    return {
+        "arenas": len(heaps),
+        "free_mb": round(free / 1048576),
+        "main_free_mb": round(main_free / 1048576),
+        "mapped_mb": round(mapped / 1048576),
+    }
+
+
+#: The libc handle with ``malloc_info`` and the stream calls it needs bound,
+#: or False once looked for and missing - see ``_libc``.
+_libc_info: Any = None
+
+
+def _malloc_info() -> str | None:
+    """``malloc_info(0, stream)`` into a string, through ``open_memstream``."""
+    global _libc_info
+    if _libc_info is None:
+        _libc_info = _load_malloc_info() or False
+    if _libc_info is False:
+        return None
+    import ctypes
+
+    lib = _libc_info
+    buffer = ctypes.c_char_p()
+    size = ctypes.c_size_t()
+    stream = lib.open_memstream(ctypes.byref(buffer), ctypes.byref(size))
+    if not stream:
+        return None
+    try:
+        status = lib.malloc_info(0, stream)
+    finally:
+        lib.fclose(stream)
+    try:
+        if status != 0 or not buffer:
+            return None
+        return ctypes.string_at(ctypes.cast(buffer, ctypes.c_void_p), size.value).decode("utf-8", "replace")
+    finally:
+        if buffer:
+            lib.free(ctypes.cast(buffer, ctypes.c_void_p))
+
+
+def _load_malloc_info() -> Any:
+    import ctypes
+    import ctypes.util
+
+    name = ctypes.util.find_library("c")
+    if not name:
+        return None
+    library = ctypes.PyDLL(name)
+    for symbol in ("malloc_info", "open_memstream", "fclose", "free"):
+        if not hasattr(library, symbol):
+            return None
+    library.open_memstream.restype = ctypes.c_void_p
+    library.open_memstream.argtypes = (ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t))
+    library.malloc_info.restype = ctypes.c_int
+    library.malloc_info.argtypes = (ctypes.c_int, ctypes.c_void_p)
+    library.fclose.restype = ctypes.c_int
+    library.fclose.argtypes = (ctypes.c_void_p,)
+    library.free.restype = None
+    library.free.argtypes = (ctypes.c_void_p,)
+    return library
 
 
 def _load_mallinfo2() -> Any:

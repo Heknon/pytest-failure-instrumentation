@@ -217,6 +217,14 @@ class MemoryProfileIncident(Incident):
     #: Megabytes of the climb charged to that stack, out of all charged.
     climb_mb: int = 0
     climb_total_mb: int = 0
+    #: For ALLOCATOR_RETENTION: glibc's arenas at the end of the worker, the
+    #: threads they were serving, the cores they were on, the free memory
+    #: the allocator keeps mapped, and what malloc_trim(0) would return.
+    arenas: Optional[int] = None
+    threads: Optional[int] = None
+    cpus: Optional[int] = None
+    allocator_free_mb: Optional[int] = None
+    trim_mb: Optional[int] = None
 
     def raw_stack(self) -> list[str]:
         return list(self.stack)
@@ -229,6 +237,11 @@ class MemoryProfileIncident(Incident):
 
     def suspect_basis_for(self, path: str) -> str:
         return f"owner of the test the memory arrived in ({path})"
+
+    def owner_when_unattributable(self) -> Optional[str]:
+        # Memory the allocator kept is nobody's frame and nobody's test: it
+        # is the C library's, and the fix is in the environment.
+        return "runtime" if self.verdict == "ALLOCATOR_RETENTION" else None
 
     def fingerprint_parts(self) -> list[str]:
         # A parametrised test's growth is one finding however many cases it
@@ -258,6 +271,11 @@ class MemoryProfileIncident(Incident):
         elif self.verdict == "WORKER_IMBALANCE":
             lines.append(
                 ", ".join(f"{worker} {rss} MB" for worker, rss in self.worker_rss.items())
+            )
+        elif self.verdict == "ALLOCATOR_RETENTION" and self.delta_mb is not None:
+            lines.append(
+                f"{self.delta_mb} MB freed and kept mapped on {self.worker}"
+                + (f", {self.arenas} arenas for {self.threads} threads" if self.arenas else "")
             )
         return lines
 
@@ -338,4 +356,9 @@ def build(finding: Finding, worker: str) -> Incident:
         stack=list(finding.stack),
         climb_mb=finding.climb_mb,
         climb_total_mb=finding.climb_total_mb,
+        arenas=finding.arenas,
+        threads=finding.threads,
+        cpus=finding.cpus,
+        allocator_free_mb=finding.allocator_free_mb,
+        trim_mb=finding.trim_mb,
     )

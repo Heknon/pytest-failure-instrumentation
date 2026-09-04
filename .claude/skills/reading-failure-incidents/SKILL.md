@@ -378,6 +378,17 @@ one; see below.
 - `PEAK_OVER_CEILING`: the test climbed to `peak_mb`, at or over the configured
   ceiling, whatever it started from and whether or not it came back. The size
   is the finding: a worker that reaches it once needs the machine to have it.
+- `ALLOCATOR_RETENTION`: `worker` grew over its whole run and nothing is using
+  the growth — `delta_mb` is memory the C allocator was handed back and kept
+  mapped, `allocator_free_mb` how much it holds that way at the end. No
+  `nodeid`, no stack, `owner=runtime`: no test did it and a leak hunt finds
+  nothing. The evidence says which of two causes it is, and they have
+  different fixes. `arenas` above a handful for `threads` threads with most of
+  the free memory in the thread arenas is glibc giving every allocating thread
+  its own arena: set `MALLOC_ARENA_MAX=2` in the workers' environment. Free
+  memory mostly in the main arena is one fragmented heap, and the evidence
+  gives `trim_mb`, what `malloc_trim(0)` would return now; the arena variable
+  does nothing for that one. `worker_rss` lists every worker it was seen on.
 
 For the verdicts about one test's climb — `RETAINED_AFTER_TEST`,
 `TRANSIENT_PEAK`, `PEAK_OVER_CEILING` and `HEAP_NOT_RETURNED` — `blamed_frame`
@@ -416,7 +427,7 @@ The incident usually settles it, and saying so is most of the value.
 | `stack_server_unavailable` | the run finished normally and nobody could watch it live | reconfigure rather than retry — the same port will be taken again. Nothing about the tests is in question, so it argues for a settings change and never for a rerun |
 | `cpu_hotspot` | the run finished; this is where its CPU went | a look, not a rerun. Route by `owner`; a `BACKGROUND_THREAD` or `NATIVE_THREADS` verdict is the answer to a worker sitting at a steady percentage with nothing to blame |
 | `cpu_burst` | the run finished; this is where its CPU went *in time* | `RECURRING_BURST` in `setup` is the fixture to make session-scoped or cache; `LONG_BURST` is one test's step to open; `BACKGROUND_BURST` is the thread to find; `CONTENDED` argues for fewer workers, not for touching any test |
-| `memory_profile` | the run finished; this is what a test did to the worker's memory | `STEADY_GROWTH` and `RETAINED_AFTER_TEST` in `call` are worth a leak hunt, and `--failure-profile-allocations` on the same tests is the next run; `HEAP_NOT_RETURNED` and `TRANSIENT_PEAK` are sizing questions, not code defects; `WORKER_IMBALANCE` argues for isolating the heavy module |
+| `memory_profile` | the run finished; this is what a test did to the worker's memory | `STEADY_GROWTH` and `RETAINED_AFTER_TEST` in `call` are worth a leak hunt, and `--failure-profile-allocations` on the same tests is the next run; `HEAP_NOT_RETURNED` and `TRANSIENT_PEAK` are sizing questions, not code defects; `WORKER_IMBALANCE` argues for isolating the heavy module; `ALLOCATOR_RETENTION` is an environment change — `MALLOC_ARENA_MAX=2` or a `malloc_trim`, the evidence says which — and never a test |
 
 `run_ending` is the field to automate on. An incident raised at detection can
 beat a CI timeout by the better part of an hour, and that lead time is only

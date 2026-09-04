@@ -42,6 +42,8 @@ def record(
     native: list[dict[str, Any]] | None = None,
     cpu_s: float | None = None,
     growth: list[dict[str, Any]] | None = None,
+    allocator: tuple[dict[str, int], dict[str, int]] | None = None,
+    threads: int | None = None,
 ) -> dict[str, Any]:
     before, peak, after = rss
     sampled = sum(stack.get("cpu_ns", 0) for stack in stacks) / 1e9
@@ -59,6 +61,10 @@ def record(
         "heap_after_mb": heap[1] if heap else None,
         "blocks_before": blocks[0] if blocks else None,
         "blocks_after": blocks[1] if blocks else None,
+        "allocator_before": allocator[0] if allocator else None,
+        "allocator_after": allocator[1] if allocator else None,
+        "threads": threads,
+        "cpus": 4,
         "gc": {"seconds": gc_seconds, "collections": 3, "by_generation": [1, 1, 1]},
         "cpu_weighted": True,
         "thread_clock": "thread-clock",
@@ -515,6 +521,125 @@ class TestReport:
         assert main["samples"] == [[1, 0]]  # speedscope wants the root first
         assert main["weights"] == [int(2e9)]
         assert document["shared"]["frames"][0] == {"name": "inner", "file": PRODUCT, "line": 14}
+
+
+class TestAllocatorRetention:
+    """The worker grew and nothing is using it - the allocator kept it."""
+
+    @staticmethod
+    def arenas(free: int, main_free: int, arenas: int = 9, trim: int = 0) -> dict[str, int]:
+        return {"arenas": arenas, "free_mb": free, "main_free_mb": main_free, "mapped_mb": free + 20, "trim_mb": trim}
+
+    def churn(
+        self,
+        count: int = 6,
+        step: int = 30,
+        free_at_end: int | None = None,
+        main_share: float = 0.05,
+        arenas: int = 9,
+        trim: int = 0,
+    ) -> list[dict[str, Any]]:
+        # Resident memory climbs `step` a test, the live heap and the object
+        # count stay flat, and the allocator's free figure climbs with it.
+        rows = []
+        for case in range(count):
+            before_free = step * case
+            after_free = step * (case + 1) if free_at_end is None else min(free_at_end, step * (case + 1))
+            rows.append(
+                record(
+                    f"t::churn[{case}]",
+                    [],
+                    [],
+                    rss=(100 + step * case, 130 + step * case, 130 + step * case),
+                    heap=(50, 50),
+                    blocks=(1000, 1000),
+                    allocator=(
+                        self.arenas(before_free, int(before_free * main_share), arenas, trim),
+                        self.arenas(after_free, int(after_free * main_share), arenas, trim),
+                    ),
+                    threads=12,
+                )
+            )
+        return rows
+
+    def test_free_memory_in_the_thread_arenas_names_malloc_arena_max(self) -> None:
+        report = analyse(self.churn(), attributor, Thresholds(retained_mb=100))
+
+        assert not findings_of(report, "STEADY_GROWTH")  # nothing in use grew
+        (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
+        assert finding.worker == "gw0"
+        assert finding.nodeid is None
+        assert finding.delta_mb == 180
+        assert finding.before_mb == 100 and finding.after_mb == 280
+        assert finding.arenas == 9 and finding.threads == 12 and finding.cpus == 4
+        assert finding.allocator_free_mb == 180
+        assert any("up 180 MB over 6 tests, with only 0 MB more in use" in line for line in finding.evidence)
+        assert any(
+            "9 malloc arenas for up to 12 threads on 4 cores" in line and "MALLOC_ARENA_MAX=2" in line
+            for line in finding.evidence
+        )
+        assert not any("malloc_trim" in line for line in finding.evidence)
+
+    def test_free_memory_in_the_main_arena_names_a_trim_instead(self) -> None:
+        report = analyse(self.churn(main_share=0.9, arenas=1, trim=40), attributor, Thresholds(retained_mb=100))
+
+        (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
+        assert finding.trim_mb == 40
+        assert any("MALLOC_ARENA_MAX would not help" in line and "40 MB right now" in line for line in finding.evidence)
+        assert not any("Set MALLOC_ARENA_MAX" in line for line in finding.evidence)
+
+    def test_growth_that_is_in_use_is_not_the_allocators(self) -> None:
+        rows = self.churn()
+        for case, row in enumerate(rows):
+            # The live heap climbs with the resident figure: kept, not freed.
+            row["heap_before_mb"], row["heap_after_mb"] = 50 + 30 * case, 80 + 30 * case
+        report = analyse(rows, attributor, Thresholds(retained_mb=100))
+
+        assert not findings_of(report, "ALLOCATOR_RETENTION")
+
+    def test_a_gap_the_allocator_does_not_account_for_is_not_raised(self) -> None:
+        # Resident memory grew 180 MB with nothing in use, but the allocator
+        # says it holds 30 MB free: whatever the rest is, it is not this.
+        report = analyse(self.churn(free_at_end=30), attributor, Thresholds(retained_mb=100))
+
+        assert not findings_of(report, "ALLOCATOR_RETENTION")
+
+    def test_under_the_threshold_is_nothing(self) -> None:
+        report = analyse(self.churn(count=3), attributor, Thresholds(retained_mb=100))
+
+        assert not findings_of(report, "ALLOCATOR_RETENTION")
+
+    def test_one_finding_for_the_run_names_the_other_workers(self) -> None:
+        rows = self.churn()
+        others = [dict(row, worker="gw1") for row in self.churn(step=25)]
+        report = analyse(rows + others, attributor, Thresholds(retained_mb=100))
+
+        (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
+        assert finding.worker == "gw0"
+        assert finding.worker_rss == {"gw0": 180, "gw1": 150}
+        assert any("the same on gw1 (150 MB)" in line for line in finding.evidence)
+
+    def test_a_test_that_left_a_step_of_it_at_once_is_folded_into_the_workers_finding(self) -> None:
+        rows = self.churn()
+        # One test leaves a threshold's worth in one go: HEAP_NOT_RETURNED on
+        # its own, and the same memory the worker's finding is about.
+        rows[2]["rss_after_mb"] = rows[2]["rss_before_mb"] + 120
+        for row in rows[3:]:
+            row["rss_before_mb"] += 90
+            row["rss_after_mb"] += 90
+        report = analyse(rows, attributor, Thresholds(retained_mb=100))
+
+        assert not findings_of(report, "HEAP_NOT_RETURNED")
+        (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
+        assert any("its biggest steps: t::churn[2] (120 MB on gw0)" in line for line in finding.evidence)
+
+    def test_a_traced_run_is_not_judged_on_its_allocator(self) -> None:
+        rows = self.churn()
+        for row in rows:
+            row["traced"] = {"before_mb": 1, "after_mb": 1, "peak_mb": 1, "tracer_mb": 30}
+        report = analyse(rows, attributor, Thresholds(retained_mb=100))
+
+        assert not findings_of(report, "ALLOCATOR_RETENTION")
 
 
 # -- bursts ---------------------------------------------------------------------

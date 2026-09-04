@@ -337,3 +337,53 @@ def test_a_libc_without_mallinfo2_is_looked_up_once_not_on_every_sample(monkeypa
     assert memory._mallinfo2() is None
     assert calls == ["c"]
     assert memory._libc is False
+
+
+def test_malloc_info_is_read_per_arena_and_the_process_totals_are_not_double_counted():
+    text = """<malloc version="1">
+<heap nr="0">
+<sizes>
+  <size from="49" to="49" total="49" count="1"/>
+</sizes>
+<total type="fast" count="2" size="1048576"/>
+<total type="rest" count="4" size="3145728"/>
+<system type="current" size="8388608"/>
+<system type="max" size="8388608"/>
+<aspace type="total" size="8388608"/>
+<aspace type="mprotect" size="8388608"/>
+</heap>
+<heap nr="1">
+<sizes>
+  <unsorted from="657" to="1541489" total="1542146" count="2"/>
+</sizes>
+<total type="fast" count="0" size="0"/>
+<total type="rest" count="3" size="62914560"/>
+<system type="current" size="67108864"/>
+<system type="max" size="67108864"/>
+<aspace type="total" size="67108864"/>
+<aspace type="mprotect" size="67108864"/>
+<aspace type="subheaps" size="1"/>
+</heap>
+<total type="fast" count="2" size="1048576"/>
+<total type="rest" count="7" size="66060288"/>
+<total type="mmap" count="3" size="610304"/>
+<system type="current" size="75497472"/>
+<system type="max" size="75497472"/>
+<aspace type="total" size="75497472"/>
+<aspace type="mprotect" size="75497472"/>
+</malloc>
+"""
+    figures = memory.parse_malloc_info(text)
+    assert figures == {"arenas": 2, "free_mb": 64, "main_free_mb": 4, "mapped_mb": 72}
+    assert memory.parse_malloc_info("<malloc version=\"1\">\n</malloc>\n") is None
+
+
+@pytest.mark.skipif(not probes.IS_LINUX if hasattr(probes, "IS_LINUX") else sys.platform != "linux", reason="glibc only")
+def test_the_allocator_figures_are_read_from_this_process_where_glibc_answers():
+    figures, source = probes.allocator_figures()
+    if source == "unavailable":
+        pytest.skip("no malloc_info in this libc")
+    assert figures is not None
+    assert figures["arenas"] >= 1
+    assert set(figures) == {"arenas", "free_mb", "main_free_mb", "mapped_mb", "trim_mb"}
+    assert figures["main_free_mb"] <= figures["free_mb"]

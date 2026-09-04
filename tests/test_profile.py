@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from pytest_failure_instrumentation import probes
 from pytest_failure_instrumentation.profile.sampler import ThreadClock
 
 from .conftest import Runner, needs_xdist
@@ -327,6 +328,51 @@ class TestMemory:
         assert 9 <= growth[0].growth.per_test_mb <= 15
         assert any("parametrisation of test_leak.py::test_leaks" in line for line in growth[0].evidence)
         assert not [incident for incident in memory(incidents) if incident.verdict == "RETAINED_AFTER_TEST"]
+
+    @pytest.mark.skipif(
+        probes.allocator_figures()[1] == "unavailable", reason="the arena reading is glibc's malloc_info"
+    )
+    def test_memory_a_thread_pool_freed_and_the_allocator_kept_is_named_with_the_fix(self, runner: Runner) -> None:
+        # Each thread of the pool gets an arena; the payloads are freed and
+        # the small index entries between them pin every heap they sit in.
+        runner.pytester.makepyfile(
+            test_ingest="""
+            from concurrent.futures import ThreadPoolExecutor
+            import pytest
+
+            INDEX = []
+
+            def parse(seed):
+                payloads = []
+                for index in range(200):
+                    payloads.append(bytearray(60_000 + ((index * seed) % 13) * 5_000))
+                    INDEX.append(bytearray(600))
+                return len(payloads)
+
+            @pytest.mark.parametrize("batch", range(4))
+            def test_ingest(batch):
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    assert sum(pool.map(parse, range(1, 9))) == 1600
+            """
+        )
+        incidents = profiled(runner)
+
+        retained = [incident for incident in memory(incidents) if incident.verdict == "ALLOCATOR_RETENTION"]
+        assert len(retained) == 1, [str(incident) for incident in memory(incidents)]
+        (incident,) = retained
+        assert incident.owner == "runtime"
+        assert incident.nodeid is None
+        assert incident.arenas is not None and incident.arenas > 2
+        assert incident.threads is not None and incident.threads >= 5
+        assert incident.delta_mb is not None and incident.delta_mb >= 40
+        assert any("MALLOC_ARENA_MAX=2" in line for line in incident.evidence)
+        # And none of the tests is raised for memory nothing is using: a
+        # step big enough to be HEAP_NOT_RETURNED alone is folded in here.
+        assert not [
+            incident
+            for incident in memory(incidents)
+            if incident.verdict in ("STEADY_GROWTH", "RETAINED_AFTER_TEST", "HEAP_NOT_RETURNED")
+        ]
 
 
 @needs_xdist
