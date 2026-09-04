@@ -595,3 +595,95 @@ def test_what_the_sampler_remembers_is_bounded_by_the_threads_that_exist() -> No
     assert -2 not in sampler._native_names
     # The thread that was actually running is still remembered.
     assert alive in sampler._previous or not sampler._previous
+
+
+class Widget:
+    """A class whose methods are what a hotspot in one would be named after."""
+
+    def render(self) -> int:
+        return sum(character for character in [1, 2, 3])
+
+    @staticmethod
+    def measure() -> int:
+        return 1
+
+    @classmethod
+    def build(cls) -> "Widget":
+        return cls()
+
+    @property
+    def size(self) -> int:
+        return 2
+
+    class Inner:
+        def deep(self) -> int:
+            return 3
+
+
+def a_module_level_function() -> list:
+    return [value for value in range(3)]
+
+
+def test_a_method_is_named_with_its_class_on_every_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run``, ``close``, ``__init__`` and ``send`` are the method names this
+    reports most often and the ones a bare name says least about, and 3.9 and
+    3.10 - both supported - have no ``co_qualname`` to read one from. The name
+    is worked out from the defining module there instead.
+
+    Checked against ``co_qualname`` itself rather than against a literal: this
+    runs the worked-out path on every interpreter, and on the ones that have
+    the real answer it asserts the two agree. Where they cannot be compared -
+    3.9 and 3.10 - the shapes below are what the later ones produce.
+    """
+    from pytest_failure_instrumentation.profile.sampler import _qualified_name
+
+    subjects = [
+        Widget.render,
+        Widget.measure,
+        Widget.build.__func__,  # type: ignore[attr-defined]
+        Widget.__dict__["size"].fget,
+        Widget.Inner.deep,
+        a_module_level_function,
+    ]
+    for function in subjects:
+        code = function.__code__
+        monkeypatch.setattr(sampling, "HAS_QUALNAME", False)
+        monkeypatch.setattr(sampling, "_qualnames", {})
+        monkeypatch.setattr(sampling, "_walked", set())
+        worked_out = _qualified_name(code)
+        if sampling.HAS_QUALNAME or hasattr(code, "co_qualname"):
+            assert worked_out == code.co_qualname, function
+        assert worked_out.startswith(("Widget.", "a_module_level_function")), function
+
+    # The comprehension inside a method is folded back into the method, which
+    # is what the analysis reads and what 3.12 produces without being asked.
+    monkeypatch.setattr(sampling, "HAS_QUALNAME", False)
+    monkeypatch.setattr(sampling, "_qualnames", {})
+    monkeypatch.setattr(sampling, "_walked", set())
+    inner = [
+        const
+        for const in Widget.render.__code__.co_consts
+        if isinstance(const, type(Widget.render.__code__))
+    ]
+    if inner:  # 3.12 inlines comprehensions, so there is no code object to find
+        assert _qualified_name(inner[0]) == "Widget.render.<locals>.<genexpr>"
+
+
+def test_a_function_that_cannot_be_found_keeps_its_bare_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Code compiled at runtime belongs to no module, so there is nothing to
+    search. It is named once, not looked for on every flush after that."""
+    from pytest_failure_instrumentation.profile.sampler import _qualified_name
+
+    monkeypatch.setattr(sampling, "HAS_QUALNAME", False)
+    monkeypatch.setattr(sampling, "_qualnames", {})
+    monkeypatch.setattr(sampling, "_walked", set())
+    namespace: dict = {}
+    exec(compile("def made_up():\n    pass\n", "<nowhere>", "exec"), namespace)
+
+    code = namespace["made_up"].__code__
+    assert _qualified_name(code) == "made_up"
+    assert code in sampling._qualnames

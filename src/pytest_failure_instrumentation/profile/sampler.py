@@ -44,6 +44,7 @@ import tracemalloc
 import weakref
 from collections import defaultdict
 from pathlib import Path
+from types import CodeType
 from typing import Any, Callable, Optional
 
 from ..probes.platform_flags import IS_LINUX
@@ -1111,7 +1112,7 @@ class Sampler:
 
         def indexes_of(stack: StackKey) -> list[int]:
             return [
-                index_of(code.co_filename, line or _line_of(code, offset), getattr(code, "co_qualname", code.co_name))
+                index_of(code.co_filename, line or _line_of(code, offset), _qualified_name(code))
                 for code, line, offset in stack
             ]
 
@@ -1344,6 +1345,114 @@ def _allocator_figures() -> Optional[dict[str, int]]:
         return probes.allocator_figures()[0]
     except Exception:
         return None
+
+
+#: Whether this interpreter's code objects carry a qualified name. 3.11 and
+#: later do; 3.9 and 3.10 are supported and do not, and the difference is
+#: visible in every finding - see _qualified_name.
+HAS_QUALNAME = hasattr((lambda: None).__code__, "co_qualname")
+
+#: Code object -> the name to report for it, on the interpreters that need
+#: one worked out. A code object is hashable by identity and is kept alive by
+#: its module anyway; what is added here is one entry per distinct function
+#: the profiler has actually sampled.
+_qualnames: dict[Any, str] = {}
+
+#: Modules already walked, by the file they were loaded from, so a function
+#: that cannot be found is not looked for again on every flush.
+_walked: set[str] = set()
+
+
+def _qualified_name(code: Any) -> str:
+    """``Poller.run``, not ``run`` - on every interpreter this supports.
+
+    A hotspot's name is most of what a reader gets: ``run``, ``close``,
+    ``__init__`` and ``send`` are the method names this reports most often and
+    the ones a bare name says least about. 3.11 and later hand it over as
+    ``co_qualname``. 3.9 and 3.10 are supported and do not, and the
+    difference showed as ``run`` where every other cell in the matrix said
+    ``Poller.run``.
+
+    It is worked out from the module the code was compiled in: a function
+    object has carried ``__qualname__`` since 3.3, so the missing piece is
+    only which function a code object belongs to, and the module that defines
+    it is where every one of them can be found. Nested code objects are
+    walked from their parent's constants, which is what puts a comprehension
+    back under the function it is written in - ``build.<locals>.<listcomp>``,
+    the shape :func:`~..profile.analysis._enclosing` folds and 3.12 produces
+    by itself.
+
+    Done at flush rather than at sample time: a sample keeps the code object
+    and nothing else, precisely so that naming costs nothing per tick. A
+    module is walked once, a name is worked out once per function, and a
+    function that cannot be found keeps its bare name rather than being
+    looked for again.
+    """
+    if HAS_QUALNAME:
+        return str(code.co_qualname)
+    known = _qualnames.get(code)
+    if known is not None:
+        return known
+    try:
+        _learn_the_names_in(code.co_filename)
+    except Exception:  # noqa: BLE001 - a bare name beats a lost record
+        pass
+    return _qualnames.setdefault(code, code.co_name)
+
+
+def _learn_the_names_in(filename: str) -> None:
+    """Map every code object defined in ``filename`` to its qualified name."""
+    if filename in _walked:
+        return
+    _walked.add(filename)
+    for module in list(sys.modules.values()):
+        if getattr(module, "__file__", None) != filename:
+            continue
+        for value in list(vars(module).values()):
+            _learn(value, seen=set())
+
+
+def _learn(value: Any, seen: set[int], prefix: str = "") -> None:
+    """Record ``value`` and, if it is a class, what it holds.
+
+    ``seen`` is by id and guards the cycle a class that refers to itself
+    makes; ``prefix`` is unused for functions, which carry their own
+    ``__qualname__``, and is what names the members of a class reached
+    through one.
+    """
+    if isinstance(value, (staticmethod, classmethod)):
+        value = value.__func__
+    elif isinstance(value, property):
+        value = value.fget
+    code = getattr(value, "__code__", None)
+    if code is not None:
+        name = getattr(value, "__qualname__", None) or code.co_name
+        _learn_the_nested(code, str(name))
+        return
+    if not isinstance(value, type) or id(value) in seen:
+        return
+    seen.add(id(value))
+    for member in list(vars(value).values()):
+        _learn(member, seen, prefix)
+
+
+def _learn_the_nested(code: Any, name: str) -> None:
+    """``code`` and every code object compiled inside it.
+
+    A comprehension, a generator expression and a nested function are each a
+    code object of their own held in their parent's constants, and the name
+    the interpreter gives them from 3.11 is the parent's with
+    ``.<locals>.<name>`` on the end. That is what is built here, so what the
+    analysis folds is the same string on every version.
+    """
+    pending = [(code, name)]
+    while pending:
+        parent, parent_name = pending.pop()
+        if _qualnames.setdefault(parent, parent_name) is not parent_name:
+            continue  # already known, and so are its children
+        for const in parent.co_consts:
+            if isinstance(const, CodeType):
+                pending.append((const, f"{parent_name}.<locals>.{const.co_name}"))
 
 
 def _stack_of(frame: Any) -> StackKey:

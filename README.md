@@ -1468,6 +1468,12 @@ without releasing the GIL. A sampler that opens a file per thread per sample
 releases the GIL on every read and then waits a whole switch interval to get it
 back from a busy test; measured, that ran a fifty-hertz sampler at eight.
 
+A function is named the way it is written — `Poller.run`, not `run`, and a
+comprehension under the function it is written in rather than as a `<listcomp>`
+nobody wrote. 3.11 and later carry that name on the code object; on 3.9 and
+3.10, which this package supports, it is worked out once per function from the
+module that defines it, at the end of a test rather than on the sampling path.
+
 Each stack is charged to the first frame, walking outward from the innermost,
 that belongs to somebody: your packages or the customer's tests first, a
 dependency failing that, the runtime failing everything. So two million calls
