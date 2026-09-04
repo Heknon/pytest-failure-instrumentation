@@ -43,6 +43,14 @@ DELIBERATE_SIGNALS = {
 }
 
 
+def signal_name(received: int) -> str:
+    """``SIGSEGV`` for 11, or ``signal 37`` where the platform has no name."""
+    try:
+        return signal.Signals(received).name
+    except (ValueError, AttributeError):
+        return f"signal {received}"
+
+
 def describe(status: int | None) -> str:
     if status is None:
         return "unknown"

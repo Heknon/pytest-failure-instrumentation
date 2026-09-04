@@ -37,7 +37,7 @@ def of(
         return "informational", None
     if ends_run and owner == "runtime":
         return "high", (
-            "raised above informational: a framework-owned defect that ended the "
-            "run - no test is at fault, so nothing else will surface it"
+            "Severity high rather than informational: a defect in the framework ended "
+            "the run, and no test is at fault, so nothing else reports it."
         )
     return BY_OWNER.get(owner, "needs-triage"), None

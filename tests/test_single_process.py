@@ -375,8 +375,9 @@ def test_a_run_that_never_came_back_is_reported_by_the_next_one(runner):
     # than blaming a gateway that was never in the picture.
     assert death.exit_status is None
     assert death.verdict == "UNKNOWN"
-    assert any("Only a parent may" in line for line in death.evidence), death.evidence
-    assert "recovered from" in str(death)
+    assert any("only the parent process could read it" in line for line in death.evidence), death.evidence
+    assert str(death).startswith("Worker main of run ")
+    assert any(line.startswith("Found in the evidence of run ") for line in death.evidence)
 
     # And the sweep still happened: the recovered directory is gone, so the
     # run after this one has nothing left to report twice.

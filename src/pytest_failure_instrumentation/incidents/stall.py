@@ -47,6 +47,7 @@ SOURCE_WORDING = {
     "frozen-fallback": "the fallback timer, after the worker stopped running Python",
     "crash": "the worker, into its crash file",
     "py-spy": "py-spy, reading the process from outside it",
+    "probe": "the worker, in answer to the stall probe",
 }
 
 
@@ -111,44 +112,53 @@ class WorkerStallIncident(Incident):
 
     def suspect_basis_for(self, path: str) -> str:
         if self.test_in_flight:
-            return f"owner of the test in flight ({path})"
+            return f"the test that was running, {path}"
         return (
-            f"owner of the last test this worker ran ({path}); nothing was in "
-            "flight when it went silent"
+            f"the last test this worker ran, {path}; nothing was running when it "
+            "went silent"
         )
 
     def fingerprint_parts(self) -> list[str]:
         return [self.kind, self.verdict, self.state]
 
+    def summary(self) -> str:
+        if self.verdict == "INSTRUMENTATION_FAILED":
+            return super().summary()
+        line = f"Worker {self.worker} has been silent for {self.silent_for_seconds:.0f} s"
+        if self.test_in_flight:
+            phase = f" ({self.phase})" if self.phase else ""
+            line += f" while running {self.test_in_flight}{phase}"
+        elif self.last_test:
+            line += f" with no test running (the last was {self.last_test})"
+        else:
+            line += " with no test running"
+        if self.state == "FROZEN":
+            line += ", and its heartbeat thread has stopped"
+        elif self.state == "BLOCKED":
+            line += ", alive but using no CPU" if self.cpu_rate is not None else ", alive"
+        elif self.state == "SILENT":
+            line += ", with no heartbeat on record"
+        if self.blamed_frame is not None:
+            line += f", in {self.blamed_frame.named()}"
+        return line
+
     def details(self) -> list[str]:
-        where = self.test_in_flight or (
-            f"no test in flight (last was {self.last_test})"
-            if self.last_test
-            else "no test in flight"
-        )
-        phase = f" ({self.phase})" if self.phase else ""
-        line = f"silent for {self.silent_for_seconds:.0f}s in {where}{phase}"
-        if self.cpu_rate is not None:
-            line += f"  cpu={self.cpu_rate:.2f} cores"
-        if self.heartbeat_age_seconds is not None:
-            line += f"  last beat {self.heartbeat_age_seconds:.0f}s ago"
-        lines = [line]
-        if self.reason:
-            lines.append(self.reason)
+        """Where the stack came from, from the fields that say so. A stack
+        nobody asked for was left while the run went on around it, and
+        reading it as a picture of now is the mistake to head off - so it
+        says where it came from as well as when. A fresh one from the
+        watchdog is still not a probe, and one from the fallback says
+        something the frames do not."""
         if not self.stack and self.stack_unavailable_reason:
-            lines.append(f"no stack: {self.stack_unavailable_reason}")
-        elif self.stack and not self.stack_probed and self.stack_age_seconds is not None:
-            # A stack nobody asked for was left while the run went on around
-            # it. Reading it as a picture of now is the mistake to head off,
-            # so it says where it came from as well as when - a fresh one from
-            # the watchdog is still not a probe, and one from the fallback
-            # says something the frames do not.
-            lines.append(
-                f"stack written {self.stack_age_seconds:.0f}s ago by "
-                f"{SOURCE_WORDING.get(self.stack_source or '', 'the worker')}, "
-                "not taken just now"
-            )
-        return lines
+            return [f"No stack: {self.stack_unavailable_reason}."]
+        if self.stack and self.stack_probed:
+            return [f"Stack taken now, by {SOURCE_WORDING.get(self.stack_source or '', 'the worker')}."]
+        if self.stack and self.stack_age_seconds is not None:
+            return [
+                f"Stack from {SOURCE_WORDING.get(self.stack_source or '', 'the worker')}, "
+                f"written {self.stack_age_seconds:.0f} s ago; it is not a picture of now."
+            ]
+        return []
 
 
 def build(
@@ -207,10 +217,7 @@ def build(
         directory, worker, pid, stack_probe, live_pid, cancel
     )
 
-    evidence = [
-        f"no report from {worker} for {silent_for:.0f}s while the run continued",
-        verdict.reason,
-    ]
+    evidence = [verdict.reason]
     confidence = verdict.confidence or CONFIDENCE.get(verdict.state, "low")
     if not in_flight and verdict.state != "FROZEN":
         # Nothing was running. A worker between two tests, still collecting, or
@@ -219,10 +226,22 @@ def build(
         # reporting - the run cannot end while a worker never comes back - but
         # not at the confidence a wedged test earns, and not blamed on a test.
         evidence.append(
-            "no test was in flight: the worker was between tests, still "
-            "collecting, or waiting to be given work"
+            "No test was running. A worker between tests, still collecting, or "
+            "waiting to be given work looks the same from outside."
         )
         confidence = "low"
+    evidence.append(
+        "The run cannot finish while xdist waits for work this worker was handed."
+    )
+    age = round(max(0.0, time.time() - written), 1) if written is not None else None
+    if in_flight:
+        evidence.append(f"Look at: {in_flight}.")
+    measured = [f"silent for {silent_for:.0f} s"]
+    if verdict.heartbeat_age is not None:
+        measured.append(f"last heartbeat {verdict.heartbeat_age:.0f} s ago")
+    if verdict.cpu_rate is not None:
+        measured.append(f"{verdict.cpu_rate:.2f} cores of CPU over the window")
+    evidence.append("Measured: " + ", ".join(measured) + ".")
 
     return WorkerStallIncident(
         worker=worker,
@@ -244,9 +263,7 @@ def build(
         stack=stack,
         stack_probed=probed,
         stack_unavailable_reason=why,
-        stack_age_seconds=(
-            round(max(0.0, time.time() - written), 1) if written is not None else None
-        ),
+        stack_age_seconds=age,
         stack_source=source,
         evidence=evidence,
     )

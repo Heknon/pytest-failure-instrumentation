@@ -61,11 +61,19 @@ class InternalErrorIncident(Incident):
     def fingerprint_parts(self) -> list[str]:
         return [self.kind, self.verdict, self.exception]
 
-    def details(self) -> list[str]:
-        lines = [self.exception] if self.exception else []
+    def summary(self) -> str:
+        if self.verdict == "INSTRUMENTATION_FAILED":
+            return super().summary()
+        line = "pytest hit an internal error"
+        if self.exception:
+            line += f": {self.exception}"
         if self.test_in_flight:
-            lines.append(f"in flight {self.test_in_flight}")
-        return lines
+            line += f", while {self.worker} was running {self.test_in_flight}"
+        elif self.worker and self.worker != "controller":
+            line += f", on {self.worker}"
+        if self.blamed_frame is not None:
+            line += f", in {self.blamed_frame.named()}"
+        return line
 
 
 def build(
@@ -83,16 +91,18 @@ def build(
     detail = chosen["detail"] if chosen else text
 
     if chosen:
-        evidence = ["captured on the worker itself, as it was raised"]
+        evidence = ["Captured on the worker itself, as it was raised."]
     elif "worker_internal_error" in text:
         # xdist relays a worker's internal error by re-raising it inside
         # worker_internal_error; that frame is the tell.
         evidence = [
-            "relayed from a worker through xdist's re-raise; worker attribution "
-            "is unreliable without worker-side capture"
+            "Relayed from a worker through xdist's re-raise; which worker raised it "
+            "is uncertain without worker-side capture."
         ]
     else:
-        evidence = ["raised on the controller itself and captured first-hand"]
+        evidence = ["Raised on the controller and captured first-hand."]
+    evidence.append("pytest ends the session on an internal error.")
+    evidence.append("Look at: the full traceback, kept in the incident's detail field.")
 
     return InternalErrorIncident(
         worker=(chosen or {}).get("worker") or worker or "controller",

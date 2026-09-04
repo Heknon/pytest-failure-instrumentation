@@ -1,6 +1,6 @@
 ---
 name: reading-failure-incidents
-description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable) and the profiler's findings (cpu hotspot, cpu burst, memory profile). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error], [run_summary] or [stack_server_unavailable] appears in CI output or a bug report, or a profile finding whose first line ends with a [cpu_hotspot ...], [cpu_burst ...] or [memory_profile ...] tag does, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
+description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable) and the profiler's findings (cpu hotspot, cpu burst, memory profile). Use when an alert whose first line ends with a [worker_death ...], [worker_stall ...], [collection_mismatch ...], [internal_error ...], [run_summary ...], [stack_server_unavailable ...], [cpu_hotspot ...], [cpu_burst ...] or [memory_profile ...] tag appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
 ---
 
 # Reading a failure incident
@@ -30,22 +30,28 @@ inventing one.
 
 ## Anatomy
 
+Every kind renders to one shape:
+
 ```
-[worker_death] NATIVE_CRASH  severity=critical  owner=product
-    blamed on engine.py:6 in native_call
-    worker=gw1  in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
-    · died while running test_crashes.py::test_crashes (call)
-    · exit status -11 - SIGSEGV: segmentation fault in native code (pid 805, via waitid)
-    · the worker wrote a stack before dying
+Worker gw1 crashed with SIGSEGV (segmentation fault in native code) while running test_crashes.py::test_crashes (call), in native_call (engine.py:6)   [worker_death NATIVE_CRASH, product, critical]
+    Exit status -11 read via waitid (pid 805).
+    The worker wrote a stack as it died.
+    Look at: test_crashes.py::test_crashes.
+    Measured: 1 test started and 0 finished on this worker.
 ```
 
 | Line | Is |
 |---|---|
-| `[kind] VERDICT severity= owner=` | the headline; `run-ending` is appended when the session died with it, and `owner=` is omitted on a `run_summary`, where nothing failed |
-| `blamed on file:line in func` | `blamed_frame` — the first frame on the stack owned by somebody |
-| *or* `no stack; suspect X (basis)` | `suspect_owner` — a lead, not a finding |
-| unprefixed lines | the kind's own facts. On a `worker_death` the first of them leads with `worker=`, the xdist gateway id that matches the `[gwN] node down` line in pytest's own output (`main` for a run with no workers) |
-| `· …` lines | `evidence` — what the verdict was reached from |
+| the first line | what happened, in words, specific to this instance: which worker (the xdist gateway id that matches the `[gwN] node down` line in pytest's own output, `main` for a run with no workers), which signal, which test, which frame (`blamed_frame`, the first frame on the stack owned by somebody). It ends with the tag `[kind VERDICT, owner, severity]`, with `run-ending` appended when the session died with it; a `run_summary` has no owner slot, because nothing failed |
+| `No stack was captured; the owner is taken from …` | `suspect_owner` and `suspect_basis` — a lead, not a finding; printed only when there was no stack |
+| every other line | exactly one of three things: a **measurement** (what was observed, and where the figure came from), what it **means by construction** (what follows from how it was measured, or from a fact about the OS, the runtime or xdist), or a **place to look** (`Look at:` a file, line, test, setting or flag). Nothing guesses at a cause in the user's code, and nothing prescribes a fix to it. Several numbers share one `Measured:` line at the end |
+| indented sub-rows | a table: the diff of a collection, the parameter values each worker produced |
+
+The lines under the first are the `evidence` field, plus a few a kind derives
+from its own fields at render time (the variant rows of a collection
+mismatch, where a stall's stack came from). The convention is held by
+`tests/test_message_convention.py`, and its rationale is in
+`incidents/base.py`.
 
 ## The numbers that mislead
 
@@ -276,25 +282,16 @@ always means a stranger or a bad address, never a colleague.
 
 ### How the profiler's findings are printed
 
-The three profiling kinds do not use the block layout above. Nothing failed,
-so there is no severity on the line and no `blamed on` line; the first line
-says what was measured in words and ends with a tag for grepping, and every
-following line is one of three things: a measurement, what that measurement
-means by construction, or a place to look. Nothing in them guesses at a cause
-or a fix, because the analysis is arithmetic over samples and knows neither.
+The same shape as every other kind (see Anatomy), with the severity always
+`informational` because nothing failed. The location is in the first line
+for a CPU finding and in the first evidence line for a memory one.
 
 ```
-CPU hotspot: load_everything (loader.py:14) used 21% of this run's CPU, 5.2 s   [cpu_hotspot PYTHON_CODE, product]
+CPU hotspot: load_everything (loader.py:14) used 21% of this run's CPU, 5.2 s   [cpu_hotspot PYTHON_CODE, product, informational]
     The time is in this function's own lines, not in calls it makes. Mostly line 14 (100%).
     Seen in 2 tests: tests/test_loading.py::test_loads_the_export, tests/test_index.py::test_index_is_complete.
     Look at: loader.py:14
 ```
-
-The tag carries `kind`, `verdict` and `owner`. A `Look at:` line is a location
-the tool actually has, or a flag that produces more information; a `Measured:`
-line is the raw numbers, labelled. When no code location was captured, the
-second line says so and names the test file the `suspect_owner` was taken
-from.
 
 ### `cpu_hotspot` — a function that burnt a share of the run's CPU
 

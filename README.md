@@ -14,13 +14,11 @@ failures cannot say for themselves, works out whose code is responsible, and
 hands you one structured incident per problem.
 
 ```
-[worker_death] NATIVE_CRASH  severity=critical  owner=product
-    blamed on engine.py:6 in native_call
-    worker=gw1  in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
-    · died while running test_crashes.py::test_crashes (call)
-    · exit status -11 - SIGSEGV: segmentation fault in native code (pid 805, via waitid)
-    · the worker wrote a stack before dying
-    · segmentation fault in native code
+Worker gw1 crashed with SIGSEGV (segmentation fault in native code) while running test_crashes.py::test_crashes (call), in native_call (engine.py:6)   [worker_death NATIVE_CRASH, product, critical]
+    Exit status -11 read via waitid (pid 805).
+    The worker wrote a stack as it died.
+    Look at: test_crashes.py::test_crashes.
+    Measured: 1 test started and 0 finished on this worker.
 ```
 
 ## The problem
@@ -155,23 +153,21 @@ This is what the plugin reports for it — two incidents, because two things wen
 wrong:
 
 ```
-[worker_death] SIGKILLED  severity=needs-triage  owner=unknown
-    worker=gw1  no test in flight  started=0 finished=0
-    · died before running any test (startup or collection)
-    · exit status -9 - SIGKILL: uncatchable kill (OOM killer or external kill) (pid 21780, via waitid)
-    · resident memory 31 MB at last checkpoint
-    · SIGKILL with no cgroup OOM event: a host-level OOM killer, a container or CI cancellation, or an external kill
+Worker gw1 was killed with SIGKILL before running any test   [worker_death SIGKILLED, unknown, needs-triage]
+    Exit status -9 read via waitid (pid 21780).
+    No cgroup OOM kill was counted during this run. SIGKILL cannot be caught, and is sent by a host OOM killer, a container or CI cancellation, or a kill command.
+    Measured: 31 MB resident at the last heartbeat. 0 tests started and 0 finished on this worker.
 
-[internal_error] INTERNAL_ERROR  severity=high  owner=runtime  run-ending
-    blamed on loadscope.py:275 in _assign_work_unit
-    KeyError: <WorkerController gw1>
-    · raised on the controller itself and captured first-hand
-    · raised above informational: a framework-owned defect that ended the run - no test is at fault, so nothing else will surface it
+pytest hit an internal error: KeyError: <WorkerController gw1>, in _assign_work_unit (loadscope.py:275)   [internal_error INTERNAL_ERROR, runtime, high, run-ending]
+    Raised on the controller and captured first-hand.
+    pytest ends the session on an internal error.
+    Look at: the full traceback, kept in the incident's detail field.
+    Severity high rather than informational: a defect in the framework ended the run, and no test is at fault, so nothing else reports it.
 ```
 
-`owner=runtime` is the load-bearing part. No test is at fault and no worker is
-at fault, so nothing else in the run will ever surface this — which is exactly
-why it is the one case where a framework defect is raised *above*
+The `runtime` owner in the tag is the load-bearing part. No test is at fault
+and no worker is at fault, so nothing else in the run will ever surface this —
+which is exactly why it is the one case where a framework defect is raised *above*
 informational.
 
 ## Install
@@ -357,6 +353,37 @@ never read as a healthy one.
 anybody, the test that was in flight is a lead worth recording — but a guess
 must never sit in the column a reader takes for a finding.
 
+### How an incident reads
+
+`str(incident)` is the alert text, and every kind renders to one shape. It is
+a convention rather than a style, and `tests/test_message_convention.py`
+holds every kind to it:
+
+1. **The first line says what happened, in words**, specific to this instance:
+   which worker, which signal, which test, which function. It ends with a tag
+   `[kind VERDICT, owner, severity]` to grep for and route on, with
+   `run-ending` appended when the session died with it. A `run_summary` has
+   no owner slot, because nothing failed.
+2. **If no stack named anybody**, one line says where the owner came from:
+   `No stack was captured; the owner is taken from the test that was running,
+   test_pool.py (customer-code).` A lead, marked as one.
+3. **Every other line is exactly one of three things.** A *measurement*: what
+   was observed, and where the figure came from when that matters (`Exit
+   status -11 read via waitid`). What that measurement *means by
+   construction*: what follows from how it was taken, or from a fact about
+   the OS, the runtime or xdist (`SIGKILL cannot be caught`, `xdist addresses
+   tests by position`). Or a *place to look*: `Look at:` a file and line, a
+   test, a setting, a flag. Several numbers share one `Measured:` line at the
+   end, labelled.
+
+What is deliberately absent: any guess at a cause in your code, and any fix
+to it. The analysis is arithmetic over evidence; it knows that a thread other
+than the test's used the CPU, not that the thread is a poller you forgot
+about. A line that named the poller would be right often enough to be
+trusted and wrong often enough to matter. Sentences are short, start with a
+capital and end with a full stop; nothing is a field dump, nothing argues for
+the finding, and nothing is said twice.
+
 ### Handing one to an agent
 
 An incident is written to be read without context, which is most of what an LLM
@@ -426,26 +453,25 @@ Sixty workers never produce sixty collections. They produce two or three
 *variants*, so this reports one row per variant, measured against the largest:
 
 ```
-[collection_mismatch] COLLECTION_MEMBERSHIP_DIFFERS  severity=needs-triage  owner=unknown  run-ending
-    no stack; suspect customer-code (owner of a module the workers disagreed about (test_collect.py))
-    2 workers produced 2 different collections
-    baseline: 1 worker collected 3 tests, and everything below is measured against that list
-    1 worker is missing 1 test, in test_collect.py (gw1)
+Workers collected different tests: 2 workers produced 2 different collections   [collection_mismatch COLLECTION_MEMBERSHIP_DIFFERS, unknown, needs-triage, run-ending]
+    No stack was captured; the owner is taken from a module the workers disagreed about, test_collect.py (customer-code).
+    Baseline: 1 worker collected 3 tests; the rows below are measured against that list.
+    1 worker is missing 1 test, in test_collect.py (gw1).
         - test_collect.py::test_two
-    whole collections written to .pytest-failures; the difference above travels in the incident
-    · xdist addresses tests by position rather than by id, so any difference between the lists is fatal - a reordering as much as a missing test
-    · the initial collections disagreed, so the run was aborted
+    xdist addresses tests by position rather than by id, so any difference between the lists stops it: a reordering as much as a missing test.
+    The initial collections disagreed, so xdist aborted the run.
+    Look at: the full id lists in .pytest-failures/run-3f9a1c2d.
 ```
 
 At sixty workers it stays the same shape, because the row count follows the
 number of *variants* rather than the number of workers:
 
 ```
-    58 workers produced 3 different collections
-    baseline: 55 workers collected 300 tests, and everything below is measured against that list
-    2 workers are missing 1 test, in test_payments.py (gw41, gw58)
+Workers collected different tests: 58 workers produced 3 different collections   [collection_mismatch COLLECTION_MEMBERSHIP_DIFFERS, unknown, needs-triage, run-ending]
+    Baseline: 55 workers collected 300 tests; the rows below are measured against that list.
+    2 workers are missing 1 test, in test_payments.py (gw41, gw58).
         - test_payments.py::test_case_017
-    1 worker has 6 extra tests, in test_legacy.py (gw17)
+    1 worker has 6 extra tests, in test_legacy.py (gw17).
         + test_legacy.py::test_extra_0
         + test_legacy.py::test_extra_1
         + test_legacy.py::test_extra_2
@@ -482,14 +508,17 @@ would otherwise be one near-identical block per worker — and prints what each
 of a few workers actually collected:
 
 ```
-[collection_mismatch] COLLECTION_PARAMETERS_UNSTABLE  severity=needs-triage  run-ending
-    6 workers produced 6 different collections
-    the tests are the same on every worker - only the parameter values differ, so these are not tests appearing and disappearing
+Workers collected the same tests with different parameter values: 6 workers produced 6 different collections   [collection_mismatch COLLECTION_PARAMETERS_UNSTABLE, unknown, needs-triage, run-ending]
+    The same tests exist on every worker; only the parameter values in their ids differ.
         test_billing.py::test_invoice
             gw0 collected acct-1791, acct-3471, acct-6305, acct-7468
             gw1 collected acct-2186, acct-2542, acct-6991, acct-9779
             gw2 collected acct-1614, acct-1950, acct-4517, acct-9313
-    compare those values: a parametrize evaluated at collection time - a random number, a timestamp, an unordered set, a call to something live - gives every worker a different id for the same test, and xdist requires the ids to match
+    Ids that differ per worker were computed at collection time from something that differs per process, and xdist requires the ids to match.
+    Look at: the parametrize arguments of those tests.
+    xdist addresses tests by position rather than by id, so any difference between the lists stops it: a reordering as much as a missing test.
+    Stripping the parameters from the ids makes every worker's collection identical.
+    The initial collections disagreed, so xdist aborted the run.
 ```
 
 The values are the diagnosis. Naming the test says where to look; three rows
@@ -724,14 +753,14 @@ report for itself, and each process in it that started a session and never
 finished one is a death:
 
 ```
-[worker_death] UNKNOWN  severity=needs-triage  owner=unknown
-    no stack; suspect customer-code (owner of the test in flight (test_pool.py))
-    recovered from run-8f21c0b4e5d7, which ended without reaching session finish
-    worker=main  in flight test_pool.py::test_writes  phase=call  started=12 finished=11
-    · died while running test_pool.py::test_writes (call)
-    · exit status unavailable (pid 21780): nothing was left to read it. Only a parent may, the parent was the run that died, and by the time this evidence was found the process was gone - so an OOM kill, a segfault and an os._exit cannot be told apart here
-    · resident memory 412 MB at last checkpoint
-    · no stack was kept here: this run had no workers, so its fatal dump went to the terminal pytest's faulthandler plugin writes to rather than into a file - set failure_crash_stack to keep a copy instead
+Worker main of run run-8f21c0b4e5d7 died while running test_pool.py::test_writes (call); its exit status could not be read   [worker_death UNKNOWN, unknown, needs-triage]
+    No stack was captured; the owner is taken from the test that was running, test_pool.py (customer-code).
+    Found in the evidence of run run-8f21c0b4e5d7, which ended without reaching session finish; it was last seen alive at 2026-09-04 09:12:41. The death is somewhere after that.
+    Exit status unavailable (pid 21780): only the parent process could read it, and the parent was the run that died. An OOM kill, a segfault and an os._exit cannot be told apart without it.
+    Look at: test_pool.py::test_writes.
+    No stack was kept: this run had no workers, so its fatal dump went to the terminal that pytest's faulthandler plugin writes to.
+    Look at: failure_crash_stack, which keeps a copy in the evidence directory.
+    Measured: 412 MB resident at the last heartbeat. 12 tests started and 11 finished on this worker.
 ```
 
 `recovered_from_run` leads the block, because a reader who takes this for the
@@ -1076,11 +1105,9 @@ running" look identical, which is the exact misreading this package exists to
 prevent:
 
 ```
-[stack_server_unavailable] PORT_TAKEN  severity=informational  owner=runtime
-    no live stacks this run: 127.0.0.1 could not serve on port 8080
-    port 8080 is held by something that is not a stack server (Address already in use);
-    pass --callstack-port with an unused port, or leave it off entirely and let one be drawn
-    · the run itself is unaffected; what is missing is the live view
+No live stack view this run: 127.0.0.1 could not serve on port 8080   [stack_server_unavailable PORT_TAKEN, runtime, informational]
+    Port 8080 is held by something that is not a stack server (Address already in use); pass --callstack-port with an unused port, or leave it off entirely and let one be drawn.
+    The run itself is unaffected; only the live view is missing.
 ```
 
 Two verdicts, because they have different remedies. `PORT_TAKEN` is a stranger
@@ -1094,7 +1121,7 @@ kind gets filtered out entirely. It is reported once per address per run, not
 once per retry, though a named port held by a stranger is re-probed for the
 life of the run.
 
-`owner=runtime`, `severity=informational`: no test is at fault and nothing is
+Owner `runtime`, severity `informational`: no test is at fault and nothing is
 broken. What is lost is a diagnostic, and somebody has to decide whether to
 reconfigure it.
 
@@ -1499,11 +1526,11 @@ blamed on pytest. So a test that reads a file whole instead of streaming it
 comes back as:
 
 ```
-Memory over the ceiling: tests/test_loading.py::test_loads_the_export reached 2374 MB, ceiling is 1000 MB   [memory_profile PEAK_OVER_CEILING, product]
-    All of the 2262 MB increase happened while load_everything (loader.py:16) was running, called from test_loads_the_export (test_loading.py:11).
+Memory over the ceiling: tests/test_loading.py::test_loads_the_export reached 1158 MB, ceiling is 1000 MB   [memory_profile PEAK_OVER_CEILING, product, informational]
+    All of the 1078 MB increase happened while load_everything (loader.py:14) was running, called from test_loads_the_export (test_loading.py:11).
     The memory was released before the test ended.
-    Look at: loader.py:16
-    Measured: process 449 MB before, 2374 MB peak, 495 MB after. Ceiling from failure_profile_peak_mb.
+    Look at: loader.py:14
+    Measured: process 417 MB before, 1158 MB peak, 463 MB after. Ceiling from failure_profile_peak_mb.
 ```
 
 What a test *kept* is measured as the larger of the resident step and the
@@ -1523,12 +1550,12 @@ did and the allocator's free figure accounts for the gap, the finding says
 where the free memory is:
 
 ```
-Memory held by the allocator: worker main has 323 MB that tests freed and the C allocator has not returned to the OS   [memory_profile ALLOCATOR_RETENTION, runtime]
+Memory held by the allocator: worker main has 289 MB that tests freed and the C allocator has not returned to the OS   [memory_profile ALLOCATOR_RETENTION, runtime, informational]
     No Python object holds this memory. It is inside glibc's heaps, mapped and unused.
-    144 MB of the 323 MB is in the main heap, 179 MB in thread arenas. 11 arenas existed for up to 8 threads on 4 cores.
-    Biggest single steps: tests/test_arenas.py::test_ingest_batch[0] (182 MB on main).
+    144 MB of the 289 MB is in the main heap, 145 MB in thread arenas. 11 arenas existed for up to 10 threads on 4 cores.
+    Biggest single steps: tests/test_arenas.py::test_ingest_batch[0] (140 MB on main).
     glibc keeps freed memory mapped inside each arena, and gives every thread that allocates an arena of its own, up to eight per core. MALLOC_ARENA_MAX limits how many thread arenas exist.
-    Measured: process 42 MB at the start, 922 MB at the end, up 880 MB over 73 tests with 466 MB of that in use.
+    Measured: process 42 MB at the start, 881 MB at the end, up 839 MB over 73 tests with 466 MB of that in use.
 ```
 
 A test that left a threshold's worth of it in one step would have been
@@ -1566,13 +1593,13 @@ peak, by traceback, weighted in bytes, beside its CPU one.
 The growth finding above, rerun that way over the two modules it names:
 
 ```
-Memory growing across tests: worker main kept 289 MB in use over 48 tests, about 6 MB per test   [memory_profile STEADY_GROWTH, customer-code]
+Memory growing across tests: worker main kept 289 MB in use over 48 tests, about 6 MB per test   [memory_profile STEADY_GROWTH, customer-code, informational]
     No single test kept enough to be reported on its own. 48 of the 48 tests each ended with more in use than they started with.
-    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests).
+    Most of it during: tests/test_memory.py::test_leaks_a_little (168 MB over 7 tests), tests/test_drift.py::test_response_is_cached (121 MB over 40 tests).
     Held at the end of the worker: 190.7 MB allocated at test_memory.py:48, called from python.py:167, _callers.py:121, _manager.py:120.
     Held at the end of the worker: 145.9 MB allocated at test_memory.py:24, called from python.py:167, _callers.py:121, _manager.py:120.
     Held at the end of the worker: 122.1 MB allocated at test_drift.py:13, called from python.py:167, _callers.py:121, _manager.py:120.
-    Measured: traced memory 1 MB before the first of these tests, 579 MB after the last. Biggest single step 24 MB. +15,685 Python objects per test.
+    Measured: traced memory 1 MB before the first of these tests, 579 MB after the last. Biggest single step 24 MB. +16,437 Python objects per test.
 ```
 
 Three lines, each an `append` to something module-level. A tracemalloc
@@ -1590,29 +1617,29 @@ This is what the example suite under
 [`examples/profiling`](examples/profiling) prints, trimmed:
 
 ```
-CPU hotspot: load_everything (loader.py:15) used 33% of this run's CPU, 9.0 s   [cpu_hotspot PYTHON_CODE, product]
-    The time is in this function's own lines, not in calls it makes. Mostly line 15 (88%), line 14 (12%).
+CPU hotspot: load_everything (loader.py:14) used 43% of this run's CPU, 15.4 s   [cpu_hotspot PYTHON_CODE, product, informational]
+    The time is in this function's own lines, not in calls it makes. Mostly line 14 (100%).
     Seen in 1 test: tests/test_loading.py::test_loads_the_export.
-    Look at: loader.py:15
+    Look at: loader.py:14
 
-CPU on a background thread: 'status-poller' used 12% of this run's CPU, 3.4 s, in Poller._run (poller.py:33)   [cpu_hotspot BACKGROUND_THREAD, product]
+CPU on a background thread: 'status-poller' used 10% of this run's CPU, 3.6 s, in Poller._run (poller.py:33)   [cpu_hotspot BACKGROUND_THREAD, product, informational]
     This thread is not the one running tests, so it uses this CPU whichever test is executing.
-    Seen in 13 tests: tests/test_polling.py::test_another_with_the_poller_running, tests/test_polling.py::test_with_the_poller_running, tests/test_sessions.py::test_request_answers[0] and 10 more, and between tests.
+    Seen in 13 tests: tests/test_polling.py::test_another_with_the_poller_running, tests/test_polling.py::test_with_the_poller_running, tests/test_sessions.py::test_request_answers[1] and 10 more, and between tests.
     Look at: poller.py:33
 
-Memory kept after test: tests/test_memory.py::test_big_fixture ended with 143 MB more in use than it started with   [memory_profile RETAINED_AFTER_TEST, customer-code]
-    139 MB of the 158 MB increase happened while big_fixture (test_memory.py:30) was running, called from call_fixture_func (fixtures.py:1005).
-    19 MB of the increase could not be attributed to any code.
+Memory kept after test: tests/test_memory.py::test_big_fixture ended with 143 MB more in use than it started with   [memory_profile RETAINED_AFTER_TEST, customer-code, informational]
+    145 MB of the 158 MB increase happened while big_fixture (test_memory.py:30) was running, called from call_fixture_func (fixtures.py:1006).
+    13 MB of the increase could not be attributed to any code.
     The increase happened during setup, so a fixture allocated it, and it was still in use after teardown.
     Look at: test_memory.py:30 and what holds its result after the test.
-    Measured: process 588 MB before, 731 MB after. Live heap +143 MB. +562 Python objects.
+    Measured: process 553 MB before, 696 MB after. Live heap +143 MB. +596 Python objects.
 
-Memory growing across tests: worker main kept 295 MB in use over 69 tests, about 4.3 MB per test   [memory_profile STEADY_GROWTH, unknown]
-    No code location was captured; the owner is taken from the test's file, tests/test_allocation.py (customer-code).
-    No single test kept enough to be reported on its own. 68 of the 69 tests each ended with more in use than they started with.
+Memory growing across tests: worker main kept 295 MB in use over 69 tests, about 4.3 MB per test   [memory_profile STEADY_GROWTH, unknown, informational]
+    No stack was captured; the owner is taken from the test's file, tests/test_allocation.py (customer-code).
+    No single test kept enough to be reported on its own. 67 of the 69 tests each ended with more in use than they started with.
     Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests), tests/test_arenas.py::test_ingest_batch (5 MB over 3 tests).
     Look at: rerun those tests with --failure-profile-allocations to see which lines hold the memory.
-    Measured: process 42 MB before the first of these tests, 922 MB after the last. Biggest single step 24 MB. 295 MB of the 466 MB increase is in use; the rest was freed and kept by the allocator. +420 Python objects per test.
+    Measured: process 42 MB before the first of these tests, 881 MB after the last. Biggest single step 24 MB. 295 MB of the 472 MB increase is in use; the rest was freed and kept by the allocator. +410 Python objects per test.
 ```
 
 And the I/O-bound suite under [`examples/profiling/tests/test_polling.py`](examples/profiling/tests/test_polling.py)
@@ -1620,15 +1647,15 @@ and its neighbours, where nothing is over the CPU share and the timeline is
 what finds the fixture:
 
 ```
-Repeated CPU burst: Session.__init__ (session.py:21) ran at full CPU for about 0.7 s in each of 6 tests, during setup   [cpu_burst RECURRING_BURST, product]
-    4.3 s of CPU in total across the 6 bursts. Called from session (test_sessions.py:13).
-    Tests: tests/test_sessions.py::test_request_answers[0], tests/test_sessions.py::test_request_answers[4], tests/test_sessions.py::test_request_answers[2] and 3 more.
+Repeated CPU burst: Session.__init__ (session.py:21) ran at full CPU for about 0.7 s in each of 6 tests, during setup   [cpu_burst RECURRING_BURST, product, informational]
+    4.2 s of CPU in total across the 6 bursts. Called from session (test_sessions.py:13).
+    Tests: tests/test_sessions.py::test_request_answers[2], tests/test_sessions.py::test_request_answers[1], tests/test_sessions.py::test_request_answers[5] and 3 more.
     Machine load during these bursts: 26%.
     Look at: session.py:21. It ran during setup of each of those tests.
 
-CPU burst: tests/test_index.py::test_index_is_complete ran at 1.0 cores for 4.1 s, starting 1.0 s into the test, during call   [cpu_burst LONG_BURST, product]
+CPU burst: tests/test_index.py::test_index_is_complete ran at 1.0 cores for 4.8 s, starting 1.1 s into the test, during call   [cpu_burst LONG_BURST, product, informational]
     Running build_index (reports.py:42), called from test_index_is_complete (test_index.py:13).
-    This burst is 94% of the test's 4.3 s of CPU. The other 1.9 s of the test's 6.2 s was waiting.
+    This burst is 97% of the test's 4.9 s of CPU. The other 1.9 s of the test's 6.8 s was waiting.
     Machine load during the burst: 26%.
     Look at: reports.py:42
 ```
@@ -1637,17 +1664,14 @@ The same run prints a summary at the end of the terminal output — the run's
 CPU against its wall time, what each worker peaked at, and the top functions:
 
 ```
-Profile: 73 tests, 34 s of wall time, 29 s CPU (0.87 cores on average), 2.2 s of it in garbage collection
-  worker main: 73 tests, 29 s CPU, peak 2374 MB, 922 MB at the end
+Profile: 73 tests, 42 s of wall time, 37 s CPU (0.90 cores on average), 3.0 s of it in garbage collection
+  worker main: 73 tests, 37 s CPU, peak 1158 MB, 878 MB at the end
 ```
 
-Every finding is printed the same way: a first line that says what was
-measured, in words, ending with a `[kind VERDICT, owner]` tag to grep for;
-then lines that are each one of three things — a measurement, what that
-measurement means by how it was taken, or a place to look. Nothing in them
-guesses at a cause or a fix, because the analysis is arithmetic over samples
-and knows neither. `Look at:` is a location the tool has or a flag that gets
-more information; `Measured:` is the raw numbers, labelled.
+Every finding is printed the way every incident is (see "How an incident
+reads"): a first line that says what was measured, in words, ending with a
+`[kind VERDICT, owner, severity]` tag; then lines that are each a
+measurement, what it means by how it was taken, or a place to look.
 
 It also writes a [speedscope](https://www.speedscope.app/) flame graph for every
 test a finding names, and for the gaps between tests, under

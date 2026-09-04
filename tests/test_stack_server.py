@@ -1638,10 +1638,10 @@ def test_the_incident_is_owned_by_the_runtime_and_stays_quiet():
         "informational"
     )
     assert "8080" in str(incident)
-    assert "the run itself is unaffected" in str(incident)
+    assert "The run itself is unaffected" in str(incident)
     # The detail is printed once. The alert text is the product, and a fact
     # printed twice reads as two findings.
-    assert str(incident).count("something else is there") == 1
+    assert str(incident).lower().count("something else is there") == 1
     # And no "blamed on" or suspect line: nothing of anybody's ran.
     assert "blamed on" not in str(incident)
     assert "suspect" not in str(incident)

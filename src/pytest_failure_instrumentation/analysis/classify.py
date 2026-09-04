@@ -18,57 +18,49 @@ if TYPE_CHECKING:  # importing it for real would close a cycle: death -> classif
 
 
 def memory_evidence(incident: WorkerDeathIncident) -> list[str]:
-    """Only for deaths where memory could be the cause.
+    """Only for deaths where memory could be the cause, as the parts of the
+    measured line.
 
     A segfault's resident size explains nothing and sends the reader to look at
     memory on a crash that has nothing to do with it.
     """
-    evidence = []
+    parts = []
     if incident.rss_mb_at_death is not None:
-        line = f"resident memory {incident.rss_mb_at_death} MB at last checkpoint"
+        part = f"{incident.rss_mb_at_death} MB resident at the last heartbeat"
         limit = incident.cgroup.max_mb if incident.cgroup else None
         if limit:
-            line += f" of a {limit} MB cgroup limit"
-        evidence.append(line)
+            part += f", of a {limit} MB cgroup limit"
+        parts.append(part)
     if incident.system_available_mb is not None:
-        evidence.append(f"system had {incident.system_available_mb} MB free")
+        parts.append(f"{incident.system_available_mb} MB free on the machine")
     delta = incident.cgroup_oom_kills_since_start
     if delta:
-        evidence.append(f"cgroup OOM kill counter rose by {delta} during this run")
-    return evidence
+        parts.append(f"cgroup OOM kills during this run: {delta}")
+    return parts
 
 
 def _written_ago(age: float | None) -> str:
     """A stack is evidence about a moment, so say which moment."""
     if age is None:
         return ""
-    return f", {age:.0f}s before this report" if age >= 1 else ", moments before"
+    return f" from {age:.0f} s before this report" if age >= 1 else " from moments before"
 
 
 def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
-    """Returns (verdict, confidence, evidence)."""
+    """Returns (verdict, confidence, evidence).
+
+    What happened and to which test is the headline's, built from the fields
+    at render time; the evidence is the facts behind it - where the status
+    came from, whether the stack is the death's, the memory figures where
+    memory could be the cause - and what each fact means by construction.
+    """
     status = incident.exit_status
     evidence: list[str] = []
 
-    if incident.test_in_flight:
-        phase = f" ({incident.phase})" if incident.phase else ""
-        evidence.append(f"died while running {incident.test_in_flight}{phase}")
-    elif incident.tests_finished:
-        # Not "died in" - the last test had already finished, and saying
-        # otherwise puts a passing test's name on a death it had no part in.
-        after = (
-            f", the last of them {incident.last_test}" if incident.last_test else ""
-        )
-        evidence.append(
-            f"died between tests, after finishing {incident.tests_finished}{after}"
-        )
-    else:
-        evidence.append("died before running any test (startup or collection)")
-
     if status is not None:
         evidence.append(
-            f"exit status {status} - {status_table.describe(status)} "
-            f"(pid {incident.worker_pid}, via {incident.exit_status_source})"
+            f"Exit status {status} read via {incident.exit_status_source} "
+            f"(pid {incident.worker_pid})."
         )
     elif incident.recovered_from_run:
         # Two ways to have no status and they have different remedies, so they
@@ -78,21 +70,19 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         # status. Nothing can recover it, which is worth saying plainly rather
         # than leaving a reader to look for a configuration that would.
         evidence.append(
-            f"exit status unavailable (pid {incident.worker_pid}): nothing was "
-            "left to read it. Only a parent may, the parent was the run that "
-            "died, and by the time this evidence was found the process was "
-            "gone - so an OOM kill, a segfault and an os._exit cannot be told "
-            "apart here"
+            f"Exit status unavailable (pid {incident.worker_pid}): only the parent "
+            "process could read it, and the parent was the run that died. An OOM "
+            "kill, a segfault and an os._exit cannot be told apart without it."
         )
     else:
         evidence.append(
-            f"exit status unavailable (pid {incident.worker_pid}); remote "
-            "gateways have no local process to query"
+            f"Exit status unavailable (pid {incident.worker_pid}): the worker ran on a "
+            "remote gateway, with no local process to ask."
         )
 
     fatal_dump = crash_stack.is_fatal(incident.crash_stack)
     if fatal_dump:
-        evidence.append("the worker wrote a fatal stack as it died")
+        evidence.append("The worker wrote a stack as it died.")
     elif incident.crash_stack:
         # A dump with no fatal banner did not come from a dying process. It is
         # still context, but it is not evidence of a crash and must not be
@@ -100,59 +90,75 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         # whether it is context at all: a stack from a slow test four minutes
         # ago describes a test that has since finished.
         evidence.append(
-            "a stack is on file but was not written by a dying process"
+            "A stack is on file"
             + _written_ago(incident.crash_stack_age_seconds)
-            + " - it is context, not evidence of a crash"
+            + ", written by a process that went on running. It is context, not "
+            "the stack of the death."
         )
+
+    look = f"Look at: {incident.test_in_flight}." if incident.test_in_flight else ""
+
+    counted = (
+        f"{incident.tests_started} test{'s' if incident.tests_started != 1 else ''} started "
+        f"and {incident.tests_finished} finished on this worker"
+    )
+
+    def close(lines: list[str], *, with_memory: bool = False) -> list[str]:
+        lines = evidence + lines
+        if look:
+            lines.append(look)
+        parts = (memory_evidence(incident) if with_memory else []) + [counted]
+        return lines + ["Measured: " + ". ".join(parts) + "."]
 
     if status is not None and status < 0:
         received = -status
         if hasattr(signal, "SIGKILL") and received == signal.SIGKILL:
-            evidence = evidence + memory_evidence(incident)
             if incident.cgroup_oom_kills_since_start:
-                return "OOM_KILLED", "high", evidence
-            return "SIGKILLED", "medium", evidence + [
-                "SIGKILL with no cgroup OOM event: a host-level OOM killer, a "
-                "container or CI cancellation, or an external kill"
-            ]
+                return "OOM_KILLED", "high", close([
+                    "The cgroup's OOM kill counter rose during this run, so the kill "
+                    "came from the cgroup's memory limit."
+                ], with_memory=True)
+            return "SIGKILLED", "medium", close([
+                "No cgroup OOM kill was counted during this run. SIGKILL cannot be "
+                "caught, and is sent by a host OOM killer, a container or CI "
+                "cancellation, or a kill command."
+            ], with_memory=True)
         if received in status_table.FATAL_SIGNALS:
-            return "NATIVE_CRASH", "high", evidence + [
-                status_table.FATAL_SIGNALS[received]
-            ]
+            return "NATIVE_CRASH", "high", close([])
         if received in status_table.DELIBERATE_SIGNALS:
-            return f"SIGNAL_{received}", "high", evidence + [
-                status_table.DELIBERATE_SIGNALS[received],
-                "nothing to triage unless the run was not meant to be stopped",
-            ]
-        return f"SIGNAL_{received}", "medium", evidence
+            return f"SIGNAL_{received}", "high", close([
+                "A stop request rather than a fault, so it is informational."
+            ])
+        return f"SIGNAL_{received}", "medium", close([])
 
     if status in status_table.WINDOWS_STATUS:
-        verdict, description = status_table.WINDOWS_STATUS[status]
-        return verdict, "high", evidence + [description]
+        verdict, _description = status_table.WINDOWS_STATUS[status]
+        return verdict, "high", close([])
 
     if fatal_dump:
         # On Windows abort() exits with 3, exactly as a deliberate os._exit(3)
         # does, so the dump is the only thing that separates them - which is
         # why it has to be a dump the dying process wrote, and not the one a
         # slow test left behind an hour earlier.
-        return "NATIVE_CRASH", "medium", evidence
+        return "NATIVE_CRASH", "medium", close([])
 
     if status is not None and 128 < status < 192:
-        return "PROBABLY_SIGNALLED", "low", evidence + [
-            f"exit code {status} is the 128+signal convention used by shells and "
-            "container runtimes; the true signal was not passed through"
-        ]
+        return "PROBABLY_SIGNALLED", "low", close([
+            "Exit codes 129 to 191 are the 128+signal convention shells and "
+            "container runtimes use; the signal itself was not passed through."
+        ])
 
     if status is not None:
         # Zero included. A worker that left the run without being asked to has
         # gone wrong whatever number it exited with, and os._exit(0) inside a
         # test is a real way to do it - reported as UNKNOWN it reads as a
         # status nobody could obtain, which is the one thing this is not.
-        return "SELF_EXIT", "medium", evidence + [
-            "the worker exited on its own: something called sys.exit() or "
-            "os._exit(), or a plugin aborted"
-        ]
+        return "SELF_EXIT", "medium", close([
+            "The exit was requested from inside the worker: sys.exit(), os._exit(), "
+            "or a plugin abort. A worker is not expected to exit before the "
+            "session ends."
+        ])
 
     # No status at all - a remote gateway, or a run found after the fact with
     # nothing left that was entitled to read one.
-    return "UNKNOWN", "low", evidence + memory_evidence(incident)
+    return "UNKNOWN", "low", close([], with_memory=True)

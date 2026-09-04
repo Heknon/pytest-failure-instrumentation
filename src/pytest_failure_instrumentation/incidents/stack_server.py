@@ -73,24 +73,18 @@ class StackServerIncident(Incident):
         """
         return [self.kind, self.verdict, self.host, str(self.requested_port)]
 
-    def details(self) -> list[str]:
+    def summary(self) -> str:
         where = "a drawn port" if self.drawn else f"port {self.requested_port}"
-        return [
-            f"no live stacks this run: {self.host} could not serve on {where}",
-            self.detail,
-        ]
+        return f"No live stack view this run: {self.host} could not serve on {where}"
 
-    def __str__(self) -> str:
-        """No "blamed on" line, and no suspect either.
-
-        The base prints one or the other above the details, and both are wrong
-        here: there is no stack because nothing of anybody's ran, and offering
-        a suspect test for a port that was already occupied when the session
-        started would be a guess pointing at somebody innocent.
-        """
-        return "\n    ".join(
-            [self.headline(), *self.details(), *(f"· {item}" for item in self.evidence)]
-        )
+    def details(self) -> list[str]:
+        # The service's own account: what held the port or refused the bind,
+        # and the option that names a different one. One line, capitalised
+        # and closed like the rest.
+        if not self.detail:
+            return []
+        text = self.detail.strip()
+        return [text[0].upper() + text[1:] + ("" if text.endswith(".") else ".")]
 
 
 def build(
@@ -111,6 +105,6 @@ def build(
         # well. The alert text is the product here, and a fact printed twice
         # reads as two findings.
         evidence=[
-            "the run itself is unaffected; what is missing is the live view",
+            "The run itself is unaffected; only the live view is missing.",
         ],
     )

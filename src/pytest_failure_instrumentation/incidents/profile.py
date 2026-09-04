@@ -39,21 +39,6 @@ def _named(frame: Optional[Frame]) -> str:
     return f"{frame.function} ({Path(frame.file).name}:{frame.line})"
 
 
-def _render(incident: Incident, headline: str) -> str:
-    """A profile finding as text: what happened in words, tagged for grep,
-    then the evidence lines. Nothing here is a failure, so there is no
-    severity on the line; and the location is in the headline or the first
-    evidence line rather than a line of its own."""
-    lines = [f"{headline}   [{incident.kind} {incident.verdict}, {incident.owner}]"]
-    if incident.blamed_frame is None and incident.suspect_owner:
-        lines.append(
-            "No code location was captured; the owner is taken from the test's file, "
-            f"{incident.suspect_basis} ({incident.suspect_owner})."
-        )
-    lines.extend(incident.evidence)
-    return "\n    ".join(lines)
-
-
 def _on(worker: Optional[str]) -> str:
     """The worker, when there is more than one to tell apart."""
     return f" on {worker}" if worker and worker != "main" else ""
@@ -104,9 +89,9 @@ class CpuHotspotIncident(Incident):
         return self.tests[0] if self.tests else None
 
     def suspect_basis_for(self, path: str) -> str:
-        return path
+        return f"the test's file, {path}"
 
-    def headline(self) -> str:
+    def summary(self) -> str:
         cost = f"{_pct(self.share_percent)} of this run's CPU, {self.cpu_seconds:.1f} s"
         if self.verdict == "GC_PRESSURE":
             return f"Garbage collection used {cost}"
@@ -118,9 +103,6 @@ class CpuHotspotIncident(Incident):
         if self.blamed_frame is not None:
             return f"CPU hotspot: {_named(self.blamed_frame)} used {cost}"
         return f"CPU hotspot: {cost}"
-
-    def __str__(self) -> str:
-        return _render(self, self.headline())
 
     def owner_when_unattributable(self) -> Optional[str]:
         # The collector and a native thread pool belong to no frame; what
@@ -174,9 +156,9 @@ class CpuBurstIncident(Incident):
         return self.nodeid or (self.tests[0] if self.tests else None)
 
     def suspect_basis_for(self, path: str) -> str:
-        return path
+        return f"the test's file, {path}"
 
-    def headline(self) -> str:
+    def summary(self) -> str:
         during = f", during {self.phase}" if self.phase else ""
         if self.verdict == "RECURRING_BURST":
             rate = "full CPU" if self.cores >= 0.9 else f"{self.cores:.1f} cores"
@@ -199,9 +181,6 @@ class CpuBurstIncident(Incident):
             f"CPU burst: {self.nodeid} ran at {self.cores:.1f} cores for {self.burst_seconds:.1f} s, "
             f"starting {self.started_s:.1f} s into the test{during}{_on(self.worker)}"
         )
-
-    def __str__(self) -> str:
-        return _render(self, self.headline())
 
     def owner_when_unattributable(self) -> Optional[str]:
         # The machine being full is nobody's frame and nobody's test.
@@ -276,9 +255,9 @@ class MemoryProfileIncident(Incident):
         return self.nodeid
 
     def suspect_basis_for(self, path: str) -> str:
-        return path
+        return f"the test's file, {path}"
 
-    def headline(self) -> str:
+    def summary(self) -> str:
         on = _on(self.worker)
         if self.verdict == "RETAINED_AFTER_TEST":
             return f"Memory kept after test: {self.nodeid} ended with {self.delta_mb} MB more in use than it started with{on}"
@@ -298,9 +277,6 @@ class MemoryProfileIncident(Incident):
         if self.verdict == "ALLOCATOR_RETENTION":
             return f"Memory held by the allocator: worker {self.worker} has {self.allocator_free_mb} MB that tests freed and the C allocator has not returned to the OS"
         return f"Memory finding: {self.verdict}" + (f" for {self.nodeid}" if self.nodeid else "")
-
-    def __str__(self) -> str:
-        return _render(self, self.headline())
 
     def owner_when_unattributable(self) -> Optional[str]:
         # Memory the allocator kept is nobody's frame and nobody's test: it

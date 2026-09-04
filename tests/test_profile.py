@@ -367,7 +367,7 @@ class TestMemory:
         assert incident.delta_mb is not None and incident.delta_mb >= 40
         assert any("MALLOC_ARENA_MAX limits how many thread arenas exist" in line for line in incident.evidence)
         assert str(incident).startswith("Memory held by the allocator: worker main has ")
-        assert "[memory_profile ALLOCATOR_RETENTION, runtime]" in str(incident).splitlines()[0]
+        assert "[memory_profile ALLOCATOR_RETENTION, runtime, informational]" in str(incident).splitlines()[0]
         # And none of the tests is raised for memory nothing is using: a
         # step big enough to be HEAP_NOT_RETURNED alone is folded in here.
         assert not [

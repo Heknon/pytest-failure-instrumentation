@@ -130,9 +130,11 @@ def test_the_alert_text_leads_with_the_blame():
         ),
     )
     rendered = str(incident).splitlines()
-    assert rendered[0] == "[worker_death] NATIVE_CRASH  severity=critical  owner=product"
-    assert rendered[1].strip() == "blamed on engine.py:6 in native_call"
-    assert "test_api.py::test_thing" in rendered[2]
+    assert rendered[0] == (
+        "Worker gw1 crashed, leaving a fatal stack while running test_api.py::test_thing "
+        "(call), in native_call (engine.py:6)   [worker_death NATIVE_CRASH, product, critical]"
+    )
+    assert "exit status -11" in rendered[1]
 
 
 def test_a_death_says_which_worker_died():
@@ -150,15 +152,16 @@ def test_a_death_says_which_worker_died():
     )
     before_any = WorkerDeathIncident(worker="gw7")
     for death in (in_flight, between, before_any):
-        facts = [line.strip() for line in str(death).splitlines()[1:]]
-        assert facts[0].startswith("worker=gw7  "), facts
+        assert str(death).startswith("Worker gw7 "), str(death)
+    assert "while running test_api.py::test_thing (call)" in str(in_flight)
+    assert "between tests, after finishing 3 (the last was test_api.py::test_thing)" in str(between)
+    assert "before running any test" in str(before_any)
 
     # A run with no workers still has one process, and it still has a name:
-    # the one its crash file carries.
+    # the one its crash file carries - and a recovered death says which run
+    # it belongs to before anything else.
     alone = WorkerDeathIncident(worker="main", recovered_from_run="run-1")
-    lines = [line.strip() for line in str(alone).splitlines()]
-    assert lines[1].startswith("recovered from run-1")
-    assert lines[2].startswith("worker=main  ")
+    assert str(alone).startswith("Worker main of run run-1 ")
 
 
 def test_a_guess_is_never_rendered_as_a_finding():
@@ -166,15 +169,20 @@ def test_a_guess_is_never_rendered_as_a_finding():
         worker="gw1",
         owner="unknown",
         suspect_owner="customer-code",
-        suspect_basis="owner of the test in flight (test_api.py)",
+        suspect_basis="the test that was running, test_api.py",
     )
-    assert "suspect customer-code" in str(incident)
-    assert "blamed on" not in str(incident)
+    lines = str(incident).splitlines()
+    assert lines[1].strip() == (
+        "No stack was captured; the owner is taken from the test that was running, "
+        "test_api.py (customer-code)."
+    )
+    assert "[worker_death UNKNOWN, unknown, needs-triage]" in lines[0]
 
 
 def test_the_summary_does_not_pretend_to_have_an_owner():
     rendered = str(RunSummaryIncident(worker="main", verdict="RUN_FINISHED"))
-    assert "owner=" not in rendered
+    assert rendered.endswith("[run_summary RUN_FINISHED, needs-triage]")
+    assert "unknown" not in rendered
 
 
 def test_the_base_is_never_emitted_directly():
@@ -216,17 +224,22 @@ MANY_WORKERS = CollectionMismatchIncident(
 
 
 def test_the_headline_leads_with_scale_not_with_a_hash():
-    first = str(MANY_WORKERS).splitlines()[1].strip()
-    assert first == "20 workers produced 2 different collections"
+    first = str(MANY_WORKERS).splitlines()[0]
+    assert first.startswith(
+        "Workers collected different tests: 20 workers produced 2 different collections"
+    )
+    assert "aaa" not in first
 
 
 def test_the_baseline_says_it_is_the_reference_rather_than_a_finding():
-    baseline = str(MANY_WORKERS).splitlines()[2].strip()
-    assert baseline.startswith("baseline: 17 workers collected 300 tests")
+    baseline = str(MANY_WORKERS).splitlines()[1].strip()
+    assert baseline == (
+        "Baseline: 17 workers collected 300 tests; the rows below are measured against that list."
+    )
 
 
 def test_a_variant_reads_as_a_sentence_about_what_it_did():
-    assert "3 workers differ: 50 missing, 9 extra (gw3, gw11, gw19)" in str(MANY_WORKERS)
+    assert "3 workers differ: 50 missing, 9 extra (gw3, gw11, gw19)." in str(MANY_WORKERS)
 
 
 def test_the_text_shows_a_sample_in_diff_notation():
@@ -277,7 +290,7 @@ def test_one_module_stays_in_the_sentence():
             },
         ],
     )
-    assert "1 worker is missing 1 test, in test_orders.py (gw1)" in str(single)
+    assert "1 worker is missing 1 test, in test_orders.py (gw1)." in str(single)
 
 
 def test_unstable_parameters_replace_the_variant_rows_entirely():
@@ -296,7 +309,7 @@ def test_unstable_parameters_replace_the_variant_rows_entirely():
         ],
     )
     rendered = str(incident)
-    assert "only the parameter values differ" in rendered
+    assert "only the parameter values in their ids differ" in rendered
     assert "test_pricing.py::test_rounding" in rendered
     assert "missing" not in rendered
     assert "baseline" not in rendered
@@ -366,11 +379,11 @@ def test_a_stall_says_why_it_has_no_stack_rather_than_blaming_the_platform():
         stack_unavailable_reason="failure_stack_probe is off, so the worker "
         "was left undisturbed",
     )
-    assert "no stack: failure_stack_probe is off" in str(silent)
+    assert "No stack: failure_stack_probe is off" in str(silent)
 
     # Nothing to explain when a stack was obtained.
     answered = WorkerStallIncident(worker="gw1", stack=["  File \"x.py\", line 1 in f"])
-    assert "no stack:" not in str(answered)
+    assert "No stack:" not in str(answered)
 
 
 def test_a_stall_says_when_an_unprompted_stack_was_taken():
@@ -384,7 +397,7 @@ def test_a_stall_says_when_an_unprompted_stack_was_taken():
         stack_age_seconds=182.0,
         stack_source="watchdog",
     )
-    assert "stack written 182s ago by the slow-test watchdog" in str(left_behind)
+    assert "Stack from the slow-test watchdog, written 182 s ago" in str(left_behind)
 
     # And which mechanism, because they do not mean the same thing. A dump
     # from the fallback timer is not "this test is taking a while" - it is the
@@ -407,7 +420,8 @@ def test_a_stall_says_when_an_unprompted_stack_was_taken():
         stack_probed=True,
         stack_age_seconds=0.0,
     )
-    assert "not taken just now" not in str(probed)
+    assert "not a picture of now" not in str(probed)
+    assert "Stack taken now" in str(probed)
 
 
 def test_a_death_dates_a_stack_that_did_not_come_from_the_death():
@@ -425,7 +439,7 @@ def test_a_death_dates_a_stack_that_did_not_come_from_the_death():
     )
     _verdict, _confidence, evidence = classify.of(stale)
     assert any(
-        "not written by a dying process" in line and "47s before this report" in line
+        "written by a process that went on running" in line and "47 s before this report" in line
         for line in evidence
     ), evidence
 

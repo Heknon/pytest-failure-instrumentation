@@ -71,9 +71,8 @@ def assess(
     if not beats:
         return Assessment(
             state="SILENT",
-            reason="the worker never wrote a heartbeat this run; the watchdog "
-            "is disabled, or nothing it wrote is still on disk, so no passive "
-            "evidence is available",
+            reason="No heartbeat was written this run: the watchdog is off, or nothing "
+            "it wrote is on disk, so there is no passive evidence either way.",
         )
 
     age = now - last_beat_time(beats)
@@ -97,8 +96,9 @@ def confirm(
         age = now - previous_last
         return Assessment(
             state="FROZEN",
-            reason=f"the worker's own background thread has not run for {age:.0f}s: "
-            "native code is holding the GIL, or the process is stopped",
+            reason=f"The worker's heartbeat thread has not run for {age:.0f} s. A Python "
+            "thread stops running when native code holds the GIL or the process is "
+            "stopped.",
             heartbeat_age=age,
         )
     return _from_cpu(beats, now, silent_for, now - last_beat_time(beats))
@@ -127,17 +127,17 @@ def _from_cpu(
         # not at the confidence a measured zero earns.
         return Assessment(
             state="BLOCKED",
-            reason="the heartbeat is still running but no CPU figure could be "
-            "measured, so this rests on the silence alone - a busy worker "
-            "cannot be ruled out",
+            reason="The heartbeat thread is running, but no CPU figure could be "
+            "measured. This rests on the silence alone, and a busy worker cannot be "
+            "ruled out.",
             cpu_rate=None,
             heartbeat_age=age,
             confidence="low",
         )
     return Assessment(
         state="BLOCKED",
-        reason="no CPU progress while the heartbeat still runs: the test thread "
-        "is blocked, and the stack says on what",
+        reason=f"The heartbeat thread is running and the process used {rate:.2f} cores "
+        "over the window: the test thread is waiting on something.",
         cpu_rate=rate,
         heartbeat_age=age,
     )

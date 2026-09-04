@@ -447,7 +447,7 @@ class IncidentEngine:
         try:
             self._enrich(incident)
         except Exception as failure:  # noqa: BLE001 - a partial incident beats none
-            incident.evidence.append(f"enrichment failed: {failure!r}")
+            incident.evidence.append(f"Enrichment failed: {failure!r}.")
 
         # The stall watcher raises from its own thread, so the counters and
         # the dedupe table are shared state.
