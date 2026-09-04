@@ -114,11 +114,21 @@ class Poller:
         self.cpu_seconds = 0.0
         self.thread = threading.Thread(target=self.run, name="status-poller", daemon=True)
 
+    #: Polls a second, and hashes per poll. A millisecond between polls is
+    #: what this said first, and on Windows a millisecond is a request for
+    #: one scheduler tick - 15.6 ms - so the thread polled sixty times a
+    #: second there against two thousand here and burnt a fortieth of the CPU
+    #: it burnt on Linux. Both numbers are above the coarsest tick any of
+    #: these platforms has, so the work per second is the same on all of them.
+    INTERVAL = 0.02
+    PER_POLL = 20
+
     def run(self):
         payload = b"x" * 400_000
-        while not self.stop.wait(0.001):
+        while not self.stop.wait(self.INTERVAL):
             before = spent()
-            hashlib.sha256(payload).hexdigest()
+            for _ in range(self.PER_POLL):
+                hashlib.sha256(payload).hexdigest()
             self.cpu_seconds += spent() - before
 
     def worked(self, seconds, timeout=90.0):
@@ -218,16 +228,24 @@ class TestCpu:
             from product import render
 
             def test_report():
-                document = {"rows": [{"id": i, "name": f"row-{i}", "value": i * 1.5} for i in range(60000)]}
-                for _ in range(4):
+                document = {"rows": [{"id": i, "name": f"row-{i}", "value": i * 1.5} for i in range(200000)]}
+                for _ in range(6):
                     render(document)
             """
         )
         incidents = profiled(runner)
 
         incident = named(incidents, "render")
-        assert incident.verdict == "LIBRARY_CALL"
         assert incident.owner == "product"
+        if incident.verdict == "PYTHON_CODE":
+            # From 3.12 `json.dumps` encodes with `indent` in C, so there is no
+            # `_iterencode` frame under `render` and the cost is charged to
+            # `render`'s own line - which is what the rule says to do with a C
+            # call that leaves no frame, and is the same answer to "whose code
+            # is this". The library below is what cannot be named there.
+            assert incident.below is None
+            return
+        assert incident.verdict == "LIBRARY_CALL"
         assert incident.below is not None
         # Windows writes the path with backslashes, and the frame carries it
         # as the interpreter reported it.
@@ -393,7 +411,11 @@ class TestMemory:
         (incident,) = ceiling
         assert incident.nodeid == "test_loading.py::test_loads_the_export"
         assert incident.peak_mb >= 300
-        assert incident.after_mb < incident.peak_mb - 100
+        # It climbed to get there rather than starting high. Whether the pages
+        # come back to the OS afterwards is the allocator's business and the
+        # platform's - see the live-heap row of the platform table - so what is
+        # asserted is the climb, not the fall.
+        assert incident.peak_mb - incident.before_mb >= 100
         # The code that was running while the memory climbed, owned by the product.
         assert incident.blamed_frame is not None
         assert incident.blamed_frame.function == "load_everything"
@@ -700,8 +722,8 @@ class TestBursts:
             from product import churn
 
             def test_index_is_complete():
-                time.sleep(0.8)
-                churn(1.6)
+                time.sleep(1.5)
+                churn(2.5)
                 time.sleep(0.5)
             """
         )
@@ -734,7 +756,7 @@ class TestBursts:
 
             @pytest.fixture
             def session():
-                return churn(0.4)
+                return churn(0.8)
 
             @pytest.mark.parametrize("case", range(5))
             def test_request(session, case):
@@ -819,9 +841,9 @@ class TestAllocationTracing:
                 return [bytearray(1_000_000) for _ in range(count)]
 
             def test_peak():
-                blob = hold(120)
+                blob = hold(200)
                 time.sleep(1.0)
-                assert len(blob) == 120
+                assert len(blob) == 200
 
             def test_keeps():
                 KEPT.extend(hold(60))
@@ -847,5 +869,5 @@ class TestAllocationTracing:
         )
         (profile,) = document["profiles"]
         assert profile["unit"] == "bytes"
-        assert sum(profile["weights"]) >= 100 * 1_000_000
+        assert sum(profile["weights"]) >= 150 * 1_000_000
         assert any(frame["file"].endswith("test_alloc.py") for frame in document["shared"]["frames"])

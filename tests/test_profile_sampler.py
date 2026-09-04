@@ -386,10 +386,37 @@ def test_a_thread_that_lives_less_than_an_interval_is_still_charged() -> None:
 
     (record,) = [entry for entry in records if entry["record"] == "test"]
     charged = sum(stack["cpu_ns"] for stack in record["stacks"] if stack["thread"] == "short") / 1e9
-    # Sampling, so not all of it: a thread that comes and goes between two
-    # ticks is never seen, and on a loaded box the ticks are further apart.
-    # Before the fix this was exactly zero, whatever the load.
-    assert charged > burnt * 0.1, (charged, burnt)
+    # Zero, and not a share, is what this asserts. Sampling never charges all
+    # of it - a thread that comes and goes between two ticks is never seen -
+    # and how much it does charge is how often the sampler got the CPU, which
+    # on a loaded runner is nothing to do with the rule under test: a macOS
+    # cell that saw 6% of it failed a 10% bar and was measuring the runner.
+    # Before the fix this was exactly zero, whatever the load, because a
+    # thread's first sighting charged nothing - and the rule that makes it
+    # non-zero is asserted on its own below.
+    assert charged > 0, (charged, burnt)
+
+
+def test_a_threads_first_sighting_charges_the_whole_counter_it_arrived_with() -> None:
+    """The rule the sampling test above can only observe through the weather.
+
+    A thread's CPU clock starts at zero when the thread does, so the first
+    reading of it is not a baseline to subtract from later ones - it is
+    everything that thread has burnt. Treated as a baseline, a thread that
+    lived less than a sampling interval was charged nothing at all, which is
+    every worker of a pool that runs one thread per task.
+    """
+    records: list[dict[str, Any]] = []
+    sampler = Sampler(records.append, lambda: 1, interval=1.0, worker="x")
+
+    # Never seen before: all of it.
+    assert sampler._cpu_delta(4242, {4242: 7_000_000}) == 7_000_000
+    # Seen before: the difference, and never a negative one.
+    sampler._last_clock = {4242: 7_000_000}
+    assert sampler._cpu_delta(4242, {4242: 9_500_000}) == 2_500_000
+    assert sampler._cpu_delta(4242, {4242: 6_000_000}) == 0
+    # Not in this reading at all: nothing to charge.
+    assert sampler._cpu_delta(4242, {}) is None
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork here")
