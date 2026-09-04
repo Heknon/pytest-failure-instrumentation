@@ -805,6 +805,7 @@ class Sampler:
                 if culprit is None:
                     culprit = next((ident for ident in frames if ident != self._own_ident), None)
                 frames = {culprit: frames[culprit]} if culprit is not None else {}
+                stacks = {culprit: stacks[culprit]} if culprit is not None else {}
             # The sampler's own thread is nobody's cost: not a stack, and
             # not a native thread either.
             seen_tids.add(self._threads.get(self._own_ident or 0, (0, ""))[0])
