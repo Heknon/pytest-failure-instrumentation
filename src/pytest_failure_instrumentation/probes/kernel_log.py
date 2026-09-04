@@ -187,6 +187,18 @@ def read(since: Optional[float] = None, elevate: bool = False) -> KernelLogReadi
     return KernelLogReading([], "unavailable", "; ".join(refusals))
 
 
+def narrowed(reading: KernelLogReading, since: Optional[float]) -> KernelLogReading:
+    """The same reading, bounded to a later window.
+
+    A reading taken for one process of a run serves every other process of it,
+    which started later: the kills are the same lines, and the only difference
+    is where the window opens. Narrowing an existing reading is what makes one
+    read of the log answer for a whole cascade of deaths - see
+    ``killer.Sources.kernel_log_reading``.
+    """
+    return KernelLogReading(_since(reading.kills, since), reading.source, reading.detail)
+
+
 def _since(kills: list[OomKill], since: Optional[float]) -> list[OomKill]:
     if since is None:
         return kills

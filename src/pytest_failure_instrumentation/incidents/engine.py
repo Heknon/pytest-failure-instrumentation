@@ -290,6 +290,8 @@ class IncidentEngine:
         #: the directory they write into exists.
         self.blocked_signals: set[int] = set()
         self.witness: controller_signals.SignalWitness | None = None
+        #: Built once, on the first death - see _kill_sources.
+        self._sources: killer.Sources | None = None
         self.witness_status = "off"
         self.tracer: signal_trace.SignalTracer | None = None
         self.controller_events: EventLog | None = None
@@ -989,13 +991,27 @@ class IncidentEngine:
         log.record(event, **fields)
 
     def _kill_sources(self) -> killer.Sources:
-        return killer.Sources(
-            directory=self.directory,
-            elevate=self.settings.elevate,
-            trace_status=self.tracer.how if self.tracer is not None else "off: not started",
-            witness_status=self.witness_status,
-            run_pids=lambda: {os.getpid(): killer.CONTROLLER, **killer.roles_in(self.directory)},
-        )
+        """One object for the whole run, not one per death.
+
+        It carries the kernel-log reading between deaths - see
+        ``killer.Sources.kernel_log_reading`` - and deaths arrive together
+        precisely when that reading is expensive and identical: an OOM kill
+        takes one worker and then the next. Everything on it is settled by
+        the time the first death can happen; the pids are read afresh on each
+        call, through the callable.
+        """
+        if self._sources is None:
+            self._sources = killer.Sources(
+                directory=self.directory,
+                elevate=self.settings.elevate,
+                trace_status=self.tracer.how if self.tracer is not None else "off: not started",
+                witness_status=self.witness_status,
+                run_pids=lambda: {
+                    os.getpid(): killer.CONTROLLER,
+                    **killer.roles_in(self.directory),
+                },
+            )
+        return self._sources
 
     def _anything_records(self) -> bool:
         """Whether any process in this run is writing down what it is doing.
