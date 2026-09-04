@@ -1547,11 +1547,11 @@ blamed on pytest. So a test that reads a file whole instead of streaming it
 comes back as:
 
 ```
-Memory over the ceiling: tests/test_loading.py::test_loads_the_export reached 1158 MB, ceiling is 1000 MB   [memory_profile PEAK_OVER_CEILING, product, informational]
-    All of the 1078 MB increase happened while load_everything (loader.py:14) was running, called from test_loads_the_export (test_loading.py:11).
+Memory over the ceiling: tests/test_loading.py::test_loads_the_export reached 1532 MB, ceiling is 1200 MB   [memory_profile PEAK_OVER_CEILING, product, informational]
+    Memory rose by 1611 MB, summed over every reading that found it higher; all of that increase happened while load_everything (loader.py:15) was running, called from test_loads_the_export (test_loading.py:11).
     The memory was released before the test ended.
-    Look at: loader.py:14
-    Measured: process 417 MB before, 1158 MB peak, 463 MB after. Ceiling from failure_profile_peak_mb.
+    Look at: loader.py:15
+    Measured: process 377 MB before, 1532 MB peak, 395 MB after. Ceiling from failure_profile_peak_mb.
 ```
 
 What a test *kept* is measured as the larger of the resident step and the
@@ -1626,11 +1626,11 @@ The growth finding above, rerun that way over the two modules it names:
 ```
 Memory growing across tests: worker main kept 289 MB in use over 48 tests, about 6 MB per test   [memory_profile STEADY_GROWTH, customer-code, informational]
     No single test kept enough to be reported on its own. 48 of the 48 tests each ended with more in use than they started with.
-    Most of it during: tests/test_memory.py::test_leaks_a_little (168 MB over 7 tests), tests/test_drift.py::test_response_is_cached (121 MB over 40 tests).
-    Held at the end of the worker: 190.7 MB allocated at test_memory.py:48, called from python.py:167, _callers.py:121, _manager.py:120.
-    Held at the end of the worker: 145.9 MB allocated at test_memory.py:24, called from python.py:167, _callers.py:121, _manager.py:120.
+    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests).
+    Held at the end of the worker: 190.7 MB allocated at test_memory.py:52, called from python.py:167, _callers.py:121, _manager.py:120.
+    Held at the end of the worker: 145.9 MB allocated at test_memory.py:28, called from python.py:167, _callers.py:121, _manager.py:120.
     Held at the end of the worker: 122.1 MB allocated at test_drift.py:13, called from python.py:167, _callers.py:121, _manager.py:120.
-    Measured: traced memory 1 MB before the first of these tests, 579 MB after the last. Biggest single step 24 MB. +16,437 Python objects per test.
+    Measured: traced memory 290 MB before the first of these tests, 460 MB after the last. Biggest single step 24 MB. +20,264 Python objects per test.
 ```
 
 Three lines, each an `append` to something module-level. A tracemalloc
@@ -1662,45 +1662,45 @@ This is what the example suite under
 [`examples/profiling`](examples/profiling) prints, trimmed:
 
 ```
-CPU hotspot: load_everything (loader.py:14) used 43% of this run's CPU, 15.4 s   [cpu_hotspot PYTHON_CODE, product, informational]
-    The time is in this function's own lines, not in calls it makes. Mostly line 14 (100%).
+CPU hotspot: load_everything (loader.py:15) used 11% of this run's CPU, 1.9 s   [cpu_hotspot PYTHON_CODE, product, informational]
+    The time is in this function's own lines, not in calls it makes. Mostly line 15 (68%), line 16 (32%).
     Seen in 1 test: tests/test_loading.py::test_loads_the_export.
-    Look at: loader.py:14
+    Look at: loader.py:15
 
-CPU on a background thread: 'status-poller' used 10% of this run's CPU, 3.6 s, in Poller._run (poller.py:33)   [cpu_hotspot BACKGROUND_THREAD, product, informational]
+CPU on a background thread: 'status-poller' used 11% of this run's CPU, 1.9 s, in Poller._run (poller.py:30)   [cpu_hotspot BACKGROUND_THREAD, product, informational]
     This thread is not the one running tests, so it uses this CPU whichever test is executing.
-    Seen in 13 tests: tests/test_polling.py::test_another_with_the_poller_running, tests/test_polling.py::test_with_the_poller_running, tests/test_sessions.py::test_request_answers[1] and 10 more, and between tests.
-    Look at: poller.py:33
+    Seen in 13 tests: tests/test_polling.py::test_with_the_poller_running, tests/test_polling.py::test_another_with_the_poller_running, tests/test_sessions.py::test_request_answers[1] and 10 more, and between tests.
+    Look at: poller.py:30
 
 Memory kept after test: tests/test_memory.py::test_big_fixture ended with 143 MB more in use than it started with   [memory_profile RETAINED_AFTER_TEST, customer-code, informational]
-    145 MB of the 158 MB increase happened while big_fixture (test_memory.py:30) was running, called from call_fixture_func (fixtures.py:1006).
-    13 MB of the increase could not be attributed to any code.
+    Memory rose by 166 MB, summed over every reading that found it higher; all of that increase happened while big_fixture (test_memory.py:34) was running, called from call_fixture_func (fixtures.py:1005).
     The increase happened during setup, so a fixture allocated it, and it was still in use after teardown.
-    Look at: test_memory.py:30 and what holds its result after the test.
-    Measured: process 553 MB before, 696 MB after. Live heap +143 MB. +596 Python objects.
+    Look at: test_memory.py:34 and what holds its result after the test.
+    Measured: process 512 MB before, 655 MB after. Live heap +143 MB. +429 Python objects.
 
-Memory growing across tests: worker main kept 295 MB in use over 69 tests, about 4.3 MB per test   [memory_profile STEADY_GROWTH, unknown, informational]
+Memory growing across tests: worker main kept 295 MB in use over 71 tests, about 4.2 MB per test   [memory_profile STEADY_GROWTH, unknown, informational]
     No stack was captured; the owner is taken from the test's file, tests/test_allocation.py (customer-code).
-    No single test kept enough to be reported on its own. 67 of the 69 tests each ended with more in use than they started with.
-    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests), tests/test_arenas.py::test_ingest_batch (5 MB over 3 tests).
+    No single test kept enough to be reported on its own. 52 of the 71 tests each ended with more in use than they started with.
+    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests), tests/test_arenas.py::test_ingest_batch (6 MB over 4 tests).
     Look at: rerun those tests with --failure-profile-allocations to see which lines hold the memory.
-    Measured: process 42 MB before the first of these tests, 881 MB after the last. Biggest single step 24 MB. 295 MB of the 472 MB increase is in use; the rest was freed and kept by the allocator. +410 Python objects per test.
+    Measured: process 43 MB before the first of these tests, 882 MB after the last. Biggest single step 24 MB. 295 MB of the 576 MB increase is in use; the rest was freed and kept by the allocator. +501 Python objects per test.
 ```
 
 And the I/O-bound suite under [`examples/profiling/tests/test_polling.py`](examples/profiling/tests/test_polling.py)
-and its neighbours, where nothing is over the CPU share and the timeline is
-what finds the fixture:
+and its neighbours, where the timeline is what finds the fixture — no single
+one of its six bursts is worth a look, and a share of the CPU says nothing
+about *when* it was spent:
 
 ```
-Repeated CPU burst: Session.__init__ (session.py:21) ran at full CPU for about 0.7 s in each of 6 tests, during setup   [cpu_burst RECURRING_BURST, product, informational]
-    4.2 s of CPU in total across the 6 bursts. Called from session (test_sessions.py:13).
-    Tests: tests/test_sessions.py::test_request_answers[2], tests/test_sessions.py::test_request_answers[1], tests/test_sessions.py::test_request_answers[5] and 3 more.
+Repeated CPU burst: Session.__init__ (session.py:30) ran at full CPU for about 0.4 s in each of 6 tests, during setup   [cpu_burst RECURRING_BURST, product, informational]
+    2.5 s of CPU in total across the 6 bursts. Called from session (test_sessions.py:13).
+    Tests: tests/test_sessions.py::test_request_answers[5], tests/test_sessions.py::test_request_answers[3], tests/test_sessions.py::test_request_answers[4] and 3 more.
     Machine load during these bursts: 26%.
-    Look at: session.py:21. It ran during setup of each of those tests.
+    Look at: session.py:30. It ran during setup of each of those tests.
 
-CPU burst: tests/test_index.py::test_index_is_complete ran at 1.0 cores for 4.8 s, starting 1.1 s into the test, during call   [cpu_burst LONG_BURST, product, informational]
+CPU burst: tests/test_index.py::test_index_is_complete ran at 1.0 cores for 2.7 s, starting 1.1 s into the test, during call   [cpu_burst LONG_BURST, product, informational]
     Running build_index (reports.py:42), called from test_index_is_complete (test_index.py:13).
-    This burst is 97% of the test's 4.9 s of CPU. The other 1.9 s of the test's 6.8 s was waiting.
+    This burst is 87% of the test's 3.4 s of CPU. The other 1.5 s of the test's 4.8 s was waiting.
     Machine load during the burst: 26%.
     Look at: reports.py:42
 ```
@@ -1709,8 +1709,14 @@ The same run prints a summary at the end of the terminal output — the run's
 CPU against its wall time, what each worker peaked at, and the top functions:
 
 ```
-Profile: 73 tests, 42 s of wall time, 37 s CPU (0.90 cores on average), 3.0 s of it in garbage collection
-  worker main: 73 tests, 37 s CPU, peak 1158 MB, 878 MB at the end
+Profile: 74 tests, 27 s of wall time, 18 s CPU (0.69 cores on average), 2.5 s of it in garbage collection
+  worker main: 74 tests, 18 s CPU, peak 1532 MB, 882 MB at the end
+Functions using the most CPU:
+   16.8%    2.98 s  build_graph  test_allocation.py  [customer-code]  in 2 tests
+   14.3%    2.53 s  render_report  reports.py  [product]  in 2 tests
+   13.6%    2.42 s  build_index  reports.py  [product]  in 1 test
+   13.4%    2.37 s  is_images_different  image_compare.py  [product]  in 3 tests
+   13.1%    2.33 s  Session.__init__  session.py  [product]  in 6 tests
 ```
 
 Every finding is printed the way every incident is (see "How an incident
