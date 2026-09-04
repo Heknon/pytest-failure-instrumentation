@@ -17,7 +17,7 @@ import pytest
 from pytest_failure_instrumentation import probes
 from pytest_failure_instrumentation.profile.sampler import ThreadClock
 
-from .conftest import Runner, needs_xdist
+from .conftest import RERUN_CONFTEST, Runner, needs_xdist
 
 #: A background thread can only be told from the test's thread where the CPU
 #: is read per thread; elsewhere the whole process is charged to the test.
@@ -434,6 +434,61 @@ class TestDistributed:
         assert incident.worker == "controller"
         assert incident.test_count == 4
         assert len([i for i in hotspots(incidents) if i.blamed_frame and i.blamed_frame.function == "compare_pixels"]) == 1
+
+
+class TestReruns:
+    def test_a_rerun_is_one_record_and_one_test(self, runner: Runner) -> None:
+        """A rerun plugin brackets each attempt with its own logstart and
+        logfinish - pytest-rerunfailures does, inside its retry loop - and the
+        profile record used to close on logfinish. So a test rerun twice wrote
+        three records under one node id, the summary added them up as three
+        tests, and a run of two tests was reported as four. The record closes
+        at the end of the protocol now, which is once per test however many
+        attempts it took, and carries the CPU of all of them.
+        """
+        runner.pytester.makeconftest(RERUN_CONFTEST)
+        runner.pytester.makepyfile(
+            test_flaky="""
+            import time
+
+            STATE = {"attempts": 0}
+
+            def burn(seconds):
+                deadline = time.perf_counter() + seconds
+                total = 0
+                while time.perf_counter() < deadline:
+                    total += sum(range(2000))
+                return total
+
+            def test_flaky():
+                STATE["attempts"] += 1
+                burn(0.4)
+                assert STATE["attempts"] > 1
+
+            def test_steady():
+                burn(0.4)
+            """
+        )
+        profiled(runner, "test_flaky.py")
+
+        records = [
+            json.loads(line)
+            for path in (runner.pytester.path / ".pytest-failures").glob("run-*/*.profile.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        tests = [record for record in records if record.get("record") == "test"]
+        assert sorted(record["nodeid"] for record in tests) == [
+            "test_flaky.py::test_flaky",
+            "test_flaky.py::test_steady",
+        ]
+        # Both attempts' CPU is in the one record, rather than a third of it
+        # in each of three: the rerun burnt 0.4s twice against test_steady's
+        # once, so it is the heavier of the two by a clear margin.
+        by_test = {record["nodeid"]: record for record in tests}
+        rerun_cpu = by_test["test_flaky.py::test_flaky"]["cpu_s"]
+        steady_cpu = by_test["test_flaky.py::test_steady"]["cpu_s"]
+        assert rerun_cpu > steady_cpu * 1.5, (rerun_cpu, steady_cpu)
+        assert "Profile: 2 tests" in runner.result.stdout.str()
 
 
 class TestArtifacts:

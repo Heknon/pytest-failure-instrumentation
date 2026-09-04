@@ -323,10 +323,22 @@ class WorkerRecorder:
         run). The test is closed at the end of teardown, as it always was,
         and not here: pytest's ``logfinish`` fires between the two, and a
         worker that dies there died between tests, not in one.
+
+        The *profile* record is the exception, and closes here. It has to be
+        written after pytest lets go of the item's fixture values - otherwise
+        every function-scoped fixture's value counts as memory the test kept,
+        and its release as the next gap's - and ``runtestprotocol`` clears
+        ``funcargs`` before it returns, so anything after that will do. It
+        used to be ``logfinish``, which is the next thing to fire and is
+        inside the protocol: a rerun plugin runs the whole protocol again,
+        ``logfinish`` and all, so a test rerun twice wrote three records and
+        the profile summary reported a run of two tests as four. Here is
+        after the last attempt, whichever attempt that turns out to be.
         """
         self._counted = None
         yield
         self._counted = None
+        self._profile("end_test", item.nodeid)
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
@@ -339,15 +351,6 @@ class WorkerRecorder:
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_teardown(self, item: pytest.Item) -> Any:
         yield from self._phase("teardown", item.nodeid)
-
-    def pytest_runtest_logfinish(self, nodeid: str, location: Any) -> None:
-        """The test's profile record closes here rather than at the end of
-        teardown: pytest lets go of the item's fixture values only after the
-        teardown hooks have all returned, so a record written inside the
-        teardown wrapper would count every function-scoped fixture's value
-        as memory the test kept, and its release as the next gap's.
-        """
-        self._profile("end_test", nodeid)
 
     def _phase(self, phase: str, nodeid: str) -> Any:
         """Which phase is open is what separates "died in teardown" from
