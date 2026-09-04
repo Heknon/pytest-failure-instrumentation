@@ -471,13 +471,20 @@ class TestMemory:
         assert any("MALLOC_ARENA_MAX limits how many thread arenas exist" in line for line in incident.evidence)
         assert str(incident).startswith("Memory held by the allocator: worker main has ")
         assert "[memory_profile ALLOCATOR_RETENTION, runtime, informational]" in str(incident).splitlines()[0]
-        # And none of the tests is raised for memory nothing is using: a
-        # step big enough to be HEAP_NOT_RETURNED alone is folded in here.
+        # Arena reuse varies by run: an individual RSS step may cross the
+        # retained threshold. Worker-wide free space cannot establish that
+        # test's object liveness, so keep the finding and state the uncertainty.
         assert not [
             incident
             for incident in memory(incidents)
-            if incident.verdict in ("STEADY_GROWTH", "RETAINED_AFTER_TEST", "HEAP_NOT_RETURNED")
+            if incident.verdict in ("STEADY_GROWTH", "HEAP_NOT_RETURNED")
         ]
+        for incident in memory(incidents):
+            if incident.verdict == "RETAINED_AFTER_TEST":
+                assert incident.nodeid is not None and incident.nodeid.startswith("test_ingest.py::test_ingest[")
+                assert incident.delta_mb is not None and incident.delta_mb >= 40
+                assert any("cannot distinguish live allocations" in line for line in incident.evidence)
+                assert not any("were freed" in line or "still in use" in line for line in incident.evidence)
 
 
 @needs_xdist
@@ -865,4 +872,3 @@ class TestAllocationTracing:
         # measured, and a bar set there failed on the one that measured 73%.
         assert sum(profile["weights"]) >= 100 * 1_000_000
         assert any(frame["file"].endswith("test_alloc.py") for frame in document["shared"]["frames"])
-
