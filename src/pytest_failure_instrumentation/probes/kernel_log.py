@@ -229,6 +229,15 @@ def _read_kmsg() -> tuple[Optional[list[tuple[Optional[float], str]]], str]:
             lines.append((boot + int(match.group("usec")) / 1e6, match.group("message")))
     finally:
         os.close(fd)
+    if not lines:
+        # An open that succeeds and reads nothing is not an empty ring buffer -
+        # a fresh open starts at the oldest record the kernel still holds, and
+        # a running kernel always holds some. It is /dev/kmsg bound to
+        # /dev/null, which systemd-nspawn and a few container runtimes do.
+        # Answering "read, 0 lines" would end the ladder here and leave the
+        # journal and dmesg untried, so an OOM kill goes unfound while the
+        # incident says the log was consulted.
+        return None, "the device read as empty, so it is not the kernel's ring buffer"
     return lines, ""
 
 
@@ -289,6 +298,12 @@ def _read_dmesg(sudo: bool = False) -> tuple[Optional[list[tuple[Optional[float]
             lines.append((None, raw))  # a dmesg built without timestamps
         else:
             lines.append((boot + float(match.group("seconds")), match.group("message")))
+    if not lines:
+        # The same as for the device above, and it matters for the same
+        # reason: an empty dmesg here would end the ladder before ``sudo
+        # dmesg``, which is the rung that answers when the buffer is
+        # restricted rather than absent.
+        return None, "dmesg printed nothing"
     return lines, ""
 
 
