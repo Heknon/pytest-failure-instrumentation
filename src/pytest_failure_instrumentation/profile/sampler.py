@@ -736,6 +736,14 @@ class Sampler:
         # 300 MB test whose memory was "kept" until long after it returned.
         if self._own_ident is not None:
             frames.pop(self._own_ident, None)
+        # The stacks are walked now, before anything below lets go of the
+        # GIL. A frame object outlives the moment it was read: a function
+        # that has returned since keeps its caller, but a generator that
+        # has yielded since has none - the interpreter links a generator's
+        # frame to its caller only while it runs - and a stack walked after
+        # the gap ends at the generator with nobody above it. See _relinked
+        # for the sightings that still do.
+        stacks = {ident: _stack_of(frame) for ident, frame in frames.items()}
         idents = frozenset(frames)
         changed = idents != self._known_idents
         self._known_idents = idents
@@ -803,7 +811,7 @@ class Sampler:
             #: What each busy thread was in before this tick overwrote it,
             #: for the memory charge below.
             prior: dict[int, Optional[tuple[int, str, StackKey, Any]]] = {}
-            for ident, frame in frames.items():
+            for ident, stack in stacks.items():
                 if ident == self._own_ident:
                     continue
                 tid, name = self._threads.get(ident, (0, f"thread {ident}"))
@@ -818,7 +826,6 @@ class Sampler:
                     cpu_ns = process_delta
                     if cpu_ns <= 0:
                         continue
-                stack = _stack_of(frame)
                 if not stack:
                     continue
                 previous = prior[ident] = self._previous.get(ident)
@@ -886,7 +893,7 @@ class Sampler:
                     if culprit is None or culprit not in frames:
                         culprit = next(iter(frames), None)
                     if culprit is not None:
-                        stack = _stack_of(frames[culprit])
+                        stack = stacks[culprit]
                         if stack:
                             _, name = self._threads.get(culprit, (0, f"thread {culprit}"))
                             # The climb happened since the last reading, and
@@ -905,7 +912,7 @@ class Sampler:
                     self._last_rss = rss
 
         self._last_clock = clocks
-        del frames
+        del frames, stacks
 
     def _close_window(self, window: _Window, machine: Any = _NOT_READ) -> None:
         """One timeline entry from what the last few ticks accumulated.
