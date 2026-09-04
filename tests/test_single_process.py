@@ -19,7 +19,9 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import needs_pyspy, needs_xdist
+from pytest_failure_instrumentation.capture.state import read_state
+
+from .conftest import RERUN_CONFTEST, needs_pyspy, needs_xdist
 
 SUITE = """
 def test_one():
@@ -43,6 +45,32 @@ from pytest_failure_instrumentation.capture.state import read_state
 def test_reads_its_own_state():
     slot, = Path(".pytest-failures").glob("*/main.state")
     Path("seen.json").write_text(json.dumps(read_state(slot)), encoding="utf-8")
+"""
+
+
+#: A test that fails once and, on its rerun, reads the record of itself. The
+#: counters can only be checked *during* a rerun from inside one.
+RERUN_INTROSPECTIVE = """
+import json
+from pathlib import Path
+
+from pytest_failure_instrumentation.capture.state import read_state
+
+
+def test_first():
+    assert True
+
+
+def test_reruns():
+    slot, = Path(".pytest-failures").glob("*/main.state")
+    if not Path("first.json").exists():
+        Path("first.json").write_text(json.dumps(read_state(slot)), encoding="utf-8")
+        assert False, "the first attempt fails"
+    Path("again.json").write_text(json.dumps(read_state(slot)), encoding="utf-8")
+
+
+def test_last():
+    assert True
 """
 
 
@@ -99,6 +127,30 @@ def test_the_state_slot_is_written_before_the_phase_it_describes(runner):
     assert seen["phase"] == "call"
     assert seen["tests_started"] == 1
     assert seen["tests_finished"] == 0
+
+
+
+def test_a_rerun_is_one_test_however_many_times_it_runs(runner):
+    """A rerun plugin runs a failed test's phases again inside the same
+    protocol. Counted at setup, every attempt was a test started, and a
+    suite of 368 with six rerun once read as 374 - on the live view, where
+    the controller's total is floored at this count. So the second setup of
+    the same protocol is not a start, and the finish counted at the end of
+    the first attempt is taken back: during the rerun the row reads one
+    running, which is what the slot beside it says."""
+    runner.pytester.makeconftest(RERUN_CONFTEST)
+    runner.pytester.makepyfile(test_rerun=RERUN_INTROSPECTIVE)
+    runner.run("test_rerun.py")
+    runner.result.assert_outcomes(passed=3)
+
+    first = json.loads((runner.pytester.path / "first.json").read_text(encoding="utf-8"))
+    again = json.loads((runner.pytester.path / "again.json").read_text(encoding="utf-8"))
+    assert (first["tests_started"], first["tests_finished"]) == (2, 1)
+    assert (again["tests_started"], again["tests_finished"]) == (2, 1), again
+    assert again["nodeid"] == "test_rerun.py::test_reruns"
+
+    final = read_state(evidence(runner.pytester) / "main.state")
+    assert (final["tests_started"], final["tests_finished"]) == (3, 3), final
 
 
 @needs_xdist
