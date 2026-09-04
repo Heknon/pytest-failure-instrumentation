@@ -124,6 +124,7 @@ replaces it:
 | `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process *outside the run* send it | nobody's code. `killer` names the sender - a CI runner cancelling, a timeout enforcer, a hand on the keyboard. Informational, and no test is suspected |
 | `KILLED_BY_RUN` | `-9` from another process of this run | the controller (execnet terminating a worker that did not exit in time) or a sibling worker - a test that kills processes |
 | `SELF_KILLED` | `-9` the worker sent to itself | the test in flight: an `os.kill(os.getpid(), SIGKILL)` or a library doing the same |
+| `TIMED_OUT` | a self-exit (code 1) or SIGALRM, and the test had run to a configured `timeout` or `faulthandler_timeout` | the hung test in flight - `matched_timeout` and `timeout_source` name the limit and enforcer, `test_seconds` how long it ran. Under heavy xdist parallelism a starved-slow test hitting the timeout is the common one |
 | `KILLED_BY_KERNEL` | `-9` with `si_code` `SI_KERNEL`, and no readable OOM log | the OOM killer, most likely; `kill_sources.kernel_log` says why the log could not be read |
 | `KILLED_AFTER_SIGTERM` | `-9`, and the controller had been sent SIGTERM shortly before | the run was being stopped; `signals_before_death` names who asked. Informational, no test suspected |
 | `RUN_STOPPED` | a recovered run whose controller was sent SIGTERM before this process's last heartbeat | the same - the process ended with the run rather than on its own |
@@ -138,6 +139,19 @@ replaces it:
 kernel log naming the pid, or the cgroup counter moving while
 `capabilities.cgroup_oom_counter` says it was readable. That distinction is
 the reason the verdicts above exist rather than one.
+
+**`recent_output`** is the tail of what the worker printed, when
+`failure_capture_output` was on: the native line a crash leaves and no stack
+carries - `OpenBLAS ... pthread_create failed`, a malloc abort. It reads fd 2
+directly into a file, so it keeps even the line printed in the phase that
+crashed, which pytest's own capture never reports. Empty means it was not
+captured (the setting was off) or the worker was silent - the `last stderr:`
+evidence line is present only when there was something to show.
+
+**`test_seconds`, `matched_timeout`, `timeout_source`** time the death against
+the run's timeouts - see `TIMED_OUT` above. `test_seconds` is on every death
+with a test in flight, so a `SELF_EXIT` can be seen to be near a limit even
+when it did not quite reach one.
 
 **`killer`, `oom`, `signals_before_death` and `kill_sources`** are the
 witnesses. `killer` is the signal that ended the process with its sender's

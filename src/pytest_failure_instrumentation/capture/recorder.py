@@ -119,17 +119,21 @@ class WorkerRecorder:
                 self._frozen_stream, settings.heartbeat_interval
             )
 
-        # A bounded copy of what pytest captured for each completed phase,
-        # so a native crash message survives the kill that swallows it - see
-        # capture.output. Fed from pytest_runtest_logreport, so it reads
-        # pytest's own capture rather than taking over a descriptor, and
-        # cannot disturb the run.
-        self.output_log: output_capture.OutputLog | None = None
+        # A tee of the worker's stderr into a bounded ring, so the one line a
+        # native death leaves - and no stack carries - survives the kill. It
+        # reads fd 2 directly because pytest's own capture reaches a report
+        # only for a completed phase, missing the crashing phase and imports.
+        # Started here (pipe and thread), but fd 2 is taken over later, once
+        # pytest's capture is up - see _tee_fd. Its own guards inside: a tee
+        # that cannot be built is a recorded reason, never a failed worker.
+        self.stderr_tee: output_capture.StderrTee | None = None
         if settings.capture_output:
-            self.output_log = self._track(
-                output_capture.OutputLog(directory / f"{worker_id}.output")
-            )
-            self.events.record("output_capture", status="on")
+            tee = output_capture.StderrTee(directory / f"{worker_id}.output")
+            tee.start()
+            if tee.active:
+                self._track(tee)
+                self.stderr_tee = tee
+            self.events.record("output_capture", status=tee.reason)
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
@@ -255,38 +259,59 @@ class WorkerRecorder:
             slow_test_seconds=self.slow_test.timeout if self.slow_test.enabled else None,
         )
 
-    @pytest.hookimpl(hookwrapper=True)
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
         yield from self._phase("setup", item.nodeid)
 
-    @pytest.hookimpl(hookwrapper=True)
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_call(self, item: pytest.Item) -> Any:
         yield from self._phase("call", item.nodeid)
 
-    @pytest.hookimpl(hookwrapper=True)
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_teardown(self, item: pytest.Item) -> Any:
         yield from self._phase("teardown", item.nodeid)
 
-    @pytest.hookimpl(trylast=True)
-    def pytest_runtest_logreport(self, report: Any) -> None:
-        """Copy each completed phase's captured output into the ring.
+    def _tee_take(self) -> None:
+        """Point fd 2 at the capture file, if the tee is on. pytest points fd 2
+        at its own file at the start of every phase; this takes it just after,
+        and _tee_hand_back gives it back at the phase's end with the phase's
+        bytes copied into pytest's file, so both keep the output."""
+        if self.stderr_tee is not None:
+            self.stderr_tee.take()
 
-        The reason a native death is explicable at all: pytest's fd capture
-        has already caught the C-level writes to stderr and attached them
-        here, and this keeps a copy that a kill cannot take. trylast, so
-        whatever else adds to the capture has run first.
-        """
-        if self.output_log is None:
-            return
-        stderr = getattr(report, "capstderr", "") or ""
-        stdout = getattr(report, "capstdout", "") or ""
-        if stderr or stdout:
-            self.output_log.add(stderr=stderr, stdout=stdout)
+    def _tee_hand_back(self) -> None:
+        if self.stderr_tee is not None:
+            self.stderr_tee.hand_back()
+
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
+    def pytest_collection(self, session: Any) -> Any:
+        # Collection is where imports run, and an import is where a native
+        # thread pool is first built and first fails. Take fd 2 over the whole
+        # of it, and again at each collector below - a module's import is where
+        # the write actually happens, and pytest re-points fd 2 at its own
+        # capture around each one.
+        self._tee_take()
+        try:
+            yield
+        finally:
+            self._tee_hand_back()
+
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
+    def pytest_make_collect_report(self, collector: Any) -> Any:
+        # Wraps the collection of one node - a module's import among them - so
+        # fd 2 is the capture file at the moment the import runs, after pytest
+        # has taken it for its own collection capture.
+        self._tee_take()
+        try:
+            yield
+        finally:
+            self._tee_hand_back()
 
     def _phase(self, phase: str, nodeid: str) -> Any:
         """Which phase is open is what separates "died in teardown" from
         "died mid-call": pytest's own logfinish fires only after the whole
         protocol, so it cannot tell them apart."""
+        self._tee_take()
         now = time.time()
         if phase == "setup":
             self.state.tests_started += 1
@@ -313,7 +338,12 @@ class WorkerRecorder:
         # reached it.
         if phase == "setup":
             self.slow_test.start_test()
-        yield
+        try:
+            yield
+        finally:
+            # Give fd 2 back to pytest, with this phase's stderr copied into
+            # pytest's own capture, whatever the phase did.
+            self._tee_hand_back()
         if self.heartbeat is not None:
             self.heartbeat.phase = None
         if phase != "teardown":

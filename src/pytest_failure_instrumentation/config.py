@@ -202,10 +202,13 @@ class Settings:
     #: Keep a bounded copy of each worker's stderr, so the one line that
     #: explains a native death - ``pthread_create failed``, ``malloc():
     #: corrupted top size``, an abort message - survives the kill that
-    #: swallows it. Off by default and POSIX-only: it is the single facility
-    #: here that takes over a process-wide file descriptor, so it is opt-in
-    #: and every step of it is guarded against ending a run. See
-    #: :mod:`.capture.output`.
+    #: swallows it. It points fd 2 at a real file for the length of each phase,
+    #: so a write followed at once by ``abort()`` is on disk before the abort
+    #: runs, and hands the bytes back to pytest's own capture at the phase's
+    #: end so nothing pytest would have shown is lost. Off by default and
+    #: POSIX-only: it is the single facility here that takes over a
+    #: process-wide file descriptor, so it is opt-in and every step is guarded
+    #: against ending a run. See :mod:`.capture.output`.
     capture_output: bool = False
     #: What to call when this run is killed - see :mod:`.incidents.reporter`.
     #: A run whose controller dies has nobody left to raise its incidents,
@@ -587,9 +590,12 @@ def add_options(parser: pytest.Parser) -> None:
         "failure_capture_output",
         help="Keep the last few KB of each worker's stderr in <worker>.output, "
         "so a native crash message (pthread_create failed, a malloc abort) "
-        "survives the kill that swallows it and reaches the incident. Off by "
-        "default, POSIX only: this takes over file descriptor 2 for the worker, "
-        "the one thing here that reaches across the whole process.",
+        "survives the kill that swallows it and reaches the incident - "
+        "including one printed in the very phase that crashes, which pytest's "
+        "own capture never reports. Off by default, POSIX only: this points "
+        "file descriptor 2 at a file for each phase, the one thing here that "
+        "reaches across the whole process, and hands the output back to "
+        "pytest's capture so its own reports are unchanged.",
         default="false",
     )
     parser.addini(

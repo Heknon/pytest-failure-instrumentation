@@ -1,63 +1,109 @@
-"""A bounded copy of what a worker printed, kept for a death that leaves no word.
+"""Every byte a killed worker wrote to stderr, kept for the incident.
 
-The line that explains a native abort - ``pthread_create failed``, a malloc
-abort - is written to stderr and captured by pytest, which keeps it only for a
-completed phase and throws it away when the worker is killed. Copied into
-``<worker>.output`` it reaches the incident. This reads pytest's own capture
-rather than a file descriptor, so the tests that matter prove it survives a
-kill and never disturbs the run.
+The line that explains a native death - ``pthread_create failed``, a malloc
+abort - is on stderr and in no stack, and the process is gone before Python
+runs. pytest hands its own capture to a report only for a phase that completed,
+so this reads fd 2 directly, into a file whose synchronous writes survive an
+abort. The tests that matter prove it catches a message printed in the very
+phase that crashes, and never disturbs pytest's own capture or the run.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import signal
+import stat
 import sys
+import tempfile
 
 import pytest
 
 from pytest_failure_instrumentation.analysis import classify
-from pytest_failure_instrumentation.capture.output import OutputLog, read_tail
+from pytest_failure_instrumentation.capture.output import StderrTee, read_tail
 from pytest_failure_instrumentation.incidents.death import WorkerDeathIncident
 
 from .conftest import needs_xdist
 
-posix_only = pytest.mark.skipif(sys.platform == "win32", reason="native abort via ctypes is POSIX here")
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX-only for now")
 
 
-def test_a_phase_is_persisted_the_moment_it_is_added(tmp_path):
-    """On disk immediately: a SIGKILL gives no chance to flush."""
-    log = OutputLog(tmp_path / "gw0.output")
-    log.add(stderr="OpenBLAS blas_thread_init: pthread_create failed")
-    # Read before close - the SIGKILL case.
-    assert read_tail(tmp_path / "gw0.output") == ["OpenBLAS blas_thread_init: pthread_create failed"]
-    log.close()
+# -- the tee, in isolation ---------------------------------------------------
 
 
-def test_the_ring_is_bounded_and_never_starts_mid_line(tmp_path):
-    log = OutputLog(tmp_path / "gw0.output", limit=2048)
-    for i in range(2000):
-        log.add(stderr=f"line {i:06d} " + "x" * 40)
-    log.close()
-    data = (tmp_path / "gw0.output").read_bytes()
-    assert len(data) <= 2048
-    assert data.startswith(b"line "), data[:20]
-    assert read_tail(tmp_path / "gw0.output")[-1].startswith("line 001999")
+@posix_only
+def test_a_synchronous_write_is_on_disk_before_the_process_could_abort(tmp_path):
+    """A real file, not a pipe: os.write(2) is a synchronous write(2) the
+    kernel has persisted before an abort on the next line could run. A pipe
+    drained by a thread of the same dying process could not promise that."""
+    tee = StderrTee(tmp_path / "gw0.output")
+    assert tee.start(), tee.reason
+    # pytest owns fd 2 by pointing it at its own file; the tee takes it after.
+    pytest_file = tempfile.TemporaryFile()
+    saved = os.dup(2)
+    os.dup2(pytest_file.fileno(), 2)
+    try:
+        tee.take()
+        assert stat.S_ISREG(os.fstat(2).st_mode)
+        os.write(2, b"OpenBLAS blas_thread_init: pthread_create failed\n")
+        # On disk now - before any hand_back, which is the abort case.
+        assert read_tail(tmp_path / "gw0.output") == ["OpenBLAS blas_thread_init: pthread_create failed"]
+        tee.hand_back()
+        # Handed back: fd 2 is pytest's file again, and it received the bytes.
+        assert stat.S_ISREG(os.fstat(2).st_mode)
+        pytest_file.seek(0)
+        assert b"pthread_create failed" in pytest_file.read()
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        pytest_file.close()
+        tee.close()
 
 
-def test_stdout_is_kept_but_tagged_and_after_stderr(tmp_path):
-    log = OutputLog(tmp_path / "gw0.output")
-    log.add(stderr="the real reason", stdout="chatty progress\nmore chatter")
-    lines = read_tail(tmp_path / "gw0.output")
-    assert lines[0] == "the real reason"
-    assert "[stdout] chatty progress" in lines and "[stdout] more chatter" in lines
+@posix_only
+def test_the_file_is_trimmed_between_phases_never_within_one(tmp_path):
+    # A throwaway stands in for pytest's capture file, so the passthrough does
+    # not reach the real terminal.
+    sink = tempfile.TemporaryFile()
+    saved = os.dup(2)
+    os.dup2(sink.fileno(), 2)
+    tee = StderrTee(tmp_path / "gw0.output", limit=2048)
+    assert tee.start()
+    try:
+        for _ in range(50):
+            os.dup2(sink.fileno(), 2)   # pytest re-takes fd 2 each phase
+            tee.take()
+            os.write(2, b"x" * 200 + b"\n")
+            tee.hand_back()
+        # Bounded: trimmed to the tail each phase, so far below the 10 KB that
+        # fifty untrimmed phases would be - and never mid-line.
+        data = (tmp_path / "gw0.output").read_bytes()
+        assert len(data) < 2048 + 400, len(data)
+        assert data.startswith(b"x")
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        tee.close()
+        sink.close()
+    # A single phase may exceed the limit while it runs - the crash-before-trim
+    # case - and its whole output is kept, not trimmed underneath it.
+    sink = tempfile.TemporaryFile()
+    saved = os.dup(2)
+    os.dup2(sink.fileno(), 2)
+    tee2 = StderrTee(tmp_path / "gw1.output", limit=512)
+    assert tee2.start()
+    try:
+        tee2.take()
+        os.write(2, b"y" * 4000 + b"\n")
+        assert len(read_tail(tmp_path / "gw1.output", limit=1 << 20)[0]) >= 4000
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        tee2.close()
+        sink.close()
 
 
-def test_empty_capture_writes_nothing(tmp_path):
-    log = OutputLog(tmp_path / "gw0.output")
-    log.add(stderr="", stdout="")
-    log.close()
-    assert not (tmp_path / "gw0.output").exists()
+# -- the verdict surfaces the line -------------------------------------------
 
 
 def test_the_verdict_surfaces_the_last_stderr_line_on_a_crash():
@@ -79,85 +125,105 @@ def test_an_absent_tail_is_not_read_as_silence():
 # -- for real ----------------------------------------------------------------
 
 
+def _abort_suite(message: str, where: str) -> str:
+    write = f'os.write(2, {message!r}.encode() + b"\\n")'
+    if where == "import":
+        return f"""
+import ctypes, os
+{write}
+def test_filler():
+    assert True
+def test_crashes():
+    ctypes.CDLL(None).abort()
+"""
+    if where == "fixture":
+        return f"""
+import ctypes, os
+import pytest
+@pytest.fixture
+def noisy():
+    {write}
+    yield
+def test_filler():
+    assert True
+def test_crashes(noisy):
+    ctypes.CDLL(None).abort()
+"""
+    return f"""
+import ctypes, os
+def test_filler():
+    assert True
+def test_crashes():
+    {write}
+    ctypes.CDLL(None).abort()
+"""
+
+
 @posix_only
 @needs_xdist
-def test_a_native_message_from_a_completed_phase_reaches_a_crash(distributed):
-    """A test whose setup prints a native line and whose body then crashes:
-    the setup completed, so pytest captured it, so it is on the incident even
-    though the crashing phase itself produced no report."""
-    distributed.pytester.makepyfile(
-        test_abort="""
-        import ctypes, os, sys
-        import pytest
-
-
-        @pytest.fixture
-        def noisy():
-            os.write(2, b"libfoo: fatal: the widget pool is exhausted\\n")
-            sys.stderr.flush()
-            yield
-
-
-        def test_filler():
-            assert True
-
-
-        def test_aborts(noisy):
-            ctypes.CDLL(None).abort()
-        """
-    )
+@pytest.mark.parametrize("where", ["call", "fixture", "import"])
+def test_a_native_message_reaches_the_incident_wherever_it_was_printed(distributed, where):
+    """The message survives whether it was printed in the crashing call, in a
+    fixture, or at import - each is a different point pytest owns fd 2, and the
+    tee takes it back at each."""
+    message = "OpenBLAS blas_thread_init: pthread_create failed for nth=64"
+    distributed.pytester.makepyfile(test_abort=_abort_suite(message, where))
     incidents = distributed.run(
         "-n", "2", "-o", "failure_capture_output=true", "test_abort.py", timeout=180
     )
     death = distributed.only(incidents, "worker_death")
-    assert death.recent_output, "capture was on and setup completed, so a tail is owed"
-    assert any("widget pool is exhausted" in line for line in death.recent_output)
+    assert death.verdict == "NATIVE_CRASH"
+    assert any("pthread_create failed" in line for line in death.recent_output), death.recent_output
     assert any(line.startswith("last stderr:") for line in death.evidence)
 
 
+@posix_only
 @needs_xdist
-def test_capture_on_does_not_disturb_a_healthy_run_or_pytests_own_output(distributed):
-    """The run passes, pytest's captured-on-failure output is intact, and the
-    setting is recorded as on."""
+def test_capture_does_not_disturb_pytests_own_captured_output(distributed):
+    """The one thing this must never do: cost pytest its captured-on-failure
+    output. A failing test's stdout and stderr still reach pytest's report."""
     distributed.pytester.makepyfile(
         test_suite="""
-        import sys
-
-
+        import os, sys
         def test_prints_then_fails():
-            print("visible stdout"); sys.stderr.write("visible stderr\\n")
+            print("VISIBLE-STDOUT")
+            sys.stderr.write("VISIBLE-STDERR\\n")
+            os.write(2, b"VISIBLE-NATIVE\\n")
             assert False
-
-
         def test_two():
             assert True
         """
     )
     result = distributed.pytester.runpytest_subprocess(
         "--failure-instrumentation", "-n", "2", "-o", "failure_capture_output=true",
-        "test_suite.py", timeout=180,
+        "test_suite.py", "-rA", timeout=180,
     )
     result.assert_outcomes(passed=1, failed=1)
-    # pytest's own captured output still reaches the report of the failing test.
-    result.stdout.fnmatch_lines(["*visible stdout*", "*visible stderr*"])
-    statuses = [
-        json.loads(line).get("status")
-        for path in (distributed.pytester.path / ".pytest-failures").glob("*/gw*.events")
-        for line in path.read_text().splitlines()
-        if '"output_capture"' in line
-    ]
-    assert statuses and all(status == "on" for status in statuses), statuses
+    result.stdout.fnmatch_lines(["*VISIBLE-STDOUT*"])
+    result.stdout.fnmatch_lines(["*VISIBLE-STDERR*"])
+    result.stdout.fnmatch_lines(["*VISIBLE-NATIVE*"])
 
 
 @needs_xdist
-def test_capture_off_by_default_keeps_no_output(distributed):
+def test_a_collection_error_is_still_reported(distributed):
+    """The collection wrapper must not swallow an import that raises."""
+    distributed.pytester.makepyfile(
+        test_broken="raise RuntimeError('boom at import')\n\ndef test_never():\n    pass\n"
+    )
+    result = distributed.pytester.runpytest_subprocess(
+        "--failure-instrumentation", "-n", "2", "-o", "failure_capture_output=true",
+        "test_broken.py", timeout=180,
+    )
+    result.stdout.fnmatch_lines(["*boom at import*"])
+
+
+@needs_xdist
+def test_capture_off_by_default_keeps_no_file(distributed):
     distributed.pytester.makepyfile(
         test_crash="""
         import ctypes
-
         def test_filler():
             assert True
-
         def test_crashes():
             ctypes.CDLL(None).abort()
         """
@@ -166,3 +232,16 @@ def test_capture_off_by_default_keeps_no_output(distributed):
     death = distributed.only(incidents, "worker_death")
     assert death.recent_output == []
     assert not list((distributed.pytester.path / ".pytest-failures").glob("*/gw*.output"))
+
+
+@needs_xdist
+def test_capture_on_is_recorded_on_the_worker_log(distributed):
+    distributed.pytester.makepyfile(test_suite="def test_one():\\n    assert True\\n")
+    distributed.run("-n", "2", "-o", "failure_capture_output=true", "test_suite.py", timeout=180)
+    statuses = [
+        json.loads(line).get("status")
+        for path in (distributed.pytester.path / ".pytest-failures").glob("*/gw*.events")
+        for line in path.read_text().splitlines()
+        if '"output_capture"' in line
+    ]
+    assert statuses and all(status == "on" for status in statuses), statuses

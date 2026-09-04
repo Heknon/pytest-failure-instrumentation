@@ -796,23 +796,31 @@ catches even the writes C code makes straight to file descriptor 2 — but it
 keeps it in a temporary file that the kill throws away, and hands it to the
 report only for a phase that *completed*.
 
-With `failure_capture_output` on, each completed phase's captured output is
-copied into `<worker>.output`, a fixed ring, and the last few kilobytes reach
-the incident as `recent_output`, with the final stderr line surfaced on the
-alert:
+With `failure_capture_output` on, fd 2 is pointed at a real file for the length
+of each phase, and the last few kilobytes reach the incident as `recent_output`,
+with the final stderr line surfaced on the alert:
 
 ```
     · segmentation fault in native code
     · last stderr: OpenBLAS blas_thread_init: pthread_create failed
 ```
 
-It reads pytest's own capture rather than taking over a file descriptor, so it
-cannot disturb the run or pytest's captured-on-failure output. The bound is
-honest: the output of the exact phase that was *still running* when the kill
-landed is lost, because pytest has not made its report yet — but the import
-that spun up the pool, the setup that logged before it aborted, and the
-previous test's last words are all kept. Off by default. An absent tail reads
-as "not captured", never as silence: the alert says which.
+A real file rather than a pipe on purpose: a write followed immediately by
+`abort()` is a synchronous `write(2)` the kernel has persisted before the abort
+runs, where a pipe drained by a thread of the same dying process would lose the
+race. So the message printed in the very phase that crashes is kept — the case
+pytest's own capture never reports, because it hands a phase's output to a
+report only once the phase has completed.
+
+It coexists with pytest rather than fighting it. pytest owns fd 2 by pointing
+it at its own file and re-points it there at the start of every phase and every
+import; this takes it over just after, at each, and hands the phase's bytes
+back to pytest's file at the phase's end, before pytest reads it — so pytest's
+captured-output-on-failure is unchanged. It is the one facility here that takes
+over a process-wide descriptor, which is why it is opt-in and guarded at every
+step: an fd operation that fails leaves fd 2 as it was and records that output
+was not captured, rather than raising. POSIX only. An absent tail reads as "not
+captured", never as silence: the alert says which.
 
 ## Who killed it
 
