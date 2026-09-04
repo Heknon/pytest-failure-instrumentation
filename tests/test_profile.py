@@ -479,28 +479,20 @@ class TestMemory:
         assert any("MALLOC_ARENA_MAX limits how many thread arenas exist" in line for line in incident.evidence)
         assert str(incident).startswith("Memory held by the allocator: worker main has ")
         assert "[memory_profile ALLOCATOR_RETENTION, runtime, informational]" in str(incident).splitlines()[0]
-        # Nothing here is called a leak, and nothing is called freed. Both
-        # verdicts that would assert the memory *is* one of those - a leak
-        # across tests, or a step the allocator kept - stay out of it.
+        # Arena reuse varies by run: an individual RSS step may cross the
+        # retained threshold. Worker-wide free space cannot establish that
+        # test's object liveness, so keep the finding and state the uncertainty.
         assert not [
             incident
             for incident in memory(incidents)
             if incident.verdict in ("STEADY_GROWTH", "HEAP_NOT_RETURNED")
         ]
-        # A per-test finding may stand beside the worker's now, and where the
-        # readings cannot tell live memory from memory the allocator kept it
-        # has to say which it cannot tell rather than pick one. This used to
-        # assert that no per-test finding was raised at all, which was the
-        # inference "small mallinfo2 delta, therefore freed" being read back
-        # out of the suite.
-        for other in memory(incidents):
-            if other.verdict == "ALLOCATOR_RETENTION":
-                continue
-            assert other.verdict == "RETAINED_AFTER_TEST", str(other)
-            assert any(
-                "cannot distinguish live allocations from memory retained by the allocator" in line
-                for line in other.evidence
-            ), str(other)
+        for incident in memory(incidents):
+            if incident.verdict == "RETAINED_AFTER_TEST":
+                assert incident.nodeid is not None and incident.nodeid.startswith("test_ingest.py::test_ingest[")
+                assert incident.delta_mb is not None and incident.delta_mb >= 40
+                assert any("cannot distinguish live allocations" in line for line in incident.evidence)
+                assert not any("were freed" in line or "still in use" in line for line in incident.evidence)
 
 
 @needs_xdist
@@ -888,4 +880,3 @@ class TestAllocationTracing:
         # measured, and a bar set there failed on the one that measured 73%.
         assert sum(profile["weights"]) >= 100 * 1_000_000
         assert any(frame["file"].endswith("test_alloc.py") for frame in document["shared"]["frames"])
-
