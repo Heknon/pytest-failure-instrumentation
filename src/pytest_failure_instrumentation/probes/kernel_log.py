@@ -126,10 +126,19 @@ class OomKill:
     shmem_rss_kb: Optional[int]
     uid: Optional[int]
     oom_score_adj: Optional[int]
+    #: The heaviest ``KEPT_TASKS`` rows, for the reader: what goes on the
+    #: incident is the top few of these.
     tasks: list[OomTask] = field(default_factory=list)
-    #: The rows the table held before ``KEPT_TASKS`` trimmed it, and the sum of
-    #: their RSS - so the fleet arithmetic is over the whole table whatever was
-    #: kept for the reader.
+    #: Every row the table held, for the arithmetic. The fleet figures - how
+    #: many of the run's processes the kernel weighed, their median size, the
+    #: victim's rank among all of them - are only true over the whole table,
+    #: and which rows belong to the run is not known here: a worker holding
+    #: less memory than four hundred other tasks is still one of ours, and
+    #: dropping it makes the run look both smaller and heavier than it was.
+    #: The parse materialises the whole table anyway, so keeping it costs no
+    #: peak memory; the object is dropped once the record is built.
+    all_tasks: list[OomTask] = field(default_factory=list)
+    #: The rows the table held, and the sum of their RSS.
     tasks_considered: int = 0
     tasks_rss_pages: int = 0
     lines: list[str] = field(default_factory=list)
@@ -441,6 +450,7 @@ def _kill(
         uid=uid,
         oom_score_adj=int(adj_match.group("adj")) if adj_match else None,
         tasks=sorted(table, key=lambda task: task.rss_pages, reverse=True)[:KEPT_TASKS],
+        all_tasks=table,
         tasks_considered=len(table),
         tasks_rss_pages=sum(task.rss_pages for task in table),
         lines=context[-6:],

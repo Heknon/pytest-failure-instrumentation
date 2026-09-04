@@ -464,11 +464,18 @@ def _oom_record(
     def megabytes(pages: int) -> int:
         return round(pages * page / 1024)
 
-    ours = [task for task in kill.tasks if task.pid in roles]
-    victim_pages = next((task.rss_pages for task in kill.tasks if task.pid == kill.victim_pid), None)
+    # Over the whole table the kernel weighed, not the heaviest few kept for
+    # the reader: `tasks_considered` and `tasks_rss_mb` below come from the
+    # whole table, and figures drawn from two different populations cannot be
+    # set beside each other. A run's smaller workers are exactly what falls
+    # off the trimmed end, which would leave `run_tasks` short, the median
+    # too high, and `pressure` reading "fleet" for a victim that outgrew one.
+    weighed = kill.all_tasks or kill.tasks
+    ours = [task for task in weighed if task.pid in roles]
+    victim_pages = next((task.rss_pages for task in weighed if task.pid == kill.victim_pid), None)
     rank = None
     if victim_pages is not None:
-        rank = 1 + sum(1 for task in kill.tasks if task.rss_pages > victim_pages)
+        rank = 1 + sum(1 for task in weighed if task.rss_pages > victim_pages)
     median = statistics.median(task.rss_pages for task in ours) if ours else None
     pressure: Optional[str] = None
     if len(ours) >= 2 and victim_pages is not None and median:
