@@ -36,10 +36,17 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import threading
 from typing import Any, Callable, Optional
 
-from ..probes.platform_flags import IS_LINUX
+#: Spelled here rather than imported from ``probes.platform_flags``, on
+#: purpose: importing anything under ``probes`` runs its ``__init__``, which
+#: imports psutil at module scope - and this module is imported by
+#: ``registration.install`` in every worker, *before* the guard that turns a
+#: psutil that will not import into a warning rather than an INTERNALERROR.
+#: See the registration module docstring for why that placement is the point.
+IS_LINUX = sys.platform.startswith("linux")
 
 #: What the controller witnesses. SIGTERM is the one every orchestrator sends
 #: before SIGKILL, and the one whose sender explains the kill that follows.
@@ -92,9 +99,13 @@ def unblock_inherited(signals: tuple[int, ...] = WITNESSED) -> None:
     that. Left blocked, a ``docker stop`` would never reach the worker and it
     would die by the SIGKILL that follows the grace period instead, taking a
     test's own subprocesses' inheritance with it. Called before the recorder
-    is built, so it happens whether or not the recorder can be.
+    is built, so it happens whether or not the recorder can be - and it must
+    never raise, for the same reason: it runs inside ``pytest_configure``.
     """
-    unblock(set(signals))
+    try:
+        unblock(set(signals))
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a run
+        pass
 
 
 class SignalWitness:

@@ -289,6 +289,11 @@ class IncidentEngine:
         self.witness_status = "off"
         self.tracer: signal_trace.SignalTracer | None = None
         self.controller_events: EventLog | None = None
+        #: Whether the witnesses' status line has been written to the
+        #: controller's log. Written once the run id is authoritative - see
+        #: :meth:`_announce_witnesses` - so the controller's own log agrees
+        #: with the workers' about which run it belongs to.
+        self.witnesses_announced = False
         if settings.kill_trace and self.distributed:
             self.blocked_signals = controller_signals.block()
 
@@ -868,11 +873,29 @@ class IncidentEngine:
         self.tracer = signal_trace.SignalTracer(
             self.directory / signal_trace.TRACE_FILE, elevate=self.settings.elevate
         )
-        how = self.tracer.start()
+        self.tracer.start()
+        if not self.distributed:
+            # No xdist id is ever coming, so this process's own name is the
+            # run id already; a distributed run announces from
+            # pytest_configure_node, once xdist has minted the real one.
+            self._announce_witnesses()
+
+    def _announce_witnesses(self) -> None:
+        """One line in the controller's log saying what was witnessing.
+
+        Written once, and not before the run id is authoritative: at session
+        start a distributed run's id is still this process's stand-in, and a
+        line stamped with it makes the controller's log disagree with every
+        worker's about which run they all belong to - which is precisely the
+        confusion the id exists to prevent.
+        """
+        if self.witnesses_announced or self.controller_events is None:
+            return
+        self.witnesses_announced = True
         self._record(
             "kill_witnesses",
             controller_witness=self.witness_status,
-            signal_trace=how,
+            signal_trace=self.tracer.how if self.tracer is not None else "off: not started",
             elevate=self.settings.elevate,
         )
 
@@ -1013,6 +1036,10 @@ class IncidentEngine:
         also removes the last way the two sides can disagree about a number
         they both act on.
         """
+        # By now xdist has built its node manager, so the id is the real one -
+        # which is what makes this the moment for the controller's own log to
+        # start, not session start.
+        self._announce_witnesses()
         try:
             node.workerinput["failure_run_id"] = self.run_id
             # The *resolved* directory, not the configured one. A worker cannot
