@@ -194,3 +194,61 @@ def test_dying_between_tests_counts_what_finished():
         exit_status=1, test_in_flight=None, phase=None, tests_finished=12
     )
     assert any("after finishing 12" in line for line in evidence)
+
+
+# -- a worker a timeout enforcer killed --------------------------------------
+
+
+@posix_only
+def test_a_self_exit_at_a_configured_timeout_is_a_timeout():
+    verdict, confidence, evidence = verdict_of(
+        exit_status=1, test_seconds=30.4, phase="call",
+        matched_timeout=30.0, timeout_source="pytest-timeout",
+    )
+    # pytest-timeout's thread method os._exit(1)s a hung worker, which is
+    # otherwise a plain SELF_EXIT.
+    assert (verdict, confidence) == ("TIMED_OUT", "high")
+    assert any("running 30.4s in the call phase" in line for line in evidence)
+    assert any("configured pytest-timeout of 30.0s" in line for line in evidence)
+
+
+def test_a_self_exit_below_every_timeout_stays_a_self_exit():
+    verdict, _, evidence = verdict_of(exit_status=1, test_seconds=2.0, phase="call")
+    assert verdict == "SELF_EXIT"
+    # The duration is still said, so a reader can see it was nowhere near one.
+    assert any("running 2.0s in the call phase" in line for line in evidence)
+
+
+def test_a_self_exit_with_no_timeout_configured_is_not_upgraded():
+    # matched_timeout is only set when a timeout was configured and reached.
+    verdict, _, _ = verdict_of(exit_status=1, test_seconds=600.0, phase="call")
+    assert verdict == "SELF_EXIT"
+
+
+@posix_only
+def test_a_sigalrm_at_a_timeout_is_a_timeout_not_a_bare_signal():
+    verdict, confidence, evidence = verdict_of(
+        exit_status=-signal.SIGALRM, test_seconds=60.2, phase="call",
+        matched_timeout=60.0, timeout_source="pytest-timeout",
+    )
+    assert (verdict, confidence) == ("TIMED_OUT", "high")
+    assert any("timeout enforcer ended it" in line for line in evidence)
+
+
+@posix_only
+def test_a_faulthandler_timeout_exit_is_a_timeout():
+    verdict, _, evidence = verdict_of(
+        exit_status=1, test_seconds=900.5, phase="teardown",
+        matched_timeout=900.0, timeout_source="faulthandler_timeout",
+    )
+    assert verdict == "TIMED_OUT"
+    assert any("faulthandler_timeout" in line for line in evidence)
+
+
+def test_a_native_crash_at_the_timeout_is_still_a_crash():
+    # A fault right at the boundary is explained by the fault, not the clock.
+    verdict, _, _ = verdict_of(
+        exit_status=-signal.SIGSEGV, test_seconds=30.1, phase="call",
+        matched_timeout=30.0, timeout_source="pytest-timeout",
+    )
+    assert verdict == "NATIVE_CRASH"

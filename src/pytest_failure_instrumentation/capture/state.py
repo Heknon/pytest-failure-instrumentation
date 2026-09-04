@@ -101,6 +101,14 @@ class WorkerState:
         #: last in" are different questions and only one of them is a finding.
         self.last_nodeid: str | None = None
         self.phase: str | None = None
+        #: When the current phase began, and when the current *test* began
+        #: (its setup). A worker killed by a timeout enforcer looks like a
+        #: plain exit; the one thing that separates it is that the test had
+        #: been running at or beyond a configured timeout when it died, and
+        #: that is what these two answer. Wall clock, so the controller that
+        #: reads the death can subtract its own now from them.
+        self.phase_started: float | None = None
+        self.test_started: float | None = None
         # Opened once; the descriptor lives for the process lifetime so a
         # write costs one syscall and survives interpreter shutdown.
         # O_BINARY matters on Windows: without it os.write translates "\n"
@@ -187,6 +195,8 @@ class WorkerState:
                 "nodeid": nodeid,
                 "last_nodeid": last_nodeid,
                 "phase": self.phase,
+                "phase_started": self.phase_started,
+                "test_started": self.test_started,
                 "tests_started": self.tests_started,
                 "tests_finished": self.tests_finished,
             }

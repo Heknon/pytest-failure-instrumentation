@@ -199,6 +199,14 @@ class Settings:
     #: ``-n`` means a sudo that would prompt fails instead, so an unattended
     #: run is never left waiting for a password.
     elevate: bool = False
+    #: Keep a bounded copy of each worker's stderr, so the one line that
+    #: explains a native death - ``pthread_create failed``, ``malloc():
+    #: corrupted top size``, an abort message - survives the kill that
+    #: swallows it. Off by default and POSIX-only: it is the single facility
+    #: here that takes over a process-wide file descriptor, so it is opt-in
+    #: and every step of it is guarded against ending a run. See
+    #: :mod:`.capture.output`.
+    capture_output: bool = False
     #: What to call when this run is killed - see :mod:`.incidents.reporter`.
     #: A run whose controller dies has nobody left to raise its incidents,
     #: and on a runner with a fresh workspace per job there is no next run
@@ -486,6 +494,11 @@ class Settings:
             "slow_test_seconds": self.slow_test_seconds,
             "stall_seconds": self.stall_seconds,
             "stack_probe": self.stack_probe,
+            # A worker-side recording concern, so it travels: the tee is
+            # installed in the worker, not the controller. kill_trace,
+            # elevate and on_run_death stay out - those are the controller's,
+            # which is where the witnesses and the sidecar live.
+            "capture_output": self.capture_output,
             # The declaration in force, resolved here rather than there. It
             # is the worker that makes it and the controller that knows
             # whether anybody is going to read the result - the two settings
@@ -568,6 +581,15 @@ def add_options(parser: pytest.Parser) -> None:
         "terminal shows you now for one an incident can carry later. Off by "
         "default; a worker keeps its own either way, because the stderr it "
         "would use is shared and nobody reads it.",
+        default="false",
+    )
+    parser.addini(
+        "failure_capture_output",
+        help="Keep the last few KB of each worker's stderr in <worker>.output, "
+        "so a native crash message (pthread_create failed, a malloc abort) "
+        "survives the kill that swallows it and reaches the incident. Off by "
+        "default, POSIX only: this takes over file descriptor 2 for the worker, "
+        "the one thing here that reaches across the whole process.",
         default="false",
     )
     parser.addini(
@@ -833,6 +855,47 @@ def _number(config: pytest.Config, name: str, fallback: float) -> float:
         return fallback
 
 
+def configured_timeouts(config: pytest.Config) -> dict[str, float]:
+    """Every per-test timeout this run has configured, by the name of what
+    enforces it.
+
+    A worker a timeout enforcer kills looks like a plain ``os._exit(1)`` from
+    the outside - which is exactly what pytest-timeout's thread method and
+    faulthandler's ``exit_on_timeout`` both do. What separates that from an
+    ordinary self-exit is that the test had been running at or beyond one of
+    these when it died, so the death is matched against them by duration.
+
+    Read on the controller, which is where the death is built and where the
+    config is. pytest-timeout's is per-test and can be raised by a marker,
+    which is not visible here; the global value is the floor, and a death that
+    matches it is named, one that only matches a marker's larger value is left
+    to read as a self-exit rather than guessed at.
+    """
+    timeouts: dict[str, float] = {}
+    faulthandler = pytest_faulthandler_timeout(config)
+    if faulthandler > 0:
+        timeouts["faulthandler_timeout"] = faulthandler
+    # pytest-timeout registers a ``--timeout`` option and a ``timeout`` ini;
+    # both raise if the plugin is not loaded, which is how its absence is
+    # told from a zero. The plugin registers under the name "timeout", not
+    # "pytest_timeout", so the option is asked for rather than the plugin.
+    for reader in (
+        lambda: config.getoption("timeout", None),
+        lambda: config.getini("timeout"),
+    ):
+        try:
+            value = reader()
+        except (ValueError, KeyError, TypeError):
+            continue
+        if value:
+            try:
+                timeouts["pytest-timeout"] = float(value)
+            except (TypeError, ValueError):
+                pass
+            break
+    return timeouts
+
+
 def pytest_faulthandler_timeout(config: pytest.Config) -> float:
     """pytest's own ``faulthandler_timeout``, or 0 when nobody set one.
 
@@ -947,6 +1010,7 @@ def resolve(config: pytest.Config) -> Settings:
         stack_probe=_flag(config, "failure_stack_probe", True),
         crash_stack=_flag(config, "failure_crash_stack", False),
         kill_trace=_flag(config, "failure_kill_trace", True),
+        capture_output=_flag(config, "failure_capture_output", False),
         elevate=_flag(config, "failure_elevate", False),
         on_run_death=str(_ini(config, "failure_on_run_death", "") or "").strip() or None,
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),

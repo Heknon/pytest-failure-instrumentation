@@ -159,6 +159,15 @@ def _written_ago(age: float | None) -> str:
     return f", {age:.0f}s before this report" if age >= 1 else ", moments before"
 
 
+def _timeout_line(incident: WorkerDeathIncident) -> str:
+    where = f" in the {incident.phase} phase" if incident.phase else ""
+    return (
+        f"the test had been running {incident.test_seconds}s{where} when the worker "
+        f"died, at or beyond the configured {incident.timeout_source} of "
+        f"{incident.matched_timeout}s: a timeout enforcer ended it"
+    )
+
+
 def _killed(incident: WorkerDeathIncident, evidence: list[str]) -> tuple[str, str, list[str]]:
     """SIGKILL, and everything that can be said about who sent it.
 
@@ -237,6 +246,17 @@ def _terminated(incident: WorkerDeathIncident, evidence: list[str]) -> tuple[str
     ]
 
 
+def _output_evidence(incident: WorkerDeathIncident) -> list[str]:
+    """The last non-empty line of the worker's stderr, when it was kept.
+
+    One line, because a crash's cause is a line - and the last one, because a
+    library that logs before it aborts puts the reason nearest the end. The
+    whole tail is on ``incident.recent_output`` for a reader who wants more.
+    """
+    lines = [line.strip() for line in incident.recent_output if line.strip()]
+    return [f"last stderr: {lines[-1]}"] if lines else []
+
+
 def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
     """Returns (verdict, confidence, evidence)."""
     status = incident.exit_status
@@ -311,6 +331,7 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         )
 
     terminated = incident.killer is not None and incident.killer.name == "TerminateProcess"
+    output = _output_evidence(incident)
     received = -status if status is not None and status < 0 else None
     if received is None and status is None and incident.killer is not None and not terminated:
         # No status to read - but a witness saw the signal that ended it,
@@ -324,11 +345,14 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
 
     if received is not None:
         if hasattr(signal, "SIGKILL") and received == signal.SIGKILL:
-            return _killed(incident, evidence + memory_evidence(incident))
+            return _killed(incident, evidence + memory_evidence(incident) + output)
         if received in status_table.FATAL_SIGNALS:
             return "NATIVE_CRASH", "high", evidence + [
                 status_table.FATAL_SIGNALS[received]
-            ] + sender_evidence(incident)
+            ] + output + sender_evidence(incident)
+        if hasattr(signal, "SIGALRM") and received == signal.SIGALRM and incident.matched_timeout:
+            # pytest-timeout's signal method raises SIGALRM at the deadline.
+            return "TIMED_OUT", "high", evidence + [_timeout_line(incident)]
         if received in status_table.DELIBERATE_SIGNALS:
             return f"SIGNAL_{received}", "high", evidence + [
                 status_table.DELIBERATE_SIGNALS[received],
@@ -352,7 +376,7 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         # does, so the dump is the only thing that separates them - which is
         # why it has to be a dump the dying process wrote, and not the one a
         # slow test left behind an hour earlier.
-        return "NATIVE_CRASH", "medium", evidence
+        return "NATIVE_CRASH", "medium", evidence + output
 
     if status is not None and 128 < status < 192:
         return "PROBABLY_SIGNALLED", "low", evidence + [
@@ -361,14 +385,26 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         ]
 
     if status is not None:
+        if incident.matched_timeout is not None and status in (1, -1):
+            # pytest-timeout's thread method and faulthandler's
+            # exit_on_timeout both os._exit(1) a hung worker, which is
+            # otherwise indistinguishable from any other self-exit. The test
+            # having reached a configured timeout is what tells them apart.
+            return "TIMED_OUT", "high", evidence + [_timeout_line(incident)]
         # Zero included. A worker that left the run without being asked to has
         # gone wrong whatever number it exited with, and os._exit(0) inside a
         # test is a real way to do it - reported as UNKNOWN it reads as a
         # status nobody could obtain, which is the one thing this is not.
-        return "SELF_EXIT", "medium", evidence + [
+        exited = [
             "the worker exited on its own: something called sys.exit() or "
             "os._exit(), or a plugin aborted"
         ]
+        if incident.test_seconds is not None and incident.phase:
+            exited.append(
+                f"the test in flight had been running {incident.test_seconds}s in the "
+                f"{incident.phase} phase"
+            )
+        return "SELF_EXIT", "medium", evidence + exited
 
     # No status at all - a remote gateway, or a run found after the fact with
     # nothing left that was entitled to read one. The kernel log is the one

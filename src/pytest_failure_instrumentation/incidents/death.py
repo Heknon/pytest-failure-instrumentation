@@ -28,6 +28,7 @@ from .. import probes
 from ..analysis import classify, exit_status
 from ..capture import crash_stack
 from ..capture import events as event_log
+from ..capture import output as output_capture
 from ..capture.state import read_state
 from ..probes import signal_trace
 from . import killer
@@ -160,6 +161,24 @@ class WorkerDeathIncident(Incident):
     #: anything else on file, which is the case worth saying out loud.
     crash_stack_age_seconds: Optional[float] = None
 
+    #: How long the test in flight had been running, and its current phase,
+    #: when the worker died. What turns a bare ``os._exit(1)`` into "a timeout
+    #: enforcer ended it": pytest-timeout and faulthandler both end a hung
+    #: worker that way, and the tell is that the test had reached a configured
+    #: timeout - see :attr:`matched_timeout`.
+    test_seconds: Optional[float] = None
+    phase_seconds: Optional[float] = None
+    #: The timeout this death reached, and what enforces it, when it did.
+    matched_timeout: Optional[float] = None
+    timeout_source: Optional[str] = None
+
+    #: The tail of the worker's stderr, when ``failure_capture_output`` kept
+    #: it. The one line a native death leaves - ``pthread_create failed``, a
+    #: malloc abort - is here and in no stack. Empty when the setting was off,
+    #: which reads differently from a worker that printed nothing: the alert
+    #: says which, so an absent tail is never taken for silence.
+    recent_output: list[str] = Field(default_factory=list)
+
     #: Who sent the signal that ended it, when a witness saw - see
     #: :mod:`.killer`. The kernel's tracepoint names a sender for every
     #: SIGKILL, which the wait status never will.
@@ -254,6 +273,7 @@ def build(
     baseline_oom_kills: int | None,
     run_id: str | None = None,
     sources: Optional[killer.Sources] = None,
+    timeouts: Optional[dict[str, float]] = None,
 ) -> WorkerDeathIncident:
     died_at = time.time()
     worker = node.gateway.id
@@ -300,6 +320,8 @@ def build(
         crash_stack_age_seconds=_age_of(crash_file) if dump else None,
         high_water=event_log.high_water_marks(events)[-1:] or None,
     )
+    _time_the_test(incident, state, died_at, timeouts)
+    incident.recent_output = output_capture.read_tail(directory / f"{worker}.output")
     if sources is not None:
         _attach_witnesses(
             incident, sources, pid, status, event_log.started_at(events), died_at
@@ -338,6 +360,41 @@ def _attach_witnesses(
     incident.oom = found.oom
     incident.signals_before_death = found.before
     incident.kill_sources = found.sources
+
+
+def _time_the_test(
+    incident: WorkerDeathIncident,
+    state: dict[str, Any],
+    died_at: float,
+    timeouts: Optional[dict[str, float]],
+) -> None:
+    """How long the test had run, and whether that reached a timeout.
+
+    The worker and the controller share a wall clock - one machine - so the
+    controller's ``died_at`` minus the worker's own ``test_started`` is how
+    long the test had been running when it died. A death that reached a
+    configured timeout is the enforcer's, whatever exit code it wears.
+    """
+    test_started = state.get("test_started")
+    phase_started = state.get("phase_started")
+    if isinstance(test_started, (int, float)):
+        incident.test_seconds = round(max(0.0, died_at - test_started), 1)
+    if isinstance(phase_started, (int, float)):
+        incident.phase_seconds = round(max(0.0, died_at - phase_started), 1)
+    if not timeouts or incident.test_seconds is None:
+        return
+    # The smallest timeout the test reached, and what enforces it. Smallest,
+    # because whichever fires first is the one that ended it; a second's slack
+    # for the enforcer's own latency and the two clocks' rounding.
+    reached = {
+        name: value
+        for name, value in timeouts.items()
+        if incident.test_seconds >= value - 1.0
+    }
+    if reached:
+        incident.timeout_source, incident.matched_timeout = min(
+            reached.items(), key=lambda item: item[1]
+        )
 
 
 def _age_of(path: Path) -> float | None:
@@ -426,6 +483,7 @@ def recover(
         crash_stack=dump,
         crash_stack_age_seconds=_age_of(directory / f"{worker}.crash") if dump else None,
         high_water=event_log.high_water_marks(events)[-1:] or None,
+        recent_output=output_capture.read_tail(directory / f"{worker}.output"),
     )
     sources = _dead_runs_sources(directory, elevate)
     # The death is somewhere after the last beat and before the next one

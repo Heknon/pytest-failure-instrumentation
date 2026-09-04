@@ -95,6 +95,51 @@ def test_sigkill_does_not_claim_an_oom_it_cannot_prove(distributed):
         assert any(line.startswith("kill witnesses:") for line in death.evidence)
 
 
+def _has_pytest_timeout() -> bool:
+    try:
+        import pytest_timeout  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+needs_pytest_timeout = pytest.mark.skipif(
+    not _has_pytest_timeout(), reason="pytest-timeout is not installed"
+)
+
+
+@posix_only
+@needs_pytest_timeout
+def test_a_worker_killed_by_pytest_timeout_reads_as_a_timeout(distributed):
+    """pytest-timeout's thread method os._exit(1)s a hung worker. That is a
+    plain SELF_EXIT from the outside; the test having reached the configured
+    timeout is what names it."""
+    distributed.pytester.makepyfile(
+        test_hang="""
+        import time
+
+
+        def test_filler():
+            assert True
+
+
+        def test_hangs():
+            time.sleep(60)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2", "--timeout", "3", "--timeout-method", "thread",
+        "test_hang.py", timeout=120,
+    )
+    death = distributed.only(incidents, "worker_death")
+    assert death.verdict == "TIMED_OUT", death.evidence
+    assert death.test_in_flight == "test_hang.py::test_hangs"
+    assert death.matched_timeout == 3.0 and death.timeout_source == "pytest-timeout"
+    assert death.test_seconds is not None and death.test_seconds >= 3.0
+    # It points at the hung test, so it is scored like the test's owner.
+    assert death.suspect_nodeid() == "test_hang.py::test_hangs"
+
+
 @posix_only
 def test_a_stop_signal_is_not_a_defect(distributed):
     distributed.pytester.makepyfile(

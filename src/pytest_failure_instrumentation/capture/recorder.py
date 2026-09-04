@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import platform
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from ..config import Settings
 from ..probes import tracing
 from . import crash_stack
 from . import memory as memory_capture
+from . import output as output_capture
 from .events import EventLog
 from .heartbeat import Heartbeat
 from .state import WorkerState
@@ -116,6 +118,18 @@ class WorkerRecorder:
             self.frozen = crash_stack.FrozenInterpreterFallback(
                 self._frozen_stream, settings.heartbeat_interval
             )
+
+        # A bounded copy of what pytest captured for each completed phase,
+        # so a native crash message survives the kill that swallows it - see
+        # capture.output. Fed from pytest_runtest_logreport, so it reads
+        # pytest's own capture rather than taking over a descriptor, and
+        # cannot disturb the run.
+        self.output_log: output_capture.OutputLog | None = None
+        if settings.capture_output:
+            self.output_log = self._track(
+                output_capture.OutputLog(directory / f"{worker_id}.output")
+            )
+            self.events.record("output_capture", status="on")
 
         self._apply_memory_limit(settings)
         self._start_monitors(settings)
@@ -253,16 +267,37 @@ class WorkerRecorder:
     def pytest_runtest_teardown(self, item: pytest.Item) -> Any:
         yield from self._phase("teardown", item.nodeid)
 
+    @pytest.hookimpl(trylast=True)
+    def pytest_runtest_logreport(self, report: Any) -> None:
+        """Copy each completed phase's captured output into the ring.
+
+        The reason a native death is explicable at all: pytest's fd capture
+        has already caught the C-level writes to stderr and attached them
+        here, and this keeps a copy that a kill cannot take. trylast, so
+        whatever else adds to the capture has run first.
+        """
+        if self.output_log is None:
+            return
+        stderr = getattr(report, "capstderr", "") or ""
+        stdout = getattr(report, "capstdout", "") or ""
+        if stderr or stdout:
+            self.output_log.add(stderr=stderr, stdout=stdout)
+
     def _phase(self, phase: str, nodeid: str) -> Any:
         """Which phase is open is what separates "died in teardown" from
         "died mid-call": pytest's own logfinish fires only after the whole
         protocol, so it cannot tell them apart."""
+        now = time.time()
         if phase == "setup":
             self.state.tests_started += 1
+            # The whole test's clock, not the phase's: pytest-timeout and
+            # faulthandler_timeout both time the item from its setup, so a
+            # death is matched against a timeout by how long the *test* ran.
+            self.state.test_started = now
         if self.heartbeat is not None:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase
-        self.state.update(nodeid=nodeid, phase=phase)
+        self.state.update(nodeid=nodeid, phase=phase, phase_started=now)
         # Started once for the whole test rather than per phase, and from
         # setup rather than from the call.
         #

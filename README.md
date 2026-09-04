@@ -372,6 +372,7 @@ reports what the incident found rather than what a `-9` looks like.
 
 | Verdict | Told apart by |
 |---|---|
+| `TIMED_OUT` | a self-exit or SIGALRM while the test had run to a configured `timeout` / `faulthandler_timeout` |
 | `OOM_KILLED` | `-9` **and** the kernel log names this pid as the OOM killer's victim, or the cgroup OOM counter moved |
 | `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process outside the run send it — the sender is named |
 | `KILLED_BY_RUN` | `-9` sent by another process of this run: the controller (execnet terminating a worker that would not exit) or a sibling worker |
@@ -756,6 +757,62 @@ which phase, how many had run, the resident memory at the last beat, and — if
 the run kept one — the fatal stack, which is enough to reach `NATIVE_CRASH`
 with a blamed frame and no status at all. That is the same position Windows is
 in for a watched worker, and it is why the dump is evidence in its own right.
+
+## A worker that timed out
+
+pytest-timeout and pytest's own `faulthandler_timeout` both end a hung worker
+by exiting it — the thread method calls `os._exit(1)`, the signal method raises
+`SIGALRM` — which from the outside is a plain `SELF_EXIT` or a bare signal,
+indistinguishable from any other. Under a hundred workers contending for the
+CPU, a test that takes two seconds unloaded can take forty, and the enforcer
+ends it: this is one of the commonest deaths a large parallel suite has, and it
+read as a mystery exit.
+
+The state slot records when each test began, so the controller — same machine,
+same wall clock — knows how long the test had been running when the worker
+died. A death that reached a configured timeout is `TIMED_OUT`, naming the
+duration, the phase and which enforcer's limit it hit:
+
+```
+[worker_death] TIMED_OUT  severity=critical  owner=product
+    worker=gw7  in flight test_slow.py::test_waits  phase=call  started=3 finished=2
+    · died while running test_slow.py::test_waits (call)
+    · exit status 1 - process exited with code 1 (pid 4821, via waitid)
+    · the test had been running 30.4s in the call phase when the worker died, at or beyond the configured pytest-timeout of 30.0s: a timeout enforcer ended it
+```
+
+The global `--timeout` / ini value is the floor; a death that only reaches a
+larger per-test marker's timeout is left as a self-exit rather than guessed at,
+and every self-exit now carries how long the test had run so a reader can see
+whether it was near a limit.
+
+## What the worker last said
+
+The line that explains a native death is usually on stderr and nowhere a stack
+can reach it: `OpenBLAS blas_thread_init: pthread_create failed` when a hundred
+workers each start a thread pool at once, a `malloc(): corrupted top size`, a
+library's own abort message. pytest already captures it — its fd-level capture
+catches even the writes C code makes straight to file descriptor 2 — but it
+keeps it in a temporary file that the kill throws away, and hands it to the
+report only for a phase that *completed*.
+
+With `failure_capture_output` on, each completed phase's captured output is
+copied into `<worker>.output`, a fixed ring, and the last few kilobytes reach
+the incident as `recent_output`, with the final stderr line surfaced on the
+alert:
+
+```
+    · segmentation fault in native code
+    · last stderr: OpenBLAS blas_thread_init: pthread_create failed
+```
+
+It reads pytest's own capture rather than taking over a file descriptor, so it
+cannot disturb the run or pytest's captured-on-failure output. The bound is
+honest: the output of the exact phase that was *still running* when the kill
+landed is lost, because pytest has not made its report yet — but the import
+that spun up the pool, the setup that logged before it aborted, and the
+previous test's last words are all kept. Off by default. An absent tail reads
+as "not captured", never as silence: the alert says which.
 
 ## Who killed it
 
@@ -1770,6 +1827,7 @@ accepted and inert.
 | `failure_crash_stack` | `false` | Keep the fatal stack of a run that has *no workers*, instead of leaving it on the stderr pytest points it at. A worker keeps its own either way |
 | `failure_kill_trace` | `true` | Witness who signals this run's processes: the controller records the sender of a SIGTERM it receives, and where the run is root (or may sudo) a sidecar on the kernel's `signal_generate` tracepoint names the sender of every SIGKILL and SIGTERM. See [Who killed it](#who-killed-it) |
 | `failure_elevate` | `false` | Allow `sudo -n` for the witnesses that need root: `dmesg` where `/dev/kmsg` and the journal are closed, and the tracepoint above |
+| `failure_capture_output` | `false` | Keep the last few KB of each worker's captured stderr, so a native crash message survives the kill that swallows it. See [What the worker last said](#what-the-worker-last-said) |
 | `failure_on_run_death` | — | A dotted path `package.module:attribute` to a callable the sidecar calls with each incident of a run whose controller was killed, so a killed run is reported at once. From Python, `install(config, on_run_death=functools.partial(...))`. See [Reporting a killed run from the sidecar](#reporting-a-killed-run-from-the-sidecar) |
 | `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |

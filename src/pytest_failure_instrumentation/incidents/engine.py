@@ -49,7 +49,7 @@ from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
 from ..capture import signals as controller_signals
 from ..capture.events import EventLog
-from ..config import SOLE_WORKER, Settings, advise
+from ..config import SOLE_WORKER, Settings, advise, configured_timeouts
 from ..probes import signal_trace
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
@@ -193,6 +193,10 @@ class IncidentEngine:
         self.settings = settings
         self.attributor = Attributor(settings.packages)
         self.baseline_oom_kills = probes.cgroup_oom_kills()
+        #: The per-test timeouts this run enforces, read once - see
+        #: :func:`..config.configured_timeouts`. A death that ran at or beyond
+        #: one of these was a timeout, not a mystery self-exit.
+        self._timeouts = configured_timeouts(config)
         self.distributed = bool(
             config.pluginmanager.hasplugin("xdist")
             and config.getoption("dist", "no") != "no"
@@ -1309,6 +1313,7 @@ class IncidentEngine:
                 self.baseline_oom_kills,
                 self.run_id,
                 sources=self._kill_sources(),
+                timeouts=self._timeouts,
             )
         except Exception as failure:  # noqa: BLE001
             incident = death.WorkerDeathIncident.degraded(
