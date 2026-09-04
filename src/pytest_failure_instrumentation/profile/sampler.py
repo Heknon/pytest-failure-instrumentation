@@ -1366,7 +1366,11 @@ def _relinked(stack: StackKey, linked: StackKey) -> StackKey:
         if _is_generator(seen):
             outermost_generator = index
     if outermost_generator is None:
-        return stack
+        # No generator was running when the thread was last seen linked:
+        # this one was entered since, from somewhere in that stack. Placed
+        # on top of all of it - the innermost frames may have returned by
+        # now, but the test and the owner they lead to are the same.
+        return tuple(stack) + tuple(linked)
     return tuple(stack) + tuple(linked[outermost_generator + 1 :])
 
 

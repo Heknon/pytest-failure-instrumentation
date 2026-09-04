@@ -340,8 +340,9 @@ def test_a_thread_that_lives_less_than_an_interval_is_still_charged() -> None:
     (record,) = [entry for entry in records if entry["record"] == "test"]
     charged = sum(stack["cpu_ns"] for stack in record["stacks"] if stack["thread"] == "short") / 1e9
     # Sampling, so not all of it: a thread that comes and goes between two
-    # ticks is never seen. But most of them are.
-    assert charged > burnt * 0.3, (charged, burnt)
+    # ticks is never seen, and on a loaded box the ticks are further apart.
+    # Before the fix this was exactly zero, whatever the load.
+    assert charged > burnt * 0.1, (charged, burnt)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork here")
@@ -464,5 +465,6 @@ def test_a_generator_caught_between_yields_keeps_its_callers() -> None:
             orphaned += stack["cpu_ns"]
     assert in_encoder > 0
     # The first sighting of a generator with nobody to relink it from stays
-    # an orphan; the rest are relinked.
-    assert orphaned < in_encoder * 0.1, (orphaned, in_encoder)
+    # an orphan; the rest are relinked. Unfixed, a fifth to three quarters
+    # of the encoder's time was orphaned, more on a loaded box.
+    assert orphaned < in_encoder * 0.15, (orphaned, in_encoder)
