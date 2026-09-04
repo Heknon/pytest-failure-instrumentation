@@ -11,10 +11,12 @@ where most of the development happens.
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import os
 import signal
 import sys
+import textwrap
 import threading
 import time
 import tracemalloc
@@ -166,9 +168,16 @@ def test_a_tight_loop_gets_its_line_even_where_the_frame_reports_none() -> None:
     sampler.begin_phase("t::a", "call")
 
     def hot() -> int:
+        # Half a second of this thread's CPU, however fast the interpreter and
+        # however busy the machine: a fixed iteration count is a fixed amount
+        # of work, and on a fast 3.13 it was over before enough ticks had
+        # landed in it to prove anything.
         total = 0
-        for value in range(3_000_000):
-            total += value & 3
+        clock = getattr(time, "thread_time", time.process_time)
+        deadline = clock() + 0.5
+        while clock() < deadline:
+            for value in range(200_000):
+                total += value & 3
         return total
 
     hot()
@@ -184,8 +193,12 @@ def test_a_tight_loop_gets_its_line_even_where_the_frame_reports_none() -> None:
     }
     assert lines, "the loop was never sampled"
     assert 0 not in lines
+    # Inside `hot`, and not its `def` line. Bounded by the function's own
+    # length rather than by a number written here, which went stale the first
+    # time the body grew.
     first = hot.__code__.co_firstlineno
-    assert all(first < line <= first + 4 for line in lines), lines
+    body = len(textwrap.dedent(inspect.getsource(hot)).splitlines())
+    assert all(first < line <= first + body for line in lines), lines
 
 
 def test_sampling_does_not_keep_a_functions_locals_alive() -> None:
@@ -608,7 +621,7 @@ class Widget:
         return 1
 
     @classmethod
-    def build(cls) -> "Widget":
+    def build(cls) -> Widget:
         return cls()
 
     @property

@@ -1559,6 +1559,16 @@ live-heap step. Resident memory understates it whenever the test fills pages
 an earlier test freed and the allocator held on to, and the heap figure is not
 fooled by that.
 
+The live heap is glibc's `mallinfo2` and nothing else (see the platform table).
+Where there is none — macOS, Windows, musl — resident memory that stayed up is
+all there is to go on, so a test that freed what it allocated but left the
+pages mapped reads as `RETAINED_AFTER_TEST` rather than `HEAP_NOT_RETURNED` or
+`TRANSIENT_PEAK`. The size and the phase are right either way; what cannot be
+had there is the sentence that separates a leak from fragmentation, and
+`ALLOCATOR_RETENTION` is not raised at all. Rerunning with
+`--failure-profile-allocations` is the answer on those platforms: tracemalloc
+measures Python's own live allocations everywhere.
+
 The worker that "freed everything and still sits at four gigabytes" is the
 one case none of the per-test rules can name, because no test did it: a few
 megabytes of freed-but-mapped memory per test, over a long worker, is under

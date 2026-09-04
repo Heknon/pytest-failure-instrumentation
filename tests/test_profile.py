@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 import pytest
@@ -25,6 +26,35 @@ needs_thread_cpu = pytest.mark.skipif(
     not ThreadClock().available, reason="no per-thread CPU clock on this platform"
 )
 
+#: The live heap - what the C allocator has handed out - is read through
+#: glibc's mallinfo2 and nowhere else. Without it, memory a test freed that
+#: the allocator kept mapped cannot be told from memory the test still holds,
+#: so a peak that came back reads as memory kept. See probes.heap_in_use_megabytes.
+HAS_LIVE_HEAP = probes.heap_in_use_megabytes()[0] is not None
+
+
+def a_core_of_its_own(wanted: float = 0.7, over: float = 0.3) -> None:
+    """Skip unless this machine will give one busy thread most of a core.
+
+    A burst is defined as a *rate* - `failure_profile_burst_cores` of a core,
+    sustained - so a scenario cannot produce one on a machine that is already
+    saturated by something else, however much CPU it is given to burn. That is
+    the profiler working: the same run raises `CONTENDED` and says the load was
+    not this run's. It is measured here rather than assumed, and just before
+    the run rather than at collection, because what a CI runner will give
+    varies minute to minute.
+    """
+    started, cpu = time.perf_counter(), time.process_time()
+    deadline = started + over
+    while time.perf_counter() < deadline:
+        sum(range(2000))
+    cores = (time.process_time() - cpu) / max(1e-9, time.perf_counter() - started)
+    if cores < wanted:
+        pytest.skip(
+            f"this machine gave one busy thread {cores:.2f} cores just now, and a "
+            f"burst is {wanted} of one sustained: the scenario cannot produce one here"
+        )
+
 PROFILE_INI = """
 [pytest]
 failure_packages = victim, product
@@ -38,6 +68,11 @@ PRODUCT_MODULE = '''
 import hashlib
 import json
 import threading
+import time
+
+#: This thread's own CPU where the platform has one, the process's otherwise.
+#: Only the poller reads it, and it is the only thread doing any work.
+spent = getattr(time, "thread_time", time.process_time)
 
 
 def compare_pixels(image1, image2, width, height):
@@ -57,14 +92,35 @@ def render(document):
 
 
 class Poller:
+    """A background thread that polls, and can be asked how much it has done.
+
+    The CPU it burns is what a test that watches it is really waiting for, so
+    that is what it counts and what `worked` waits on. Sleeping for a stretch
+    of wall time instead made the scenario worth whatever share of a core the
+    machine happened to have going: on a saturated CI runner the poller got a
+    tenth of one, finished the run under the threshold, and the finding this
+    is about was never raised.
+    """
+
     def __init__(self):
         self.stop = threading.Event()
+        self.cpu_seconds = 0.0
         self.thread = threading.Thread(target=self.run, name="status-poller", daemon=True)
 
     def run(self):
         payload = b"x" * 400_000
         while not self.stop.wait(0.001):
+            before = spent()
             hashlib.sha256(payload).hexdigest()
+            self.cpu_seconds += spent() - before
+
+    def worked(self, seconds, timeout=90.0):
+        """Block until this thread has burnt `seconds` more CPU than it had."""
+        target = self.cpu_seconds + seconds
+        deadline = time.monotonic() + timeout
+        while self.cpu_seconds < target and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return self.cpu_seconds >= target
 '''
 
 LOADER_MODULE = '''
@@ -74,6 +130,22 @@ def load_everything(records):
     payload = b"".join(b"record %d\\n" % index * 40 for index in range(records))
     return len(payload.decode("ascii").splitlines())
 '''
+
+
+#: The lines of ``compare_pixels``'s inner loop, worked out from the module
+#: rather than written down: a line added to the header above moved them, and
+#: three tests that named them by number all failed at once for a reason that
+#: had nothing to do with what they check.
+PIXEL_LOOP_LINES = tuple(
+    number
+    for number, text in enumerate(PRODUCT_MODULE.splitlines(), 1)
+    if text.strip() in (
+        "for y in range(height):",
+        "offset = (y * width + x) * 3",
+        "if image1[offset:offset + 3] != image2[offset:offset + 3]:",
+        "differing += 1",
+    )
+)
 
 
 def profiled(runner: Runner, *arguments: str, timeout: float = 120.0) -> list[Any]:
@@ -125,7 +197,7 @@ class TestCpu:
         # The line is the comparison inside the loop, not the def line and
         # not 0: on 3.11 the frame reports no line at the loop's back edge,
         # and the sampler resolves it from the instruction offset instead.
-        assert incident.hottest_lines[0].line in (13, 14, 15, 16)
+        assert incident.hottest_lines[0].line in PIXEL_LOOP_LINES
         assert incident.self_share_percent > 90
         assert incident.share_percent > 50
         assert incident.tests == ["test_screens.py::test_screen_settles"]
@@ -150,7 +222,9 @@ class TestCpu:
         assert incident.verdict == "LIBRARY_CALL"
         assert incident.owner == "product"
         assert incident.below is not None
-        assert incident.below.file.endswith("json/encoder.py")
+        # Windows writes the path with backslashes, and the frame carries it
+        # as the interpreter reported it.
+        assert incident.below.file.replace("\\", "/").endswith("json/encoder.py")
         assert incident.below.owner == "runtime"
         assert incident.self_share_percent < 50
 
@@ -169,11 +243,15 @@ class TestCpu:
                 yield poller
                 poller.stop.set()
 
+            # Each test waits for the poller to do a measured amount of work
+            # rather than for a stretch of the clock: the finding is about
+            # the CPU it used, and a busy machine must not be able to shrink
+            # that without the test noticing.
             def test_one(poller):
-                time.sleep(1.2)
+                assert poller.worked(0.6)
 
             def test_two(poller):
-                time.sleep(1.2)
+                assert poller.worked(0.6)
             """
         )
         incidents = profiled(runner)
@@ -278,7 +356,15 @@ class TestMemory:
         incidents = profiled(runner)
 
         (incident,) = memory(incidents)
-        assert incident.verdict in ("TRANSIENT_PEAK", "HEAP_NOT_RETURNED")
+        # Telling "freed, and the allocator kept the pages" from "still held"
+        # needs the live heap, and the live heap is glibc's mallinfo2. Where
+        # there is none - macOS, Windows, musl - resident memory that stayed
+        # up is all there is to go on, and memory kept is what it honestly
+        # reads as. See probes.heap_in_use_megabytes and the platform table.
+        if HAS_LIVE_HEAP:
+            assert incident.verdict in ("TRANSIENT_PEAK", "HEAP_NOT_RETURNED")
+        else:
+            assert incident.verdict in ("TRANSIENT_PEAK", "HEAP_NOT_RETURNED", "RETAINED_AFTER_TEST")
         assert incident.nodeid == "test_peak.py::test_peak"
         assert incident.peak_mb >= incident.before_mb + 100
 
@@ -575,11 +661,16 @@ def test_frameless_hotspots_belong_to_the_runtime(verdict: str) -> None:
 CHURN_MODULE = '''
 
 def churn(seconds):
-    """A stretch of a core: the CPU step in a test that otherwise waits."""
+    """A stretch of a core: the CPU step in a test that otherwise waits.
+
+    Measured in CPU rather than in wall time, so that a machine which is busy
+    with something else makes this take longer rather than makes it do less.
+    """
     import time
-    deadline = time.perf_counter() + seconds
+    clock = getattr(time, "thread_time", time.process_time)
+    deadline = clock() + seconds
     total = 0
-    while time.perf_counter() < deadline:
+    while clock() < deadline:
         total += sum(range(2000))
     return total
 '''
@@ -593,6 +684,7 @@ def bursts(incidents: list[Any]) -> list[Any]:
 
 class TestBursts:
     def test_a_long_burst_in_a_waiting_test_is_named_with_when_it_started(self, runner: Runner) -> None:
+        a_core_of_its_own()
         runner.pytester.makeini(BURST_INI + "failure_profile_burst_seconds = 1\n")
         (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE + CHURN_MODULE, encoding="utf-8")
         runner.pytester.makepyfile(
@@ -623,6 +715,7 @@ class TestBursts:
         assert "starting" in str(incident).splitlines()[0]
 
     def test_the_same_fixture_bursting_in_every_test_is_one_recurring_finding(self, runner: Runner) -> None:
+        a_core_of_its_own()
         # A burst too short to be raised on its own, five times over.
         runner.pytester.makeini(BURST_INI + "failure_profile_burst_seconds = 30\n")
         (runner.pytester.path / "product.py").write_text(PRODUCT_MODULE + CHURN_MODULE, encoding="utf-8")

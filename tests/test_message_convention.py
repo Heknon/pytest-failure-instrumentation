@@ -176,7 +176,16 @@ def test_every_incident_renders_to_the_one_shape(every_kind: list[Incident]) -> 
 
 
 def test_a_lead_says_where_the_owner_came_from(every_kind: list[Incident]) -> None:
-    (kill,) = [incident for incident in every_kind if incident.verdict == "OOM_KILLED"]
+    """The lead line is what this is about, and it is the same sentence
+    whatever the death is classified as.
+
+    Picked out by the worker that died rather than by ``OOM_KILLED``: the
+    verdict is read from the reader's own ``signal`` module, which on Windows
+    has no ``SIGKILL`` - so ``a_kill()`` is ``SIGNAL_9`` there and this found
+    nothing to unpack. That is the classifier working as written (see
+    ``analysis.exit_status``); the lead is not about it.
+    """
+    (kill,) = [incident for incident in every_kind if getattr(incident, "worker", None) == "gw2"]
     assert str(kill).splitlines()[1].strip() == (
         "No stack was captured; the owner is taken from the last test this worker finished, "
         "test_api.py; nothing was running when it died (customer-code)."
