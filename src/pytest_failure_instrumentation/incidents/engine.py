@@ -1150,51 +1150,59 @@ class IncidentEngine:
         write = terminalreporter.write_line
         terminalreporter.section("failure-instrumentation profile", sep="=")
         if report is None:
-            write("no profile records: nothing in this run was sampling")
+            write("No profile records were written: nothing in this run was sampling.")
             return
         cores = report.process_cpu_s / report.wall_s if report.wall_s else 0.0
+        several = len(report.workers) > 1
+
+        def seconds(value: float) -> str:
+            return f"{value:.1f} s" if value < 10 else f"{value:.0f} s"
+
         write(
-            f"{report.tests} tests, {report.process_cpu_s:.1f} s CPU over {report.wall_s:.1f} s of "
-            f"worker time ({cores:.2f} cores), sampled {report.sampled_cpu_s:.1f} s of it"
-            + ("" if report.cpu_weighted else " (wall-weighted: no CPU clock here)")
-            + (
-                ""
-                if report.per_thread
-                else " (no per-thread CPU clock here: the process's CPU is charged to the test's thread)"
-            )
-            + (f", {report.native_cpu_s:.1f} s in native threads" if report.native_cpu_s >= 0.1 else "")
-            + (f", gc {report.gc_s:.1f} s" if report.gc_s >= 0.1 else "")
+            f"Profile: {report.tests} test{'s' if report.tests != 1 else ''}, {seconds(report.wall_s)} of "
+            f"{'worker time (summed across workers)' if several else 'wall time'}, "
+            f"{seconds(report.process_cpu_s)} CPU ({cores:.2f} cores on average)"
+            + (f", {report.gc_s:.1f} s of it in garbage collection" if report.gc_s >= 0.1 else "")
+            + (f", {report.native_cpu_s:.1f} s of it in threads with no Python stack" if report.native_cpu_s >= 0.1 else "")
         )
+        if not report.cpu_weighted:
+            write("  CPU could not be read at all on this platform: samples are weighted by wall time instead.")
+        elif not report.per_thread:
+            write(
+                "  CPU could not be read per thread on this platform: all CPU is attributed to the "
+                "thread running the test."
+            )
         if report.allocations:
             write(
-                "allocation tracing was on: the CPU figures include the tracer's own cost, "
-                "and no CPU finding is raised from a traced run"
+                "  Allocation tracing was on: CPU figures include the tracer's cost, so no CPU "
+                "findings are raised."
             )
         for worker, facts in sorted(report.workers.items()):
-            peak = f"{facts['peak_mb']} MB peak" if facts["peak_mb"] is not None else "peak unknown"
-            end = f"{facts['end_mb']} MB at the end" if facts["end_mb"] is not None else ""
+            peak = f"peak {facts['peak_mb']} MB" if facts["peak_mb"] is not None else "peak unknown"
+            end = f", {facts['end_mb']} MB at the end" if facts["end_mb"] is not None else ""
             write(
-                f"  {worker}: {facts['tests']} tests, {facts['cpu_s']:.1f} s CPU, {peak}"
-                + (f", {end}" if end else "")
+                f"  worker {worker}: {facts['tests']} test{'s' if facts['tests'] != 1 else ''}, "
+                f"{seconds(facts['cpu_s'])} CPU, {peak}{end}"
             )
-        if report.functions:
-            write("top functions by CPU charged to them:")
+        # With tracing on the table is the tracer's own cost, not the tests'.
+        if report.functions and not report.allocations:
+            write("Functions using the most CPU:")
             total = report.sampled_cpu_s + report.native_cpu_s
             for cost in report.functions[:8]:
-                seconds = cost.cpu_ns / 1e9
-                share = 100.0 * seconds / total if total else 0.0
-                where = f"in {len(cost.tests)} test(s)"
+                share = 100.0 * (cost.cpu_ns / 1e9) / total if total else 0.0
+                count = len(cost.tests)
+                where = f"in {count} test{'s' if count != 1 else ''}"
                 if cost.gap_cpu_ns:
                     where = f"{where} and between tests" if cost.tests else "between tests"
                 write(
-                    f"  {share:5.1f}%  {seconds:7.2f} s  {Path(cost.file).name}:{cost.function}"
+                    f"  {share:5.1f}%  {cost.cpu_ns / 1e9:6.2f} s  {cost.function}  {Path(cost.file).name}"
                     f"  [{cost.owner}]  {where}"
                 )
         findings = list(self.profile_incidents)
         if not findings:
-            write("no findings: nothing crossed the thresholds")
+            write("No findings: nothing crossed the thresholds.")
             return
-        write(f"{len(findings)} finding(s):")
+        write(f"{len(findings)} finding{'s' if len(findings) != 1 else ''}:")
         for incident in findings:
             write("")
             write(str(incident))

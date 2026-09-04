@@ -450,7 +450,7 @@ class Sampler:
         #: it was seen on - see LATE_TICK_FACTOR. The stamp is what keeps a
         #: thread that idled for a minute from having its next work charged
         #: to whatever it was doing a minute ago.
-        self._previous: dict[int, tuple[int, str, StackKey]] = {}
+        self._previous: dict[int, tuple[int, str, StackKey, Any]] = {}
         #: When the background window was set aside for a test, so the time
         #: the test took is not also counted as the background's.
         self._paused: Optional[tuple[float, float]] = None
@@ -582,6 +582,17 @@ class Sampler:
             self._last_heap = heap
 
     def end_test(self, nodeid: str) -> None:
+        # One last sample for this test, taken on the test's own thread. A
+        # native call that held the GIL for seconds kept the sampler off the
+        # CPU, and by the time it runs again the next test has started: the
+        # CPU would land in that test's record, under whatever it was doing.
+        # Sampled here, it lands in this record under the stack the thread
+        # was last seen in, which is the call that held the GIL.
+        if self._thread.is_alive() and self._window.nodeid == nodeid:
+            try:
+                self._sample(boundary=True)
+            except Exception:  # noqa: BLE001 - a lost sample beats a lost record
+                pass
         with self._lock:
             window = self._window
             if window.nodeid != nodeid:
@@ -613,7 +624,11 @@ class Sampler:
         tids.update(self._all_tids)
         return tids
 
-    def _sample(self) -> None:
+    def _sample(self, boundary: bool = False) -> None:
+        """One tick. ``boundary`` is the extra sample end_test takes on the
+        test's thread: whatever CPU has accrued since the last tick belongs
+        to the stack the thread was last seen in, not to the test runner's
+        frames that happen to be there now."""
         now = time.monotonic()
         wall_ns = int((now - self._last_tick) * 1e9)
         self._last_tick = now
@@ -633,7 +648,7 @@ class Sampler:
             self._all_tids = self.clock.discover()
         clocks = self.clock.read(self._tids_to_read())
 
-        late = wall_ns > LATE_TICK_FACTOR * self.interval * 1e9
+        late = boundary or wall_ns > LATE_TICK_FACTOR * self.interval * 1e9
         process_cpu = time.process_time_ns()
         process_delta = max(0, process_cpu - self._last_process_cpu)
         self._last_process_cpu = process_cpu
@@ -657,7 +672,7 @@ class Sampler:
             seen_tids.add(self._threads.get(self._own_ident or 0, (0, ""))[0])
             #: What each busy thread was in before this tick overwrote it,
             #: for the memory charge below.
-            prior: dict[int, Optional[tuple[int, str, StackKey]]] = {}
+            prior: dict[int, Optional[tuple[int, str, StackKey, Any]]] = {}
             for ident, frame in frames.items():
                 if ident == self._own_ident:
                     continue
@@ -677,9 +692,13 @@ class Sampler:
                 if not stack:
                     continue
                 previous = prior[ident] = self._previous.get(ident)
-                self._previous[ident] = (self._ticks, name, stack)
-                if late and previous is not None and previous[0] == self._ticks - 1:
-                    _, name, stack = previous
+                self._previous[ident] = (self._ticks, name, stack, window)
+                # Only from the tick before, and only within the same window:
+                # a late tick that straddles the end of one test and the start
+                # of the next would otherwise charge the first test's tail to
+                # the second, under the first test's stack.
+                if late and previous is not None and previous[0] == self._ticks - 1 and previous[3] is window:
+                    _, name, stack, _ = previous
                 background = window.test_thread is not None and ident != window.test_thread
                 entry = window.stacks[(phase, name, background, stack)]
                 entry[0] += cpu_ns

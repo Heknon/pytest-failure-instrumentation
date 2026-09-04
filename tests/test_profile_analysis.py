@@ -212,7 +212,7 @@ class TestBetweenTests:
         assert finding.tests == ["t::a"]
         assert finding.test_count == 1
         assert not any("background on" in nodeid for nodeid in finding.tests)
-        assert any("across 1 test(s) and between tests" in line for line in finding.evidence)
+        assert any("Seen in 1 test: t::a, and between tests." in line for line in finding.evidence)
         (cost,) = report.functions
         assert cost.gap_cpu_ns == int(1.0 * 1e9)
         assert list(cost.tests) == ["t::a"]
@@ -224,7 +224,7 @@ class TestBetweenTests:
         (finding,) = findings_of(report, "PYTHON_CODE")
         assert finding.tests == []
         assert finding.test_count == 0
-        assert any("between tests, with none in flight" in line for line in finding.evidence)
+        assert any("Seen only between tests, with no test running." in line for line in finding.evidence)
 
 
 class TestGarbageCollection:
@@ -261,7 +261,7 @@ class TestRetained:
         (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
         assert finding.delta_mb == 160
         assert finding.phase == "call"
-        assert any("+160 MB more in use" in line for line in finding.evidence)
+        assert any(line.startswith("Measured: process") and "Live heap +160 MB" in line for line in finding.evidence)
 
     def test_memory_kept_by_a_fixture_names_setup(self) -> None:
         report = analyse(
@@ -272,7 +272,7 @@ class TestRetained:
 
         (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
         assert finding.phase == "setup"
-        assert any("fixture" in line for line in finding.evidence)
+        assert any("during setup, so a fixture allocated it" in line for line in finding.evidence)
 
     def test_memory_kept_but_freed_is_the_allocator_not_a_leak(self) -> None:
         report = analyse(
@@ -320,8 +320,8 @@ class TestPeak:
         assert finding.climb_total_mb == 320
         assert finding.stack[0].startswith(f'  File "{PRODUCT}", line 14')
         expected = (
-            "300 MB of the 320 MB climb happened under imaging.py:14 in load_everything "
-            "(product), called from test_screens.py:30 in test_export"
+            "300 MB of the 320 MB increase happened while load_everything (imaging.py:14) "
+            "was running, called from test_export (test_screens.py:30)."
         )
         assert any(expected in line for line in finding.evidence)
 
@@ -338,7 +338,7 @@ class TestPeak:
         assert finding.stack == []
         assert finding.climb_mb == 0
         assert finding.climb_total_mb == 300
-        assert any("300 MB of the 300 MB climb" in line and "anybody's code" in line for line in finding.evidence)
+        assert any("300 MB of the increase could not be attributed to any code." == line for line in finding.evidence)
 
     def test_a_climb_under_the_runtime_falls_back_to_the_stack_a_tick_earlier(self) -> None:
         frames = [
@@ -388,7 +388,8 @@ class TestPeak:
 
         (finding,) = report.findings
         assert finding.verdict == "PEAK_OVER_CEILING"
-        assert any("4100 MB of it was still there" in line for line in finding.evidence)
+        assert any("4100 MB of it was still in use after the test." == line for line in finding.evidence)
+        assert finding.ceiling_mb == 4000
 
     def test_memory_kept_in_pages_an_earlier_test_freed_is_still_retained(self) -> None:
         # Resident memory grew 60 MB; the live heap grew 150 MB. The test
@@ -401,7 +402,7 @@ class TestPeak:
 
         (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
         assert finding.delta_mb == 150
-        assert "understates" in finding.evidence[0]
+        assert any("lower than the live-heap figure" in line for line in finding.evidence)
 
 
 class TestGrowth:
@@ -417,7 +418,7 @@ class TestGrowth:
         assert finding.growth_tests == 6
         assert finding.delta_mb == 180
         assert finding.growth_per_test_mb == 30.0
-        assert any("parametrisation of t::leaks" in line for line in finding.evidence)
+        assert any("All of them are cases of t::leaks." == line for line in finding.evidence)
         # None of the steps was a finding of its own.
         assert not findings_of(report, "RETAINED_AFTER_TEST")
 
@@ -573,11 +574,13 @@ class TestAllocatorRetention:
         assert finding.before_mb == 100 and finding.after_mb == 280
         assert finding.arenas == 9 and finding.threads == 12 and finding.cpus == 4
         assert finding.allocator_free_mb == 180
-        assert any("up 180 MB over 6 tests, with only 0 MB more in use" in line for line in finding.evidence)
         assert any(
-            "9 malloc arenas for up to 12 threads on 4 cores" in line and "MALLOC_ARENA_MAX=2" in line
+            "Measured: process 100 MB at the start, 280 MB at the end, up 180 MB over 6 tests with 0 MB of that in use."
+            == line
             for line in finding.evidence
         )
+        assert any("9 arenas existed for up to 12 threads on 4 cores" in line for line in finding.evidence)
+        assert any("MALLOC_ARENA_MAX limits how many thread arenas exist" in line for line in finding.evidence)
         assert not any("malloc_trim" in line for line in finding.evidence)
 
     def test_free_memory_in_the_main_arena_names_a_trim_instead(self) -> None:
@@ -585,8 +588,8 @@ class TestAllocatorRetention:
 
         (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
         assert finding.trim_mb == 40
-        assert any("MALLOC_ARENA_MAX would not help" in line and "40 MB right now" in line for line in finding.evidence)
-        assert not any("Set MALLOC_ARENA_MAX" in line for line in finding.evidence)
+        assert any("MALLOC_ARENA_MAX does not affect" in line and "currently 40 MB" in line for line in finding.evidence)
+        assert not any("limits how many thread arenas" in line for line in finding.evidence)
 
     def test_growth_that_is_in_use_is_not_the_allocators(self) -> None:
         rows = self.churn()
@@ -617,7 +620,7 @@ class TestAllocatorRetention:
         (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
         assert finding.worker == "gw0"
         assert finding.worker_rss == {"gw0": 180, "gw1": 150}
-        assert any("the same on gw1 (150 MB)" in line for line in finding.evidence)
+        assert any("The same on gw1 (150 MB)." == line for line in finding.evidence)
 
     def test_a_test_that_left_a_step_of_it_at_once_is_folded_into_the_workers_finding(self) -> None:
         rows = self.churn()
@@ -631,7 +634,7 @@ class TestAllocatorRetention:
 
         assert not findings_of(report, "HEAP_NOT_RETURNED")
         (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
-        assert any("its biggest steps: t::churn[2] (120 MB on gw0)" in line for line in finding.evidence)
+        assert any("Biggest single steps: t::churn[2] (120 MB on gw0)." == line for line in finding.evidence)
 
     def test_a_traced_run_is_not_judged_on_its_allocator(self) -> None:
         rows = self.churn()
@@ -684,8 +687,9 @@ class TestBursts:
         assert finding.frame is not None and finding.frame.function == "build_index"
         assert finding.frame.owner == "product"
         assert finding.stack[0].startswith(f'  File "{PRODUCT}", line 31')
-        assert any("starting 0.5 s into the test" in line for line in finding.evidence)
-        assert any("is waiting" in line for line in finding.evidence)
+        assert any("was waiting." in line for line in finding.evidence)
+        assert any(line.startswith("Running build_index (imaging.py:31)") for line in finding.evidence)
+        assert any(line == "Look at: imaging.py:31" for line in finding.evidence)
 
     def test_a_burst_shorter_than_the_threshold_is_not_a_finding(self) -> None:
         entry = record("t::index", [stack([0, 1], 1.0)], self.frames, cpu_s=1.0)
@@ -719,7 +723,7 @@ class TestBursts:
         assert finding.frame is not None and finding.frame.function == "Session.__init__"
         assert finding.cpu_seconds == 2.0
         assert finding.burst_seconds == 0.4
-        assert any("fixture" in line for line in finding.evidence)
+        assert any("It ran during setup of each of those tests." in line for line in finding.evidence)
         assert len(finding.tests) == 3
 
     def test_four_tests_bursting_is_not_yet_recurring(self) -> None:
@@ -757,7 +761,7 @@ class TestBursts:
         (finding,) = bursts_of(report)
         assert finding.verdict == "BACKGROUND_BURST"
         assert finding.nodeid is None
-        assert any("between tests" in line for line in finding.evidence)
+        assert any("This thread is not the one running tests." in line for line in finding.evidence)
 
     def test_a_pinned_machine_and_starved_workers_is_contended(self) -> None:
         records = []
@@ -774,7 +778,7 @@ class TestBursts:
         assert finding.cores == 0.2
         assert finding.machine_busy_percent == 100.0
         assert finding.cpus == 4
-        assert any("over 90% busy for 100%" in line for line in finding.evidence)
+        assert any(line.startswith("1 worker on 4 cores, so the load was not only this run's workers.") for line in finding.evidence)
 
     def test_a_machine_busy_for_a_moment_is_not_contended(self) -> None:
         entry = record("t::a", [stack([1], 0.6)], self.frames, cpu_s=0.6)
@@ -790,7 +794,7 @@ class TestBursts:
 
         (finding,) = [finding for finding in bursts_of(report) if finding.verdict == "LONG_BURST"]
         assert finding.machine_busy_percent == 98.0
-        assert any("pinned" in line for line in finding.evidence)
+        assert any("The machine was saturated, so this took longer than its CPU time." in line for line in finding.evidence)
 
     def test_one_quiet_window_does_not_end_a_burst_but_two_do(self) -> None:
         entry = record("t::index", [stack([0, 1], 2.5)], self.frames, cpu_s=2.6)
@@ -842,7 +846,7 @@ class TestDrift:
         (finding,) = findings_of(report, "STEADY_GROWTH")
         assert finding.delta_mb == 150
         assert finding.growth_objects_per_test == 300
-        assert any(line.startswith("most of it in: t::cached (120 MB over 6 tests), t::noisy (30 MB over 3 tests)") for line in finding.evidence)
+        assert any(line.startswith("Most of it during: t::cached (120 MB over 6 tests), t::noisy (30 MB over 3 tests)") for line in finding.evidence)
         assert any("--failure-profile-allocations" in line for line in finding.evidence)
 
     def test_drift_with_tracing_on_names_the_lines_holding_it(self) -> None:
@@ -857,7 +861,7 @@ class TestDrift:
 
         (finding,) = findings_of(report, "STEADY_GROWTH")
         assert any(
-            line == "held at the end of the worker: 176.5 MB allocated at encoder.py:5 <- imaging.py:9 <- test_screens.py:30"
+            line == "Held at the end of the worker: 176.5 MB allocated at encoder.py:5, called from imaging.py:9, test_screens.py:30."
             for line in finding.evidence
         )
         assert finding.frame is not None
@@ -876,7 +880,7 @@ class TestAllocationTracing:
 
         (finding,) = findings_of(report, "TRANSIENT_PEAK")
         assert any(
-            line == "at the peak: 300.5 MB allocated at encoder.py:5 <- imaging.py:12 <- test_screens.py:30"
+            line == "Held at the peak: 300.5 MB allocated at encoder.py:5, called from imaging.py:12, test_screens.py:30."
             for line in finding.evidence
         )
         assert finding.frame is not None and finding.frame.owner == "product"
@@ -889,7 +893,7 @@ class TestAllocationTracing:
 
         (finding,) = findings_of(report, "TRANSIENT_PEAK")
         assert finding.frame is not None and finding.frame.function == "load_everything"
-        assert any(line.startswith("at the peak:") for line in finding.evidence)
+        assert any(line.startswith("Held at the peak:") for line in finding.evidence)
 
     def test_traced_figures_replace_the_resident_ones(self) -> None:
         # Resident memory says 300 MB kept; the tracer says the test freed
@@ -901,7 +905,7 @@ class TestAllocationTracing:
         (finding,) = report.findings
         assert finding.verdict == "TRANSIENT_PEAK"
         assert finding.peak_mb == 210 and finding.delta_mb == 210
-        assert any("figures are from tracemalloc" in line and "250 MB" in line for line in finding.evidence)
+        assert any("Figures are from tracemalloc" in line and "250 MB" in line for line in finding.evidence)
 
     def test_traced_memory_kept_is_in_use_by_definition(self) -> None:
         entry = record("t::a", [], self.frames, rss=(100, 400, 400), heap=(0, 0))
@@ -911,7 +915,7 @@ class TestAllocationTracing:
 
         (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
         assert finding.delta_mb == 150
-        assert any(line.startswith("still held afterwards: 149.0 MB allocated at encoder.py:5") for line in finding.evidence)
+        assert any(line.startswith("Still held after the test: 149.0 MB allocated at encoder.py:5") for line in finding.evidence)
         assert not findings_of(report, "HEAP_NOT_RETURNED")
 
     def test_memory_speedscope_is_the_allocations_at_the_peak_in_bytes(self) -> None:

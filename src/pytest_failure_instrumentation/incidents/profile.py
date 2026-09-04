@@ -27,6 +27,38 @@ from ..profile.analysis import Finding
 from .base import Frame, Incident
 
 
+def _pct(value: float) -> str:
+    if value >= 10:
+        return f"{value:.0f}%"
+    return f"{value:.1f}%".replace(".0%", "%")
+
+
+def _named(frame: Optional[Frame]) -> str:
+    if frame is None:
+        return ""
+    return f"{frame.function} ({Path(frame.file).name}:{frame.line})"
+
+
+def _render(incident: Incident, headline: str) -> str:
+    """A profile finding as text: what happened in words, tagged for grep,
+    then the evidence lines. Nothing here is a failure, so there is no
+    severity on the line; and the location is in the headline or the first
+    evidence line rather than a line of its own."""
+    lines = [f"{headline}   [{incident.kind} {incident.verdict}, {incident.owner}]"]
+    if incident.blamed_frame is None and incident.suspect_owner:
+        lines.append(
+            "No code location was captured; the owner is taken from the test's file, "
+            f"{incident.suspect_basis} ({incident.suspect_owner})."
+        )
+    lines.extend(incident.evidence)
+    return "\n    ".join(lines)
+
+
+def _on(worker: Optional[str]) -> str:
+    """The worker, when there is more than one to tell apart."""
+    return f" on {worker}" if worker and worker != "main" else ""
+
+
 class HotLine(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -72,7 +104,23 @@ class CpuHotspotIncident(Incident):
         return self.tests[0] if self.tests else None
 
     def suspect_basis_for(self, path: str) -> str:
-        return f"owner of the test it cost most in ({path})"
+        return path
+
+    def headline(self) -> str:
+        cost = f"{_pct(self.share_percent)} of this run's CPU, {self.cpu_seconds:.1f} s"
+        if self.verdict == "GC_PRESSURE":
+            return f"Garbage collection used {cost}"
+        if self.verdict == "NATIVE_THREADS":
+            return f"CPU in threads with no Python stack: {cost}"
+        where = f", in {_named(self.blamed_frame)}" if self.blamed_frame is not None else ""
+        if self.verdict == "BACKGROUND_THREAD":
+            return f"CPU on a background thread: {self.thread!r} used {cost}{where}"
+        if self.blamed_frame is not None:
+            return f"CPU hotspot: {_named(self.blamed_frame)} used {cost}"
+        return f"CPU hotspot: {cost}"
+
+    def __str__(self) -> str:
+        return _render(self, self.headline())
 
     def owner_when_unattributable(self) -> Optional[str]:
         # The collector and a native thread pool belong to no frame; what
@@ -82,20 +130,6 @@ class CpuHotspotIncident(Incident):
 
     def fingerprint_parts(self) -> list[str]:
         return [self.kind, self.verdict]
-
-    def details(self) -> list[str]:
-        lines = []
-        if self.blamed_frame is not None:
-            where = f"{self.share_percent:g}% of the run's CPU, {self.cpu_seconds:.1f} s"
-            if self.thread and self.verdict == "BACKGROUND_THREAD":
-                where += f", on thread {self.thread!r}"
-            lines.append(where)
-        if self.below is not None:
-            # No line: what is under a call is a module and a function, and
-            # the line moves with every sample.
-            where = Path(self.below.file).name
-            lines.append(f"below {where} in {self.below.function} ({self.below.owner})")
-        return lines
 
 
 class CpuBurstIncident(Incident):
@@ -140,7 +174,34 @@ class CpuBurstIncident(Incident):
         return self.nodeid or (self.tests[0] if self.tests else None)
 
     def suspect_basis_for(self, path: str) -> str:
-        return f"owner of the test the burst was in ({path})"
+        return path
+
+    def headline(self) -> str:
+        during = f", during {self.phase}" if self.phase else ""
+        if self.verdict == "RECURRING_BURST":
+            rate = "full CPU" if self.cores >= 0.9 else f"{self.cores:.1f} cores"
+            return (
+                f"Repeated CPU burst: {_named(self.blamed_frame) or 'the same code'} ran at {rate} "
+                f"for about {self.burst_seconds:.1f} s in each of {self.test_count} tests{during}"
+            )
+        if self.verdict == "CONTENDED":
+            return (
+                f"Machine saturated: over 90% busy for {self.machine_busy_percent:g}% of this run "
+                f"({self.burst_seconds:g} s), and each worker got {self.cores:.1f} cores while it was"
+            )
+        if self.verdict == "BACKGROUND_BURST":
+            when = f"while {self.nodeid} was running" if self.nodeid else "between tests"
+            return (
+                f"CPU burst on a background thread: {self.thread!r} ran at {self.cores:.1f} cores "
+                f"for {self.burst_seconds:.1f} s {when}{_on(self.worker)}"
+            )
+        return (
+            f"CPU burst: {self.nodeid} ran at {self.cores:.1f} cores for {self.burst_seconds:.1f} s, "
+            f"starting {self.started_s:.1f} s into the test{during}{_on(self.worker)}"
+        )
+
+    def __str__(self) -> str:
+        return _render(self, self.headline())
 
     def owner_when_unattributable(self) -> Optional[str]:
         # The machine being full is nobody's frame and nobody's test.
@@ -153,29 +214,6 @@ class CpuBurstIncident(Incident):
         if self.verdict == "RECURRING_BURST":
             return [self.kind, self.verdict]
         return [self.kind, self.verdict, (self.nodeid or "").split("[")[0]]
-
-    def details(self) -> list[str]:
-        lines = []
-        if self.nodeid:
-            lines.append(f"test {self.nodeid}" + (f"  worker={self.worker}" if self.worker else ""))
-        if self.verdict == "RECURRING_BURST":
-            lines.append(
-                f"{self.cpu_seconds:.1f} s of CPU in bursts across {self.test_count} tests, "
-                f"typically {self.burst_seconds:g} s at {self.cores:g} cores"
-                + (f" in {self.phase}" if self.phase else "")
-            )
-        elif self.verdict == "CONTENDED":
-            lines.append(
-                f"machine pinned for {self.burst_seconds:g} s, {self.cores:g} cores per worker"
-                + (f", {self.workers} workers on {self.cpus} cores" if self.cpus else "")
-            )
-        else:
-            lines.append(
-                f"{self.burst_seconds:g} s at {self.cores:g} cores, {self.started_s:g} s in"
-                + (f", in {self.phase}" if self.phase else "")
-                + (f", on thread {self.thread!r}" if self.thread and self.verdict == "BACKGROUND_BURST" else "")
-            )
-        return lines
 
 
 class MemoryGrowth(BaseModel):
@@ -217,6 +255,8 @@ class MemoryProfileIncident(Incident):
     #: Megabytes of the climb charged to that stack, out of all charged.
     climb_mb: int = 0
     climb_total_mb: int = 0
+    #: For PEAK_OVER_CEILING: the ceiling that was crossed.
+    ceiling_mb: Optional[int] = None
     #: For ALLOCATOR_RETENTION: glibc's arenas at the end of the worker, the
     #: threads they were serving, the cores they were on, the free memory
     #: the allocator keeps mapped, and what malloc_trim(0) would return.
@@ -236,7 +276,31 @@ class MemoryProfileIncident(Incident):
         return self.nodeid
 
     def suspect_basis_for(self, path: str) -> str:
-        return f"owner of the test the memory arrived in ({path})"
+        return path
+
+    def headline(self) -> str:
+        on = _on(self.worker)
+        if self.verdict == "RETAINED_AFTER_TEST":
+            return f"Memory kept after test: {self.nodeid} ended with {self.delta_mb} MB more in use than it started with{on}"
+        if self.verdict == "HEAP_NOT_RETURNED":
+            return f"Memory freed but not returned: {self.nodeid} ended with the process {self.delta_mb} MB larger, and none of it in use{on}"
+        if self.verdict == "TRANSIENT_PEAK":
+            return f"Memory peak during test: {self.nodeid} grew by {self.delta_mb} MB to {self.peak_mb} MB, then freed it{on}"
+        if self.verdict == "PEAK_OVER_CEILING":
+            ceiling = f", ceiling is {self.ceiling_mb} MB" if self.ceiling_mb else ""
+            return f"Memory over the ceiling: {self.nodeid} reached {self.peak_mb} MB{ceiling}{on}"
+        if self.verdict == "STEADY_GROWTH":
+            growth = self.growth
+            tests = f" over {growth.tests} tests, about {growth.per_test_mb:g} MB per test" if growth else ""
+            return f"Memory growing across tests: worker {self.worker} kept {self.delta_mb} MB in use{tests}"
+        if self.verdict == "WORKER_IMBALANCE":
+            return f"One worker much larger than the others: {self.worker} peaked at {self.peak_mb} MB, the median worker at {self.median_mb} MB"
+        if self.verdict == "ALLOCATOR_RETENTION":
+            return f"Memory held by the allocator: worker {self.worker} has {self.allocator_free_mb} MB that tests freed and the C allocator has not returned to the OS"
+        return f"Memory finding: {self.verdict}" + (f" for {self.nodeid}" if self.nodeid else "")
+
+    def __str__(self) -> str:
+        return _render(self, self.headline())
 
     def owner_when_unattributable(self) -> Optional[str]:
         # Memory the allocator kept is nobody's frame and nobody's test: it
@@ -249,35 +313,6 @@ class MemoryProfileIncident(Incident):
         # row - the worker is left out on purpose.
         name = (self.nodeid or "").split("[")[0]
         return [self.kind, self.verdict, name]
-
-    def details(self) -> list[str]:
-        lines = []
-        if self.nodeid and self.verdict != "STEADY_GROWTH":
-            lines.append(f"test {self.nodeid}" + (f"  worker={self.worker}" if self.worker else ""))
-        if self.verdict == "RETAINED_AFTER_TEST" and self.delta_mb is not None:
-            lines.append(f"kept {self.delta_mb} MB" + (f" in {self.phase}" if self.phase else ""))
-        elif self.verdict == "HEAP_NOT_RETURNED" and self.delta_mb is not None:
-            lines.append(f"{self.delta_mb} MB still mapped after it, none of it in use")
-        elif self.verdict == "TRANSIENT_PEAK" and self.delta_mb is not None:
-            lines.append(f"peaked {self.delta_mb} MB above where it started")
-        elif self.verdict == "PEAK_OVER_CEILING" and self.peak_mb is not None:
-            lines.append(f"reached {self.peak_mb} MB")
-        elif self.verdict == "STEADY_GROWTH" and self.growth is not None:
-            lines.append(
-                f"{self.delta_mb} MB over {self.growth.tests} tests on {self.worker}, "
-                f"{self.growth.per_test_mb:g} MB each"
-                + (f" and {self.growth.objects_per_test:,d} objects" if self.growth.objects_per_test else "")
-            )
-        elif self.verdict == "WORKER_IMBALANCE":
-            lines.append(
-                ", ".join(f"{worker} {rss} MB" for worker, rss in self.worker_rss.items())
-            )
-        elif self.verdict == "ALLOCATOR_RETENTION" and self.delta_mb is not None:
-            lines.append(
-                f"{self.delta_mb} MB freed and kept mapped on {self.worker}"
-                + (f", {self.arenas} arenas for {self.threads} threads" if self.arenas else "")
-            )
-        return lines
 
 
 def build(finding: Finding, worker: str) -> Incident:
@@ -356,6 +391,7 @@ def build(finding: Finding, worker: str) -> Incident:
         stack=list(finding.stack),
         climb_mb=finding.climb_mb,
         climb_total_mb=finding.climb_total_mb,
+        ceiling_mb=finding.ceiling_mb,
         arenas=finding.arenas,
         threads=finding.threads,
         cpus=finding.cpus,

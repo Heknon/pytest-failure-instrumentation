@@ -176,6 +176,8 @@ class Finding:
     after_mb: Optional[int] = None
     peak_mb: Optional[int] = None
     delta_mb: Optional[int] = None
+    #: For a ceiling finding: the configured ceiling it crossed.
+    ceiling_mb: Optional[int] = None
     growth_tests: int = 0
     growth_per_test_mb: float = 0.0
     worker_rss: dict[str, int] = field(default_factory=dict)
@@ -421,6 +423,53 @@ def _percent(part: float, whole: float) -> float:
     return round(100.0 * part / whole, 1) if whole > 0 else 0.0
 
 
+def _pct(value: float) -> str:
+    """A percentage a reader takes in at a glance: whole from ten up, one
+    decimal below."""
+    if value >= 10:
+        return f"{value:.0f}%"
+    return f"{value:.1f}%".replace(".0%", "%")
+
+
+def _place(frame: FrameRef) -> str:
+    return f"{Path(frame.file).name}:{frame.line}"
+
+
+def _named(frame: FrameRef) -> str:
+    return f"{frame.function} ({_place(frame)})"
+
+
+def _listed(names: list[str], total: int, limit: int = 3) -> str:
+    rest = total - min(len(names), limit)
+    return ", ".join(names[:limit]) + (f" and {rest} more" if rest > 0 else "")
+
+
+def _measured(
+    record: dict[str, Any],
+    before: int,
+    after: int,
+    traced: bool,
+    *,
+    peak: Optional[int] = None,
+    parts: Optional[list[str]] = None,
+    understated: bool = False,
+) -> str:
+    """The numbers, labelled, in one line at the end of a memory finding."""
+    figure = "traced memory" if traced else "process"
+    line = f"Measured: {figure} {before} MB before"
+    if peak is not None:
+        line += f", {peak} MB peak"
+    line += f", {after} MB after."
+    for part in parts or []:
+        line += f" {part}."
+    if understated:
+        line += (
+            " The process figure is lower than the live-heap figure because the test reused "
+            "pages an earlier test had freed."
+        )
+    return line
+
+
 def _cpu_findings(ranked: list[FunctionCost], total_ns: int, limits: Thresholds) -> list[Finding]:
     findings = []
     for cost in ranked:
@@ -433,17 +482,17 @@ def _cpu_findings(ranked: list[FunctionCost], total_ns: int, limits: Thresholds)
         below_share = 100.0 - self_share
         thread = cost.threads.most_common(1)[0][0] if cost.threads else None
         below_frame: Optional[FrameRef] = None
-        where = f"across {len(cost.tests)} test(s)"
-        if cost.gap_cpu_ns:
-            where = f"{where} and between tests" if cost.tests else "between tests, with none in flight"
-        evidence = [
-            f"{share:g}% of the run's CPU ({seconds:.1f} s) {where}, on thread {thread!r}",
+        frame = cost.representative[0] if cost.representative else None
+        hottest = [
+            (line, _percent(line_ns, cost.cpu_ns)) for line, line_ns in cost.lines.most_common(3)
         ]
+        evidence: list[str] = []
         if background >= 50.0:
             verdict = "BACKGROUND_THREAD"
             evidence.append(
-                f"{background:g}% of it is on a thread other than the one running the "
-                "test: this cost is paid whatever test is in flight"
+                "This thread is not the one running tests, so it uses this CPU whichever test "
+                "is executing."
+                + ("" if background >= 99.5 else f" {_pct(background)} of the CPU was on it.")
             )
         elif below_share >= 50.0 and cost.below:
             verdict = "LIBRARY_CALL"
@@ -451,26 +500,34 @@ def _cpu_findings(ranked: list[FunctionCost], total_ns: int, limits: Thresholds)
             function = cost.below_functions.most_common(1)[0][0]
             below_frame = FrameRef(file, 0, function, owner)
             evidence.append(
-                f"{_percent(below_ns, cost.cpu_ns):g}% of it is below "
-                f"{Path(file).name} ({owner}), mostly in {function}: the cost is in "
-                "what this function calls, not in its own lines"
+                "The time is inside calls this function makes, not in its own lines: "
+                f"{_pct(_percent(below_ns, cost.cpu_ns))} of it under {Path(file).name} ({owner}), "
+                f"mostly in {function}."
             )
         else:
             verdict = "PYTHON_CODE"
-            evidence.append(
-                f"{self_share:g}% of it is on this function's own lines: Python-level "
-                "work, or C calls made from them that leave no frame of their own"
-            )
-        hottest = [
-            (line, _percent(line_ns, cost.cpu_ns)) for line, line_ns in cost.lines.most_common(3)
-        ]
-        if hottest and verdict == "PYTHON_CODE":
-            evidence.append(
-                "hottest lines: "
-                + ", ".join(f"line {line} ({percent:g}%)" for line, percent in hottest)
-            )
+            line = "The time is in this function's own lines, not in calls it makes."
+            if hottest:
+                line += " Mostly " + ", ".join(
+                    f"line {number} ({_pct(percent)})" for number, percent in hottest
+                ) + "."
+            evidence.append(line)
         examples = [nodeid for nodeid, _ in cost.tests.most_common(3)]
-        frame = cost.representative[0] if cost.representative else None
+        if cost.tests:
+            seen = (
+                f"Seen in {len(cost.tests)} test{'s' if len(cost.tests) != 1 else ''}: "
+                + _listed(examples, len(cost.tests))
+            )
+            if cost.gap_cpu_ns:
+                seen += ", and between tests"
+        else:
+            seen = "Seen only between tests, with no test running"
+        evidence.append(seen + ".")
+        if frame is not None:
+            look = f"Look at: {_place(frame)}"
+            if verdict == "LIBRARY_CALL" and below_frame is not None:
+                look += f" and its calls into {Path(below_frame.file).name}"
+            evidence.append(look)
         findings.append(
             Finding(
                 kind="cpu_hotspot",
@@ -500,15 +557,16 @@ def _gc_finding(
         return []
     worst = sorted(by_test.items(), key=lambda item: -item[1])[:3]
     evidence = [
-        f"the garbage collector took {gc_seconds:.1f} s, {share:g}% of the run's CPU",
-        "collections are triggered by allocation volume: a test building millions of "
-        "small objects pays for full passes over everything the process holds",
+        "Collections run in proportion to how many objects are allocated. The time is "
+        "counted on whichever test was running.",
     ]
     if worst:
         evidence.append(
-            "most of it in: "
+            "Most of it during: "
             + ", ".join(f"{nodeid} ({seconds:.1f} s)" for nodeid, seconds in worst)
+            + "."
         )
+        evidence.append(f"Look at: what {worst[0][0]} allocates.")
     return [
         Finding(
             kind="cpu_hotspot",
@@ -537,10 +595,10 @@ def _native_finding(
             kind="cpu_hotspot",
             verdict="NATIVE_THREADS",
             evidence=[
-                f"{share:g}% of the run's CPU ({seconds:.1f} s) was burnt by threads "
-                "Python has no stack for - a thread pool started by a C extension, "
-                "or a runtime of its own",
-                f"by kernel thread name: {names}",
+                "These threads were started by native code, so there is no Python line to "
+                "attribute them to.",
+                f"By kernel thread name: {names}.",
+                "Look at: which extension modules start threads with these names.",
             ],
             cpu_seconds=round(seconds, 3),
             share_percent=share,
@@ -594,22 +652,22 @@ def _climb(
         charged[key] += megabytes
         if key not in heaviest or megabytes > heaviest[key][0]:
             heaviest[key] = (megabytes, frames[blamed_at:])
-    too_quick = (
-        f"{unplaced} MB of the {total} MB climb happened between two readings, or under "
-        "the runtime alone, and could not be placed under anybody's code"
-    )
+    too_quick = f"{unplaced} MB of the increase could not be attributed to any code."
     if not charged:
         return None, [], 0, total, [too_quick] if unplaced else []
     key, megabytes = max(charged.items(), key=lambda item: item[1])
     stack = heaviest[key][1]
     frame = stack[0]
-    evidence = [
-        f"{megabytes} MB of the {total} MB climb happened under "
-        f"{Path(frame.file).name}:{frame.line} in {frame.function} ({frame.owner})"
-    ]
+    amount = (
+        f"All of the {total} MB increase"
+        if megabytes == total
+        else f"{megabytes} MB of the {total} MB increase"
+    )
+    line = f"{amount} happened while {_named(frame)} was running"
     caller = _caller(stack)
     if caller is not None:
-        evidence[0] += f", called from {Path(caller.file).name}:{caller.line} in {caller.function}"
+        line += f", called from {_named(caller)}"
+    evidence = [line + "."]
     if unplaced:
         evidence.append(too_quick)
     return frame, _faulthandler_lines(stack), megabytes, total, evidence
@@ -640,7 +698,6 @@ def _memory_findings(
             before, after, peak, traced = _figures(record)
             retained = _kept(record)
             traced_note = _traced_note(record) if traced else []
-            figure = "traced memory" if traced else "resident memory"
             # A test is raised for the ceiling when it climbed to get there. A
             # worker already over it from what earlier tests kept is every
             # later test's problem, and the growth finding names the cause;
@@ -651,35 +708,32 @@ def _memory_findings(
                 and peak - before >= limits.retained_mb // 2
             )
             if over_ceiling:
-                frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
-                frame, stack, held = _holders(record, "holders_peak", "at the peak", attributor, frame, stack)
+                frame, stack, climb, climb_total, evidence = _climb(record, attributor)
+                frame, stack, held = _holders(record, "holders_peak", "Held at the peak", attributor, frame, stack)
+                evidence.extend(held)
+                if retained >= limits.retained_mb:
+                    evidence.append(f"{retained} MB of it was still in use after the test.")
+                else:
+                    evidence.append("The memory was released before the test ended.")
+                if frame is not None:
+                    evidence.append(f"Look at: {_place(frame)}")
+                evidence.append(
+                    _measured(record, before, after, traced, peak=peak)
+                    + " Ceiling from failure_profile_peak_mb."
+                )
+                evidence.extend(traced_note)
                 findings.append(
                     Finding(
                         kind="memory_profile",
                         verdict="PEAK_OVER_CEILING",
-                        evidence=[
-                            f"{figure} reached {peak} MB during the test, over the "
-                            f"{limits.peak_mb} MB ceiling; it started at {before} MB and "
-                            f"ended at {after} MB",
-                            "the size is the finding whatever happened to it afterwards: "
-                            "a worker that reaches this once needs the machine to have "
-                            "it, and a run with several of them is an OOM kill waiting "
-                            "for the right schedule",
-                        ]
-                        + traced_note
-                        + climb_evidence
-                        + held
-                        + (
-                            [f"and {retained} MB of it was still there once the test was over"]
-                            if retained >= limits.retained_mb
-                            else []
-                        ),
+                        evidence=evidence,
                         nodeid=record["nodeid"],
                         worker=worker,
                         before_mb=before,
                         after_mb=after,
                         peak_mb=peak,
                         delta_mb=peak - before,
+                        ceiling_mb=limits.peak_mb,
                         frame=frame,
                         stack=stack,
                         climb_mb=climb,
@@ -688,35 +742,29 @@ def _memory_findings(
                 )
             elif retained >= limits.retained_mb:
                 phase = _phase_of_step(record.get("rss_at") or {}, limits.retained_mb)
-                evidence = [
-                    f"{figure} {before} MB before, {after} MB after: "
-                    f"{after - before} MB kept once the test was over",
-                ]
-                if retained > after - before:
-                    evidence[0] = (
-                        f"resident memory {before} MB before, {after} MB after, but the "
-                        f"live heap grew {retained} MB: the test filled pages an earlier "
-                        "test had freed, so the resident figure understates what it kept"
-                    )
-                evidence.extend(traced_note)
-                live, live_evidence = _still_in_use(record, retained)
-                evidence.extend(live_evidence)
-                frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
-                evidence.extend(climb_evidence)
-                frame, stack, held = _holders(record, "holders_kept", "still held afterwards", attributor, frame, stack)
+                live, live_parts = _still_in_use(record, retained)
+                frame, stack, climb, climb_total, evidence = _climb(record, attributor)
+                frame, stack, held = _holders(record, "holders_kept", "Still held after the test", attributor, frame, stack)
                 evidence.extend(held)
+                measured = _measured(
+                    record, before, after, traced, parts=live_parts, understated=retained > after - before
+                )
                 if live is False:
                     findings.append(
                         Finding(
                             kind="memory_profile",
                             verdict="HEAP_NOT_RETURNED",
-                            evidence=evidence
+                            evidence=[
+                                "The objects were freed. The C allocator kept the pages mapped, "
+                                "which is normal allocator behaviour."
+                            ]
+                            + evidence
                             + [
-                                "freed, but the allocator kept the pages mapped: fragmentation "
-                                "rather than a leak. Later allocations reuse it; what it costs "
-                                "is the worker's footprint, and the fix is isolating the test "
-                                "that needs it rather than hunting a leak"
-                            ],
+                                "Look at: nothing in Python holds this. See ALLOCATOR_RETENTION if "
+                                "the whole worker grows this way.",
+                                measured,
+                            ]
+                            + traced_note,
                             nodeid=record["nodeid"],
                             worker=worker,
                             phase=phase,
@@ -733,16 +781,29 @@ def _memory_findings(
                     continue
                 if phase == "setup":
                     evidence.append(
-                        "the step happened during setup, so a fixture built it - a "
-                        "session or module fixture keeps it for the rest of the run"
+                        "The increase happened during setup, so a fixture allocated it, and it "
+                        "was still in use after teardown."
                     )
                 elif phase == "call":
                     evidence.append(
-                        "the step happened in the test's own body and survived teardown: "
-                        "a cache, a module-level list, or a leak"
+                        "The increase happened during the test body and was still in use after "
+                        "teardown."
                     )
                 elif phase:
-                    evidence.append(f"the step happened during {phase}")
+                    evidence.append(
+                        f"The increase happened during {phase} and was still in use afterwards."
+                    )
+                else:
+                    evidence.append("It was still in use after teardown.")
+                if frame is not None:
+                    evidence.append(f"Look at: {_place(frame)} and what holds its result after the test.")
+                elif not traced:
+                    evidence.append(
+                        "Look at: rerun with --failure-profile-allocations to see which lines "
+                        "hold the memory."
+                    )
+                evidence.append(measured)
+                evidence.extend(traced_note)
                 findings.append(
                     Finding(
                         kind="memory_profile",
@@ -762,22 +823,23 @@ def _memory_findings(
                     )
                 )
             elif peak - max(before, after) >= limits.retained_mb:
-                frame, stack, climb, climb_total, climb_evidence = _climb(record, attributor)
-                frame, stack, held = _holders(record, "holders_peak", "at the peak", attributor, frame, stack)
+                frame, stack, climb, climb_total, evidence = _climb(record, attributor)
+                frame, stack, held = _holders(record, "holders_peak", "Held at the peak", attributor, frame, stack)
+                evidence.extend(held)
+                evidence.append(
+                    "The memory was released before the test ended. This is the amount a worker "
+                    "needs to have free to run this test."
+                )
+                if frame is not None:
+                    evidence.append(f"Look at: {_place(frame)}")
+                evidence.append(_measured(record, before, after, traced, peak=peak))
+                evidence.extend(traced_note)
                 risen = peak - before
                 findings.append(
                     Finding(
                         kind="memory_profile",
                         verdict="TRANSIENT_PEAK",
-                        evidence=[
-                            f"{figure} climbed {risen} MB to {peak} MB during the "
-                            f"test and came back to {after} MB",
-                            "freed on return, so it costs peak memory rather than a leak: "
-                            "it is what decides how many workers fit on the machine",
-                        ]
-                        + traced_note
-                        + climb_evidence
-                        + held,
+                        evidence=evidence,
                         nodeid=record["nodeid"],
                         worker=worker,
                         before_mb=before,
@@ -809,8 +871,9 @@ def _memory_findings(
             steps.sort(key=lambda finding: -(finding.delta_mb or 0))
             whole.evidence.insert(
                 2,
-                "its biggest steps: "
-                + ", ".join(f"{step.nodeid} ({step.delta_mb} MB on {step.worker})" for step in steps[:3]),
+                "Biggest single steps: "
+                + ", ".join(f"{step.nodeid} ({step.delta_mb} MB on {step.worker})" for step in steps[:3])
+                + ".",
             )
             findings = [finding for finding in findings if finding not in steps]
         findings.extend(retention)
@@ -884,32 +947,32 @@ def _allocator_retention(
     cpus = int(last.get("cpus") or 0)
     trim = int(after.get("trim_mb") or 0)
     evidence = [
-        f"{worker} ended {last['rss_after_mb']} MB resident, up {resident} MB over {count} tests, "
-        f"with only {live} MB more in use: {free_growth} MB of the growth is memory the "
-        f"allocator was handed back and kept mapped, {free_mb} MB of it at the end",
-        "no test holds it: the memory is not in use, so a leak hunt finds nothing. It is "
-        "the allocator's to give back, and it does not",
+        "No Python object holds this memory. It is inside glibc's heaps, mapped and unused.",
+        f"{main_free} MB of the {free_mb} MB is in the main heap, {other_free} MB in thread arenas. "
+        f"{arenas} arena{'s' if arenas != 1 else ''} existed for up to {threads} threads on {cpus} cores.",
     ]
     if arenas > 1 and other_free >= free_mb / 2:
         evidence.append(
-            f"{arenas} malloc arenas for up to {threads} threads on {cpus} cores, and {other_free} MB "
-            f"of the {free_mb} MB free is in the thread arenas: glibc gives every thread that "
-            "allocates an arena of its own, up to eight per core, and each keeps what it "
-            "frees. Set MALLOC_ARENA_MAX=2 in the workers' environment"
+            "glibc keeps freed memory mapped inside each arena, and gives every thread that "
+            "allocates an arena of its own, up to eight per core. MALLOC_ARENA_MAX limits how "
+            "many thread arenas exist."
         )
     else:
         evidence.append(
-            f"{main_free} MB of the {free_mb} MB free is in the main arena, so MALLOC_ARENA_MAX "
-            "would not help: this is one heap fragmented by small survivors between the big "
-            "allocations. malloc_trim(0) after the heavy tests returns what sits above the "
-            f"last live chunk - {trim} MB right now - and MALLOC_TRIM_THRESHOLD_ makes the "
-            "allocator do that on its own"
+            "glibc keeps freed memory mapped inside each arena. Most of this is in the main "
+            f"heap, which MALLOC_ARENA_MAX does not affect; malloc_trim(0) releases the main "
+            f"heap's free tail, currently {trim} MB, and MALLOC_TRIM_THRESHOLD_ sets when glibc "
+            "does that on its own."
         )
-    others = [entry[1] for entry in found[1:]]
+    others = found[1:]
     if others:
         evidence.append(
-            "the same on " + ", ".join(f"{name} ({entry[0]} MB)" for name, entry in zip(others, found[1:]))
+            "The same on " + ", ".join(f"{entry[1]} ({entry[0]} MB)" for entry in others) + "."
         )
+    evidence.append(
+        f"Measured: process {first['rss_before_mb']} MB at the start, {last['rss_after_mb']} MB "
+        f"at the end, up {resident} MB over {count} tests with {live} MB of that in use."
+    )
     return [
         Finding(
             kind="memory_profile",
@@ -951,9 +1014,9 @@ def _figures(record: dict[str, Any]) -> tuple[int, int, int, bool]:
 def _traced_note(record: dict[str, Any]) -> list[str]:
     traced = record.get("traced") or {}
     return [
-        "figures are from tracemalloc: Python allocations only, with the tracer's own "
-        f"{int(traced.get('tracer_mb') or 0)} MB of tables left out; resident memory was "
-        f"{record.get('rss_before_mb')} MB before and {record.get('rss_after_mb')} MB after"
+        "Figures are from tracemalloc (Python allocations only, the tracer's own "
+        f"{int(traced.get('tracer_mb') or 0)} MB excluded). Process size: "
+        f"{record.get('rss_before_mb')} MB before, {record.get('rss_after_mb')} MB after."
     ]
 
 
@@ -984,11 +1047,13 @@ def _holders(
         # A comprehension and the function it is in are one line to a reader.
         places: list[str] = []
         for entry in frames:
-            place = f"{Path(entry.file).name}:{entry.line}"
+            place = _place(entry)
             if not places or places[-1] != place:
                 places.append(place)
-        where = " <- ".join(places[:4])
-        evidence.append(f"{label}: {holder.get('mb')} MB allocated at {where}")
+        line = f"{label}: {holder.get('mb')} MB allocated at {places[0]}"
+        if len(places) > 1:
+            line += ", called from " + ", ".join(places[1:4])
+        evidence.append(line + ".")
         if frame is None:
             blamed_at = _blame_index(frames)
             frame = frames[blamed_at]
@@ -1004,34 +1069,28 @@ BYTES_PER_BLOCK = 64
 
 def _still_in_use(record: dict[str, Any], retained_mb: int) -> tuple[Optional[bool], list[str]]:
     """Whether the memory a test left behind is alive, from the live-heap
-    readings, and the sentence that says so. None where nothing was read."""
+    readings, and the labelled figures that say so, for the measured line.
+    None where nothing was read."""
     if _figures(record)[3]:
-        return True, [
-            f"tracemalloc counts {retained_mb} MB more live Python allocations than before "
-            "the test: in use, not pages the allocator kept"
-        ]
+        return True, [f"Live Python allocations +{retained_mb} MB (tracemalloc)"]
     heap_before, heap_after = record.get("heap_before_mb"), record.get("heap_after_mb")
     blocks_before, blocks_after = record.get("blocks_before"), record.get("blocks_after")
-    evidence: list[str] = []
+    parts: list[str] = []
     live_mb = 0
     measured = False
     if heap_before is not None and heap_after is not None:
         measured = True
         grew = int(heap_after) - int(heap_before)
         live_mb += max(0, grew)
-        evidence.append(
-            f"the C allocator has {grew:+d} MB more in use than before the test"
-        )
+        parts.append(f"Live heap {grew:+d} MB")
     if blocks_before is not None and blocks_after is not None:
         measured = True
         grew_blocks = int(blocks_after) - int(blocks_before)
         live_mb += max(0, grew_blocks * BYTES_PER_BLOCK // 1048576)
-        evidence.append(
-            f"Python holds {grew_blocks:+,d} small-object blocks more than before"
-        )
+        parts.append(f"{grew_blocks:+,d} Python objects")
     if not measured:
-        return None, evidence
-    return live_mb >= retained_mb // 2, evidence
+        return None, parts
+    return live_mb >= retained_mb // 2, parts
 
 
 def _phase_of_step(rss_at: dict[str, Any], threshold_mb: int) -> Optional[str]:
@@ -1096,46 +1155,47 @@ def _drift(
         entry[0] += step
         entry[1] += 1
     resident = sum(_figures(record)[1] - _figures(record)[0] for record in rows)
+    traced = _figures(first)[3]
     evidence = [
-        f"{len(rows)} tests on {worker} kept {total} MB between them that is still in use: "
-        f"about {per_test:.1f} MB per test"
-        + (f" and {objects:,d} live objects" if objects else "")
-        + f", the biggest single step {biggest} MB; "
-        + ("traced memory" if _figures(first)[3] else "resident memory")
-        + f" was {_figures(first)[0]} MB before {first['nodeid']} and {_figures(last)[1]} MB "
-        f"after {last['nodeid']}"
-        + (
-            f", and these tests grew it {resident} MB in all, the other {resident - total} MB "
-            "pages the allocator kept after they freed"
-            if resident > total + 1
-            else ""
-        ),
-        "no single test crossed the threshold, so a per-test check would never flag this; "
-        f"spread over {growing} of the {len(rows)} tests, it is the shape of a leak",
+        f"No single test kept enough to be reported on its own. {growing} of the {len(rows)} "
+        "tests each ended with more in use than they started with.",
     ]
     if len(by_name) == 1:
-        evidence.append(f"every one of them is a parametrisation of {next(iter(by_name))}")
+        evidence.append(f"All of them are cases of {next(iter(by_name))}.")
     else:
         heaviest = sorted(by_name.items(), key=lambda item: -item[1][0])[:3]
         evidence.append(
-            "most of it in: "
+            "Most of it during: "
             + ", ".join(
                 f"{name} ({megabytes} MB over {count} test{'s' if count != 1 else ''})"
                 for name, (megabytes, count) in heaviest
                 if megabytes > 0
             )
+            + "."
         )
     frame: Optional[FrameRef] = None
     stack: list[str] = []
     if session is not None:
         frame, stack, held = _holders(
-            session, "holders_session", "held at the end of the worker", attributor, None, []
+            session, "holders_session", "Held at the end of the worker", attributor, None, []
         )
         evidence.extend(held)
     else:
         evidence.append(
-            "rerun these tests with --failure-profile-allocations to see the lines that hold it"
+            "Look at: rerun those tests with --failure-profile-allocations to see which lines "
+            "hold the memory."
         )
+    evidence.append(
+        f"Measured: {'traced memory' if traced else 'process'} {_figures(first)[0]} MB before the "
+        f"first of these tests, {_figures(last)[1]} MB after the last. Biggest single step {biggest} MB."
+        + (
+            f" {total} MB of the {resident} MB increase is in use; the rest was freed and kept by "
+            "the allocator."
+            if resident > total + 1
+            else ""
+        )
+        + (f" +{objects:,d} Python objects per test." if objects else "")
+    )
     return [
         Finding(
             kind="memory_profile",
@@ -1225,13 +1285,16 @@ def _imbalance(by_worker: dict[str, list[dict[str, Any]]], limits: Thresholds) -
         ),
         None,
     )
-    evidence = [
-        f"{worst_worker} peaked at {worst} MB while the median worker peaked at {typical} MB",
-        "xdist hands tests out one at a time, so the worker that happened to receive the "
-        "test or fixture that builds this is the one that holds it",
-    ]
+    evidence = []
     if diverged is not None:
-        evidence.append(f"it first stood clear of its siblings during {diverged['nodeid']}")
+        evidence.append(f"{worst_worker} first exceeded the others during {diverged['nodeid']}.")
+    evidence.append(
+        "xdist assigns tests to workers as they free up, so the worker that ran this test is "
+        "the one holding the memory."
+    )
+    if diverged is not None:
+        evidence.append(f"Look at: {diverged['nodeid']}, and the findings about it.")
+    evidence.append("Measured: " + ", ".join(f"{name} {rss} MB" for name, rss in sorted(peaks.items())) + ".")
     return [
         Finding(
             kind="memory_profile",
@@ -1371,11 +1434,11 @@ def _where(stack: list[FrameRef]) -> str:
     if not stack:
         return ""
     frame = stack[0]
-    where = f"under {Path(frame.file).name}:{frame.line} in {frame.function} ({frame.owner})"
+    where = f"Running {_named(frame)}"
     caller = _caller(stack)
     if caller is not None:
-        where += f", called from {Path(caller.file).name}:{caller.line} in {caller.function}"
-    return where
+        where += f", called from {_named(caller)}"
+    return where + "."
 
 
 def _caller(stack: list[FrameRef]) -> Optional[FrameRef]:
@@ -1398,12 +1461,9 @@ def _machine_line(burst: _Burst) -> list[str]:
     busy = burst.machine_busy_percent
     if busy is None:
         return []
-    line = f"the machine was {busy:g}% busy over the burst"
+    line = f"Machine load during the burst: {_pct(busy)}."
     if busy * 10 >= PINNED_PERMILLE:
-        line += (
-            ": pinned, so this got a slice of a core and took longer than its CPU "
-            "cost - the other workers are in the burst too"
-        )
+        line += " The machine was saturated, so this took longer than its CPU time."
     return [line]
 
 
@@ -1464,25 +1524,23 @@ def _burst_findings(
 def _long_burst(burst: _Burst, stack: list[FrameRef], record: dict[str, Any], limits: Thresholds) -> Finding:
     wall = float(record.get("wall_s") or 0.0)
     cpu = float(record.get("cpu_s") or 0.0)
-    evidence = [
-        f"{burst.seconds:.1f} s at {burst.cores:.1f} cores, starting {burst.started_s:.1f} s into "
-        f"the test, in {burst.phase or 'the test'}",
-    ]
+    evidence = [_where(stack)] if stack else []
     if cpu > 0 and wall > 0:
         share = min(100.0, _percent(burst.cpu_ns / 1e9, cpu))
         waiting = max(0.0, wall - cpu)
         if waiting >= max(1.0, burst.seconds / 3):
             evidence.append(
-                f"{share:g}% of the test's {cpu:.1f} s of CPU is in this one burst; the other "
-                f"{waiting:.1f} s of its {wall:.1f} s is waiting"
+                f"This burst is {_pct(share)} of the test's {cpu:.1f} s of CPU. The other "
+                f"{waiting:.1f} s of the test's {wall:.1f} s was waiting."
             )
         else:
             evidence.append(
-                f"{share:g}% of the test's {cpu:.1f} s of CPU is in this one burst, and the test "
-                f"is busy for most of its {wall:.1f} s: a hotspot as much as a burst"
+                f"This burst is {_pct(share)} of the test's {cpu:.1f} s of CPU, and the test was "
+                f"busy for nearly all of its {wall:.1f} s."
             )
-    evidence.extend([_where(stack)] if stack else [])
     evidence.extend(_machine_line(burst))
+    if stack:
+        evidence.append(f"Look at: {_place(stack[0])}")
     return Finding(
         kind="cpu_burst",
         verdict="LONG_BURST",
@@ -1520,25 +1578,19 @@ def _recurring_burst(
     _, stack, _ = max(group, key=lambda item: item[0].cpu_ns)
     machine = [value for burst in bursts for value in burst.machine]
     busy = round(sum(machine) / len(machine) / 10, 1) if machine else None
+    caller = _caller(stack)
     evidence = [
-        f"{len(bursts)} bursts in {len(tests)} tests, {total_cpu:.1f} s of CPU between them at "
-        f"{total_cpu / total_seconds if total_seconds else 0:.1f} cores, typically {typical:.1f} s "
-        f"each, in {phase or 'the test'}",
-        _where(stack),
+        f"{total_cpu:.1f} s of CPU in total across the {len(bursts)} bursts."
+        + (f" Called from {_named(caller)}." if caller is not None else ""),
+        "Tests: " + _listed([nodeid for nodeid, _ in tests.most_common(3)], len(tests)) + ".",
     ]
-    if phase == "setup":
-        evidence.append(
-            "in setup, so a fixture does this for every test that asks for it: what costs a "
-            "second here costs a thousand tests a quarter of an hour of a core, and the "
-            "workers pay it at the same moment when they start together"
-        )
-    elif phase == "call":
-        evidence.append(
-            "in the test bodies themselves: the same work in every one of them, the "
-            "shape of a helper doing per-call what it could do once"
-        )
     if busy is not None:
-        evidence.append(f"the machine was {busy:g}% busy over these bursts")
+        evidence.append(f"Machine load during these bursts: {_pct(busy)}.")
+    if stack:
+        look = f"Look at: {_place(stack[0])}."
+        if phase:
+            look += f" It ran during {phase} of each of those tests."
+        evidence.append(look)
     longest = max(bursts, key=lambda burst: burst.seconds)
     return Finding(
         kind="cpu_burst",
@@ -1561,15 +1613,13 @@ def _recurring_burst(
 
 def _background_burst(burst: _Burst, stack: list[FrameRef], record: dict[str, Any], count: int) -> Finding:
     evidence = [
-        f"{burst.seconds:.1f} s at {burst.cores:.1f} cores on thread {burst.thread!r}"
-        + (f" while {burst.nodeid} was running" if burst.nodeid else " between tests")
-        + (f"; {count} bursts like it on this thread" if count > 1 else ""),
-        "a thread that is not running the test: a poller, a log shipper, a client's "
-        "keepalive. Paid whatever test is in flight, which is what a worker at a steady "
-        "percentage with nothing to blame is doing",
+        (_where(stack) + " " if stack else "") + "This thread is not the one running tests."
     ]
-    evidence.extend([_where(stack)] if stack else [])
+    if count > 1:
+        evidence.append(f"{count} bursts like it on this thread.")
     evidence.extend(_machine_line(burst))
+    if stack:
+        evidence.append(f"Look at: {_place(stack[0])}")
     return Finding(
         kind="cpu_burst",
         verdict="BACKGROUND_BURST",
@@ -1624,22 +1674,15 @@ def _contention_finding(
     cores = busy_cpu_ns / (busy_ms * 1e6)
     if share < 0.5 or cores >= limits.burst_cores:
         return []
-    evidence = [
-        f"the machine was over {PINNED_PERMILLE / 10:g}% busy for {share:.0%} of the sampled "
-        f"worker time ({busy_ms / 1000:.0f} s), and a worker got {cores:.2f} cores while it was",
-        "a test's duration here is not its cost: the workers were waiting for a core as "
-        "well as for whatever they were waiting for",
-    ]
-    if cpus:
-        evidence.append(
-            f"{worker_count} worker(s) on {cpus} cores"
-            + (
-                ": more workers than cores, so they queue for them even when every "
-                "one of them is mostly waiting on I/O"
-                if worker_count > cpus
-                else "; what pinned it was not only this run's workers"
-            )
-        )
+    waiting = "Test durations include waiting for a core, so they are longer than the tests' CPU time."
+    workers = f"{worker_count} worker{'s' if worker_count != 1 else ''} on {cpus} core{'s' if cpus != 1 else ''}"
+    if cpus and worker_count > cpus:
+        evidence = [f"{workers}. {waiting}"]
+    elif cpus:
+        evidence = [f"{workers}, so the load was not only this run's workers. {waiting}"]
+    else:
+        evidence = [waiting]
+    evidence.append("Look at: the worker count, and what else was running on the machine.")
     return [
         Finding(
             kind="cpu_burst",

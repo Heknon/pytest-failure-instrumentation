@@ -214,7 +214,7 @@ class TestCpu:
         # for the plugin that takes the profile, like --callstack-port.
         result = runner.pytester.runpytest_subprocess("--failure-profile", "-p", "no:cacheprovider")
 
-        result.stdout.fnmatch_lines(["*failure-instrumentation profile*", "*no findings*"])
+        result.stdout.fnmatch_lines(["*failure-instrumentation profile*", "*No findings*"])
         assert Runner.of_kind(runner.incidents(), "run_summary")
 
 
@@ -306,7 +306,7 @@ class TestMemory:
         assert incident.owner == "product"
         assert incident.climb_mb > 0
         assert incident.raw_stack()[0].startswith('  File "')
-        assert any("climb happened under product.py" in line for line in incident.evidence)
+        assert any("increase happened while load_everything (product.py:" in line for line in incident.evidence)
 
     def test_a_run_of_small_leaks_is_growth(self, runner: Runner) -> None:
         runner.pytester.makepyfile(
@@ -326,7 +326,7 @@ class TestMemory:
         assert len(growth) == 1
         assert growth[0].growth.tests >= 5
         assert 9 <= growth[0].growth.per_test_mb <= 15
-        assert any("parametrisation of test_leak.py::test_leaks" in line for line in growth[0].evidence)
+        assert any("All of them are cases of test_leak.py::test_leaks." == line for line in growth[0].evidence)
         assert not [incident for incident in memory(incidents) if incident.verdict == "RETAINED_AFTER_TEST"]
 
     @pytest.mark.skipif(
@@ -365,7 +365,9 @@ class TestMemory:
         assert incident.arenas is not None and incident.arenas > 2
         assert incident.threads is not None and incident.threads >= 5
         assert incident.delta_mb is not None and incident.delta_mb >= 40
-        assert any("MALLOC_ARENA_MAX=2" in line for line in incident.evidence)
+        assert any("MALLOC_ARENA_MAX limits how many thread arenas exist" in line for line in incident.evidence)
+        assert str(incident).startswith("Memory held by the allocator: worker main has ")
+        assert "[memory_profile ALLOCATOR_RETENTION, runtime]" in str(incident).splitlines()[0]
         # And none of the tests is raised for memory nothing is using: a
         # step big enough to be HEAP_NOT_RETURNED alone is folded in here.
         assert not [
@@ -553,7 +555,9 @@ class TestBursts:
         assert incident.blamed_frame is not None and incident.blamed_frame.function == "churn"
         assert incident.owner == "product"
         assert incident.severity == "informational"
-        assert any("is waiting" in line for line in incident.evidence)
+        assert any("was waiting." in line for line in incident.evidence)
+        assert str(incident).startswith("CPU burst: test_index.py::test_index_is_complete ran at ")
+        assert "starting" in str(incident).splitlines()[0]
 
     def test_the_same_fixture_bursting_in_every_test_is_one_recurring_finding(self, runner: Runner) -> None:
         # A burst too short to be raised on its own, five times over.
@@ -583,7 +587,8 @@ class TestBursts:
         assert incident.phase == "setup"
         assert incident.blamed_frame is not None and incident.blamed_frame.function == "churn"
         assert incident.cpu_seconds >= 1.0
-        assert any("fixture" in line for line in incident.evidence)
+        assert any("It ran during setup of each of those tests." in line for line in incident.evidence)
+        assert str(incident).startswith("Repeated CPU burst: ")
 
 
 class TestAllocationTracing:
@@ -613,12 +618,12 @@ class TestAllocationTracing:
         by_test = {incident.nodeid: incident for incident in memory(incidents)}
         peak = by_test["test_alloc.py::test_peak"]
         assert peak.verdict == "TRANSIENT_PEAK"
-        assert any(line.startswith("at the peak:") and "test_alloc.py:6" in line for line in peak.evidence)
-        assert any("figures are from tracemalloc" in line for line in peak.evidence)
+        assert any(line.startswith("Held at the peak:") and "test_alloc.py:6" in line for line in peak.evidence)
+        assert any("Figures are from tracemalloc" in line for line in peak.evidence)
         assert peak.blamed_frame is not None and peak.blamed_frame.file.endswith("test_alloc.py")
         kept = by_test["test_alloc.py::test_keeps"]
         assert kept.verdict == "RETAINED_AFTER_TEST"
-        assert any(line.startswith("still held afterwards:") and "test_alloc.py:6" in line for line in kept.evidence)
+        assert any(line.startswith("Still held after the test:") and "test_alloc.py:6" in line for line in kept.evidence)
         profiles = sorted(path.name for path in (runner.pytester.path / ".pytest-failures").glob("run-*/profiles/*"))
         assert any(re.fullmatch(r"test_alloc\.py_test_peak-[0-9a-f]{8}\.memory\.speedscope\.json", name) for name in profiles)
         assert any(re.fullmatch(r"test_alloc\.py_test_peak-[0-9a-f]{8}\.speedscope\.json", name) for name in profiles)

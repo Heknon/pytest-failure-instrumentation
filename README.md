@@ -1499,12 +1499,11 @@ blamed on pytest. So a test that reads a file whole instead of streaming it
 comes back as:
 
 ```
-[memory_profile] PEAK_OVER_CEILING  severity=informational  owner=product
-    blamed on loader.py:14 in load_everything
-    test tests/test_loading.py::test_loads_the_export  worker=main
-    reached 1236 MB
-    · resident memory reached 1236 MB during the test, over the 1000 MB ceiling; it started at 84 MB and ended at 136 MB
-    · 1152 MB of the 1152 MB climb happened under loader.py:14 in load_everything (product), called from test_loading.py:11 in test_loads_the_export
+Memory over the ceiling: tests/test_loading.py::test_loads_the_export reached 2374 MB, ceiling is 1000 MB   [memory_profile PEAK_OVER_CEILING, product]
+    All of the 2262 MB increase happened while load_everything (loader.py:16) was running, called from test_loads_the_export (test_loading.py:11).
+    The memory was released before the test ended.
+    Look at: loader.py:16
+    Measured: process 449 MB before, 2374 MB peak, 495 MB after. Ceiling from failure_profile_peak_mb.
 ```
 
 What a test *kept* is measured as the larger of the resident step and the
@@ -1524,12 +1523,12 @@ did and the allocator's free figure accounts for the gap, the finding says
 where the free memory is:
 
 ```
-[memory_profile] ALLOCATOR_RETENTION  severity=informational  owner=runtime
-    124 MB freed and kept mapped on main, 11 arenas for 10 threads
-    · main ended 173 MB resident, up 131 MB over 6 tests, with only 7 MB more in use: 124 MB of the growth is memory the allocator was handed back and kept mapped, 125 MB of it at the end
-    · no test holds it: the memory is not in use, so a leak hunt finds nothing. It is the allocator's to give back, and it does not
-    · its biggest steps: tests/test_arenas.py::test_ingest_batch[0] (131 MB on main)
-    · 11 malloc arenas for up to 10 threads on 4 cores, and 125 MB of the 125 MB free is in the thread arenas: glibc gives every thread that allocates an arena of its own, up to eight per core, and each keeps what it frees. Set MALLOC_ARENA_MAX=2 in the workers' environment
+Memory held by the allocator: worker main has 323 MB that tests freed and the C allocator has not returned to the OS   [memory_profile ALLOCATOR_RETENTION, runtime]
+    No Python object holds this memory. It is inside glibc's heaps, mapped and unused.
+    144 MB of the 323 MB is in the main heap, 179 MB in thread arenas. 11 arenas existed for up to 8 threads on 4 cores.
+    Biggest single steps: tests/test_arenas.py::test_ingest_batch[0] (182 MB on main).
+    glibc keeps freed memory mapped inside each arena, and gives every thread that allocates an arena of its own, up to eight per core. MALLOC_ARENA_MAX limits how many thread arenas exist.
+    Measured: process 42 MB at the start, 922 MB at the end, up 880 MB over 73 tests with 466 MB of that in use.
 ```
 
 A test that left a threshold's worth of it in one step would have been
@@ -1567,20 +1566,18 @@ peak, by traceback, weighted in bytes, beside its CPU one.
 The growth finding above, rerun that way over the two modules it names:
 
 ```
-[memory_profile] STEADY_GROWTH  severity=informational  owner=customer-code
-    blamed on test_memory.py:48 in ?
-    292 MB over 48 tests on main, 6.1 MB each and 15,906 objects
-    · 48 tests on main kept 292 MB between them that is still in use: about 6.1 MB per test and 15,906 live objects, the biggest single step 24 MB; traced memory was 1 MB before tests/test_drift.py::test_response_is_cached[0] and 579 MB after tests/test_memory.py::test_leaks_a_little[6]
-    · no single test crossed the threshold, so a per-test check would never flag this; spread over 48 of the 48 tests, it is the shape of a leak
-    · most of it in: tests/test_memory.py::test_leaks_a_little (168 MB over 7 tests), tests/test_drift.py::test_response_is_cached (124 MB over 40 tests)
-    · held at the end of the worker: 190.7 MB allocated at test_memory.py:48 <- python.py:167 <- _callers.py:121 <- _manager.py:120
-    · held at the end of the worker: 145.9 MB allocated at test_memory.py:24 <- python.py:167 <- _callers.py:121 <- _manager.py:120
-    · held at the end of the worker: 122.1 MB allocated at test_drift.py:13 <- python.py:167 <- _callers.py:121 <- _manager.py:120
+Memory growing across tests: worker main kept 289 MB in use over 48 tests, about 6 MB per test   [memory_profile STEADY_GROWTH, customer-code]
+    No single test kept enough to be reported on its own. 48 of the 48 tests each ended with more in use than they started with.
+    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests).
+    Held at the end of the worker: 190.7 MB allocated at test_memory.py:48, called from python.py:167, _callers.py:121, _manager.py:120.
+    Held at the end of the worker: 145.9 MB allocated at test_memory.py:24, called from python.py:167, _callers.py:121, _manager.py:120.
+    Held at the end of the worker: 122.1 MB allocated at test_drift.py:13, called from python.py:167, _callers.py:121, _manager.py:120.
+    Measured: traced memory 1 MB before the first of these tests, 579 MB after the last. Biggest single step 24 MB. +15,685 Python objects per test.
 ```
 
-Three lines, each an `append` to something module-level, which is the
-answer. The `?` is a tracemalloc frame: it knows the file and line and not
-the function.
+Three lines, each an `append` to something module-level. A tracemalloc
+frame knows the file and line and not the function, which is why those lines
+carry no function name.
 
 Tracing costs three to six times on allocation-heavy code and far more on a
 tight loop of small objects, which is why it is a rerun and not the nightly —
@@ -1593,38 +1590,29 @@ This is what the example suite under
 [`examples/profiling`](examples/profiling) prints, trimmed:
 
 ```
-[cpu_hotspot] PYTHON_CODE  severity=informational  owner=product
-    blamed on image_compare.py:20 in is_images_different
-    12.6% of the run's CPU, 0.9 s
-    · 12.6% of the run's CPU (0.9 s) across 3 test(s), on thread 'MainThread'
-    · 100% of it is on this function's own lines: Python-level work, or C calls made from them that leave no frame of their own
-    · hottest lines: line 20 (100%)
+CPU hotspot: load_everything (loader.py:15) used 33% of this run's CPU, 9.0 s   [cpu_hotspot PYTHON_CODE, product]
+    The time is in this function's own lines, not in calls it makes. Mostly line 15 (88%), line 14 (12%).
+    Seen in 1 test: tests/test_loading.py::test_loads_the_export.
+    Look at: loader.py:15
 
-[cpu_hotspot] LIBRARY_CALL  severity=informational  owner=product
-    blamed on reports.py:22 in render_report
-    15.2% of the run's CPU, 1.0 s
-    below encoder.py in _make_iterencode.<locals>._iterencode_dict (runtime)
-    · 95.1% of it is below encoder.py (runtime), mostly in _make_iterencode.<locals>._iterencode_dict: the cost is in what this function calls, not in its own lines
+CPU on a background thread: 'status-poller' used 12% of this run's CPU, 3.4 s, in Poller._run (poller.py:33)   [cpu_hotspot BACKGROUND_THREAD, product]
+    This thread is not the one running tests, so it uses this CPU whichever test is executing.
+    Seen in 13 tests: tests/test_polling.py::test_another_with_the_poller_running, tests/test_polling.py::test_with_the_poller_running, tests/test_sessions.py::test_request_answers[0] and 10 more, and between tests.
+    Look at: poller.py:33
 
-[cpu_hotspot] BACKGROUND_THREAD  severity=informational  owner=product
-    blamed on poller.py:30 in Poller._run
-    14.7% of the run's CPU, 1.0 s, on thread 'status-poller'
-    · 100% of it is on a thread other than the one running the test: this cost is paid whatever test is in flight
+Memory kept after test: tests/test_memory.py::test_big_fixture ended with 143 MB more in use than it started with   [memory_profile RETAINED_AFTER_TEST, customer-code]
+    139 MB of the 158 MB increase happened while big_fixture (test_memory.py:30) was running, called from call_fixture_func (fixtures.py:1005).
+    19 MB of the increase could not be attributed to any code.
+    The increase happened during setup, so a fixture allocated it, and it was still in use after teardown.
+    Look at: test_memory.py:30 and what holds its result after the test.
+    Measured: process 588 MB before, 731 MB after. Live heap +143 MB. +562 Python objects.
 
-[memory_profile] RETAINED_AFTER_TEST  severity=informational  owner=unknown
-    no stack; suspect customer-code (owner of the test the memory arrived in (tests/test_memory.py))
-    test tests/test_memory.py::test_big_fixture  worker=main
-    kept 143 MB in setup
-    · the C allocator has +143 MB more in use than before the test
-    · the step happened during setup, so a fixture built it - a session or module fixture keeps it for the rest of the run
-
-[memory_profile] STEADY_GROWTH  severity=informational  owner=unknown
-    no stack; suspect customer-code (owner of the test the memory arrived in (tests/test_allocation.py))
-    289 MB over 66 tests on main, 4.4 MB each and 188 objects
-    · 66 tests on main kept 289 MB between them that is still in use: about 4.4 MB per test and 188 live objects, the biggest single step 24 MB; resident memory was 49 MB before tests/test_allocation.py::test_graph_builds and 732 MB after tests/test_sessions.py::test_request_answers[5], and these tests grew it 446 MB in all, the other 157 MB pages the allocator kept after they freed
-    · no single test crossed the threshold, so a per-test check would never flag this; spread over 62 of the 66 tests, it is the shape of a leak
-    · most of it in: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests)
-    · rerun these tests with --failure-profile-allocations to see the lines that hold it
+Memory growing across tests: worker main kept 295 MB in use over 69 tests, about 4.3 MB per test   [memory_profile STEADY_GROWTH, unknown]
+    No code location was captured; the owner is taken from the test's file, tests/test_allocation.py (customer-code).
+    No single test kept enough to be reported on its own. 68 of the 69 tests each ended with more in use than they started with.
+    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests), tests/test_arenas.py::test_ingest_batch (5 MB over 3 tests).
+    Look at: rerun those tests with --failure-profile-allocations to see which lines hold the memory.
+    Measured: process 42 MB before the first of these tests, 922 MB after the last. Biggest single step 24 MB. 295 MB of the 466 MB increase is in use; the rest was freed and kept by the allocator. +420 Python objects per test.
 ```
 
 And the I/O-bound suite under [`examples/profiling/tests/test_polling.py`](examples/profiling/tests/test_polling.py)
@@ -1632,27 +1620,36 @@ and its neighbours, where nothing is over the CPU share and the timeline is
 what finds the fixture:
 
 ```
-[cpu_burst] RECURRING_BURST  severity=informational  owner=product
-    blamed on session.py:21 in Session.__init__
-    2.1 s of CPU in bursts across 6 tests, typically 0.34 s at 1.03 cores in setup
-    · 6 bursts in 6 tests, 2.1 s of CPU between them at 1.0 cores, typically 0.3 s each, in setup
-    · under session.py:21 in Session.__init__ (product), called from test_sessions.py:13 in session
-    · in setup, so a fixture does this for every test that asks for it: what costs a second here costs a thousand tests a quarter of an hour of a core, and the workers pay it at the same moment when they start together
-    · the machine was 26.7% busy over these bursts
+Repeated CPU burst: Session.__init__ (session.py:21) ran at full CPU for about 0.7 s in each of 6 tests, during setup   [cpu_burst RECURRING_BURST, product]
+    4.3 s of CPU in total across the 6 bursts. Called from session (test_sessions.py:13).
+    Tests: tests/test_sessions.py::test_request_answers[0], tests/test_sessions.py::test_request_answers[4], tests/test_sessions.py::test_request_answers[2] and 3 more.
+    Machine load during these bursts: 26%.
+    Look at: session.py:21. It ran during setup of each of those tests.
 
-[cpu_burst] LONG_BURST  severity=informational  owner=product
-    blamed on reports.py:42 in build_index
-    test tests/test_index.py::test_index_is_complete  worker=main
-    2.95 s at 0.99 cores, 1.05 s in, in call
-    · 2.9 s at 1.0 cores, starting 1.1 s into the test, in call
-    · 96.5% of the test's 3.0 s of CPU is in this one burst; the other 1.9 s of its 5.0 s is waiting
-    · under reports.py:42 in build_index (product), called from test_index.py:13 in test_index_is_complete
-    · the machine was 25.4% busy over the burst
+CPU burst: tests/test_index.py::test_index_is_complete ran at 1.0 cores for 4.1 s, starting 1.0 s into the test, during call   [cpu_burst LONG_BURST, product]
+    Running build_index (reports.py:42), called from test_index_is_complete (test_index.py:13).
+    This burst is 94% of the test's 4.3 s of CPU. The other 1.9 s of the test's 6.2 s was waiting.
+    Machine load during the burst: 26%.
+    Look at: reports.py:42
 ```
 
 The same run prints a summary at the end of the terminal output — the run's
-CPU against its wall time, what each worker peaked at, and the top functions —
-and writes a [speedscope](https://www.speedscope.app/) flame graph for every
+CPU against its wall time, what each worker peaked at, and the top functions:
+
+```
+Profile: 73 tests, 34 s of wall time, 29 s CPU (0.87 cores on average), 2.2 s of it in garbage collection
+  worker main: 73 tests, 29 s CPU, peak 2374 MB, 922 MB at the end
+```
+
+Every finding is printed the same way: a first line that says what was
+measured, in words, ending with a `[kind VERDICT, owner]` tag to grep for;
+then lines that are each one of three things — a measurement, what that
+measurement means by how it was taken, or a place to look. Nothing in them
+guesses at a cause or a fix, because the analysis is arithmetic over samples
+and knows neither. `Look at:` is a location the tool has or a flag that gets
+more information; `Measured:` is the raw numbers, labelled.
+
+It also writes a [speedscope](https://www.speedscope.app/) flame graph for every
 test a finding names, and for the gaps between tests, under
 `<run directory>/profiles/` (`<test>-<hash>.speedscope.json` for CPU, and
 with allocation tracing on `<test>-<hash>.memory.speedscope.json` for the

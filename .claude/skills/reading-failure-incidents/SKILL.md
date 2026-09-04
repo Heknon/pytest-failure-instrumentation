@@ -1,6 +1,6 @@
 ---
 name: reading-failure-incidents
-description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable) and the profiler's findings (cpu hotspot, cpu burst, memory profile). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error], [run_summary], [stack_server_unavailable], [cpu_hotspot], [cpu_burst] or [memory_profile] appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
+description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable) and the profiler's findings (cpu hotspot, cpu burst, memory profile). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error], [run_summary] or [stack_server_unavailable] appears in CI output or a bug report, or a profile finding whose first line ends with a [cpu_hotspot ...], [cpu_burst ...] or [memory_profile ...] tag does, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
 ---
 
 # Reading a failure incident
@@ -274,6 +274,28 @@ and nothing is broken. **It is never raised because another pytest session holds
 the port** — that is the shared mode working as designed, so seeing this kind
 always means a stranger or a bad address, never a colleague.
 
+### How the profiler's findings are printed
+
+The three profiling kinds do not use the block layout above. Nothing failed,
+so there is no severity on the line and no `blamed on` line; the first line
+says what was measured in words and ends with a tag for grepping, and every
+following line is one of three things: a measurement, what that measurement
+means by construction, or a place to look. Nothing in them guesses at a cause
+or a fix, because the analysis is arithmetic over samples and knows neither.
+
+```
+CPU hotspot: load_everything (loader.py:14) used 21% of this run's CPU, 5.2 s   [cpu_hotspot PYTHON_CODE, product]
+    The time is in this function's own lines, not in calls it makes. Mostly line 14 (100%).
+    Seen in 2 tests: tests/test_loading.py::test_loads_the_export, tests/test_index.py::test_index_is_complete.
+    Look at: loader.py:14
+```
+
+The tag carries `kind`, `verdict` and `owner`. A `Look at:` line is a location
+the tool actually has, or a flag that produces more information; a `Measured:`
+line is the raw numbers, labelled. When no code location was captured, the
+second line says so and names the test file the `suspect_owner` was taken
+from.
+
 ### `cpu_hotspot` — a function that burnt a share of the run's CPU
 
 Raised only when profiling is on (`--failure-profile` or `failure_profile`), and a
@@ -401,8 +423,8 @@ or a worker with no stack to read — there is no frame and `suspect_owner` is
 the owner of the test's module instead.
 
 With `--failure-profile-allocations` the evidence also carries what tracemalloc saw:
-"at the peak: 57.2 MB allocated at loader.py:12 <- reports.py:40" (allocation
-site first) and "still held afterwards: …" for what the test kept. These name
+"Held at the peak: 57.2 MB allocated at loader.py:12, called from reports.py:40"
+(allocation site first) and "Still held after the test: …" for what the test kept. These name
 the *holder* where the sampled stack names the *runner*, and they differ
 exactly when a leak is one function's result kept by another. The figures are
 then tracemalloc's own — Python allocations only, the tracer's tables left
