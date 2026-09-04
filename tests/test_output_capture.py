@@ -299,3 +299,40 @@ def test_capture_on_is_recorded_on_the_worker_log(distributed):
         if '"output_capture"' in line
     ]
     assert statuses and all(status == "on" for status in statuses), statuses
+
+
+def test_the_tail_is_read_by_seeking_not_by_reading_the_file_in(tmp_path):
+    """The ring is trimmed between phases and never during one, so a phase
+    that logs heavily leaves a file of any size at all - and this runs on the
+    controller, once per dead worker, to keep the last few KB of it.
+
+    Reading the whole thing in to slice the end off puts a runaway test's
+    entire output through the controller's memory at the moment it is already
+    dealing with a death.
+    """
+    path = tmp_path / "gw0.output"
+    with path.open("wb") as handle:
+        for index in range(200_000):
+            handle.write(b"line %d: %s\n" % (index, b"z" * 40))
+    size = path.stat().st_size
+    assert size > 8 * 1024 * 1024, "a file far larger than the tail being asked for"
+
+    tail = read_tail(path, limit=4096)
+
+    assert tail and tail[-1] == "line 199999: " + "z" * 40
+    assert sum(len(line) + 1 for line in tail) <= 4096
+    # The seek lands mid-line, and half a line read as a whole one is a line
+    # the worker never wrote.
+    assert all(line.startswith("line ") for line in tail)
+
+
+def test_a_file_smaller_than_the_tail_keeps_its_first_line(tmp_path):
+    path = tmp_path / "gw0.output"
+    path.write_bytes(b"first\nsecond\n")
+    assert read_tail(path, limit=4096) == ["first", "second"]
+
+
+def test_a_worker_that_kept_nothing_reads_as_nothing(tmp_path):
+    assert read_tail(tmp_path / "absent.output") == []
+    (tmp_path / "empty.output").write_bytes(b"")
+    assert read_tail(tmp_path / "empty.output") == []

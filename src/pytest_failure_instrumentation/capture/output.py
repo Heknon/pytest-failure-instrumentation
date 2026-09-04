@@ -186,9 +186,23 @@ class StderrTee:
 
 
 def read_tail(path: Path, limit: int = RING_BYTES) -> list[str]:
-    """A worker's captured stderr, as lines, or empty if none was kept."""
+    """A worker's captured stderr, as lines, or empty if none was kept.
+
+    Seeks to the end rather than reading the file in: the ring is trimmed
+    between phases and never during one - see :meth:`StderrTee._trim` - so a
+    single phase that logs heavily leaves a file of any size at all, and this
+    runs on the controller, once per dead worker. A partial first line is
+    dropped when the seek landed inside one.
+    """
     try:
-        raw = path.read_bytes()[-limit:]
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            raw = handle.read()
     except OSError:
         return []
-    return raw.decode("utf-8", "replace").splitlines()
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if size > limit and lines:
+        lines = lines[1:]
+    return lines
