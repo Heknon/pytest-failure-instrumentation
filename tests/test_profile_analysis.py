@@ -9,15 +9,22 @@ produces records these rules fire on.
 
 from __future__ import annotations
 
+import sysconfig
 from typing import Any
 
 from pytest_failure_instrumentation.analysis.attribution import Attributor
 from pytest_failure_instrumentation.profile import analysis
 from pytest_failure_instrumentation.profile.analysis import Thresholds, analyse, speedscope
 
+# Taken from the interpreter rather than written down: the attributor knows
+# the stdlib by where sysconfig says it is, and a hardcoded /usr/lib path only
+# looks like the stdlib on the machine it was written on. The installed paths
+# below are recognised by their site-packages segment wherever they sit.
+STDLIB = sysconfig.get_paths()["stdlib"].replace("\\", "/")
+
 PRODUCT = "/srv/product/imaging.py"
 TEST = "/srv/tests/test_screens.py"
-LIBRARY = "/usr/lib/python3.11/json/encoder.py"
+LIBRARY = f"{STDLIB}/json/encoder.py"
 PILLOW = "/usr/lib/python3.11/site-packages/PIL/Image.py"
 RUNTIME = "/usr/lib/python3.11/site-packages/_pytest/python.py"
 
@@ -149,6 +156,46 @@ class TestBlame:
         (finding,) = report.findings
         assert finding.frame is not None and finding.frame.function == "build_graph"
         assert finding.self_share_percent == 100.0
+
+    def test_the_frame_is_on_the_hottest_line_not_the_heaviest_stack(self) -> None:
+        # Line 14 costs 6 s over three callers at 2 s each; line 20 costs 3 s
+        # from one. The heaviest single stack is on line 20, but "mostly line
+        # 14" must point the reader, and the engine's stack, at line 14.
+        frames = [
+            frame(PRODUCT, 14, "hot"),
+            frame(PRODUCT, 20, "hot"),
+            frame(TEST, 30, "test_one"),
+            frame(TEST, 40, "test_two"),
+            frame(TEST, 50, "test_three"),
+        ]
+        stacks = [stack([0, 2], 2.0), stack([0, 3], 2.0), stack([0, 4], 2.0), stack([1, 2], 3.0)]
+        report = analyse([record("t::a", stacks, frames)], attributor)
+
+        (finding,) = findings_of(report, "PYTHON_CODE")
+        assert finding.hottest_lines == [(14, 66.7), (20, 33.3)]
+        assert finding.frame is not None and finding.frame.line == 14
+        assert finding.stack[0].startswith(f'  File "{PRODUCT}", line 14 in hot')
+        assert any(line == "Look at: imaging.py:14" for line in finding.evidence)
+
+    def test_the_attributor_answers_a_path_once(self) -> None:
+        # Every frame of every record is asked about, and the answer for a
+        # path never changes, so it is worked out once per path.
+        class Counting(Attributor):
+            classified = 0
+
+            def _classify(self, path: str) -> str:
+                Counting.classified += 1
+                return super()._classify(path)
+
+        counting = Counting(("product",))
+        frames = [frame(PRODUCT, 14, "hot"), frame(TEST, 30, "test_x")]
+        records = [record(f"t::a[{case}]", [stack([0, 1], 1.0)], frames) for case in range(5)]
+        report = analyse(records, counting)
+
+        assert findings_of(report, "PYTHON_CODE")
+        assert Counting.classified == 2
+        assert counting.owner_of(PRODUCT) == "product" and counting.owner_of(TEST) == "customer-code"
+        assert Counting.classified == 2
 
 
 class TestThresholds:
@@ -289,6 +336,27 @@ class TestRetained:
 
         assert [finding.verdict for finding in report.findings] == ["RETAINED_AFTER_TEST"]
 
+    def test_a_block_count_alone_cannot_say_the_memory_was_freed(self) -> None:
+        # No heap reading - macOS, Windows - and one block more: a numpy
+        # array holding the two hundred megabytes is one block. The blocks
+        # at their rough size are a floor, and a floor under the bar says
+        # nothing, not "none of it in use".
+        report = analyse([record("t::a", [], [], rss=(100, 300, 300), blocks=(1000, 1001))], attributor)
+
+        assert not findings_of(report, "HEAP_NOT_RETURNED")
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
+        assert finding.delta_mb == 200
+        assert not any("none of it" in line for line in finding.evidence)
+        assert any("+1 Python objects" in line for line in finding.evidence)
+
+    def test_a_block_count_alone_that_clears_the_bar_says_the_memory_is_in_use(self) -> None:
+        # Two million small objects at 64 bytes is over 120 MB: enough on
+        # its own to say the memory is in use.
+        report = analyse([record("t::a", [], [], rss=(100, 300, 300), blocks=(1000, 2_001_000))], attributor)
+
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
+        assert finding.delta_mb == 200
+
     def test_under_the_threshold_is_nothing(self) -> None:
         report = analyse([record("t::a", [], [], rss=(100, 150, 150), heap=(0, 50))], attributor, Thresholds(retained_mb=100))
 
@@ -320,10 +388,32 @@ class TestPeak:
         assert finding.climb_total_mb == 320
         assert finding.stack[0].startswith(f'  File "{PRODUCT}", line 14')
         expected = (
-            "300 MB of the 320 MB increase happened while load_everything (imaging.py:14) "
-            "was running, called from test_export (test_screens.py:30)."
+            "Memory rose by 320 MB, summed over every reading that found it higher; 300 MB of that "
+            "increase happened while load_everything (imaging.py:14) was running, called from "
+            "test_export (test_screens.py:30)."
         )
-        assert any(expected in line for line in finding.evidence)
+        assert any(expected == line for line in finding.evidence)
+
+    def test_the_total_is_the_sum_of_the_readings_and_is_called_that(self) -> None:
+        # A test that allocates and frees fifty megabytes ten times: every
+        # upward reading is charged, so the total is five hundred next to a
+        # peak of two hundred and fifty. The number is right; it must not be
+        # called the increase.
+        frames = [frame(PRODUCT, 3, "churn"), frame(TEST, 8, "test_churns")]
+        growth = [{"thread": "MainThread", "frames": [0, 1], "mb": 50}] * 10
+        report = analyse([record("t::a", [], frames, rss=(100, 250, 100), growth=growth)], attributor)
+
+        (finding,) = findings_of(report, "TRANSIENT_PEAK")
+        assert finding.climb_mb == 500
+        assert finding.climb_total_mb == 500
+        assert finding.peak_mb == 250
+        expected = (
+            "Memory rose by 500 MB, summed over every reading that found it higher; all of that "
+            "increase happened while churn (imaging.py:3) was running, called from "
+            "test_churns (test_screens.py:8)."
+        )
+        assert any(expected == line for line in finding.evidence)
+        assert not any("500 MB increase" in line for line in finding.evidence)
 
     def test_a_climb_seen_under_the_runtime_alone_is_unplaced_rather_than_blamed_on_it(self) -> None:
         # The reading landed after the body returned, with pytest's own
@@ -451,6 +541,40 @@ class TestGrowth:
         report = analyse(records, attributor, Thresholds(growth_tests=4))
 
         assert not findings_of(report, "STEADY_GROWTH")
+
+    def test_tests_that_kept_nothing_by_the_live_figures_are_not_growing(self) -> None:
+        # Three tests keep 40 MB each; four keep nothing but fifty blocks,
+        # which every test does. Fewer than half grew, so this is three
+        # steps, not a drift - however many blocks the others were up by.
+        records = [
+            record(f"t::keeps[{case}]", [], [], rss=(100 + 40 * case, 140 + 40 * case, 140 + 40 * case), heap=(40 * case, 40 + 40 * case), blocks=(1000, 1050))
+            for case in range(3)
+        ]
+        records += [
+            record(f"t::clean[{case}]", [], [], rss=(220, 220, 220), heap=(120, 120), blocks=(1000, 1050))
+            for case in range(4)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        assert not findings_of(report, "STEADY_GROWTH")
+
+    def test_objects_per_test_is_over_the_tests_where_they_were_counted(self) -> None:
+        records = [
+            record(f"t::leaks[{case}]", [], [], rss=(100 + 30 * case, 130 + 30 * case, 130 + 30 * case), heap=(30 * case, 30 + 30 * case), blocks=(1000, 1300) if case % 2 else None)
+            for case in range(6)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.growth_objects_per_test == 300
+
+    def test_no_minimum_number_of_tests_is_not_an_error(self) -> None:
+        # growth_tests=0 asks for no minimum. A worker whose only test was
+        # raised on its own has no rows for the rule, and that is nothing.
+        report = analyse([record("t::a", [], [], rss=(100, 300, 300))], attributor, Thresholds(growth_tests=0))
+
+        assert not findings_of(report, "STEADY_GROWTH")
+        assert findings_of(report, "RETAINED_AFTER_TEST")
 
 
 class TestImbalance:
@@ -591,6 +715,17 @@ class TestAllocatorRetention:
         assert any("MALLOC_ARENA_MAX does not affect" in line and "currently 40 MB" in line for line in finding.evidence)
         assert not any("limits how many thread arenas" in line for line in finding.evidence)
 
+    def test_a_main_arena_with_no_free_tail_does_not_recommend_a_trim(self) -> None:
+        # The free memory is in the main heap and none of it is at the tail:
+        # a trim would return nothing, and saying "currently 0 MB" next to a
+        # recommendation to trim is telling the reader to do nothing.
+        report = analyse(self.churn(main_share=0.9, arenas=1, trim=0), attributor, Thresholds(retained_mb=100))
+
+        (finding,) = findings_of(report, "ALLOCATOR_RETENTION")
+        assert finding.trim_mb == 0
+        assert any("MALLOC_ARENA_MAX does not affect" in line and "a trim would return nothing" in line for line in finding.evidence)
+        assert not any("malloc_trim(0) releases" in line or "currently 0 MB" in line for line in finding.evidence)
+
     def test_growth_that_is_in_use_is_not_the_allocators(self) -> None:
         rows = self.churn()
         for case, row in enumerate(rows):
@@ -698,6 +833,25 @@ class TestBursts:
 
         assert bursts_of(report) == []
 
+    def test_one_window_as_long_as_a_burst_is_a_burst(self) -> None:
+        # A native call held the GIL for five seconds, so the sampler's next
+        # tick came five seconds late: one window, five seconds of wall and
+        # of CPU. One tick's worth of noise is a tenth of a second, not that.
+        entry = record("t::index", [stack([0, 1], 5.0)], self.frames, cpu_s=5.0)
+        entry["timeline"] = [
+            [100, int(0.02 * 1e8), 200, "call", None, None],
+            [5100, int(5e9), 300, "call", "MainThread", [0, 1]],
+            *([5200 + 100 * n, int(0.02 * 1e8), 200, "call", None, None] for n in range(5)),
+        ]
+        report = analyse([entry], attributor, Thresholds(burst_seconds=2.0, burst_cores=0.7))
+
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "LONG_BURST"
+        assert finding.burst_seconds == 5.0
+        assert finding.cores == 1.0
+        assert finding.started_s == 0.1
+        assert finding.frame is not None and finding.frame.function == "build_index"
+
     def test_a_single_busy_window_is_noise_however_often_it_recurs(self) -> None:
         records = []
         for case in range(6):
@@ -779,6 +933,24 @@ class TestBursts:
         assert finding.machine_busy_percent == 100.0
         assert finding.cpus == 4
         assert any(line.startswith("1 worker on 4 cores, so the load was not only this run's workers.") for line in finding.evidence)
+
+    def test_contention_is_not_summed_across_workers(self) -> None:
+        # Two workers side by side, each pinned for the whole of a 3 s run:
+        # the run was pinned for 3 s, not 6, and for all of it, not twice
+        # all of it. The cores are the average of what each got.
+        records = []
+        for worker, cores in (("gw0", 0.2), ("gw1", 0.4)):
+            entry = record(f"t::slow[{worker}]", [stack([1], 0.6)], self.frames, worker=worker, cpu_s=0.6)
+            entry["timeline"] = timeline(*busy(30, [1], cores=cores, machine=960))
+            records.append(entry)
+        report = analyse(records, attributor, Thresholds(burst_seconds=2.0, burst_cores=0.7))
+
+        (finding,) = bursts_of(report)
+        assert finding.verdict == "CONTENDED"
+        assert finding.burst_seconds == 3.0
+        assert finding.machine_busy_percent == 100.0
+        assert finding.cores == 0.3
+        assert finding.worker_count == 2
 
     def test_a_machine_busy_for_a_moment_is_not_contended(self) -> None:
         entry = record("t::a", [stack([1], 0.6)], self.frames, cpu_s=0.6)
@@ -884,6 +1056,21 @@ class TestAllocationTracing:
             for line in finding.evidence
         )
         assert finding.frame is not None and finding.frame.owner == "product"
+
+    def test_holders_under_the_runtime_alone_leave_the_frame_unplaced(self) -> None:
+        # tracemalloc saw the memory allocated under pytest's own frames and
+        # the stdlib's. That is evidence, but naming re/__init__.py as the
+        # frame would send the reader into the runtime.
+        frames = [frame(RUNTIME, 167, ""), frame(f"{STDLIB}/re/__init__.py", 5, "")]
+        entry = record("t::a", [], frames, rss=(100, 420, 110))
+        entry["holders_peak"] = [{"mb": 300.5, "frames": [0, 1]}]
+        report = analyse([entry], attributor)
+
+        (finding,) = findings_of(report, "TRANSIENT_PEAK")
+        assert any(line == "Held at the peak: 300.5 MB allocated at __init__.py:5, called from python.py:167." for line in finding.evidence)
+        assert finding.frame is None
+        assert finding.stack == []
+        assert not any(line.startswith("Look at:") for line in finding.evidence)
 
     def test_a_sampled_stack_outranks_the_holders_for_the_frame(self) -> None:
         frames = self.frames + [frame(PRODUCT, 40, "load_everything")]

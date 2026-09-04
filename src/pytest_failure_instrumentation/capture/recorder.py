@@ -223,6 +223,17 @@ class WorkerRecorder:
         self.profiler.start()
         self.events.record("profiler_started", **self.profiler.describe())
 
+    def _profile(self, method: str, *args: Any) -> None:
+        """Hand the profiler a boundary. It is a diagnostic and this is a
+        pytest hook: whatever it raises is recorded against the worker and
+        is not the test's failure, and never the run's."""
+        if self.profiler is None:
+            return
+        try:
+            getattr(self.profiler, method)(*args)
+        except Exception as failure:  # noqa: BLE001 - a profiler must never end a run
+            self.events.record("profiler_failed", method=method, detail=repr(failure))
+
     def _start_monitors(self, settings: Settings) -> None:
         if not settings.watchdog:
             return
@@ -296,8 +307,7 @@ class WorkerRecorder:
         teardown wrapper would count every function-scoped fixture's value
         as memory the test kept, and its release as the next gap's.
         """
-        if self.profiler is not None:
-            self.profiler.end_test(nodeid)
+        self._profile("end_test", nodeid)
 
     def _phase(self, phase: str, nodeid: str) -> Any:
         """Which phase is open is what separates "died in teardown" from
@@ -324,11 +334,9 @@ class WorkerRecorder:
         # reached it.
         if phase == "setup":
             self.slow_test.start_test()
-        if self.profiler is not None:
-            self.profiler.begin_phase(nodeid, phase)
+        self._profile("begin_phase", nodeid, phase)
         yield
-        if self.profiler is not None:
-            self.profiler.end_phase(phase)
+        self._profile("end_phase", phase)
         if self.heartbeat is not None:
             self.heartbeat.phase = None
         if phase != "teardown":
@@ -368,9 +376,8 @@ class WorkerRecorder:
     def pytest_sessionfinish(self, exitstatus: int) -> None:
         if self.heartbeat is not None:
             self.heartbeat.stop()
-        if self.profiler is not None:
-            # Writes the background record, which is the CPU spent with no
-            # test in flight: what the controller reads a moment later.
-            self.profiler.stop()
+        # Writes the background record, which is the CPU spent with no test
+        # in flight: what the controller reads a moment later.
+        self._profile("stop")
         self.events.record("worker_finish", exitstatus=int(exitstatus))
         self.state.update(phase=None, nodeid=None)

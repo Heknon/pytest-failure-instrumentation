@@ -15,7 +15,11 @@ the process needs the GIL, so a native call that holds it for half a second
 delays the next sample by half a second. Counting samples would then miss
 most of that call; weighting by the counter charges the whole half second to
 the frame that was in it. The profile can be late by one sample, never wrong
-about the total.
+about the total for a thread it has seen. A thread's first sighting charges
+everything its clock holds, since the clock started with the thread; what a
+thread burns after its last sighting and before it exits cannot be read from
+outside it, and a thread that comes and goes between two ticks is never seen
+at all. That remainder is in the process figure and in no stack.
 
 What the kernel counts and Python cannot see is kept too. A thread pool a C
 extension started has no Python stack to sample, but it has a CPU counter and
@@ -337,6 +341,10 @@ def _thread_name(tid: int) -> str:
 # -- the sampler ---------------------------------------------------------------
 
 
+#: What _close_window is handed when the caller did not read the machine's
+#: load first: None is a reading that failed, so it cannot be the marker.
+_NOT_READ = object()
+
 #: (code, line, instruction offset) per frame, innermost first. The line is
 #: what the frame reported and can be None - see _line_of - so the offset is
 #: kept to resolve it from at flush.
@@ -435,8 +443,18 @@ class Sampler:
         self.nodeid: Optional[str] = None
         self.phase: Optional[str] = None
         self._lock = threading.Lock()
+        #: Serialises _sample itself. The sampling thread takes one every
+        #: interval and end_test takes one on the test's thread; the two
+        #: read and write the same tick state (_last_tick, _last_clock, the
+        #: thread table) before and after _lock, and two at once would
+        #: charge one interval's CPU twice.
+        self._sample_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="failure-profile", daemon=True)
+        #: Set in a forked child, where this object is a copy with no thread
+        #: behind it and a log descriptor that belongs to the parent. See
+        #: _detach_in_child.
+        self._forked = False
         self._own_ident: Optional[int] = None
         self._last_clock: dict[int, int] = {}
         self._last_tick = time.monotonic()
@@ -468,10 +486,25 @@ class Sampler:
         self.samples_taken = 0
         self.session_started = time.monotonic()
         self.session_cpu_started = time.process_time()
+        _live.add(self)
 
     # -- lifecycle -----------------------------------------------------------
 
+    @property
+    def tracing(self) -> bool:
+        """Whether allocation tracing is on *now*.
+
+        Asked for at construction is not the same thing: a suite that checks
+        its own leaks calls ``tracemalloc.stop()`` in a test, and that leaves
+        the profiler with nothing to snapshot for the rest of the run - which
+        is the suite's business, and not a reason to error every test after
+        it. Every snapshot asks this first.
+        """
+        return self.allocations and tracemalloc.is_tracing()
+
     def start(self) -> None:
+        if self._thread.ident is not None:
+            return  # already running; a second start would raise
         self._refresh_threads()
         self._all_tids = self.clock.discover()
         self._last_clock = self.clock.read(self._tids_to_read())
@@ -509,7 +542,7 @@ class Sampler:
         """What tracemalloc sees holding memory now that it did not before the
         first test: (megabytes, traceback) for the three biggest, from a
         megabyte up. Empty when tracing was off or nothing accumulated."""
-        if not self.allocations or self._session_snapshot is None:
+        if not self.tracing or self._session_snapshot is None:
             return []
         try:
             now = _snapshot()
@@ -528,15 +561,27 @@ class Sampler:
 
     def begin_phase(self, nodeid: str, phase: str) -> None:
         """Called on the test's own thread, which is how that thread is known."""
+        if self._forked:
+            return
         with self._lock:
             if self._window.nodeid != nodeid:
+                if self._window.nodeid is not None:
+                    # A test whose end was never announced: a plugin that
+                    # owns the runtest protocol without a logfinish, or a
+                    # run that fell over between teardown and logfinish.
+                    # Written as far as it got rather than dropped, and its
+                    # time given back to the background's clock.
+                    self._finish_test_window()
                 self._close_window(self._window)
                 self._window = _Window(nodeid, self._rss())
                 self._paused = (time.monotonic(), time.process_time())
-                if self.allocations:
-                    self._window.snapshot_before = _snapshot()
-                    self._window.traced_before = tracemalloc.get_traced_memory()[0]
-                    tracemalloc.reset_peak()
+                if self.tracing:
+                    try:
+                        self._window.snapshot_before = _snapshot()
+                        self._window.traced_before = tracemalloc.get_traced_memory()[0]
+                        tracemalloc.reset_peak()
+                    except Exception:  # noqa: BLE001 - tracing stopped under us
+                        self._window.snapshot_before = None
                     if self._session_snapshot is None:
                         self._session_snapshot = self._window.snapshot_before
             window = self._window
@@ -548,6 +593,8 @@ class Sampler:
             self.phase = phase
 
     def end_phase(self, phase: str) -> None:
+        if self._forked:
+            return
         with self._lock:
             window = self._window
             if window.phase_started is not None and window.phase_started[0] == phase:
@@ -562,9 +609,12 @@ class Sampler:
     def _settle_climb(self, window: _Window, rss: Optional[int]) -> None:
         """A phase boundary is a reading too, and a climb it finds that the
         sampler never saw is still charged - to no stack, because the frames
-        that made it are gone by now. The record then says how much of the
-        climb was too quick to be placed, rather than losing it or, worse,
-        resetting the baseline over it so it was never counted at all.
+        that made it are gone by now, with the stack the test's thread was
+        last sampled in as the fallback the analysis may place it on: a body
+        that allocated and returned between two readings was sampled inside
+        that body. The record then says how much of the climb was too quick
+        to be placed, rather than losing it or, worse, resetting the baseline
+        over it so it was never counted at all.
 
         Called with the lock held, on the test's thread.
         """
@@ -575,7 +625,11 @@ class Sampler:
         if heap is not None and self._last_heap is not None:
             climb = max(climb, heap - self._last_heap)
         if climb > 0:
-            window.growth[("", (), ())] += climb
+            fallback: StackKey = ()
+            earlier = self._previous.get(window.test_thread) if window.test_thread is not None else None
+            if earlier is not None and earlier[3] is window:
+                fallback = earlier[2]
+            window.growth[("", (), fallback)] += climb
         if rss is not None:
             self._last_rss = rss
         if heap is not None:
@@ -588,26 +642,55 @@ class Sampler:
         # CPU would land in that test's record, under whatever it was doing.
         # Sampled here, it lands in this record under the stack the thread
         # was last seen in, which is the call that held the GIL.
+        if self._forked:
+            return
         if self._thread.is_alive() and self._window.nodeid == nodeid:
             try:
                 self._sample(boundary=True)
             except Exception:  # noqa: BLE001 - a lost sample beats a lost record
                 pass
         with self._lock:
-            window = self._window
-            if window.nodeid != nodeid:
+            if self._window.nodeid != nodeid:
                 return
-            self._flush(window, TEST_RECORD)
-            self._window = self._background
-            if self._paused is not None:
-                # The background's clocks skip the test, so its record says
-                # what the gaps cost and not what the tests did as well.
-                wall, cpu = self._paused
-                self._background.started += time.monotonic() - wall
-                self._background.cpu_started += time.process_time() - cpu
-                self._paused = None
-            self.nodeid = None
-            self.phase = None
+            self._finish_test_window()
+
+    def _finish_test_window(self) -> None:
+        """Write the open test's record and go back to the background window.
+        Called with the lock held."""
+        self._flush(self._window, TEST_RECORD)
+        self._window = self._background
+        if self._paused is not None:
+            # The background's clocks skip the test, so its record says
+            # what the gaps cost and not what the tests did as well.
+            wall, cpu = self._paused
+            self._background.started += time.monotonic() - wall
+            self._background.cpu_started += time.process_time() - cpu
+            self._paused = None
+        self.nodeid = None
+        self.phase = None
+
+    def _detach_in_child(self) -> None:
+        """What a forked child is left with.
+
+        The child has this object's state and none of its thread, and the
+        sampling thread may have held ``_lock`` at the moment of the fork -
+        it releases the GIL inside it - so the copy's lock would stay held
+        for ever, and the child's first ``begin_phase`` would wait on it for
+        ever, which under pytest-forked is the whole run. The locks are
+        replaced and the sampler is marked stopped and forked: nothing here
+        profiles the child, and nothing writes to the log, whose descriptor
+        is the parent's.
+        """
+        self._lock = threading.Lock()
+        self._sample_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._stop.set()
+        self._stopped = True
+        self._forked = True
+        try:
+            gc.callbacks.remove(self._on_gc)
+        except ValueError:
+            pass
 
     # -- the sampling thread -------------------------------------------------
 
@@ -629,6 +712,15 @@ class Sampler:
         test's thread: whatever CPU has accrued since the last tick belongs
         to the stack the thread was last seen in, not to the test runner's
         frames that happen to be there now."""
+        with self._sample_lock:
+            self._tick(boundary)
+
+    def _tick(self, boundary: bool) -> None:
+        """The body of a sample. Every read that releases the GIL - the
+        kernel's thread list, resident memory, the machine's load, a native
+        thread's name - is made before ``_lock`` is taken, so the lock is
+        never held across a point where the test thread can run and fork.
+        See _detach_in_child."""
         now = time.monotonic()
         wall_ns = int((now - self._last_tick) * 1e9)
         self._last_tick = now
@@ -641,12 +733,46 @@ class Sampler:
         if self._own_ident is not None:
             frames.pop(self._own_ident, None)
         idents = frozenset(frames)
-        if idents != self._known_idents:
-            self._refresh_threads()
-            self._known_idents = idents
-        if self._ticks % DISCOVER_EVERY == 0:
-            self._all_tids = self.clock.discover()
+        changed = idents != self._known_idents
+        self._known_idents = idents
+        # Every tick, not only when the set of idents changes: a thread
+        # started as another ends takes the dead one's ident - it is a
+        # pthread handle, reused at once - and the set looks the same while
+        # the table behind it names a thread that is gone. A pool running a
+        # task per thread was invisible that way. Enumerating is a list copy
+        # under an uncontended lock, microseconds, and keeps the GIL.
+        self._refresh_threads()
+        # The clocks straight after the frames, before anything below lets
+        # go of the GIL. A thread in ``frames`` is alive now; one that lives
+        # less than an interval - a pool's worker, one per task - may not be
+        # by the time a procfs read has handed the GIL back to the thread
+        # running the test, and a dead thread's clock cannot be read. A
+        # clock read is a syscall that keeps the GIL.
         clocks = self.clock.read(self._tids_to_read())
+        # A frame on a thread Python has no object for - _thread.start_new_thread
+        # - is a thread whose tid only the kernel can say. Listing the kernel's
+        # threads is a procfs read that lets go of the GIL, and under a busy
+        # thread every release costs a switch interval to get it back, so it
+        # is not done for every thread that comes and goes: only for one of
+        # those, or on the schedule that finds a C extension's pool.
+        unknown = changed and any(ident not in self._threads for ident in idents)
+        if unknown or self._ticks % DISCOVER_EVERY == 0:
+            self._all_tids = self.clock.discover()
+            missing = [tid for tid in self._all_tids if tid not in clocks]
+            if missing:
+                clocks.update(self.clock.read(missing))
+        # Names for the kernel threads Python has no object for, read here
+        # because reading one opens a procfs file.
+        python_tids = {tid for tid, _ in self._threads.values()}
+        for tid in clocks:
+            if tid not in python_tids and tid not in self._native_names:
+                self._native_names[tid] = _thread_name(tid)
+        reading = self._ticks % RSS_EVERY == 0
+        rss = self._rss() if reading else None
+        heap = _heap_in_use() if reading else None
+        machine: Any = _NOT_READ
+        if self._window_ticks + 1 >= WINDOW_TICKS:
+            machine = self._machine.busy_permille()
 
         late = boundary or wall_ns > LATE_TICK_FACTOR * self.interval * 1e9
         process_cpu = time.process_time_ns()
@@ -714,9 +840,7 @@ class Sampler:
                     continue
                 delta = self._cpu_delta(tid, clocks)
                 if delta:
-                    native_name = self._native_names.get(tid)
-                    if native_name is None:
-                        native_name = self._native_names[tid] = _thread_name(tid)
+                    native_name = self._native_names.get(tid, f"tid {tid}")
                     entry = window.native.setdefault(tid, [native_name, 0])
                     entry[1] += delta
 
@@ -727,20 +851,18 @@ class Sampler:
             self._window_cpu_ns += process_delta
             self._window_ticks += 1
             if self._window_ticks >= WINDOW_TICKS:
-                self._close_window(window)
-            if self._ticks % RSS_EVERY == 0:
-                rss = self._rss()
+                self._close_window(window, machine)
+            if reading:
                 if rss is not None and (window.rss_peak is None or rss > window.rss_peak):
                     window.rss_peak = rss
                 climb = 0
                 if rss is not None and self._last_rss is not None:
                     climb = rss - self._last_rss
-                heap = _heap_in_use()
                 if heap is not None and self._last_heap is not None:
                     climb = max(climb, heap - self._last_heap)
                 if heap is not None:
                     self._last_heap = heap
-                if rss is not None and self.allocations:
+                if rss is not None and self.tracing:
                     self._snapshot_if_climbing(window, rss)
                 if climb > 0:
                     # Charged to the test's own thread, or to whichever thread
@@ -772,22 +894,26 @@ class Sampler:
         self._last_clock = clocks
         del frames
 
-    def _close_window(self, window: _Window) -> None:
+    def _close_window(self, window: _Window, machine: Any = _NOT_READ) -> None:
         """One timeline entry from what the last few ticks accumulated.
 
         Called with the lock held. The stack kept is the one that burnt the
         most CPU in the window, on whichever thread; a burst's blame comes
         from the stacks of its windows, and the thread name says whether it
-        was the test's own.
+        was the test's own. The sampling thread reads the machine's load
+        before taking the lock and passes it in; the test's own thread, at
+        a boundary, reads it here.
         """
         if self._window_ticks == 0:
             return
+        if machine is _NOT_READ:
+            machine = self._machine.busy_permille()
         top = max(self._window_stacks.items(), key=lambda item: item[1])[0] if self._window_stacks else None
         window.windows.append(
             [
                 int((time.monotonic() - window.started) * 1000),
                 self._window_cpu_ns,
-                self._machine.busy_permille(),
+                machine,
                 self.phase,
                 top,
             ]
@@ -805,7 +931,7 @@ class Sampler:
         last snapshot, and at least a second has passed. The last one taken
         is what held the memory nearest the peak.
         """
-        if window.nodeid is None or window.rss_before is None:
+        if window.nodeid is None or window.rss_before is None or not self.tracing:
             return
         climbed = rss - window.rss_before
         now = time.monotonic()
@@ -823,7 +949,13 @@ class Sampler:
             return None
         previous = self._last_clock.get(tid)
         if previous is None:
-            return 0  # first sighting: nothing to difference against
+            # First sighting. A thread's clock starts at zero when the thread
+            # does, and every thread alive when the sampler started was read
+            # then - so a thread seen for the first time now was born since,
+            # and its whole counter is CPU burnt during this run. Returning
+            # nothing here lost every thread that lived less than an
+            # interval: a pool's workers, one per task.
+            return max(0, clocks[tid])
         return max(0, clocks[tid] - previous)
 
     def _refresh_threads(self) -> None:
@@ -864,16 +996,58 @@ class Sampler:
     def _flush(self, window: _Window, kind: str) -> None:
         """Resolve names once and hand the aggregate to whoever records it.
 
-        Called with the lock held. Frames are written as a table and stacks
-        as index lists, so a test with a thousand distinct stacks over the
-        same forty frames does not spell each frame a thousand times.
+        Called with the lock held, from inside pytest's hooks - so nothing
+        here may raise: a record that cannot be built is lost, and the
+        window is reset either way. Frames are written as a table and
+        stacks as index lists, so a test with a thousand distinct stacks
+        over the same forty frames does not spell each frame a thousand
+        times.
         """
+        if self._forked:
+            return
         now = time.monotonic()
-        self._close_window(window)
+        try:
+            self._close_window(window)
+        except Exception:  # noqa: BLE001
+            pass
         rss_after = self._rss()
         heap_after = _heap_in_use()
         blocks_after = sys.getallocatedblocks()
         allocator_after = _allocator_figures()
+        try:
+            self.record(self._record_of(window, kind, now, rss_after, heap_after, blocks_after, allocator_after))
+        except Exception:  # noqa: BLE001 - a lost record beats a lost run
+            pass
+        # Whatever this window was, its aggregates are written now. The
+        # background window keeps accumulating between tests.
+        window.stacks.clear()
+        window.native.clear()
+        window.growth.clear()
+        window.gc_seconds = 0.0
+        window.gc_collections = [0, 0, 0]
+        window.started = now
+        window.cpu_started = time.process_time()
+        window.rss_before = rss_after
+        window.rss_peak = rss_after
+        window.rss_at = {}
+        window.heap_before = heap_after
+        window.blocks_before = blocks_after
+        window.allocator_before = allocator_after
+        window.threads_peak = 0
+        window.windows = []
+        window.snapshot_before = window.snapshot_peak = None
+        window.phase_cpu.clear()
+
+    def _record_of(
+        self,
+        window: _Window,
+        kind: str,
+        now: float,
+        rss_after: Optional[int],
+        heap_after: Optional[int],
+        blocks_after: int,
+        allocator_after: Optional[dict[str, int]],
+    ) -> dict[str, Any]:
         frames: dict[tuple[str, int, str], int] = {}
 
         def index_of(file: str, line: int, function: str) -> int:
@@ -979,30 +1153,7 @@ class Sampler:
                 if cpu_ns > 0
             ],
         }
-        try:
-            self.record(record)
-        except Exception:  # noqa: BLE001
-            pass
-        # Whatever this window was, its aggregates are written now. The
-        # background window keeps accumulating between tests.
-        window.stacks.clear()
-        window.native.clear()
-        window.growth.clear()
-        window.gc_seconds = 0.0
-        window.gc_collections = [0, 0, 0]
-        window.started = now
-        window.cpu_started = time.process_time()
-        window.rss_before = rss_after
-        window.rss_peak = rss_after
-        window.rss_at = {}
-        window.heap_before = heap_after
-        window.blocks_before = blocks_after
-        window.allocator_before = allocator_after
-        window.threads_peak = 0
-        window.windows = []
-        window.snapshot_before = window.snapshot_peak = None
-        window.phase_cpu.clear()
-
+        return record
 
     def _allocation_report(self, window: _Window, kind: str, index_of: Any) -> dict[str, Any]:
         """What tracemalloc says about this test, when it was tracing.
@@ -1015,7 +1166,7 @@ class Sampler:
         allocator enough to leave resident memory up after the test freed
         everything.
         """
-        if not self.allocations or kind != TEST_RECORD or window.snapshot_before is None:
+        if not self.tracing or kind != TEST_RECORD or window.snapshot_before is None:
             return {}
         report: dict[str, Any] = {}
         current, peak = tracemalloc.get_traced_memory()
@@ -1060,6 +1211,25 @@ class Sampler:
                 )
             report["memory_stacks"] = stacks
         return report
+
+
+#: Every sampler this process has built, for the fork handler below. Weak,
+#: so a sampler a test built and dropped is not kept alive by it.
+_live: Any = weakref.WeakSet()
+
+
+def _after_fork_in_child() -> None:
+    """A forked child inherits every sampler's state and none of its thread.
+    See Sampler._detach_in_child. Registered once, for every sampler."""
+    for sampler in list(_live):
+        try:
+            sampler._detach_in_child()
+        except Exception:  # noqa: BLE001 - never the child's problem
+            pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _snapshot() -> Any:

@@ -11,10 +11,15 @@ where most of the development happens.
 from __future__ import annotations
 
 import gc
+import json
+import os
+import signal
 import sys
 import threading
 import time
+import tracemalloc
 import weakref
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -202,9 +207,12 @@ def test_sampling_does_not_keep_a_functions_locals_alive() -> None:
         holder.append(weakref.ref(blob))
         time.sleep(0.2)
 
-    allocate()
+    # Off before the allocation, not after: the sampler allocates on every
+    # tick, and a collection between the return and the check would clear a
+    # cycle the sampler had created, and pass this test with the bug present.
     gc.disable()
     try:
+        allocate()
         alive = holder[0]() is not None
     finally:
         gc.enable()
@@ -252,3 +260,169 @@ def test_allocation_tracing_deepens_a_tracer_somebody_started_shallower():
         tracemalloc.stop()
         if was_tracing:
             tracemalloc.start()
+
+
+def nodeids_of(records: list[dict[str, Any]]) -> list[str]:
+    return [entry["nodeid"] for entry in records if entry["record"] == "test"]
+
+
+def test_a_test_that_stops_tracemalloc_does_not_break_the_ones_after_it() -> None:
+    """A suite that checks its own leaks starts and stops tracemalloc inside
+    a test. With allocation tracing on, that used to raise out of the next
+    begin_phase - inside pytest's hook - and error every test after it."""
+    was_tracing = tracemalloc.is_tracing()
+    tracemalloc.start(5)
+    records: list[dict[str, Any]] = []
+    sampler = Sampler(records.append, lambda: 1, interval=0.005, worker="x", allocations=True, retained_mb=1)
+    assert sampler.allocations
+    sampler.start()
+    try:
+        sampler.begin_phase("t::stops", "call")
+        tracemalloc.stop()
+        sampler.end_phase("call")
+        sampler.end_test("t::stops")
+        sampler.begin_phase("t::after", "call")
+        sampler.end_phase("call")
+        sampler.end_test("t::after")
+    finally:
+        sampler.stop()
+        if was_tracing:
+            tracemalloc.start()
+    assert nodeids_of(records) == ["t::stops", "t::after"]
+    assert [entry["record"] for entry in records][-1] == "background"
+
+
+def test_a_test_whose_end_was_never_announced_is_still_written() -> None:
+    """A plugin that owns the runtest protocol without a logfinish, or a run
+    that fell over between teardown and logfinish, leaves a test window open
+    when the next test begins. It is written as far as it got."""
+    records: list[dict[str, Any]] = []
+    sampler = Sampler(records.append, lambda: 1, interval=0.005, worker="x")
+    sampler.start()
+    sampler.begin_phase("t::orphan", "call")
+    spin_for(0.02)
+    sampler.begin_phase("t::next", "call")
+    sampler.end_phase("call")
+    sampler.end_test("t::next")
+    sampler.stop()
+    assert nodeids_of(records) == ["t::orphan", "t::next"]
+
+
+def test_starting_twice_is_harmless() -> None:
+    sampler = Sampler(lambda record: None, lambda: 1, interval=0.005, worker="x")
+    sampler.start()
+    sampler.start()
+    sampler.stop()
+
+
+@pytest.mark.skipif(not ThreadClock().available, reason="no per-thread clock here")
+def test_a_thread_that_lives_less_than_an_interval_is_still_charged() -> None:
+    """A thread's clock starts at zero with the thread, so its first sighting
+    already says what it burnt. Charging nothing on a first sighting lost
+    every thread that lived less than an interval - a pool's workers, one per
+    task - and the sampler contradicted its own process figure."""
+    records: list[dict[str, Any]] = []
+    sampler = Sampler(records.append, lambda: 1, interval=0.002, worker="x")
+    if sampler.clock.source == "psutil":
+        pytest.skip("the psutil reader's ticks are too far apart to see a short thread")
+    sampler.start()
+    sampler.begin_phase("t::a", "call")
+    started = time.process_time()
+    for _ in range(30):
+        thread = threading.Thread(target=spin_for, args=(0.015,), name="short")
+        thread.start()
+        thread.join()
+    burnt = time.process_time() - started
+    sampler.end_phase("call")
+    sampler.end_test("t::a")
+    sampler.stop()
+
+    (record,) = [entry for entry in records if entry["record"] == "test"]
+    charged = sum(stack["cpu_ns"] for stack in record["stacks"] if stack["thread"] == "short") / 1e9
+    # Sampling, so not all of it: a thread that comes and goes between two
+    # ticks is never seen. But most of them are.
+    assert charged > burnt * 0.3, (charged, burnt)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork here")
+# 3.12 warns that forking a multi-threaded process may deadlock the child,
+# which is the hazard this test exists to exercise.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_child_neither_hangs_nor_writes_records(tmp_path: Path) -> None:
+    """The sampling thread releases the GIL while it holds the lock, so a
+    fork on the test thread can copy a held lock into a child that has no
+    thread to release it. The child's first begin_phase then waited for
+    ever - under pytest-forked, the whole run did. The child is detached:
+    it does not hang, and it does not write into the parent's log."""
+    log = tmp_path / "records.jsonl"
+
+    def record(entry: dict[str, Any]) -> None:
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"record": entry["record"], "nodeid": entry["nodeid"]}) + "\n")
+
+    sampler = Sampler(record, lambda: 1, interval=0.001, worker="x")
+    sampler.start()
+    sampler.begin_phase("t::parent", "call")
+    spin_for(0.05)
+    pid = os.fork()
+    if pid == 0:
+        # The child: what pytest-forked does next.
+        try:
+            sampler.begin_phase("t::child", "call")
+            sampler.end_phase("call")
+            sampler.end_test("t::child")
+            sampler.stop()
+        finally:
+            os._exit(0)
+    deadline = time.monotonic() + 20
+    while True:
+        finished, status = os.waitpid(pid, os.WNOHANG)
+        if finished:
+            break
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("the forked child hung")
+        time.sleep(0.01)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    sampler.end_phase("call")
+    sampler.end_test("t::parent")
+    sampler.stop()
+    written = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [entry["nodeid"] for entry in written if entry["record"] == "test"] == ["t::parent"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="resident memory is read through psutil there; not what this checks")
+def test_a_climb_between_two_readings_carries_the_last_sampled_stack() -> None:
+    """A body that allocates and returns between two memory readings is
+    seen only by the reading at the phase boundary, where the frames that
+    made it are gone. The stack the test's thread was last sampled in goes
+    with the charge, for the analysis to place it on."""
+    from pytest_failure_instrumentation import probes
+
+    records: list[dict[str, Any]] = []
+    sampler = Sampler(records.append, lambda: probes.resident_megabytes()[0], interval=0.01, worker="x")
+    sampler.start()
+    sampler.begin_phase("t::a", "call")
+
+    def allocate() -> bytearray:
+        block = bytearray(64 * 1024 * 1024)
+        block[::4096] = b"x" * len(block[::4096])
+        spin_for(0.2)  # long enough to be sampled inside it several times
+        return block
+
+    kept = allocate()
+    sampler.end_phase("call")
+    sampler.end_test("t::a")
+    sampler.stop()
+    del kept
+
+    (record,) = [entry for entry in records if entry["record"] == "test"]
+    names = {
+        record["frames"][index].split("|")[2]
+        for entry in record["growth"]
+        for index in (entry.get("frames") or []) + (entry.get("fallback") or [])
+    }
+    assert sum(entry["mb"] for entry in record["growth"]) >= 32, record["growth"]
+    # Qualified where the interpreter qualifies (3.11+ writes <locals>.allocate).
+    assert any(name.split(".")[-1] == "allocate" for name in names), (record["growth"], names)

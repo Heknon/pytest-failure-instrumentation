@@ -141,6 +141,12 @@ class FunctionCost:
     #: from the blamed frame outward. Rendered as the incident's stack.
     representative: list[FrameRef] = field(default_factory=list)
     representative_cpu_ns: int = 0
+    #: line -> (cpu, stack): the most expensive stack that was *in* each of
+    #: this function's own lines. The heaviest single stack can be on a line
+    #: that is not the hottest - one caller spending 3 s on line 20 against
+    #: three spending 2 s each on line 14 - and a finding that says "mostly
+    #: line 14" must point its frame and stack at line 14.
+    by_line: dict[int, tuple[int, list[FrameRef]]] = field(default_factory=dict)
 
     @property
     def key(self) -> tuple[str, str]:
@@ -383,6 +389,9 @@ def analyse(
             if blamed_at == 0:
                 cost.self_cpu_ns += cpu_ns
                 cost.lines[blamed.line] += cpu_ns
+                heaviest_on_line = cost.by_line.get(blamed.line)
+                if heaviest_on_line is None or cpu_ns > heaviest_on_line[0]:
+                    cost.by_line[blamed.line] = (cpu_ns, frames)
             else:
                 top = frames[0]
                 cost.below[(top.file, top.owner)] += cpu_ns
@@ -482,7 +491,7 @@ def _cpu_findings(ranked: list[FunctionCost], total_ns: int, limits: Thresholds)
         below_share = 100.0 - self_share
         thread = cost.threads.most_common(1)[0][0] if cost.threads else None
         below_frame: Optional[FrameRef] = None
-        frame = cost.representative[0] if cost.representative else None
+        representative = cost.representative
         hottest = [
             (line, _percent(line_ns, cost.cpu_ns)) for line, line_ns in cost.lines.most_common(3)
         ]
@@ -511,7 +520,13 @@ def _cpu_findings(ranked: list[FunctionCost], total_ns: int, limits: Thresholds)
                 line += " Mostly " + ", ".join(
                     f"line {number} ({_pct(percent)})" for number, percent in hottest
                 ) + "."
+                # The frame and the stack point at the hottest line, which is
+                # what the sentence names, rather than at the heaviest stack.
+                on_hottest_line = cost.by_line.get(hottest[0][0])
+                if on_hottest_line is not None:
+                    representative = on_hottest_line[1]
             evidence.append(line)
+        frame = representative[0] if representative else None
         examples = [nodeid for nodeid, _ in cost.tests.most_common(3)]
         if cost.tests:
             seen = (
@@ -534,7 +549,7 @@ def _cpu_findings(ranked: list[FunctionCost], total_ns: int, limits: Thresholds)
                 verdict=verdict,
                 evidence=evidence,
                 frame=frame,
-                stack=_faulthandler_lines(cost.representative),
+                stack=_faulthandler_lines(representative),
                 below=below_frame,
                 cpu_seconds=round(seconds, 3),
                 share_percent=share,
@@ -658,12 +673,14 @@ def _climb(
     key, megabytes = max(charged.items(), key=lambda item: item[1])
     stack = heaviest[key][1]
     frame = stack[0]
-    amount = (
-        f"All of the {total} MB increase"
-        if megabytes == total
-        else f"{megabytes} MB of the {total} MB increase"
+    # The total is every upward reading added up, not the test's net rise:
+    # a test that allocates and frees fifty megabytes ten times rose by five
+    # hundred, next to a peak a tenth of that. Said as what it is.
+    amount = "all of that increase" if megabytes == total else f"{megabytes} MB of that increase"
+    line = (
+        f"Memory rose by {total} MB, summed over every reading that found it higher; "
+        f"{amount} happened while {_named(frame)} was running"
     )
-    line = f"{amount} happened while {_named(frame)} was running"
     caller = _caller(stack)
     if caller is not None:
         line += f", called from {_named(caller)}"
@@ -875,7 +892,9 @@ def _memory_findings(
                 + ", ".join(f"{step.nodeid} ({step.delta_mb} MB on {step.worker})" for step in steps[:3])
                 + ".",
             )
-            findings = [finding for finding in findings if finding not in steps]
+            # By identity: two findings with the same fields are still two.
+            folded = {id(step) for step in steps}
+            findings = [finding for finding in findings if id(finding) not in folded]
         findings.extend(retention)
     return findings
 
@@ -957,12 +976,22 @@ def _allocator_retention(
             "allocates an arena of its own, up to eight per core. MALLOC_ARENA_MAX limits how "
             "many thread arenas exist."
         )
-    else:
+    elif trim > 0:
         evidence.append(
             "glibc keeps freed memory mapped inside each arena. Most of this is in the main "
             f"heap, which MALLOC_ARENA_MAX does not affect; malloc_trim(0) releases the main "
             f"heap's free tail, currently {trim} MB, and MALLOC_TRIM_THRESHOLD_ sets when glibc "
             "does that on its own."
+        )
+    else:
+        # The free tail is what a trim gives back, and there is none: the
+        # free memory sits between allocations still in use. Recommending a
+        # trim next to the figure that says it would return nothing is worse
+        # than saying where the memory is.
+        evidence.append(
+            "glibc keeps freed memory mapped inside each arena. Most of this is in the main "
+            "heap, which MALLOC_ARENA_MAX does not affect, between allocations still in use "
+            "rather than at the heap's free tail, so a trim would return nothing."
         )
     others = found[1:]
     if others:
@@ -1033,7 +1062,10 @@ def _holders(
 
     A tracemalloc traceback is oldest frame first; a reader wants the
     allocation site first, so it is turned round. The frames carry no
-    function name, and are blamed by file like any other.
+    function name, and are blamed by file like any other - and, like a
+    climb, never on the runtime alone: a holder allocated under pytest's
+    frames and the stdlib's stays in the evidence, but naming re/__init__.py
+    as the frame would send the reader to the wrong place.
     """
     table = [_frame(entry, attributor) for entry in record.get("frames") or []]
     evidence: list[str] = []
@@ -1055,9 +1087,10 @@ def _holders(
             line += ", called from " + ", ".join(places[1:4])
         evidence.append(line + ".")
         if frame is None:
-            blamed_at = _blame_index(frames)
-            frame = frames[blamed_at]
-            stack = _faulthandler_lines(frames[blamed_at:])
+            owned_at = _owned_index(frames)
+            if owned_at is not None:
+                frame = frames[owned_at]
+                stack = _faulthandler_lines(frames[owned_at:])
     return frame, stack, evidence
 
 
@@ -1070,27 +1103,38 @@ BYTES_PER_BLOCK = 64
 def _still_in_use(record: dict[str, Any], retained_mb: int) -> tuple[Optional[bool], list[str]]:
     """Whether the memory a test left behind is alive, from the live-heap
     readings, and the labelled figures that say so, for the measured line.
-    None where nothing was read."""
+    None where nothing was read - or where only the object count was, and
+    it does not settle it.
+
+    The heap figure is Linux-only. Elsewhere the blocks are all there is,
+    and blocks at their rough size are a floor, not a measure: one numpy
+    array holding two hundred megabytes is one block. A floor that clears
+    the bar says the memory is in use; one that does not says nothing, and
+    is never taken for "freed".
+    """
     if _figures(record)[3]:
         return True, [f"Live Python allocations +{retained_mb} MB (tracemalloc)"]
     heap_before, heap_after = record.get("heap_before_mb"), record.get("heap_after_mb")
     blocks_before, blocks_after = record.get("blocks_before"), record.get("blocks_after")
     parts: list[str] = []
     live_mb = 0
-    measured = False
+    heap_read = False
+    blocks_read = False
     if heap_before is not None and heap_after is not None:
-        measured = True
+        heap_read = True
         grew = int(heap_after) - int(heap_before)
         live_mb += max(0, grew)
         parts.append(f"Live heap {grew:+d} MB")
     if blocks_before is not None and blocks_after is not None:
-        measured = True
+        blocks_read = True
         grew_blocks = int(blocks_after) - int(blocks_before)
         live_mb += max(0, grew_blocks * BYTES_PER_BLOCK // 1048576)
         parts.append(f"{grew_blocks:+,d} Python objects")
-    if not measured:
+    if not heap_read and not blocks_read:
         return None, parts
-    return live_mb >= retained_mb // 2, parts
+    if live_mb >= retained_mb // 2:
+        return True, parts
+    return False if heap_read else None, parts
 
 
 def _phase_of_step(rss_at: dict[str, Any], threshold_mb: int) -> Optional[str]:
@@ -1134,19 +1178,27 @@ def _drift(
         for record in tests
         if abs(_kept(record)) < limits.retained_mb and abs(_live_step(record)) < limits.retained_mb
     ]
-    if len(rows) < limits.growth_tests:
+    # A growth_tests of 0 asks for no minimum, not for a rule over no rows.
+    if not rows or len(rows) < limits.growth_tests:
         return []
     steps = [_live_step(record) for record in rows]
     total = sum(steps)
     biggest = max(steps)
     blocks = [_blocks_kept(record) for record in rows]
+    # A test grew when it kept a megabyte by the live figures - the step,
+    # or the blocks at their rough size where the step is the resident one.
+    # A megabyte because the rest of the rule is in whole megabytes, and it
+    # is the smallest step the figures can show; a count of blocks alone is
+    # always up by something, and a few hundred of them is nothing kept.
     growing = sum(
-        1 for step, kept in zip(steps, blocks) if step > 0 or (kept is not None and kept > 0)
+        1
+        for step, kept in zip(steps, blocks)
+        if step >= 1 or (kept is not None and kept * BYTES_PER_BLOCK >= 1048576)
     )
     if total < limits.retained_mb or biggest >= total / 2 or growing < len(rows) / 2:
         return []
     counted = [kept for kept in blocks if kept is not None]
-    objects = sum(counted) // len(rows) if counted else None
+    objects = sum(counted) // len(counted) if counted else None
     first, last = rows[0], rows[-1]
     per_test = total / len(rows)
     by_name: dict[str, list[int]] = defaultdict(lambda: [0, 0])
@@ -1313,7 +1365,10 @@ def _imbalance(by_worker: dict[str, list[dict[str, Any]]], limits: Thresholds) -
 # -- bursts ----------------------------------------------------------------------
 
 #: A burst is at least this many consecutive busy windows: one window is a
-#: tick's worth of noise, two is a fifth of a second of a core.
+#: tick's worth of noise, two is a fifth of a second of a core. Unless the
+#: one window is itself as long as a burst must be: a native call that held
+#: the GIL for five seconds lands in one late tick, and one window of five
+#: seconds is not noise.
 MIN_BURST_WINDOWS = 2
 #: Per mille of the machine busy for a window to count as pinned.
 PINNED_PERMILLE = 900
@@ -1375,7 +1430,9 @@ def _bursts(record: dict[str, Any], limits: Thresholds) -> list[_Burst]:
 
     def close() -> None:
         nonlocal current, pending
-        if current is not None and current.windows >= MIN_BURST_WINDOWS:
+        if current is not None and (
+            current.windows >= MIN_BURST_WINDOWS or current.seconds >= limits.burst_seconds
+        ):
             bursts.append(current)
         current = None
         pending = None
@@ -1648,12 +1705,20 @@ def _contention_finding(
     Twenty workers on four cores read as twenty processes at a few percent
     each, and every test takes longer than its CPU says it should. Nothing
     on any stack explains it; the machine's own figure does.
+
+    The workers run side by side, so their timelines cover the same run
+    and are not added up: four workers each pinned for three seconds of a
+    ten-second run were pinned for three seconds, not twelve. The seconds
+    and the share are one worker's - the one with the longest timeline,
+    which saw most of the run - and the cores are the average over every
+    worker's pinned windows, since each got its own slice.
     """
-    busy_ms = total_ms = 0
-    busy_cpu_ns = 0
+    #: worker -> [busy ms, total ms, cpu ns over the busy windows].
+    by_worker: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     cpus: Optional[int] = None
     for record in records:
         cpus = int(record.get("cpus") or 0) or cpus
+        figures = by_worker[str(record.get("worker") or "")]
         previous = 0
         for entry in record.get("timeline") or []:
             try:
@@ -1664,14 +1729,19 @@ def _contention_finding(
             previous = offset_ms
             if wall_ms <= 0:
                 continue
-            total_ms += wall_ms
+            figures[1] += wall_ms
             if machine is not None and int(machine) >= PINNED_PERMILLE:
-                busy_ms += wall_ms
-                busy_cpu_ns += cpu_ns
-    if total_ms == 0 or busy_ms < limits.burst_seconds * 1000:
+                figures[0] += wall_ms
+                figures[2] += cpu_ns
+    if not by_worker:
+        return []
+    busy_ms, total_ms, _ = max(by_worker.values(), key=lambda figures: figures[1])
+    if total_ms == 0 or busy_ms == 0 or busy_ms < limits.burst_seconds * 1000:
         return []
     share = busy_ms / total_ms
-    cores = busy_cpu_ns / (busy_ms * 1e6)
+    all_busy_ms = sum(figures[0] for figures in by_worker.values())
+    all_busy_cpu_ns = sum(figures[2] for figures in by_worker.values())
+    cores = all_busy_cpu_ns / (all_busy_ms * 1e6)
     if share < 0.5 or cores >= limits.burst_cores:
         return []
     waiting = "Test durations include waiting for a core, so they are longer than the tests' CPU time."
