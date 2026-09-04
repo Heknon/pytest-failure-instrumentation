@@ -17,7 +17,7 @@ from collections import Counter
 from typing import Any, Callable
 
 from .. import probes
-from ..errors import TracemallocConflict
+from ..errors import refuse_a_shared_tracer
 
 DEFAULT_HIGH_WATER_FRACTION = 0.75
 
@@ -128,13 +128,10 @@ class TracemallocSession:
     """A tracer started and owned by this plugin."""
 
     def __init__(self, depth: int) -> None:
-        if tracemalloc.is_tracing():
-            active_depth = tracemalloc.get_traceback_limit()
-            raise TracemallocConflict(
-                "--failure-profile-allocations requires exclusive ownership of "
-                f"tracemalloc, but it is already active with depth {active_depth}; "
-                "disable the other allocation profiler and rerun"
-            )
+        # Asked again here, not only at setup: a conftest is free to start a
+        # tracer in a fixture or at collection, which is after the setup check
+        # and before this. See errors.refuse_a_shared_tracer.
+        refuse_a_shared_tracer()
         tracemalloc.start(depth)
         self._closed = False
 

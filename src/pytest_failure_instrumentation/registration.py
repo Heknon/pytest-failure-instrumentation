@@ -56,7 +56,7 @@ from .config import (
     pytest_faulthandler_timeout,
     resolve,
 )
-from .errors import TracemallocConflict
+from .errors import TracemallocConflict, refuse_a_shared_tracer
 
 #: Where the settings in force are kept, so a later caller can see them and
 #: the entry point can tell "already installed" from "nobody has yet".
@@ -179,6 +179,19 @@ def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
     Inside the guard the same failure is the warning-and-disable path the
     module docstring promises: no instrumentation, and a run that still runs.
     """
+    # Asked in every process that reaches here, and therefore first in the
+    # one that spawns the others: under xdist the controller configures
+    # before a worker exists, so a tracer that is already running is one
+    # usage error at the top of the run rather than the same error thrown
+    # out of pytest_configure on every worker at once. Not inside a _built
+    # guard, because it is the one failure here that is meant to end the run
+    # - see refuse_a_shared_tracer and _built.
+    if settings.profile_allocations:
+        try:
+            refuse_a_shared_tracer()
+        except TracemallocConflict as failure:
+            raise pytest.UsageError(str(failure)) from failure
+
     # pytest's faulthandler_timeout is read here rather than in the recorder:
     # it is not a setting of this plugin's and does not travel in Settings,
     # but it decides whether the frozen-interpreter fallback may arm the one

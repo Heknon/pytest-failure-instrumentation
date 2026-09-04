@@ -618,6 +618,40 @@ class TestAllocationTracing:
         )
         assert "test_must_not_run" not in runner.result.stdout.str()
 
+    @needs_xdist
+    def test_an_existing_tracer_is_refused_before_the_workers_are_started(
+        self, distributed: Runner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same refusal under -n, and the reason it is made where it is.
+
+        The check used to live only where the tracer is started, which under
+        xdist is on a worker - so every worker raised it at once, out of
+        pytest_configure, and the run printed four pluggy tracebacks and the
+        profiler's "nothing in this run was sampling" summary after spending
+        the better part of a minute starting the workers it was about to
+        refuse. The controller configures before a worker exists, and the
+        environment that made this true for a worker is true for it too.
+        """
+        monkeypatch.setenv("PYTHONTRACEMALLOC", "3")
+        distributed.pytester.makepyfile("def test_must_not_run():\n    assert False\n")
+
+        distributed.run("--failure-profile-allocations", "-n", "2")
+
+        assert distributed.result.ret == pytest.ExitCode.USAGE_ERROR
+        distributed.result.stderr.fnmatch_lines(
+            [
+                "*--failure-profile-allocations requires exclusive ownership of "
+                "tracemalloc, but it is already active with depth 3*"
+            ]
+        )
+        output = distributed.result.stdout.str()
+        assert "test_must_not_run" not in output
+        # The point of moving the check: one sentence, not a traceback per
+        # worker, and no profile summary for a profile that never started.
+        assert "Traceback" not in output
+        assert "gw0" not in output
+        assert "failure-instrumentation profile" not in output
+
     def test_tracing_names_the_holders_and_writes_a_memory_flame_graph(self, runner: Runner) -> None:
         runner.pytester.makeini(PROFILE_INI)
         runner.pytester.makepyfile(
