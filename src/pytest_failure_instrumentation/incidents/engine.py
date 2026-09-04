@@ -107,6 +107,23 @@ RESERVED_NAMES = frozenset(
 #: loaded runner rather than a real deadline.
 WATCHER_JOIN_SECONDS = 10.0
 
+#: Written once at the top of the evidence directory, so that the directory a
+#: run makes in somebody's checkout does not become a commit. What is under it
+#: is one directory per run of scratch that a later run deletes: it is evidence
+#: of a process that is over, not source, and the ``git status`` it would
+#: otherwise fill is the one a developer reads to see what they changed.
+#:
+#: ``*`` covers the ignore file itself, which is deliberate and is what
+#: pytest's own ``.pytest_cache/.gitignore`` does: a file whose whole job is to
+#: keep a directory out of the repository has no business being the one thing
+#: in it that ends up committed.
+GITIGNORE_FILE = ".gitignore"
+GITIGNORE_BODY = (
+    "# Created automatically by pytest-failure-instrumentation.\n"
+    "# One directory per run of evidence, pruned by later runs - not source.\n"
+    "*\n"
+)
+
 
 def usable_as_a_run_name(value: str) -> bool:
     """Whether ``value`` is one directory component that means only itself."""
@@ -328,6 +345,10 @@ class IncidentEngine:
         an existing artifacts directory, and a green run that deletes somebody's
         coverage report has done more damage than any failure it might have
         explained.
+
+        The directory is also made to ignore itself in git, under the same
+        rule about whose directory it is - see
+        :meth:`_keep_the_evidence_out_of_git`.
         """
         if not self.distributed and not self.settings.stack_server and not self.records_here:
             return
@@ -356,6 +377,54 @@ class IncidentEngine:
             # be a name nothing else agrees with. The events files inside carry
             # it, and they are written from the start.
             self._write_marker()
+        except OSError:
+            return  # bookkeeping must never break a run
+        # After the marker, not before: the test of whether this directory is
+        # ours to write an ignore file into is that everything in it is ours,
+        # and until the line above ran, our own run directory was not.
+        self._keep_the_evidence_out_of_git()
+
+    def _keep_the_evidence_out_of_git(self) -> None:
+        """Ignore this directory in git, when it is ours to say so.
+
+        The default ``failure_directory`` is a directory in the checkout, made
+        by a plugin the developer did not ask to think about, and what lands in
+        it is scratch: a run's own state slots, event logs and stacks, which
+        the next run over the same directory deletes. Untracked, that is a
+        ``git status`` full of files nobody will ever commit, and the first
+        thing an unlucky ``git add -A`` commits.
+
+        So the directory carries the ignore file rather than the repository's
+        own ``.gitignore`` carrying a line about us: a directory that ignores
+        itself needs no change to a file the developer maintains, and it works
+        the same for the second checkout, the CI image and the colleague who
+        just installed the plugin.
+
+        *When it is ours to say so* is the whole of the care here.
+        ``failure_directory`` is documented as a natural thing to point at an
+        existing artifacts directory, shared with whatever else writes there -
+        and dropping ``*`` into somebody else's directory would quietly stop
+        git from seeing their files too, which is a change to their repository
+        that this plugin has no business making. So the file is written only
+        into a directory holding nothing but run directories of ours: the one
+        this run just made, the ones still going, and nothing else. A directory
+        with a stranger's file in it keeps whatever ignore rules it already
+        had, and a ``.gitignore`` that is already there is never rewritten -
+        it may be the developer's, and it says what they meant.
+
+        That rule is what makes the worst case harmless rather than merely
+        unlikely: ``failure_directory = .`` is the checkout itself, and the
+        checkout is full of files that are not ours, so it gets no ignore file
+        at all rather than one that hides the whole repository.
+        """
+        root = self.settings.directory
+        try:
+            ignore = root / GITIGNORE_FILE
+            if ignore.exists():
+                return
+            if any(leftovers.marker(path) is None for path in root.iterdir()):
+                return  # something here is not ours; see the docstring
+            ignore.write_text(GITIGNORE_BODY, encoding="utf-8")
         except OSError:
             return  # bookkeeping must never break a run
 

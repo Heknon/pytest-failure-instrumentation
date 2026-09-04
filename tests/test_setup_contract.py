@@ -458,7 +458,9 @@ def test_a_run_name_that_is_an_absolute_path_does_not_move_the_evidence(
     )
 
     assert [path.name for path in root.iterdir()] == ["artifacts"]
-    runs = list((root / "artifacts").iterdir())
+    # Directories only: the ignore file that keeps the evidence out of git
+    # sits beside them, and this is a count of runs.
+    runs = [path for path in (root / "artifacts").iterdir() if path.is_dir()]
     assert len(runs) == 1 and (runs[0] / "owner.json").exists()
     assert list(runs[0].glob("*.state")), "the workers wrote where the controller did"
     distributed.result.stderr.fnmatch_lines(["*PYTEST_RUN_ID*escaped-absolute*"])
@@ -486,7 +488,9 @@ def test_a_run_name_that_climbs_out_of_the_directory_does_not_climb(
     )
 
     assert [path.name for path in root.iterdir()] == ["artifacts"]
-    runs = list((root / "artifacts").iterdir())
+    # Directories only: the ignore file that keeps the evidence out of git
+    # sits beside them, and this is a count of runs.
+    runs = [path for path in (root / "artifacts").iterdir() if path.is_dir()]
     assert len(runs) == 1 and (runs[0] / "owner.json").exists()
     distributed.result.stderr.fnmatch_lines(["*PYTEST_RUN_ID*escaped-upward*"])
 
@@ -540,6 +544,72 @@ def test_pruning_a_directory_that_does_not_exist_is_not_an_error(tmp_path):
     from pytest_failure_instrumentation.incidents.engine import prune_finished_runs
 
     prune_finished_runs(tmp_path / "never-created")
+
+
+# -- and out of the repository it is standing in --------------------------
+
+
+def test_the_evidence_directory_ignores_itself_in_git(runner):
+    """A plugin the developer did not ask to think about must not turn up in
+    the ``git status`` they read to see what they changed.
+
+    Everything under the directory is one run's scratch that a later run
+    deletes, so the directory carries the ignore file itself rather than the
+    repository's own ``.gitignore`` carrying a line about us - which works the
+    same in the next checkout and on the colleague's machine.
+    """
+    runner.pytester.makepyfile(test_suite=SUITE)
+    runner.run("test_suite.py")
+
+    ignore = runner.pytester.path / ".pytest-failures" / ".gitignore"
+    assert "*" in ignore.read_text(encoding="utf-8").splitlines()
+
+
+def test_a_directory_that_already_holds_our_runs_still_gets_one(runner):
+    """The upgrade path. A directory made by an older version is as much ours
+    as one made a moment ago, and it is the one already in somebody's
+    checkout."""
+    runner.pytester.makepyfile(test_suite=SUITE)
+    import json
+    import os
+
+    earlier = runner.pytester.path / ".pytest-failures" / "run-earlier"
+    earlier.mkdir(parents=True)
+    (earlier / "owner.json").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+
+    runner.run("test_suite.py")
+
+    assert (runner.pytester.path / ".pytest-failures" / ".gitignore").exists()
+
+
+def test_a_gitignore_that_is_already_there_is_never_rewritten(runner):
+    """It may be the developer's, and then it says what they meant."""
+    runner.pytester.makepyfile(test_suite=SUITE)
+    evidence = runner.pytester.path / ".pytest-failures"
+    evidence.mkdir()
+    (evidence / ".gitignore").write_text("*\n!keep-me.json\n", encoding="utf-8")
+
+    runner.run("test_suite.py")
+
+    assert (evidence / ".gitignore").read_text(encoding="utf-8") == "*\n!keep-me.json\n"
+
+
+def test_a_directory_shared_with_somebody_else_gets_no_ignore_file(runner):
+    """``failure_directory`` is a natural thing to point at an existing
+    artifacts directory, and ``*`` dropped into one would quietly stop git
+    from seeing files that were never ours to hide."""
+    runner.pytester.makepyfile(test_suite=SUITE)
+    artifacts = runner.pytester.path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "coverage.xml").write_text("<coverage/>", encoding="utf-8")
+
+    runner.run("-o", "failure_directory=artifacts", "test_suite.py")
+
+    assert not (artifacts / ".gitignore").exists()
+    assert (artifacts / "coverage.xml").exists()
+    assert [path for path in artifacts.iterdir() if path.is_dir()], (
+        "the run still wrote its evidence there"
+    )
 
 
 @needs_xdist
