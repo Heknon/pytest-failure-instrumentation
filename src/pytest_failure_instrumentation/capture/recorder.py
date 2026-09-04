@@ -56,6 +56,10 @@ class WorkerRecorder:
         self.monitor: memory_capture.MemoryMonitor | None = None
         self.profiler: Any = None
         self._allocation_tracer: memory_capture.TracemallocSession | None = None
+        #: The test whose protocol is open and has already been counted as
+        #: started, or None between tests. What makes a rerun not count twice
+        #: - see pytest_runtest_protocol.
+        self._counted: str | None = None
         # Filled as each resource is opened, so close() works on a recorder
         # that never finished being built.
         self._open_resources: list[Any] = []
@@ -296,6 +300,35 @@ class WorkerRecorder:
         )
 
     @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_protocol(self, item: pytest.Item, nextitem: Any) -> Any:
+        """One test, however many times its phases run inside this.
+
+        ``tests_started`` and ``tests_finished`` count tests, and the phases
+        are not a count of tests. A rerun plugin - pytest-rerunfailures,
+        flaky, and every one written the same way - implements this hook and
+        runs ``runtestprotocol`` again inside it when the test fails, so setup
+        and teardown run once per attempt while the test, its node id and its
+        slot in the scheduler's queue are one. Counting it at setup counted
+        every attempt, and a suite of 368 tests with six of them rerun once
+        was reported as 374: the controller's total is floored at this
+        counter, so an attempt counted here became a test nobody was given.
+
+        A hookwrapper is around every implementation, the rerun plugin's
+        included, so this opens and closes exactly once per test whatever
+        happens in between - which is all it is here for. The counting stays
+        in the phases, where the slot is written anyway: what this adds is
+        the boundary, so that a setup for the id already counted in *this*
+        protocol is a rerun, and the same id in the next protocol is the next
+        test (``--keep-duplicates`` collects a file twice, and both copies
+        run). The test is closed at the end of teardown, as it always was,
+        and not here: pytest's ``logfinish`` fires between the two, and a
+        worker that dies there died between tests, not in one.
+        """
+        self._counted = None
+        yield
+        self._counted = None
+
+    @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
         yield from self._phase("setup", item.nodeid)
 
@@ -321,7 +354,20 @@ class WorkerRecorder:
         "died mid-call": pytest's own logfinish fires only after the whole
         protocol, so it cannot tell them apart."""
         if phase == "setup":
-            self.state.tests_started += 1
+            if self._counted != nodeid:
+                # The first setup of the protocol is the test starting.
+                self._counted = nodeid
+                self.state.tests_started += 1
+            elif self.state.tests_finished > 0:
+                # A second one is a rerun of the same test, which is not a
+                # test starting - see pytest_runtest_protocol - and the
+                # finish counted at the end of its last attempt was not a
+                # finish either. It is taken back rather than never counted,
+                # because at the end of a teardown nobody yet knows whether
+                # an attempt was the last; and it is taken back rather than
+                # left, because the row is read as ``started - finished``
+                # running, and that read zero beside a call phase in the slot.
+                self.state.tests_finished -= 1
         if self.heartbeat is not None:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase
