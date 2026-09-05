@@ -1022,7 +1022,8 @@ carries the target's PID and API return status, and the event header carries the
 the process it was written in, which is the caller. Only successful calls
 are attributed. `killer.api_status` preserves the API result; `killer.exit_code`
 comes from the parent's observed process status and is unavailable during
-recovery. It is never inferred from ETW's `ReturnCode`. A sidecar of the same shape
+recovery. It is never inferred from ETW's `ReturnCode`. A rejected call or stale
+PID match does not end the wait for a valid termination record. A sidecar of the same shape
 as the Linux one consumes a real-time session on that provider, sweeps the
 sessions a killed sidecar would have left (a machine holds at most 64), and
 writes the same JSON lines; the verdict is `KILLED_BY_PROCESS` with the
@@ -2026,6 +2027,9 @@ Threads that start and exit between samples can go unseen.
 Windows starts with CPU baselines for known Python threads and discovers
 native-only threads on the first sampling tick, then on the normal discovery
 schedule. Discovery does not block the test thread before sampling starts.
+When profiling and kill tracing are both enabled, the controller prepares its
+profile reporting models while the separate ETW process starts, then joins
+that preparation before startup returns.
 
 The native qualification probe remains a visible, non-blocking diagnostic:
 its JSON preserves failed attribution measurements. Python detection, quiet

@@ -416,15 +416,15 @@ def _settled(
     arrived while the size is unchanged.
     """
     found = sources.trace_reading()
-    if not sources.live or time.monotonic() - sources._trace_waited_at < 2.0:
-        return found
-    sources._trace_waited_at = time.monotonic()
-    deadline = time.monotonic() + TRACE_SETTLE_SECONDS
-    size = _size_of(sources.trace_path)
     # A rejected call, old PID reuse, or a different signal is not the event
     # we are waiting for. Such a row must not end settling before the actual
     # termination reaches the file.
     ready = ready or (lambda witness: witness.target_pid == pid and witness.delivered)
+    if (any(ready(witness) for witness in found) or not sources.live
+            or time.monotonic() - sources._trace_waited_at < 2.0):
+        return found
+    deadline = time.monotonic() + TRACE_SETTLE_SECONDS
+    size = _size_of(sources.trace_path)
     while not any(ready(witness) for witness in found) and time.monotonic() < deadline:
         time.sleep(TRACE_POLL_SECONDS)
         grown = _size_of(sources.trace_path)
@@ -432,6 +432,10 @@ def _settled(
             continue
         size = grown
         found = sources.trace_reading()
+    # Share the completed wait. Dating the cooldown from its start makes
+    # Windows' two-second wait expire its own two-second cooldown, so every
+    # death in a cascade pays again.
+    sources._trace_waited_at = time.monotonic()
     return found
 
 
