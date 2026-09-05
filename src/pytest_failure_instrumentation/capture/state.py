@@ -101,6 +101,14 @@ class WorkerState:
         #: last in" are different questions and only one of them is a finding.
         self.last_nodeid: str | None = None
         self.phase: str | None = None
+        #: When the current phase began, and when the current *test* began
+        #: (its setup). These clocks let the controller correlate death with
+        #: the test's effective timeout; timing alone does not prove which
+        #: process or mechanism ended it. Wall clock, shared with the
+        #: controller that reads the death.
+        self.phase_started: float | None = None
+        self.test_started: float | None = None
+        self.timeout_settings: list[dict[str, Any]] = []
         # Opened once; the descriptor lives for the process lifetime so a
         # write costs one syscall and survives interpreter shutdown.
         # O_BINARY matters on Windows: without it os.write translates "\n"
@@ -187,6 +195,9 @@ class WorkerState:
                 "nodeid": nodeid,
                 "last_nodeid": last_nodeid,
                 "phase": self.phase,
+                "phase_started": self.phase_started,
+                "test_started": self.test_started,
+                "timeout_settings": self.timeout_settings,
                 "tests_started": self.tests_started,
                 "tests_finished": self.tests_finished,
             }

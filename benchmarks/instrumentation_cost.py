@@ -5,13 +5,75 @@ from __future__ import annotations
 import json
 import os
 import pstats
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
-from profile_gate import WORKLOAD
+from profile_gate import WORKLOAD, _run
+
+
+def compare_master(root: Path, output: Path, baseline: Path, repeats: int = 5) -> dict:
+    """Compare exact sources on one runner, including tracing's marginal cost."""
+    current = Path(__file__).resolve().parents[1]
+    modes = {
+        "master_disabled": (baseline, "baseline", ""),
+        "branch_disabled": (current, "baseline", ""),
+        "master_profile": (baseline, "profile", ""),
+        "branch_profile": (current, "profile", ""),
+        "branch_profile_trace_off": (current, "profile", "-o failure_kill_trace=false"),
+    }
+    # Entry points are installed from the branch. Verify PYTHONPATH actually
+    # selects the requested source in every controller and worker process.
+    (root / "conftest.py").write_text('''
+import os
+from pathlib import Path
+import pytest_failure_instrumentation as package
+assert Path(package.__file__).resolve().is_relative_to(Path(os.environ["PFI_EXPECTED_SOURCE"]))
+''', encoding="utf-8")
+    destination = output / "master-comparison"
+    destination.mkdir(exist_ok=True)
+    timings: dict[str, list[float]] = {name: [] for name in modes}
+
+    def run(name: str, trial: str) -> float:
+        checkout, mode, options = modes[name]
+        source = str((checkout / "src").resolve())
+        with patch.dict(os.environ, {
+            "PYTHONPATH": source, "PFI_EXPECTED_SOURCE": source,
+            "PYTEST_ADDOPTS": options,
+        }):
+            elapsed, logs = _run(root, mode, workers=4)
+        (destination / f"{trial}-{name}.log").write_text(logs, encoding="utf-8")
+        return elapsed
+
+    for name in modes:
+        run(name, "warmup")
+    names = tuple(modes)
+    for repetition in range(repeats):
+        # Rotate and reverse the order so one variant does not always get
+        # the same position relative to runner load or filesystem caches.
+        order = names[repetition % len(names):] + names[:repetition % len(names)]
+        if repetition % 2:
+            order = tuple(reversed(order))
+        for name in order:
+            timings[name].append(run(name, str(repetition)))
+    medians = {name: statistics.median(values) for name, values in timings.items()}
+    result = {
+        "master_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=baseline, text=True).strip(),
+        "branch_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=current, text=True).strip(),
+        "seconds": timings,
+        "median_seconds": medians,
+        "branch_vs_master_profile_ratio": medians["branch_profile"] / medians["master_profile"],
+        "master_profile_overhead_ratio": medians["master_profile"] / medians["master_disabled"],
+        "branch_profile_overhead_ratio": medians["branch_profile"] / medians["branch_disabled"],
+        "tracing_marginal_seconds": medians["branch_profile"] - medians["branch_profile_trace_off"],
+    }
+    (destination / "comparison.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result, indent=2), flush=True)
+    return result
 
 PARALLEL_TIMING = '''
 import json
@@ -124,6 +186,8 @@ def main() -> int:
                 return completed.returncode
             workers = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(destination.glob("gw*.json"))]
             print(json.dumps({"mode": mode, "elapsed": elapsed, "workers": workers}), flush=True)
+        if baseline := os.environ.get("PFI_BASELINE_ROOT"):
+            compare_master(root, output, Path(baseline))
     return 0
 
 

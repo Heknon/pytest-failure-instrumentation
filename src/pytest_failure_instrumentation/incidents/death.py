@@ -28,8 +28,12 @@ from .. import probes
 from ..analysis import classify, exit_status
 from ..capture import crash_stack
 from ..capture import events as event_log
+from ..capture import output as output_capture
 from ..capture.state import read_state
+from ..probes import signal_trace
+from . import killer
 from .base import CgroupMemory, Incident
+from .killer import KillSources, OomKillRecord, SignalRecord
 
 #: The signals faulthandler installs a handler for, and therefore the deaths
 #: that are expected to leave a dump behind. A worker killed by anything else -
@@ -157,6 +161,39 @@ class WorkerDeathIncident(Incident):
     #: anything else on file, which is the case worth saying out loud.
     crash_stack_age_seconds: Optional[float] = None
 
+    #: How long the test in flight had been running, and its current phase,
+    #: when the worker died. What turns a bare ``os._exit(1)`` into "a timeout
+    #: enforcer ended it": pytest-timeout and faulthandler both end a hung
+    #: worker that way, and the tell is that the test had reached a configured
+    #: timeout - see :attr:`matched_timeout`.
+    test_seconds: Optional[float] = None
+    phase_seconds: Optional[float] = None
+    #: The timeout this death reached, and what enforces it, when it did.
+    matched_timeout: Optional[float] = None
+    timeout_source: Optional[str] = None
+
+    #: The tail of the worker's stderr, when ``failure_capture_output`` kept
+    #: it. The one line a native death leaves - ``pthread_create failed``, a
+    #: malloc abort - is here and in no stack. Empty when the setting was off,
+    #: which reads differently from a worker that printed nothing: the alert
+    #: says which, so an absent tail is never taken for silence.
+    recent_output: list[str] = Field(default_factory=list)
+
+    #: Who sent the signal that ended it, when a witness saw - see
+    #: :mod:`.killer`. The kernel's tracepoint names a sender for every
+    #: SIGKILL, which the wait status never will.
+    killer: Optional[SignalRecord] = None
+    #: The kernel's own record of choosing this process, when its log held
+    #: one: the constraint, the cgroup, and the table of every task it weighed.
+    oom: Optional[OomKillRecord] = None
+    #: Signals to this worker or to the controller shortly before the death -
+    #: above all the SIGTERM an orchestrator sends before the SIGKILL it will
+    #: not otherwise explain.
+    signals_before_death: list[SignalRecord] = Field(default_factory=list)
+    #: What each witness said about itself on this machine, so a verdict that
+    #: reached none of them says which was withheld and by what.
+    kill_sources: Optional[KillSources] = None
+
     def raw_stack(self) -> list[str]:
         return self.crash_stack
 
@@ -176,6 +213,11 @@ class WorkerDeathIncident(Incident):
         return self.crash_stack, False  # faulthandler prints deepest first
 
     def suspect_nodeid(self) -> str | None:
+        if self.verdict in classify.DELIBERATE_STOPS:
+            # Somebody outside the run stopped it, and a witness saw who. The
+            # test that happened to be running is not a lead; naming it would
+            # put an owner on a cancellation.
+            return None
         return self.test_in_flight or self.last_test
 
     def suspect_basis_for(self, path: str) -> str:
@@ -187,7 +229,12 @@ class WorkerDeathIncident(Incident):
         )
 
     def fingerprint_parts(self) -> list[str]:
-        return [self.kind, self.verdict, str(self.exit_status)]
+        parts = [self.kind, self.verdict, str(self.exit_status)]
+        if self.killer is not None and self.killer.origin == "process":
+            # Killed by whom is what recurs: every kill from the same runner
+            # binary is one incident, whichever test it landed on.
+            parts.append(self.killer.sender_comm or "")
+        return parts
 
     def summary(self) -> str:
         """Which worker, what happened to it, what it was doing, and where.
@@ -244,6 +291,11 @@ class WorkerDeathIncident(Incident):
         return f"died ({self.verdict})"
 
     def _what_it_was_doing(self) -> str:
+        if self.worker == "controller" and self.recovered_from_run:
+            # It runs no tests, so none of the phrasings below is about it -
+            # and "before running any test" would read as a run that never
+            # got going, which is the opposite of what happened.
+            return "without reaching session finish, leaving its workers to finish on their own"
         if self.test_in_flight:
             phase = f" ({self.phase})" if self.phase else ""
             return f"while running {self.test_in_flight}{phase}"
@@ -261,7 +313,9 @@ def build(
     directory: Path,
     baseline_oom_kills: int | None,
     run_id: str | None = None,
+    sources: Optional[killer.Sources] = None,
 ) -> WorkerDeathIncident:
+    died_at = time.time()
     worker = node.gateway.id
     crash_file = directory / f"{worker}.crash"
     events = event_log.this_run(
@@ -306,8 +360,81 @@ def build(
         crash_stack_age_seconds=_age_of(crash_file) if dump else None,
         high_water=event_log.high_water_marks(events)[-1:] or None,
     )
+    _time_the_test(incident, state, died_at)
+    incident.recent_output = output_capture.read_tail(directory / f"{worker}.output")
+    if sources is not None:
+        _attach_witnesses(
+            incident, sources, pid, status, event_log.started_at(events), died_at
+        )
     incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
     return incident
+
+
+def _attach_witnesses(
+    incident: WorkerDeathIncident,
+    sources: killer.Sources,
+    pid: Optional[int],
+    status: Optional[int],
+    started_at: Optional[float],
+    died_at: float,
+) -> None:
+    """Ask every witness, and never let the asking cost the incident.
+
+    Attribution is extra evidence on top of a death already established. A
+    kernel log that cannot be parsed or a trace file that is half-written
+    must degrade to "this source failed", written on the incident, and not
+    to a degraded incident with nothing else on it.
+    """
+    try:
+        found = killer.attribute(
+            sources, pid=pid, exit_status=status, started_at=started_at, died_at=died_at
+        )
+    except Exception as failure:  # noqa: BLE001 - see the docstring
+        incident.kill_sources = KillSources(
+            kernel_log=f"failed ({failure!r})",
+            signal_trace=sources.trace_status,
+            controller_witness=sources.witness_status,
+        )
+        return
+    incident.killer = found.killer
+    incident.oom = found.oom
+    incident.signals_before_death = found.before
+    incident.kill_sources = found.sources
+
+
+def _time_the_test(
+    incident: WorkerDeathIncident,
+    state: dict[str, Any],
+    died_at: float,
+) -> None:
+    """How long the test had run, and whether that reached a timeout.
+
+    The worker and the controller share a wall clock - one machine - so the
+    controller's ``died_at`` minus the worker's own ``test_started`` is how
+    long the test had been running when it died. Only the effective limits
+    saved by that worker count; elapsed time is correlation, not proof.
+    """
+    test_started = state.get("test_started")
+    phase_started = state.get("phase_started")
+    if isinstance(test_started, (int, float)):
+        incident.test_seconds = round(max(0.0, died_at - test_started), 1)
+    if isinstance(phase_started, (int, float)):
+        incident.phase_seconds = round(max(0.0, died_at - phase_started), 1)
+    if not incident.phase or not incident.test_in_flight:
+        return
+    reached = []
+    for deadline in state.get("timeout_settings") or []:
+        if not isinstance(deadline, dict):
+            continue
+        start = phase_started if deadline.get("scope") == "call" else test_started
+        if deadline.get("scope") == "call" and incident.phase != "call":
+            continue
+        seconds = deadline.get("seconds")
+        if (isinstance(start, (int, float)) and isinstance(seconds, (int, float))
+                and seconds > 0 and died_at - start >= seconds):
+            reached.append((str(deadline.get("source")), float(seconds)))
+    if reached:
+        incident.timeout_source, incident.matched_timeout = min(reached, key=lambda pair: pair[1])
 
 
 def _age_of(path: Path) -> float | None:
@@ -328,7 +455,9 @@ def _delta(current: int | None, baseline: int | None) -> int | None:
     return current - baseline
 
 
-def recover(events_path: Path, session: str) -> Optional[WorkerDeathIncident]:
+def recover(
+    events_path: Path, session: str, elevate: bool = False
+) -> Optional[WorkerDeathIncident]:
     """The death of a process nobody was watching, from what it left on disk.
 
     ``events_path`` is one process's event log inside a run directory that is
@@ -346,10 +475,15 @@ def recover(events_path: Path, session: str) -> Optional[WorkerDeathIncident]:
     memory it was using and whether it was burning CPU, and a fatal dump - if
     this run kept one - names the frame.
 
-    Nothing about *this* machine is attached to it. The cgroup figures and the
-    OOM counter describe the moment they are read, and reading them now would
-    put this run's memory pressure on a death that happened an hour ago,
-    under a verdict that reads as a finding.
+    Nothing about *this* machine's present is attached to it. The cgroup
+    figures and the OOM counter describe the moment they are read, and reading
+    them now would put this run's memory pressure on a death that happened an
+    hour ago, under a verdict that reads as a finding. The witnesses are the
+    exception, because they are records of moments rather than readings of
+    now: the dead run's own trace file and controller log, and the kernel log,
+    which is machine-wide and timestamped - a kill in the dead run's window
+    is the dead run's. ``elevate`` is the *reporting* run's permission to
+    spend sudo on that log.
     """
     worker = events_path.stem
     directory = events_path.parent
@@ -389,6 +523,16 @@ def recover(events_path: Path, session: str) -> Optional[WorkerDeathIncident]:
         crash_stack=dump,
         crash_stack_age_seconds=_age_of(directory / f"{worker}.crash") if dump else None,
         high_water=event_log.high_water_marks(events)[-1:] or None,
+        recent_output=output_capture.read_tail(directory / f"{worker}.output"),
+    )
+    sources = _dead_runs_sources(directory, elevate)
+    # The death is somewhere after the last beat and before the next one
+    # would have been due; a generous window, because the beat interval is
+    # the dead run's setting and not this one's to know.
+    last_seen = beats[-1].get("time") if beats else None
+    died_by = (last_seen + RECOVERED_DEATH_WINDOW_SECONDS) if last_seen else time.time()
+    _attach_witnesses(
+        incident, sources, incident.worker_pid, None, event_log.started_at(events), died_by
     )
     incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
     seen = (
@@ -409,6 +553,98 @@ def recover(events_path: Path, session: str) -> Optional[WorkerDeathIncident]:
     else:
         incident.evidence.extend(kept)
     return incident
+
+
+#: How long after its last heartbeat a recovered process is taken to have
+#: died within. Three default intervals: past that a beat would have landed.
+RECOVERED_DEATH_WINDOW_SECONDS = 15.0
+
+
+def recover_controller(
+    directory: Path, session: str, marker: dict[str, Any], elevate: bool = False
+) -> Optional[WorkerDeathIncident]:
+    """The death of a run's controller, which nothing else on disk records.
+
+    A worker leaves an event log with a start and, if it got there, a finish.
+    The controller of a distributed run leaves neither: it runs no tests and
+    keeps no heartbeat. What it leaves is the marker with its pid and, from
+    :mod:`.killer`, a log of the SIGTERM it was sent. A cancelled CI job is
+    exactly this case - and its workers are *not* the evidence, because
+    execnet sends each of them SIGINT once the controller is gone, and they
+    finish their sessions cleanly five seconds later. For a long time that
+    made a cancelled run a run about which nothing was said at all.
+
+    ``marker`` is the directory's ``owner.json``, already read and already
+    judged to name a process that is over and never stamped its finish. A run
+    with no workers is not this: its one process is ``main`` and has an event
+    log of its own, and this returns None for it rather than reporting one
+    death twice.
+    """
+    pid = marker.get("pid")
+    if not isinstance(pid, int):
+        return None
+    if pid in {read_state(state, None).get("pid") for state in directory.glob("*.state")}:
+        return None  # a run with no workers: its process is recovered as "main"
+    controller_log = event_log.read_events(directory / killer.CONTROLLER_EVENTS)
+    run_id = _run_id(controller_log) or next(
+        (
+            _run_id(event_log.read_events(path))
+            for path in sorted(directory.glob("*.events"))
+            if path.name != killer.CONTROLLER_EVENTS
+        ),
+        None,
+    )
+    started_at = marker.get("started_at") if isinstance(marker.get("started_at"), (int, float)) else None
+    last_seen = _last_seen(directory)
+
+    incident = WorkerDeathIncident(
+        worker="controller",
+        worker_pid=pid,
+        recovered_from_run=session,
+        run_id=run_id or session,
+        last_seen_at=last_seen,
+        exit_status_source="unavailable",
+        exit_status_meaning="unknown",
+    )
+    sources = _dead_runs_sources(directory, elevate)
+    died_by = (last_seen + RECOVERED_DEATH_WINDOW_SECONDS) if last_seen else time.time()
+    _attach_witnesses(incident, sources, pid, None, started_at, died_by)
+    incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
+    return incident
+
+
+def _dead_runs_sources(directory: Path, elevate: bool) -> killer.Sources:
+    """What a run that is over left for its witnesses to be read from.
+
+    Nothing is still writing here, so nothing is waited for.
+    """
+    trace = directory / signal_trace.TRACE_FILE
+    witness = directory / killer.CONTROLLER_EVENTS
+    return killer.Sources(
+        directory=directory,
+        elevate=elevate,
+        trace_status=(
+            "the dead run's trace file" if trace.exists() else "off: the dead run left no trace file"
+        ),
+        witness_status=(
+            "the dead run's controller log"
+            if witness.exists()
+            else "off: the dead run left no controller log"
+        ),
+        live=False,
+    )
+
+
+def _last_seen(directory: Path) -> Optional[float]:
+    """The last moment anything in this run was known to be alive: the newest
+    line any of its processes wrote."""
+    latest: Optional[float] = None
+    for path in directory.glob("*.events"):
+        for event in event_log.tail_events(path):
+            stamp = event.get("time")
+            if isinstance(stamp, (int, float)) and (latest is None or stamp > latest):
+                latest = float(stamp)
+    return latest
 
 
 def _run_id(events: list[dict[str, Any]]) -> Optional[str]:

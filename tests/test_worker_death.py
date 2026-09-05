@@ -80,11 +80,64 @@ def test_sigkill_does_not_claim_an_oom_it_cannot_prove(distributed):
     incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
 
     death = distributed.only(incidents, "worker_death")
-    # OOM_KILLED needs the cgroup counter to have moved. Without it the honest
-    # answer is that something killed it.
-    assert death.verdict == "SIGKILLED"
     assert death.exit_status == -signal.SIGKILL
-    assert any("No cgroup OOM kill was counted" in line for line in death.evidence)
+    if death.kill_sources is not None and death.kill_sources.signal_trace.endswith("tracefs"):
+        # Root, or a sudo this run may spend: the kernel's signal tracepoint
+        # saw the worker send the signal to itself, and says so.
+        assert death.verdict == "SELF_KILLED"
+        assert death.killer is not None and death.killer.origin == "self"
+    else:
+        # OOM_KILLED needs the cgroup counter to have moved. Without it, or a
+        # witness to the sender, the honest answer is that something killed it
+        # - and which witnesses this machine withheld is on the incident.
+        assert death.verdict == "SIGKILLED"
+        assert any("No cgroup OOM kill was counted" in line for line in death.evidence)
+        assert any(line.startswith("Kill witnesses:") for line in death.evidence)
+
+
+def _has_pytest_timeout() -> bool:
+    try:
+        import pytest_timeout  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+needs_pytest_timeout = pytest.mark.skipif(
+    not _has_pytest_timeout(), reason="pytest-timeout is not installed"
+)
+
+
+@posix_only
+@needs_pytest_timeout
+def test_a_worker_killed_by_pytest_timeout_reads_as_a_timeout(distributed):
+    """pytest-timeout's thread method os._exit(1)s a hung worker. That is a
+    plain SELF_EXIT from the outside; the test having reached the configured
+    timeout is what names it."""
+    distributed.pytester.makepyfile(
+        test_hang="""
+        import time
+
+
+        def test_filler():
+            assert True
+
+
+        def test_hangs():
+            time.sleep(60)
+        """
+    )
+    incidents = distributed.run(
+        "-n", "2", "--timeout", "3", "--timeout-method", "thread",
+        "test_hang.py", timeout=120,
+    )
+    death = distributed.only(incidents, "worker_death")
+    assert death.verdict == "POSSIBLE_TIMEOUT", death.evidence
+    assert death.test_in_flight == "test_hang.py::test_hangs"
+    assert death.matched_timeout == 3.0 and death.timeout_source == "pytest-timeout"
+    assert death.test_seconds is not None and death.test_seconds >= 3.0
+    # It points at the hung test, so it is scored like the test's owner.
+    assert death.suspect_nodeid() == "test_hang.py::test_hangs"
 
 
 @posix_only
@@ -440,7 +493,9 @@ def test_a_probe_stack_left_behind_is_dated_and_not_called_a_crash(distributed):
     )
 
     death = distributed.only(incidents, "worker_death")
-    assert death.verdict == "SIGKILLED"
+    # SELF_KILLED where the kernel's signal tracepoint could be watched (root,
+    # or a sudo this run may spend) and saw the worker signal itself.
+    assert death.verdict in ("SIGKILLED", "SELF_KILLED")
     assert death.crash_stack, "the probe answered, so there is a stack on file"
     assert death.crash_stack_age_seconds is not None
     assert any(
@@ -567,6 +622,12 @@ def test_a_death_between_tests_is_not_blamed_on_the_test_that_passed(distributed
     assert death.phase is None
     assert death.tests_started == death.tests_finished == 2
     assert "between tests, after finishing 2 (the last was test_gap.py::test_finishes)" in str(death).splitlines()[0]
+    # The test's clock is cleared with the test. Left running it measures the
+    # gap since a test that already passed, and the controller matches that
+    # against the run's timeouts - so an idle worker's exit is reported as
+    # TIMED_OUT, against a test that was never killed.
+    assert death.test_seconds is None and death.phase_seconds is None
+    assert death.matched_timeout is None and death.verdict != "POSSIBLE_TIMEOUT"
     # The lead is still offered - it is the best one there is - but it says
     # which kind of guess it is rather than claiming the test was running.
     assert "nothing was running when it died" in str(death)

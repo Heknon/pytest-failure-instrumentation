@@ -56,15 +56,15 @@ def rendered(**fields) -> str:
 
 
 @posix_only
-def test_the_cgroup_counter_is_what_licenses_an_oom_verdict():
+def test_the_cgroup_counter_is_correlation_not_victim_identification():
     verdict, confidence, evidence = verdict_of(
         exit_status=-signal.SIGKILL,
         cgroup_oom_kills_since_start=1,
         rss_mb_at_death=3900,
         cgroup=CgroupMemory(max_mb=4096),
     )
-    assert verdict == "OOM_KILLED"
-    assert confidence == "high"
+    assert verdict == "SIGKILLED"
+    assert confidence == "medium"
     assert any("cgroup OOM kills during this run: 1" in line for line in evidence)
     assert any("of a 4096 MB cgroup limit" in line for line in evidence)
 
@@ -199,3 +199,103 @@ def test_dying_before_any_test_says_so():
 def test_dying_between_tests_counts_what_finished():
     text = rendered(exit_status=1, test_in_flight=None, phase=None, tests_finished=12)
     assert "between tests, after finishing 12" in text.splitlines()[0]
+
+
+# -- a worker a timeout enforcer killed --------------------------------------
+
+
+@posix_only
+def test_a_self_exit_at_a_configured_timeout_is_a_timeout():
+    verdict, confidence, evidence = verdict_of(
+        exit_status=1, test_seconds=30.4, phase="call",
+        matched_timeout=30.0, timeout_source="pytest-timeout",
+    )
+    # pytest-timeout's thread method os._exit(1)s a hung worker, which is
+    # otherwise a plain SELF_EXIT.
+    assert (verdict, confidence) == ("POSSIBLE_TIMEOUT", "medium")
+    assert any("running 30.4s in the call phase" in line for line in evidence)
+    assert any("configured pytest-timeout of 30.0s" in line for line in evidence)
+
+
+def test_a_self_exit_below_every_timeout_stays_a_self_exit():
+    verdict, _, evidence = verdict_of(exit_status=1, test_seconds=2.0, phase="call")
+    assert verdict == "SELF_EXIT"
+    # The duration is still said, so a reader can see it was nowhere near one.
+    assert any("reached 2.0s in the call phase" in line for line in evidence)
+
+
+def test_a_self_exit_with_no_timeout_configured_is_not_upgraded():
+    # matched_timeout is only set when a timeout was configured and reached.
+    verdict, _, _ = verdict_of(exit_status=1, test_seconds=600.0, phase="call")
+    assert verdict == "SELF_EXIT"
+
+
+@posix_only
+def test_a_sigalrm_at_a_timeout_is_a_timeout_not_a_bare_signal():
+    verdict, confidence, evidence = verdict_of(
+        exit_status=-signal.SIGALRM, test_seconds=60.2, phase="call",
+        matched_timeout=60.0, timeout_source="pytest-timeout",
+    )
+    assert (verdict, confidence) == ("POSSIBLE_TIMEOUT", "medium")
+    assert any("does not prove" in line for line in evidence)
+
+
+@posix_only
+def test_a_faulthandler_timeout_exit_is_a_timeout():
+    verdict, _, evidence = verdict_of(
+        exit_status=1, test_seconds=900.5, phase="teardown",
+        matched_timeout=900.0, timeout_source="faulthandler_timeout",
+    )
+    assert verdict == "POSSIBLE_TIMEOUT"
+    assert any("faulthandler_timeout" in line for line in evidence)
+
+
+def test_a_native_crash_at_the_timeout_is_still_a_crash():
+    # A fault right at the boundary is explained by the fault, not the clock.
+    verdict, _, _ = verdict_of(
+        exit_status=-signal.SIGSEGV, test_seconds=30.1, phase="call",
+        matched_timeout=30.0, timeout_source="pytest-timeout",
+    )
+    assert verdict == "NATIVE_CRASH"
+
+
+@posix_only
+def test_a_timeout_is_never_matched_against_a_worker_with_nothing_in_flight():
+    """A clock left running is not a test still running.
+
+    The recorder clears the test's clock at teardown along with its node id,
+    so a worker that exits between tests carries no duration at all. This is
+    the second half of that: with no phase open there is no test for an
+    enforcer to have ended, whatever a duration says - and TIMED_OUT names a
+    test and blames its owner, so it may not rest on one slot being cleared.
+    """
+    verdict, _, evidence = verdict_of(
+        exit_status=1, test_in_flight=None, phase=None,
+        test_seconds=901.0, matched_timeout=900.0, timeout_source="faulthandler_timeout",
+    )
+    assert verdict == "SELF_EXIT"
+    assert not any("timeout enforcer" in line for line in evidence)
+
+
+# -- a run somebody stopped --------------------------------------------------
+
+
+def test_a_stopped_run_is_scored_and_suspected_like_the_kills_it_matches():
+    """RUN_STOPPED is a cancellation seen from the other side.
+
+    The SIGTERM is on the controller's log rather than on this process, but
+    the conclusion is the one KILLED_BY_PROCESS and KILLED_AFTER_SIGTERM
+    reach: nobody's test is at fault. Both consequences follow from one list,
+    so a verdict cannot be in it for scoring and out of it for suspicion.
+    """
+    from pytest_failure_instrumentation.analysis import severity
+
+    assert "RUN_STOPPED" in classify.DELIBERATE_STOPS
+    assert severity.of("worker_death", "unknown", "RUN_STOPPED", "medium", False) == (
+        "informational",
+        None,
+    )
+    stopped = death(verdict="RUN_STOPPED", test_in_flight="test_api.py::test_thing")
+    # The test that happened to be running when the job was cancelled is not
+    # a lead, and naming it would put an owner on somebody's Ctrl-C.
+    assert stopped.suspect_nodeid() is None

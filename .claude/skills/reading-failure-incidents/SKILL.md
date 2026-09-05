@@ -89,11 +89,14 @@ The reverse reading matters just as much: `suspect_owner: null` together with a
 can state flatly.
 
 **`severity`** — derived from `owner`: `product`→critical, `third-party`→high,
-`customer-code`/`runtime`→informational, `unknown`→needs-triage. Two overrides:
-a `run_summary`, and a `SIGNAL_*` identified with high confidence, are
-informational; a framework defect that ended the run is raised to high, because
-no test is at fault and nothing else will ever surface it. `needs-triage` means
-"somebody has to look", not "this is bad".
+`customer-code`/`runtime`→informational, `unknown`→needs-triage. Three
+overrides are informational: a `run_summary`; a `SIGNAL_*` identified with high
+confidence; and a run somebody deliberately stopped - `KILLED_BY_PROCESS`,
+`KILLED_AFTER_SIGTERM`, `RUN_STOPPED` - where the same list also stops any test
+being suspected, since a cancellation is nobody's defect. A framework defect
+that ended the run is raised the other way, to high, because no test is at
+fault and nothing else will ever surface it. `needs-triage` means "somebody has
+to look", not "this is bad".
 
 So `severity` answers *who acts*, and `run_ending` is the closest thing to a
 blast-radius field: it says the session had no path to completion. Anyone
@@ -126,23 +129,78 @@ replaces it:
 
 | Verdict | Means | Points at |
 |---|---|---|
-| `OOM_KILLED` | `-9` **and** the cgroup OOM counter moved during this run | memory: the workload, the limit, or worker count |
-| `SIGKILLED` | `-9`, counter flat | something outside the container: host-level OOM, CI/container cancellation, runner preemption, an external kill |
+| `OOM_KILLED` | `-9` **and** the kernel log names this pid as the victim, within its death window during this run | memory. Read `oom.pressure`: `fleet` means the run's processes exceeded the limit together (fewer workers or more memory); `own weight` means this one was far above its peers (the test in flight) |
+| `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process *outside the run* send it | nobody's code. `killer` names the sender - a CI runner cancelling, a timeout enforcer, a hand on the keyboard. Informational, and no test is suspected |
+| `KILLED_BY_RUN` | `-9` from another process of this run | the controller (execnet terminating a worker that did not exit in time) or a sibling worker - a test that kills processes |
+| `SELF_KILLED` | `-9` the worker sent to itself | the test in flight: an `os.kill(os.getpid(), SIGKILL)` or a library doing the same |
+| `POSSIBLE_TIMEOUT` | a self-exit (code 1) or SIGALRM that reached its effective terminating timeout; medium-confidence correlation, not proof | the hung test in flight - `matched_timeout` and `timeout_source` name the limit and enforcer, `test_seconds` how long it ran. Under heavy xdist parallelism a starved-slow test hitting the timeout is the common one |
+| `KILLED_BY_KERNEL` | `-9` with `si_code` `SI_KERNEL`, and no readable OOM log | the OOM killer, most likely; `kill_sources.kernel_log` says why the log could not be read |
+| `KILLED_AFTER_SIGTERM` | `-9`, and the controller had been sent SIGTERM shortly before | the run was being stopped; `signals_before_death` names who asked. Informational, no test suspected |
+| `RUN_STOPPED` | a recovered run whose controller was sent SIGTERM before this process's last heartbeat | the same - the process ended with the run rather than on its own |
+| `SIGKILLED` | `-9` and no witness answered | something outside the container: host-level OOM, CI/container cancellation, runner preemption, an external kill. The `kill witnesses:` evidence line says which source was withheld and why - that is what to fix before guessing |
 | `NATIVE_CRASH` | fatal signal, or a Windows NTSTATUS | the blamed frame — a C extension or a ctypes call |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP | nothing, unless the run was not meant to be stopped |
 | `SELF_EXIT` | an exit status and no signal — **including 0** | `sys.exit()`, `os._exit()`, or a plugin aborting. A worker that left without being asked to has gone wrong whatever number it exited with, so a clean 0 here is a finding, not an all-clear |
 | `PROBABLY_SIGNALLED` | exit code 128–191 | a wrapper that ate the signal; the true one did not survive |
 | `UNKNOWN` | no status obtainable — a remote gateway, or a run recovered after the fact | nothing — do not guess one |
 
-`-9` alone never licenses "we ran out of memory"; only the cgroup counter does,
-and only when `capabilities.cgroup_oom_counter` says it was readable. That
-distinction is the reason both verdicts exist.
+`-9` alone never licenses "we ran out of memory"; only a witness does - the
+kernel log naming the pid, or the cgroup counter moving while
+`capabilities.cgroup_oom_counter` says it was readable. That distinction is
+the reason the verdicts above exist rather than one.
+
+**`recent_output`** is the tail of what the worker printed, when
+`failure_capture_output` was on: the native line a crash leaves and no stack
+carries - `OpenBLAS ... pthread_create failed`, a malloc abort. It reads fd 2
+directly into a file, so it keeps even the line printed in the phase that
+crashed, which pytest's own capture never reports. Empty means it was not
+captured (the setting was off) or the worker was silent - the `last stderr:`
+evidence line is present only when there was something to show.
+
+**`test_seconds`, `matched_timeout`, `timeout_source`** time the death against
+the run's timeouts - see `POSSIBLE_TIMEOUT` above. `test_seconds` is on every death
+with a test in flight, so a `SELF_EXIT` can be seen to be near a limit even
+when it did not quite reach one.
+
+**`killer`, `oom`, `signals_before_death` and `kill_sources`** are the
+witnesses. `killer` is the signal that ended the process with its sender's
+pid, uid, comm, command line and `sender_role` (`itself`, `this run's
+controller`, `gw3, another process of this run`, `outside this run`). `oom`
+is the kernel's own record: the constraint (`CONSTRAINT_MEMCG` is a cgroup's
+limit, `CONSTRAINT_NONE` the machine's), the cgroup, and the table it weighed
+- `run_tasks`/`run_rss_mb` are this run's share of it, `victim_rank` where the
+victim stood, and `triggered_by_*` the process whose allocation hit the limit,
+which is often not the victim. `signals_before_death` is what was sent to this
+worker or to the controller in the minutes before, above all a SIGTERM.
+`kill_sources` says what each witness could do on this machine; a `SIGKILLED`
+or `UNKNOWN` verdict is only as unknown as that record says, and the remedy is
+usually there (`failure_elevate` on a runner with sudo; a readable
+`/dev/kmsg`; administrator rights on Windows). On Windows `killer.name` is
+`TerminateProcess` rather than a signal, `killer.signal` is 0, and
+`killer.api_status` is the API result (zero means success). `killer.exit_code`
+is the observed process exit status, unavailable during recovery - `1` is `taskkill /F` or a
+Go program such as the GitLab runner, `-1` (4294967295) is .NET's
+`Process.Kill`, `15` is Python's `os.kill`.
 
 Two absences carry information here. No `of a N MB cgroup limit` clause means
 no container limit was discovered, so raising one may change nothing. And no
 `system had N MB free` line means no high-water snapshot ever fired — the
 worker never came near a ceiling — which is evidence against memory in its own
 right.
+
+**`worker=controller` with `recovered_from_run` is a cancelled or killed run.**
+The controller runs no tests and keeps no heartbeat, so it is recovered from
+its marker and its own log rather than from an event log: a job cancellation
+is a controller sent SIGTERM while its workers finish cleanly on execnet's
+SIGINT, and this is the one incident such a run produces. `killer` names who
+sent it; the verdict is `SIGNAL_15` when a witness saw the signal and
+`UNKNOWN` when none did, with `kill_sources` saying why.
+
+An incident like that may also arrive through `failure_on_run_death` rather
+than the hook: the sidecar that outlived the killed run reports it at once,
+with the same fields, and stamps the run's marker `reported_at` so no later
+run raises it again. `raised_at` is then within a minute of the death rather
+than whenever the next run happened.
 
 **`recovered_from_run` means this is about a different run from the one that
 reported it.** A run whose own process was killed has no survivor to report it,
@@ -488,3 +546,9 @@ that was never shown.
 `.pytest-failures/` on the runner holds whole collections and raw dumps, and
 that machine is usually gone by the time anyone reads the alert — which is why
 everything above travels in the incident itself.
+
+Recovery callbacks are checkpointed after success under an OS lock. Failed
+deliveries retain evidence for retry; deduplicate by run ID and fingerprint
+because delivery is at least once. The plugin preserves signal masks and
+handlers. Without kernel tracing, a SIGTERM sender remains unknown. A cgroup
+OOM counter increase alone does not identify this worker as the victim.

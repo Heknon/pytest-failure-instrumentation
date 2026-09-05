@@ -34,6 +34,6 @@ path imports it.
 from .config import Settings
 from .registration import install, installed_settings
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 __all__ = ["Settings", "__version__", "install", "installed_settings"]

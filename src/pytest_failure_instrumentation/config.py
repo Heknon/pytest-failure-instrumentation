@@ -182,6 +182,42 @@ class Settings:
     #: is a blamed frame. Turn it on where the incident is the artefact that
     #: gets read and the terminal is not, which is most of CI.
     crash_stack: bool = False
+    #: Whether this run witnesses who signals its processes - see
+    #: :mod:`.incidents.killer`. Kernel tracing uses Linux tracefs or Windows
+    #: ETW where permitted; it never changes signal masks or handlers.
+    kill_trace: bool = True
+    #: Whether this run may spend ``sudo -n`` on the sources that need root:
+    #: the kernel log where ``/dev/kmsg`` and the journal are closed to this
+    #: user, and the tracepoint above. Off by default, because a plugin that
+    #: starts running sudo on everybody who upgrades it has overstepped;
+    #: ``-n`` means a sudo that would prompt fails instead, so an unattended
+    #: run is never left waiting for a password.
+    elevate: bool = False
+    #: Keep a bounded copy of each worker's stderr, so the one line that
+    #: explains a native death - ``pthread_create failed``, ``malloc():
+    #: corrupted top size``, an abort message - survives the kill that
+    #: swallows it. It points fd 2 at a real file for the length of each phase,
+    #: so a write followed at once by ``abort()`` is on disk before the abort
+    #: runs, and hands the bytes back to pytest's own capture at the phase's
+    #: end so nothing pytest would have shown is lost. Off by default and
+    #: POSIX-only: it is the single facility here that takes over a
+    #: process-wide file descriptor, so it is opt-in and every step is guarded
+    #: against ending a run. See :mod:`.capture.output`.
+    capture_output: bool = False
+    #: What to call when this run is killed - see :mod:`.incidents.reporter`.
+    #: A run whose controller dies has nobody left to raise its incidents,
+    #: and on a runner with a fresh workspace per job there is no next run
+    #: to recover them; the sidecar that outlives the controller reports them
+    #: instead, by calling this with each incident the way the hook would be.
+    #:
+    #: It travels to a different process as a pickle, which sets the rules: a
+    #: module-level function, or a ``functools.partial`` of one with picklable
+    #: bound arguments, or a dotted path ``package.module:attribute`` (the
+    #: only form ini can express). A lambda or a closure is warned about at
+    #: session start and the run proceeds without a reporter. It runs as the
+    #: user that started the run, with that user's environment, never as
+    #: root - the sidecar itself unpickles nothing.
+    on_run_death: Any = None
     #: Which declaration a worker makes on Linux, where Yama restricts who may
     #: read a process. "parent" nominates the controller and covers a session
     #: reading its own workers, which is how the live view is used by default;
@@ -501,6 +537,11 @@ class Settings:
             "slow_test_seconds": self.slow_test_seconds,
             "stall_seconds": self.stall_seconds,
             "stack_probe": self.stack_probe,
+            # A worker-side recording concern, so it travels: the tee is
+            # installed in the worker, not the controller. kill_trace,
+            # elevate and on_run_death stay out - those are the controller's,
+            # which is where the witnesses and the sidecar live.
+            "capture_output": self.capture_output,
             # The declaration in force, resolved here rather than there. It
             # is the worker that makes it and the controller that knows
             # whether anybody is going to read the result - the two settings
@@ -598,6 +639,44 @@ def add_options(parser: pytest.Parser) -> None:
         "default; a worker keeps its own either way, because the stderr it "
         "would use is shared and nobody reads it.",
         default="false",
+    )
+    parser.addini(
+        "failure_capture_output",
+        help="Keep the last few KB of each worker's stderr in <worker>.output, "
+        "so a native crash message (pthread_create failed, a malloc abort) "
+        "survives the kill that swallows it and reaches the incident - "
+        "including one printed in the very phase that crashes, which pytest's "
+        "own capture never reports. Off by default, POSIX only: this points "
+        "file descriptor 2 at a file for each phase, the one thing here that "
+        "reaches across the whole process, and hands the output back to "
+        "pytest's capture so its own reports are unchanged.",
+        default="false",
+    )
+    parser.addini(
+        "failure_kill_trace",
+        help="Witness who kills this run's processes using Linux tracefs or Windows ETW "
+        "where permitted. Preserves signal masks and handlers. On by default.",
+        default="true",
+    )
+    parser.addini(
+        "failure_elevate",
+        help="Allow sudo -n for the witnesses that need root: the kernel log "
+        "(dmesg) where /dev/kmsg and the journal are closed to this user, and "
+        "the signal tracepoint. Off by default. -n means a sudo that would "
+        "prompt fails rather than hangs. Linux only: on Windows the ETW "
+        "session needs the run itself to hold administrator rights.",
+        default="false",
+    )
+    parser.addini(
+        "failure_on_run_death",
+        help="A dotted path, package.module:attribute, to a callable the "
+        "sidecar calls with each incident of a run whose controller was "
+        "killed - a cancelled job, an OOM kill - so a killed run is reported "
+        "at once rather than by the next run over the same directory, which "
+        "on a fresh-workspace runner never comes. From Python, "
+        "install(config, on_run_death=functools.partial(...)) takes a "
+        "callable directly. Runs as the user that started the run.",
+        default="",
     )
     parser.addini(
         "failure_stack_server",
@@ -1043,6 +1122,10 @@ def resolve(config: pytest.Config) -> Settings:
         stall_seconds=_number(config, "failure_stall_seconds", 300.0),
         stack_probe=_flag(config, "failure_stack_probe", True),
         crash_stack=_flag(config, "failure_crash_stack", False),
+        kill_trace=_flag(config, "failure_kill_trace", True),
+        capture_output=_flag(config, "failure_capture_output", False),
+        elevate=_flag(config, "failure_elevate", False),
+        on_run_death=str(_ini(config, "failure_on_run_death", "") or "").strip() or None,
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
         stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,

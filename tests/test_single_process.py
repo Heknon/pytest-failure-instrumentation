@@ -405,7 +405,9 @@ def test_a_run_that_never_came_back_is_reported_by_the_next_one(runner):
     already making to clear the evidence away.
     """
     runner.pytester.makepyfile(test_gone=LEAVES_WITHOUT_FINISHING)
-    assert runner.run("test_gone.py") == [], "a dead run reports nothing itself"
+    # This scenario has no survivor. An enabled ETW sidecar survives the
+    # controller and may still hold its trace file open during recovery.
+    assert runner.run("test_gone.py", "-o", "failure_kill_trace=false") == [], "a dead run reports nothing itself"
     killed = evidence(runner.pytester).name
 
     runner.pytester.makepyfile(test_after=SUITE)

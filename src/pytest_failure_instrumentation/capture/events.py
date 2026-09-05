@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+CONTROLLER_EVENTS = "controller.events"
+
 
 class EventLog:
     def __init__(self, path: Path, run_id: str | None = None) -> None:
@@ -107,6 +109,14 @@ def worker_pid(events: list[dict[str, Any]]) -> int | None:
     for event in events:
         if event.get("event") == "worker_start" and event.get("pid"):
             return int(event["pid"])
+    return None
+
+
+def started_at(events: list[dict[str, Any]]) -> float | None:
+    """When this process started its session, from its own first record."""
+    for event in events:
+        if event.get("event") == "worker_start" and isinstance(event.get("time"), (int, float)):
+            return float(event["time"])
     return None
 
 

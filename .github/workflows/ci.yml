@@ -193,6 +193,10 @@ jobs:
           tests/test_stall_probe.py
           tests/test_exit_status.py
           tests/test_crash_dump_race.py
+          tests/test_kill_readiness.py
+          tests/test_kill_attribution.py::test_the_fleet_table_says_it_was_pressure_across_workers
+          tests/test_output_capture.py::test_capture_off_by_default_keeps_no_file
+          tests/test_single_process.py::test_a_run_that_never_came_back_is_reported_by_the_next_one
 
       - name: Export failed test IDs
         if: failure() && steps.tests.outcome == 'failure'

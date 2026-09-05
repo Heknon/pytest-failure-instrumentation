@@ -6,7 +6,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: profiling-iteration-${{ github.ref }}
+  group: profiling-iteration-${{ github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'profiling-iterate' && github.event.label.name != 'profiling-macos' && github.event.label.name || 'active' }}
   cancel-in-progress: true
 jobs:
   linux:
@@ -71,7 +71,11 @@ jobs:
             tests/test_probes.py::test_windows_rss_falls_back_if_native_read_fails
             tests/test_probes.py::test_windows_description_reads_os_once_without_querying_processor
             tests/test_setup_contract.py::test_clean_controller_does_not_load_failure_specific_models
+            tests/test_setup_contract.py::test_clean_recording_without_an_incident_hook_does_not_load_models
             tests/test_models.py
+            tests/test_kill_readiness.py
+            tests/test_kill_attribution.py::test_the_etw_sidecar_witnesses_a_termination
+            tests/test_kill_attribution.py::test_a_worker_terminated_from_outside_names_its_killer_on_windows
         run: python .github/scripts/run_targeted_tests.py
       - name: Detection and overhead
         if: success() || failure()
@@ -84,7 +88,16 @@ jobs:
         run: python benchmarks/readiness_gate.py native --native-diagnostic --output readiness/native.json
       - name: Explain instrumentation startup and recording costs
         if: success() || failure()
-        run: python benchmarks/instrumentation_cost.py
+        env:
+          BASELINE_SHA: ${{ github.event.pull_request.base.sha }}
+          PFI_BASELINE_ROOT: ${{ runner.temp }}/pfi-master
+        run: |
+          git fetch --no-tags origin $env:BASELINE_SHA
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git worktree add --detach $env:PFI_BASELINE_ROOT $env:BASELINE_SHA
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python benchmarks/instrumentation_cost.py
+          exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:

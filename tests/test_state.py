@@ -146,3 +146,26 @@ def test_a_record_with_no_run_id_at_all_is_still_read(tmp_path):
     state.update(nodeid="t.py::test_a", phase="call")
 
     assert read_state(tmp_path / "gw0.state", "run-now")["nodeid"] == "t.py::test_a"
+
+
+def test_the_tests_clock_is_cleared_with_the_test(tmp_path):
+    """Read on the controller as "how long the test had been running when this
+    worker died", and matched there against the run's configured timeouts.
+
+    A clock left running past teardown measures the gap since a test that
+    already passed, and keeps growing - so an idle worker's ``os._exit(1)``
+    reaches any timeout you like and is reported as one, naming that test and
+    blaming its owner.
+    """
+    state = WorkerState(tmp_path / "gw0.state", 4242)
+    state.update(nodeid="t.py::test_a", phase="setup", test_started=1000.0, phase_started=1000.0)
+    state.update(nodeid="t.py::test_a", phase="call", phase_started=1001.0)
+
+    running = read_state(tmp_path / "gw0.state")
+    assert running["test_started"] == 1000.0 and running["phase_started"] == 1001.0
+
+    state.update(phase=None, nodeid=None, phase_started=None, test_started=None)
+
+    idle = read_state(tmp_path / "gw0.state")
+    assert idle["test_started"] is None and idle["phase_started"] is None
+    assert idle["last_nodeid"] == "t.py::test_a"  # what it was is still kept

@@ -36,25 +36,29 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from .. import probes
-from ..analysis import fingerprint as fingerprint_of
-from ..analysis import severity as severity_of
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
+from ..capture.events import CONTROLLER_EVENTS, EventLog
 from ..config import SOLE_WORKER, Settings, advise
+from ..probes import signal_trace
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
-from . import leftovers, summary
-from .base import UNSET_RUN_ID, Capabilities, Incident, frame_from
+from . import leftovers, reporter
 from .leftovers import OWNER_FILE, prune_finished_runs
+
+if TYPE_CHECKING:
+    from . import killer
+    from .base import Incident
 
 #: The environment variable that names this run's evidence directory, and the
 #: only value in this package that a person hands over and the filesystem then
@@ -274,6 +278,23 @@ class IncidentEngine:
         #: anything - but session start and finish are here, and giving it a
         #: plugin of its own would be two objects with one lifetime.
         self.stacks: Any = None
+        # Kernel tracing observes kills without altering signal delivery.
+        #: Built once, on the first death - see _kill_sources.
+        self._sources: killer.Sources | None = None
+        self.witness_status = "off"
+        self.tracer: signal_trace.SignalTracer | None = None
+        self.controller_events: EventLog | None = None
+        #: Whether the witnesses' status line has been written to the
+        #: controller's log. Written once the run id is authoritative - see
+        #: :meth:`_announce_witnesses` - so the controller's own log agrees
+        #: with the workers' about which run it belongs to.
+        self.witnesses_announced = False
+        #: Whether the sidecar will report this run's death itself, and if
+        #: not, why - see :mod:`.reporter` and :meth:`_reporter_payload`.
+        self.reporter_status = "off: failure_on_run_death is not set"
+        # Do not intercept SIGTERM: masks escape into subprocesses and a Python
+        # handler delays termination while the GIL is held. Kernel witnesses
+        # identify senders without changing the process being observed.
         #: What the profiler found, kept for the terminal summary, which runs
         #: after session finish and is the one place a person asked to see it.
         self.profile_report: Any = None
@@ -427,7 +448,8 @@ class IncidentEngine:
             ignore = root / GITIGNORE_FILE
             if ignore.exists():
                 return
-            if any(leftovers.marker(path) is None for path in root.iterdir()):
+            if any(leftovers.marker(path) is None for path in root.iterdir()
+                   if path.name != leftovers.LOCK_FILE):
                 return  # something here is not ours; see the docstring
             ignore.write_text(GITIGNORE_BODY, encoding="utf-8")
         except OSError:
@@ -468,12 +490,18 @@ class IncidentEngine:
         run reports what it finds before it has anything of its own to say.
         """
         try:
-            found = leftovers.deaths_left_behind(self.settings.directory, self.directory)
+            leftovers.deliver_left_behind(
+                self.settings.directory, self.directory, self._deliver_recovered,
+                elevate=self.settings.elevate,
+            )
         except Exception as failure:  # noqa: BLE001 - never break a starting run
             advise(f"the previous runs' evidence could not be read: {failure!r}")
-            return
-        for incident in found:
-            self.raise_incident(incident)
+
+
+    def _deliver_recovered(self, incident: Incident) -> None:
+        """Let callback failure escape to recovery so its evidence remains retryable."""
+        self._enrich(incident)
+        self.config.hook.pytest_failure_incident(incident=incident)
 
     def _warn_if_a_live_session_already_owns_this_directory(self) -> None:
         """Two runs may share a directory on purpose - but not at once.
@@ -539,43 +567,11 @@ class IncidentEngine:
         return True
 
     def _enrich(self, incident: Incident) -> None:
-        """Everything that is the same whatever kind this is."""
-        lines, reverse = incident.blame_stack()
-        blame = self.attributor.blame(lines, reverse=reverse)
-        incident.top_frame = frame_from(blame["top_frame"])
-        incident.blamed_frame = frame_from(blame["blamed_frame"])
-        incident.owner = blame["owner"] or "unknown"
-        if incident.owner == "unknown":
-            # A kind that fails before anybody's code runs knows its own owner;
-            # attribution had no frames to find it from.
-            incident.owner = incident.owner_when_unattributable() or "unknown"
+        """Everything that is the same whatever kind this is - see :mod:`.enrich`,
+        which the sidecar's reporter shares with this."""
+        from .enrich import enrich
 
-        nodeid = incident.suspect_nodeid()
-        if incident.owner == "unknown" and nodeid:
-            path = str(nodeid).split("::")[0]
-            if path:
-                incident.suspect_owner = self.attributor.owner_of(str(Path(path).resolve()))
-                incident.suspect_basis = incident.suspect_basis_for(path)
-
-        incident.run_ending = incident.ends_this_run()
-        severity, why = severity_of.of(
-            incident.kind, incident.owner, incident.verdict,
-            incident.confidence, incident.run_ending,
-        )
-        incident.severity = severity
-        if why:
-            incident.evidence.append(why)
-
-        incident.fingerprint = fingerprint_of.of(incident, incident.blamed_frame)
-        # This run's, unless the incident is about another one. A death
-        # recovered from a directory somebody else left behind carries the id
-        # of the run that died: it is the key a consumer joins on, and the
-        # run that merely found it is not the run it happened in.
-        if incident.run_id == UNSET_RUN_ID:
-            incident.run_id = self.run_id
-        incident.raised_at = time.time()
-        incident.capabilities = Capabilities(**probes.capabilities())
-        incident.product_version = self.settings.product_version
+        enrich(incident, self.attributor, self.settings.product_version, self.run_id)
 
     # -- liveness --------------------------------------------------------
 
@@ -738,6 +734,7 @@ class IncidentEngine:
         # later, so one read settles it for the run.
         self.records_here = self.recorder is not None
         self._prepare_directory()
+        self._start_kill_witnesses()
 
         # Whether or not this is distributed: a single-process run has a stack
         # worth serving too, and it is the one this process can read for free.
@@ -811,6 +808,202 @@ class IncidentEngine:
                 daemon=True,
             )
             self.watcher.start()
+
+    # -- who killed it -----------------------------------------------------
+
+    def _start_kill_witnesses(self) -> None:
+        """Start what will say who kills a process of this run.
+
+        Kernel tracing never changes signal masks or handlers. Unavailable
+        tracing is recorded on incidents rather than affecting cancellation.
+        """
+        # The profiler will need these models at finish. Prepare them while
+        # Windows starts ETW in its separate interpreter, overlapping the
+        # two cold starts. All witness operations stay on the calling thread.
+        prepare = None
+        if signal_trace.IS_WINDOWS and self.settings.profile and self.settings.kill_trace:
+            try:
+                prepare = threading.Thread(
+                    target=self._prepare_profile_models,
+                    name="failure-instrumentation-profile-models", daemon=True,
+                )
+                prepare.start()
+            except Exception:  # noqa: BLE001 - fall back to ordinary lazy imports
+                prepare = None
+        try:
+            self._start_kill_witnesses_or_fail()
+        except Exception as failure:  # noqa: BLE001 - see the docstring
+            self.witness_status = f"off: failed ({failure!r})"
+        finally:
+            if prepare is not None:
+                prepare.join()
+
+    @staticmethod
+    def _prepare_profile_models() -> None:
+        try:
+            import importlib
+
+            importlib.import_module("pytest_failure_instrumentation.incidents.profile")
+        except Exception:  # noqa: BLE001 - reporting retains its normal error handling
+            pass
+
+    def _start_kill_witnesses_or_fail(self) -> None:
+        if not self.settings.kill_trace:
+            self.witness_status = "off: failure_kill_trace is off"
+            # No witnesses - but a reporter, if one is configured, is a
+            # separate promise, and needs only a sidecar that watches.
+            self._start_reporter_only()
+            return
+        if not self._anything_records() or not self.directory.is_dir():
+            self.witness_status = "off: nothing in this run records, so there is nowhere to write"
+            return
+        try:
+            self.controller_events = EventLog(self.directory / CONTROLLER_EVENTS)
+        except OSError as failure:
+            self.controller_events = None
+            self.witness_status = f"off: the controller's log could not be opened ({failure!r})"
+        if self.controller_events is not None:
+            self.witness_status = (
+                "off: signal delivery is preserved; sender attribution requires kernel tracing"
+            )
+        payload = self._reporter_payload()
+        self.tracer = signal_trace.SignalTracer(
+            self.directory / signal_trace.TRACE_FILE,
+            elevate=self.settings.elevate,
+            reporter=payload,
+        )
+        self.tracer.start()
+        if payload is not None:
+            self.reporter_status = (
+                "armed" if self.tracer.active else f"off: the sidecar is not running ({self.tracer.how})"
+            )
+        if not self.distributed:
+            # No xdist id is ever coming, so this process's own name is the
+            # run id already; a distributed run announces from
+            # pytest_configure_node, once xdist has minted the real one.
+            self._announce_witnesses()
+
+    def _announce_witnesses(self) -> None:
+        """One line in the controller's log saying what was witnessing.
+
+        Written once, and not before the run id is authoritative: at session
+        start a distributed run's id is still this process's stand-in, and a
+        line stamped with it makes the controller's log disagree with every
+        worker's about which run they all belong to - which is precisely the
+        confusion the id exists to prevent.
+        """
+        if self.witnesses_announced or self.controller_events is None:
+            return
+        self.witnesses_announced = True
+        try:
+            self._record(
+                "kill_witnesses",
+                controller_witness=self.witness_status,
+                signal_trace=self.tracer.how if self.tracer is not None else "off: not started",
+                reporter=self.reporter_status,
+                elevate=self.settings.elevate,
+            )
+        except Exception:  # noqa: BLE001 - a line that cannot be written
+            pass  # is not a run that cannot proceed
+
+    def _start_reporter_only(self) -> None:
+        payload = self._reporter_payload()
+        if payload is None or not self._anything_records() or not self.directory.is_dir():
+            return
+        self.tracer = signal_trace.SignalTracer(
+            self.directory / signal_trace.TRACE_FILE, reporter=payload, trace=False
+        )
+        self.tracer.start()
+        self.reporter_status = (
+            "armed" if self.tracer.active else f"off: the sidecar is not running ({self.tracer.how})"
+        )
+        if not self.distributed:
+            self._announce_witnesses()  # a distributed run announces from configure_node
+
+    def _reporter_payload(self) -> dict[str, Any] | None:
+        """What the sidecar needs to report this run's death without us.
+
+        The callable as a pickle or a dotted path, this process's
+        environment and import path, where the evidence is, and the settings
+        the incident is enriched with - see :mod:`.reporter`. Built once at
+        session start, so a callable that cannot travel is said here, while
+        somebody is listening, rather than discovered after the run is dead.
+        """
+        target = self.settings.on_run_death
+        if not target:
+            return None
+        try:
+            spec = reporter.describe_callable(target)
+        except Exception as failure:  # noqa: BLE001 - a pickle that fails is a warning
+            self.reporter_status = f"off: failure_on_run_death cannot travel to the sidecar ({failure!r})"
+            advise(
+                f"failure_on_run_death={target!r} cannot be handed to the sidecar: "
+                f"{failure!r}. It has to be a module-level function, or a "
+                "functools.partial of one with picklable arguments, or a dotted "
+                "path 'package.module:attribute'; a killed run will not be reported"
+            )
+            return None
+        rootdir = getattr(self.config, "rootpath", None) or getattr(self.config, "rootdir", None)
+        return {
+            "callable": spec,
+            "env": dict(os.environ),
+            "rootdir": str(rootdir) if rootdir else None,
+            "sys_path": list(sys.path),
+            "python": sys.executable,
+            "directory": str(self.directory),
+            "session": self.session_id,
+            "controller_pid": os.getpid(),
+            "packages": list(self.settings.packages),
+            "product_version": self.settings.product_version,
+            "elevate": self.settings.elevate,
+        }
+
+    def _stop_kill_witnesses(self) -> None:
+        for step in (
+            lambda: self.tracer.stop() if self.tracer is not None else None,
+            lambda: self.controller_events.close() if self.controller_events is not None else None,
+        ):
+            try:
+                step()
+            except Exception:  # noqa: BLE001 - session finish must not fail here
+                continue
+
+    def _record(self, event: str, **fields: Any) -> None:
+        """A line in the controller's own log, stamped with the run id as it
+        is known *now* - which at configure time it was not."""
+        log = self.controller_events
+        if log is None:
+            return
+        try:
+            log.run_id = self.run_id
+        except Exception:  # noqa: BLE001 - an id that cannot be settled yet
+            pass  # leaves the line unstamped rather than unwritten
+        log.record(event, **fields)
+
+    def _kill_sources(self) -> killer.Sources:
+        """One object for the whole run, not one per death.
+
+        It carries the kernel-log reading between deaths - see
+        ``killer.Sources.kernel_log_reading`` - and deaths arrive together
+        precisely when that reading is expensive and identical: an OOM kill
+        takes one worker and then the next. Everything on it is settled by
+        the time the first death can happen; the pids are read afresh on each
+        call, through the callable.
+        """
+        if self._sources is None:
+            from . import killer
+
+            self._sources = killer.Sources(
+                directory=self.directory,
+                elevate=self.settings.elevate,
+                trace_status=self.tracer.how if self.tracer is not None else "off: not started",
+                witness_status=self.witness_status,
+                run_pids=lambda: {
+                    os.getpid(): killer.CONTROLLER,
+                    **killer.roles_in(self.directory),
+                },
+            )
+        return self._sources
 
     def _anything_records(self) -> bool:
         """Whether any process in this run is writing down what it is doing.
@@ -914,6 +1107,10 @@ class IncidentEngine:
         also removes the last way the two sides can disagree about a number
         they both act on.
         """
+        # By now xdist has built its node manager, so the id is the real one -
+        # which is what makes this the moment for the controller's own log to
+        # start, not session start.
+        self._announce_witnesses()
         try:
             node.workerinput["failure_run_id"] = self.run_id
             # The *resolved* directory, not the configured one. A worker cannot
@@ -1124,7 +1321,12 @@ class IncidentEngine:
 
         try:
             incident: Incident = death.build(
-                node, error, self.directory, self.baseline_oom_kills, self.run_id
+                node,
+                error,
+                self.directory,
+                self.baseline_oom_kills,
+                self.run_id,
+                sources=self._kill_sources(),
             )
         except Exception as failure:  # noqa: BLE001
             incident = death.WorkerDeathIncident.degraded(
@@ -1325,17 +1527,26 @@ class IncidentEngine:
                 self._report_profile()
             except Exception as failure:  # noqa: BLE001 - a lost profile beats a lost run
                 print(f"[failure-instrumentation] profile analysis failed: {failure!r}", flush=True)
-        self.raise_incident(
-            summary.build(
-                exitstatus,
-                self.seen,
-                self.raised,
-                self.suppressed,
-                self.run_ending,
-                self.distributed,
+        # With no receivers, a summary has no observable work to do. Keep
+        # model validation imports off clean recording-only sessions.
+        if self.config.hook.pytest_failure_incident.get_hookimpls():
+            from . import summary
+
+            self.raise_incident(
+                summary.build(
+                    exitstatus,
+                    self.seen,
+                    self.raised,
+                    self.suppressed,
+                    self.run_ending,
+                    self.distributed,
+                )
             )
-        )
         self.schedule.close()
+        # After the summary: nothing of this run's dies after it that anybody
+        # would report, and a witness still up while the summary was being
+        # raised is a witness for a death the summary could still count.
+        self._stop_kill_witnesses()
         # Said after the summary rather than before it, and it is the last
         # thing this run does that a later one can read: from here on, this
         # directory says it reached its end and has nothing left to report.

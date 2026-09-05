@@ -43,7 +43,7 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.label.name != 'full-portability' && github.event.label.name || 'active' }}
   cancel-in-progress: true
 
 jobs:

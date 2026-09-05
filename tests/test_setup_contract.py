@@ -298,7 +298,7 @@ def test_a_finished_runs_directory_is_pruned_and_a_live_one_is_not(tmp_path):
     finished = tmp_path / "run-finished"
     for path, pid in ((live, os.getpid()), (finished, 999999)):
         path.mkdir()
-        (path / "owner.json").write_text(json.dumps({"pid": pid}), encoding="utf-8")
+        (path / "owner.json").write_text(json.dumps({"pid": pid, "finished_at": 1}), encoding="utf-8")
         (path / "gw0.events").write_text("evidence\n", encoding="utf-8")
 
     prune_finished_runs(tmp_path)
@@ -648,7 +648,7 @@ def test_clean_controller_does_not_load_failure_specific_models():
     source = (
         "import sys\n"
         "import pytest_failure_instrumentation.incidents.engine\n"
-        "for kind in ('collection', 'death', 'stall', 'internal_error'):\n"
+        "for kind in ('collection', 'death', 'stall', 'internal_error', 'killer'):\n"
         "    assert 'pytest_failure_instrumentation.incidents.' + kind not in sys.modules, kind\n"
     )
     finished = subprocess.run(
@@ -734,3 +734,19 @@ def test_the_token_is_never_printed_by_the_advice_about_two_installs(runner):
     assert "stack_server_token" in said, said
     for secret in ("tok-in-force-9d41", "tok-offered-5b27"):
         assert secret not in said, f"{secret} reached the run's output"
+
+
+
+def test_clean_recording_without_an_incident_hook_does_not_load_models(pytester):
+    pytester.makeconftest("""
+import sys
+import pytest
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_sessionfinish(session):
+    yield
+    assert "pydantic" not in sys.modules
+""")
+    pytester.makepyfile("def test_ok(): pass")
+    result = pytester.runpytest_subprocess("--failure-instrumentation", timeout=30)
+    result.assert_outcomes(passed=1)

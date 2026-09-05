@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from ..probes import tracing
 from ..probes.platform_flags import platform_description
 from . import crash_stack
 from . import memory as memory_capture
+from . import output as output_capture
 from .events import EventLog
 from .heartbeat import Heartbeat
 from .state import WorkerState
@@ -122,6 +124,26 @@ class WorkerRecorder:
             self.frozen = crash_stack.FrozenInterpreterFallback(
                 self._frozen_stream, settings.heartbeat_interval
             )
+
+        # A tee of the worker's stderr into a bounded ring, so the one line a
+        # native death leaves - and no stack carries - survives the kill. It
+        # reads fd 2 directly because pytest's own capture reaches a report
+        # only for a completed phase, missing the crashing phase and imports.
+        # Started here (pipe and thread), but fd 2 is taken over later, once
+        # pytest's capture is up - see _tee_fd. Its own guards inside: a tee
+        # that cannot be built is a recorded reason, never a failed worker.
+        self.stderr_tee: output_capture.StderrTee | None = None
+        if settings.capture_output:
+            tee = output_capture.StderrTee(directory / f"{worker_id}.output")
+            tee.start()
+            if tee.active:
+                self._track(tee)
+                self.stderr_tee = tee
+            self.events.record("output_capture", status=tee.reason)
+        #: Set when the tee did not take fd 2 for the current phase - see
+        #: _tee_take. Read by _tee_hand_back, so it never restores a
+        #: descriptor it did not take.
+        self._tee_stood_down = False
 
         self._apply_memory_limit(settings)
         if settings.profile_allocations:
@@ -340,22 +362,79 @@ class WorkerRecorder:
         self._counted = None
         self._profile("end_test", item.nodeid)
 
-    @pytest.hookimpl(hookwrapper=True)
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
-        yield from self._phase("setup", item.nodeid)
+        yield from self._phase("setup", item.nodeid, item)
 
-    @pytest.hookimpl(hookwrapper=True)
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_call(self, item: pytest.Item) -> Any:
-        yield from self._phase("call", item.nodeid)
+        yield from self._phase("call", item.nodeid, item)
 
-    @pytest.hookimpl(hookwrapper=True)
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_teardown(self, item: pytest.Item) -> Any:
-        yield from self._phase("teardown", item.nodeid)
+        yield from self._phase("teardown", item.nodeid, item)
 
-    def _phase(self, phase: str, nodeid: str) -> Any:
+    #: Fixtures that take fd 1/2 over for the test themselves. Taking fd 2 out
+    #: from under one of them makes its readouterr() miss what the test wrote,
+    #: which is a change to a passing test's behaviour - the one thing this may
+    #: never do. A test that captures its own fd output is also watching its
+    #: own crash, so the tee stands down for it and loses nothing worth having.
+    #: capsys / capsysbinary are sys-level and untouched, so they are not here.
+    _FD_CAPTURE_FIXTURES = frozenset({"capfd", "capfdbinary"})
+
+    def _tee_take(self, item: pytest.Item | None = None) -> None:
+        """Point fd 2 at the capture file, if the tee is on and no fd-capture
+        fixture owns it for this test. pytest points fd 2 at its own file at
+        the start of every phase; this takes it just after, and _tee_hand_back
+        gives it back at the phase's end with the phase's bytes copied into
+        pytest's file, so both keep the output."""
+        if self.stderr_tee is None:
+            return
+        if item is not None and self._FD_CAPTURE_FIXTURES.intersection(
+            getattr(item, "fixturenames", ())
+        ):
+            self._tee_stood_down = True
+            return
+        self._tee_stood_down = False
+        self.stderr_tee.take()
+
+    def _tee_hand_back(self) -> None:
+        # Only hand back what was taken: a phase the tee stood down for never
+        # touched fd 2, and calling hand_back then would restore a descriptor
+        # it does not own.
+        if self.stderr_tee is not None and not self._tee_stood_down:
+            self.stderr_tee.hand_back()
+
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
+    def pytest_collection(self, session: Any) -> Any:
+        # Collection is where imports run, and an import is where a native
+        # thread pool is first built and first fails. Take fd 2 over the whole
+        # of it, and again at each collector below - a module's import is where
+        # the write actually happens, and pytest re-points fd 2 at its own
+        # capture around each one.
+        self._tee_take()
+        try:
+            yield
+        finally:
+            self._tee_hand_back()
+
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
+    def pytest_make_collect_report(self, collector: Any) -> Any:
+        # Wraps the collection of one node - a module's import among them - so
+        # fd 2 is the capture file at the moment the import runs, after pytest
+        # has taken it for its own collection capture.
+        self._tee_take()
+        try:
+            yield
+        finally:
+            self._tee_hand_back()
+
+    def _phase(self, phase: str, nodeid: str, item: pytest.Item | None = None) -> Any:
         """Which phase is open is what separates "died in teardown" from
         "died mid-call": pytest's own logfinish fires only after the whole
         protocol, so it cannot tell them apart."""
+        self._tee_take(item)
+        now = time.time()
         if phase == "setup":
             if self._counted != nodeid:
                 # The first setup of the protocol is the test starting.
@@ -371,10 +450,19 @@ class WorkerRecorder:
                 # left, because the row is read as ``started - finished``
                 # running, and that read zero beside a call phase in the slot.
                 self.state.tests_finished -= 1
+            # The whole test's clock, not the phase's: pytest-timeout and
+            # faulthandler_timeout both time the item from its setup, so a
+            # death is matched against a timeout by how long the *test* ran.
+            # Set on every attempt, rerun or not: an enforcer gives each
+            # attempt its own deadline, measured from that attempt's setup.
+            self.state.test_started = now
+            from .timeouts import effective
+
+            self.state.timeout_settings = effective(item) if item is not None else []
         if self.heartbeat is not None:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase
-        self.state.update(nodeid=nodeid, phase=phase)
+        self.state.update(nodeid=nodeid, phase=phase, phase_started=now)
         # Started once for the whole test rather than per phase, and from
         # setup rather than from the call.
         #
@@ -391,7 +479,12 @@ class WorkerRecorder:
         if phase == "setup":
             self.slow_test.start_test()
         self._profile("begin_phase", nodeid, phase)
-        yield
+        try:
+            yield
+        finally:
+            # Give fd 2 back to pytest, with this phase's stderr copied into
+            # pytest's own capture, whatever the phase did.
+            self._tee_hand_back()
         self._profile("end_phase", phase)
         if self.heartbeat is not None:
             self.heartbeat.phase = None
@@ -406,9 +499,16 @@ class WorkerRecorder:
         # which the incident is then attributed, with an owner and a severity.
         # What that test was is still worth knowing, so the slot keeps it in
         # `last_nodeid`, where nothing can mistake it for the present.
+        #
+        # The two clocks go with it, and for the same reason. They are read on
+        # the controller as "how long the test had been running when this
+        # worker died" and matched against the run's timeouts - so a clock
+        # left running between tests makes an idle worker's `os._exit(1)`
+        # reach any timeout you like, and the death is reported as TIMED_OUT
+        # against a test that had already passed.
         if self.heartbeat is not None:
             self.heartbeat.nodeid = None
-        self.state.update(phase=None, nodeid=None)
+        self.state.update(phase=None, nodeid=None, phase_started=None, test_started=None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_internalerror(self, excrepr: object) -> None:
