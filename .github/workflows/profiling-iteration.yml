@@ -9,6 +9,23 @@ concurrency:
   group: profiling-iteration-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  linux:
+    if: contains(github.event.pull_request.labels.*.name, 'profiling-iterate') && (github.event.action != 'labeled' || github.event.label.name == 'profiling-iterate')
+    name: Linux / CPU fallback regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - name: Repeat the CPU fallback regression
+        run: |
+          for trial in 1 2 3 4 5; do
+            python -m pytest -q tests/test_profile_sampler.py::test_without_a_per_thread_clock_the_process_cpu_goes_to_the_test_thread || exit 1
+          done
   macos:
     if: contains(github.event.pull_request.labels.*.name, 'profiling-macos') && (github.event.action != 'labeled' || github.event.label.name == 'profiling-macos')
     name: macOS / recorded timeline regression

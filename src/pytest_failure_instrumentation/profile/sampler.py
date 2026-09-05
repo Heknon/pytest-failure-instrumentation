@@ -10,12 +10,11 @@ sample. A blocked thread moves it by nothing and vanishes from the profile; a
 thread spinning on a non-blocking read moves it fully and becomes the widest
 thing in it.
 
-The weighting also fixes the sampler's own blind spot. Sampling from inside
-the process needs the GIL, so a native call that holds it for half a second
-delays the next sample by half a second. Counting samples would then miss
-most of that call; weighting by the counter charges the whole half second to
-the frame that was in it. The profile can be late by one sample, never wrong
-about the total for a thread it has seen. A thread's first sighting charges
+CPU weighting preserves measured CPU across delayed ticks, but cannot recover
+a stack that was never observed. Sampling from inside the process needs the
+GIL: a native call may hold it throughout its execution and return before the
+sampler sees its Python wrapper. Its CPU remains measurable, but attributing
+it to the previous stack is an estimate and can name the wrong function. A thread's first sighting charges
 everything its clock holds, since the clock started with the thread; what a
 thread burns after its last sighting and before it exits cannot be read from
 outside it, and a thread that comes and goes between two ticks is never seen
@@ -1384,6 +1383,33 @@ def _snapshot() -> Any:
     )
 
 
+class _WindowsSystemClock:
+    """Whole-machine CPU totals without a GIL handoff on 64-bit Windows.
+
+    GetSystemTimes covers only one processor group above 64 logical CPUs;
+    those machines keep the existing psutil reader.
+    """
+
+    def __init__(self) -> None:
+        import ctypes
+
+        if ctypes.sizeof(ctypes.c_void_p) != 8 or not 0 < (os.cpu_count() or 0) <= 64:
+            raise OSError("use the portable system clock on this machine")
+        self.ctypes = ctypes
+        self.kernel = ctypes.PyDLL("kernel32", use_last_error=True)
+        self.kernel.GetSystemTimes.argtypes = (ctypes.POINTER(ctypes.c_uint64),) * 3
+        self.kernel.GetSystemTimes.restype = ctypes.c_int32
+
+    def read(self) -> tuple[int, int]:
+        idle, kernel, user = (self.ctypes.c_uint64() for _ in range(3))
+        if not self.kernel.GetSystemTimes(
+            self.ctypes.byref(idle), self.ctypes.byref(kernel), self.ctypes.byref(user)
+        ):
+            raise OSError("GetSystemTimes failed")
+        # Kernel time already includes idle time.
+        return kernel.value + user.value, idle.value
+
+
 class _MachineClock:
     """How busy the whole machine is, per window, as a per-mille figure.
 
@@ -1395,6 +1421,14 @@ class _MachineClock:
 
     def __init__(self) -> None:
         self._last: Any = None
+        self._windows: Any = None
+        self._windows_last: Any = None
+        if sys.platform == "win32":
+            try:
+                self._windows = _WindowsSystemClock()
+                self._windows_last = self._windows.read()
+            except Exception:
+                self._windows = None
         try:
             import psutil
 
@@ -1404,6 +1438,18 @@ class _MachineClock:
             self._psutil = None
 
     def busy_permille(self) -> Optional[int]:
+        if self._windows is not None:
+            try:
+                windows_now = self._windows.read()
+                windows_last, self._windows_last = self._windows_last, windows_now
+                total, idle = windows_now[0] - windows_last[0], windows_now[1] - windows_last[1]
+                if total <= 0:
+                    return None
+                return max(0, min(1000, int(1000 * (total - idle) / total)))
+            except Exception:
+                # Reset the fallback baseline; never mix counter sources.
+                self._windows = None
+                self._last = None
         if self._psutil is None:
             return None
         try:

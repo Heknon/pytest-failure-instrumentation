@@ -146,7 +146,13 @@ def test_without_a_per_thread_clock_the_process_cpu_goes_to_the_test_thread() ->
     sampler.clock.source = "unavailable"
     sampler.start()
     sampler.begin_phase("t::a", "call")
-    spin_for(0.3)
+    # The assertion is about CPU, so time the workload by CPU as well.
+    # A wall-time burn can receive arbitrarily little CPU on a loaded host.
+    deadline = time.thread_time() + 0.3
+    wall_deadline = time.monotonic() + 10.0
+    while time.thread_time() < deadline:
+        if time.monotonic() >= wall_deadline:
+            pytest.fail("runner could not provide 0.3 seconds of CPU within 10 seconds")
     sampler.end_phase("call")
     sampler.end_test("t::a")
     sampler.stop()
@@ -809,3 +815,35 @@ def test_windows_clock_closes_handles_on_exception() -> None:
     with pytest.raises(OSError, match="thread query failed"):
         clock.read([1])
     assert closed == [123]
+
+
+def test_windows_system_clock_counts_idle_only_once():
+    import ctypes
+    from types import SimpleNamespace
+
+    def read(idle, kernel, user):
+        idle._obj.value, kernel._obj.value, user._obj.value = 40, 60, 20
+        return 1
+
+    clock = sampling._WindowsSystemClock.__new__(sampling._WindowsSystemClock)
+    clock.ctypes = ctypes
+    clock.kernel = SimpleNamespace(GetSystemTimes=read)
+    assert clock.read() == (80, 40)
+
+
+def test_windows_system_clock_failure_resets_portable_baseline():
+    from collections import namedtuple
+    from types import SimpleNamespace
+
+    def fails():
+        raise OSError("clock unavailable")
+
+    Times = namedtuple("Times", "user system idle")
+    readings = iter([Times(100, 100, 100), Times(105, 110, 105)])
+    clock = sampling._MachineClock.__new__(sampling._MachineClock)
+    clock._windows = SimpleNamespace(read=fails)
+    clock._last = Times(0, 0, 0)
+    clock._psutil = SimpleNamespace(cpu_times=lambda: next(readings))
+    assert clock.busy_permille() is None
+    assert clock._windows is None
+    assert clock.busy_permille() == 750
