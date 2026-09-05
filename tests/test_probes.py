@@ -47,6 +47,30 @@ def wait_for(read, timeout: float = 10.0):
 # -- what this machine can measure ---------------------------------------
 
 
+def test_windows_description_reads_os_once_without_querying_processor(monkeypatch):
+    from pytest_failure_instrumentation.probes import platform_flags
+
+    calls = []
+
+    def os_version():
+        calls.append("os")
+        return "2025Server", "10.0.26100", "SP0", "Multiprocessor Free"
+
+    def unused_processor_query():
+        pytest.fail("Windows OS description must not query the processor")
+
+    monkeypatch.setattr(platform_flags, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform_flags.platform, "win32_ver", os_version)
+    monkeypatch.setattr(platform_flags.platform, "platform", unused_processor_query)
+    platform_flags.platform_description.cache_clear()
+    try:
+        for _ in range(3):
+            assert platform_flags.platform_description() == "Windows-2025Server-10.0.26100-SP0"
+        assert calls == ["os"]
+    finally:
+        platform_flags.platform_description.cache_clear()
+
+
 def test_resident_memory_is_measurable_on_every_supported_platform():
     """A missing figure is reported as unmeasurable rather than as fine, so an
     always-unavailable probe would be honest and useless at the same time."""

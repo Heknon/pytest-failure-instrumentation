@@ -12,15 +12,15 @@ import platform
 from typing import Any
 
 from . import memory, pyspy, stacks, tracing
-from .platform_flags import IS_WINDOWS
+from .platform_flags import IS_WINDOWS, platform_description
 
 
 def capabilities() -> dict[str, Any]:
     resident, resident_source = memory.resident_megabytes()
     available, available_source = memory.system_available_megabytes()
     return {
-        "platform": platform.platform(),
-        "system": platform.system(),
+        "platform": platform_description(),
+        "system": "Windows" if IS_WINDOWS else platform.system(),
         "python": platform.python_version(),
         "resident_memory": resident_source if resident is not None else "unavailable",
         "system_memory": available_source if available is not None else "unavailable",

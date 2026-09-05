@@ -13,7 +13,6 @@ no /proc read, no allocation tracking.
 from __future__ import annotations
 
 import os
-import platform
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,7 @@ import pytest
 
 from ..config import Settings
 from ..probes import tracing
+from ..probes.platform_flags import platform_description
 from . import crash_stack
 from . import memory as memory_capture
 from .events import EventLog
@@ -154,7 +154,7 @@ class WorkerRecorder:
             "worker_start",
             pid=os.getpid(),
             python=sys.version.split()[0],
-            platform=platform.platform(),
+            platform=platform_description(),
             executable=sys.executable,
             # Recorded because it is the difference between "no stack" and
             # "no stack, and here is the reason", and it is only knowable here.

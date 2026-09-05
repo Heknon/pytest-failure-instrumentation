@@ -69,6 +69,7 @@ jobs:
             tests/test_probes.py::test_resident_memory_is_measurable_on_every_supported_platform
             tests/test_probes.py::test_psapi_answers_without_psutil
             tests/test_probes.py::test_windows_rss_falls_back_if_native_read_fails
+            tests/test_probes.py::test_windows_description_reads_os_once_without_querying_processor
         run: python .github/scripts/run_targeted_tests.py
       - name: Detection and overhead
         if: success() || failure()
