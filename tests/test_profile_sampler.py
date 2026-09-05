@@ -424,45 +424,8 @@ def test_starting_twice_is_harmless() -> None:
     sampler.stop()
 
 
-@pytest.mark.skipif(not ThreadClock().available, reason="no per-thread clock here")
-def test_a_thread_that_lives_less_than_an_interval_is_still_charged() -> None:
-    """A thread's clock starts at zero with the thread, so its first sighting
-    already says what it burnt. Charging nothing on a first sighting lost
-    every thread that lived less than an interval - a pool's workers, one per
-    task - and the sampler contradicted its own process figure."""
-    records: list[dict[str, Any]] = []
-    sampler = Sampler(records.append, lambda: 1, interval=0.002, worker="x")
-    if sampler.clock.source == "psutil":
-        pytest.skip("the psutil reader's ticks are too far apart to see a short thread")
-    sampler.start()
-    sampler.begin_phase("t::a", "call")
-    started = time.process_time()
-    for _ in range(30):
-        thread = threading.Thread(target=spin_for, args=(0.015,), name="short")
-        thread.start()
-        thread.join()
-    burnt = time.process_time() - started
-    sampler.end_phase("call")
-    sampler.end_test("t::a")
-    sampler.stop()
-
-    (record,) = [entry for entry in records if entry["record"] == "test"]
-    charged = sum(stack["cpu_ns"] for stack in record["stacks"] if stack["thread"] == "short") / 1e9
-    # Zero, and not a share, is what this asserts. Sampling never charges all
-    # of it - a thread that comes and goes between two ticks is never seen -
-    # and how much it does charge is how often the sampler got the CPU, which
-    # on a loaded runner is nothing to do with the rule under test: a macOS
-    # cell that saw 6% of it failed a 10% bar and was measuring the runner.
-    # Before the fix this was exactly zero, whatever the load, because a
-    # thread's first sighting charged nothing - and the rule that makes it
-    # non-zero is asserted on its own below.
-    assert charged > 0, (charged, burnt)
-
-
 def test_a_threads_first_sighting_charges_the_whole_counter_it_arrived_with() -> None:
-    """The rule the sampling test above can only observe through the weather.
-
-    A thread's CPU clock starts at zero when the thread does, so the first
+    """A thread's CPU clock starts at zero when the thread does, so the first
     reading of it is not a baseline to subtract from later ones - it is
     everything that thread has burnt. Treated as a baseline, a thread that
     lived less than a sampling interval was charged nothing at all, which is
