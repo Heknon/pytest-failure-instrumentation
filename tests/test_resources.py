@@ -268,7 +268,9 @@ def test_resource_endpoint_uses_existing_auth_and_typed_client(tmp_path):
 
 
 @pytest.mark.parametrize("workers", [0, 2])
-def test_pytest_lifecycle_live_only_and_no_worker_collectors(pytester, workers, monkeypatch):
+def test_pytest_lifecycle_live_only_and_no_worker_collectors(pytester, workers):
+    if workers:
+        pytest.importorskip("xdist")
     pytester.makepyfile('''
 import json
 import time
