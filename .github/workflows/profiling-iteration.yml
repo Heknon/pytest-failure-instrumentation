@@ -88,7 +88,16 @@ jobs:
         run: python benchmarks/readiness_gate.py native --native-diagnostic --output readiness/native.json
       - name: Explain instrumentation startup and recording costs
         if: success() || failure()
-        run: python benchmarks/instrumentation_cost.py
+        env:
+          BASELINE_SHA: ${{ github.event.pull_request.base.sha }}
+          PFI_BASELINE_ROOT: ${{ runner.temp }}/pfi-master
+        run: |
+          git fetch --no-tags origin $env:BASELINE_SHA
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git worktree add --detach $env:PFI_BASELINE_ROOT $env:BASELINE_SHA
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python benchmarks/instrumentation_cost.py
+          exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
