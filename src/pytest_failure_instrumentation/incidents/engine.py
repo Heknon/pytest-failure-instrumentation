@@ -41,22 +41,25 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from .. import probes
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
-from ..capture.events import EventLog
+from ..capture.events import CONTROLLER_EVENTS, EventLog
 from ..config import SOLE_WORKER, Settings, advise
 from ..probes import signal_trace
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
-from . import killer, leftovers, reporter, summary
+from . import leftovers, reporter, summary
 from .base import Incident
 from .enrich import enrich
 from .leftovers import OWNER_FILE, prune_finished_runs
+
+if TYPE_CHECKING:
+    from . import killer
 
 #: The environment variable that names this run's evidence directory, and the
 #: only value in this package that a person hands over and the filesystem then
@@ -829,7 +832,7 @@ class IncidentEngine:
             self.witness_status = "off: nothing in this run records, so there is nowhere to write"
             return
         try:
-            self.controller_events = EventLog(self.directory / killer.CONTROLLER_EVENTS)
+            self.controller_events = EventLog(self.directory / CONTROLLER_EVENTS)
         except OSError as failure:
             self.controller_events = None
             self.witness_status = f"off: the controller's log could not be opened ({failure!r})"
@@ -962,6 +965,8 @@ class IncidentEngine:
         call, through the callable.
         """
         if self._sources is None:
+            from . import killer
+
             self._sources = killer.Sources(
                 directory=self.directory,
                 elevate=self.settings.elevate,

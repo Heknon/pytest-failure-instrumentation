@@ -648,7 +648,7 @@ def test_clean_controller_does_not_load_failure_specific_models():
     source = (
         "import sys\n"
         "import pytest_failure_instrumentation.incidents.engine\n"
-        "for kind in ('collection', 'death', 'stall', 'internal_error'):\n"
+        "for kind in ('collection', 'death', 'stall', 'internal_error', 'killer'):\n"
         "    assert 'pytest_failure_instrumentation.incidents.' + kind not in sys.modules, kind\n"
     )
     finished = subprocess.run(

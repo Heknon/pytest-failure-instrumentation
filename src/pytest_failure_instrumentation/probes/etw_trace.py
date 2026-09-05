@@ -9,7 +9,7 @@ caller survives in the wait status, exactly as on Linux.
 The kernel keeps the record anyway. The ``Microsoft-Windows-Kernel-Audit-API-
 Calls`` ETW provider writes an event from ``NtTerminateProcess`` - event 2,
 ``KERNEL_AUDIT_API_TERMINATEPROCESS`` - carrying the target's pid and the
-return code, and every ETW event's header carries the pid of the process it
+API return status (not the victim's exit code), and every ETW event's header carries the pid of the process it
 was written in, which here is the caller. That is "who called TerminateProcess
 on gw3", the same question ``signal_generate`` answers on Linux.
 
@@ -492,7 +492,7 @@ def decode(record: Any) -> Optional[dict[str, Any]]:
         "via": "TerminateProcess",
         "sender_pid": int(header.ProcessId),
         "target_pid": int(target),
-        "exit_code": int(code),
+        "api_status": int(code),
         "wall": round(filetime_to_epoch(int(header.TimeStamp)), 6),
     }
 

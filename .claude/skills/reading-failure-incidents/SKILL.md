@@ -177,7 +177,8 @@ or `UNKNOWN` verdict is only as unknown as that record says, and the remedy is
 usually there (`failure_elevate` on a runner with sudo; a readable
 `/dev/kmsg`; administrator rights on Windows). On Windows `killer.name` is
 `TerminateProcess` rather than a signal, `killer.signal` is 0, and
-`killer.exit_code` is the code the caller passed - `1` is `taskkill /F` or a
+`killer.api_status` is the API result (zero means success). `killer.exit_code`
+is the observed process exit status, unavailable during recovery - `1` is `taskkill /F` or a
 Go program such as the GitLab runner, `-1` (4294967295) is .NET's
 `Process.Kill`, `15` is Python's `os.kill`.
 

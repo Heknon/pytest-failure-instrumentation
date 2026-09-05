@@ -1016,8 +1016,11 @@ is one process calling `TerminateProcess` on another, with whatever exit code
 the caller chose — `1` from `taskkill /F` and from the GitLab runner, `-1`
 from .NET's `Process.Kill`, `15` from Python's `os.kill`. The kernel logs the
 call through the `Microsoft-Windows-Kernel-Audit-API-Calls` provider: event 2
-carries the target's pid and the code, and the event header carries the pid of
-the process it was written in, which is the caller. A sidecar of the same shape
+carries the target's PID and API return status, and the event header carries the PID of
+the process it was written in, which is the caller. Only successful calls
+are attributed. `killer.api_status` preserves the API result; `killer.exit_code`
+comes from the parent's observed process status and is unavailable during
+recovery. It is never inferred from ETW's `ReturnCode`. A sidecar of the same shape
 as the Linux one consumes a real-time session on that provider, sweeps the
 sessions a killed sidecar would have left (a machine holds at most 64), and
 writes the same JSON lines; the verdict is `KILLED_BY_PROCESS` with the

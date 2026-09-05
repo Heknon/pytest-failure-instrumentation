@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+CONTROLLER_EVENTS = "controller.events"
+
 
 class EventLog:
     def __init__(self, path: Path, run_id: str | None = None) -> None:

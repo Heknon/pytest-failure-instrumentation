@@ -332,3 +332,26 @@ def test_etw_sidecar_runs_without_the_package_or_site_dependencies(tmp_path):
     assert completed.returncode == 0, completed.stderr.decode()
     assert json.loads(output.read_text())["mode"] == "watch"
     assert not (tmp_path / "reporter.log").exists()
+
+
+@pytest.mark.parametrize("status,delivered", [(0, True), (0xC0000022, False)])
+def test_etw_payload_carries_api_status_not_process_exit_code(status, delivered):
+    import ctypes
+    import struct
+
+    from pytest_failure_instrumentation.probes import etw_trace
+
+    payload = ctypes.create_string_buffer(struct.pack("<II", 456, status))
+    event = etw_trace.EVENT_RECORD()
+    event.EventHeader.ProviderId = etw_trace.GUID.of(etw_trace.PROVIDER)
+    event.EventHeader.EventDescriptor.Id = etw_trace.TERMINATE_PROCESS_EVENT
+    event.EventHeader.ProcessId = 123
+    event.EventHeader.TimeStamp = etw_trace.FILETIME_EPOCH
+    event.UserData = ctypes.addressof(payload)
+    event.UserDataLength = 8
+    decoded = etw_trace.decode(event)
+    assert decoded["api_status"] == status
+    assert "exit_code" not in decoded
+    witness = signal_trace.parse_record(decoded)
+    assert witness.delivered is delivered
+    assert witness.exit_code is None

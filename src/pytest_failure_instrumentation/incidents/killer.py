@@ -46,7 +46,7 @@ from ..probes import kernel_log, signal_trace
 #: The controller's own rare-event log, beside the workers'. It holds what only
 #: the controller can witness - the SIGTERM it was sent - and, for a run found
 #: dead by a later one, is the one record of who told it to stop.
-CONTROLLER_EVENTS = "controller.events"
+CONTROLLER_EVENTS = event_log.CONTROLLER_EVENTS
 #: The role the controller's pid is filed under, so a signal it sent - execnet
 #: terminating a worker that would not exit - reads as what it is.
 CONTROLLER = "the controller"
@@ -78,6 +78,7 @@ class SignalRecord(BaseModel):
     signal: int
     name: str = ""
     exit_code: Optional[int] = None
+    api_status: Optional[int] = None
     at: Optional[float] = None
     #: Measured from when the controller learned of the death, so it is a
     #: lower bound on how long before the process actually ended.
@@ -381,16 +382,10 @@ def _from_trace(
     killer: Optional[SignalRecord] = None
     for record in reversed(mine):
         if record.name == "TerminateProcess":
-            # The status a terminated Windows process reports is the code
-            # the caller passed, so a witness whose code matches is the one;
-            # with no status to match, the latest is.
-            if (
-                exit_status is None
-                or record.exit_code is None
-                or record.exit_code == exit_status & 0xFFFFFFFF
-            ):
-                killer = record
-                break
+            # ETW confirms API success; only the parent knows the exit code.
+            record.exit_code = exit_status & 0xFFFFFFFF if exit_status is not None else None
+            killer = record
+            break
         elif (exit_status is None and record.signal == 9) or (fatal is not None and record.signal == fatal):
             killer = record
             break
@@ -448,6 +443,7 @@ def _record(
         signal=witness.signal,
         name="TerminateProcess" if witness.via == "TerminateProcess" else _name(witness.signal),
         exit_code=witness.exit_code,
+        api_status=witness.api_status,
         at=witness.at,
         seconds_before_death=_before(witness.at, died_at),
         si_code=witness.si_code,

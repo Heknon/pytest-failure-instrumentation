@@ -364,6 +364,10 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             f"{incident.killer.name} sent to pid {incident.worker_pid}."
         )
 
+    if terminated and incident.killer is not None and incident.killer.origin != "self":
+        # A successful external termination may choose a crash-shaped code.
+        return _terminated(incident, close)
+
     if received is not None:
         if hasattr(signal, "SIGKILL") and received == signal.SIGKILL:
             evidence.extend(output)

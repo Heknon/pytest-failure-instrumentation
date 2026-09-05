@@ -616,12 +616,12 @@ def test_a_windows_termination_is_read_as_a_witness(tmp_path):
         tmp_path,
         {
             "via": "TerminateProcess", "sender_pid": 5120, "target_pid": 4242,
-            "exit_code": 1, "wall": 1000.0,
+            "api_status": 0, "wall": 1000.0,
             "sender_exe": "C:\\GitLab-Runner\\gitlab-runner.exe", "sender_comm": "gitlab-runner.exe",
         },
     )
     (seen,) = signal_trace.witnessed(path)
-    assert seen.via == "TerminateProcess" and seen.exit_code == 1
+    assert seen.via == "TerminateProcess" and seen.api_status == 0 and seen.exit_code is None
     assert (seen.sender_pid, seen.sender_comm, seen.target_pid) == (5120, "gitlab-runner.exe", 4242)
     assert seen.signal == 0 and not seen.from_kernel
 
@@ -644,23 +644,23 @@ def test_a_windows_termination_is_read_as_a_witness(tmp_path):
     )
 
 
-def test_a_termination_whose_code_does_not_match_is_not_borrowed(tmp_path):
+def test_a_failed_termination_is_not_attributed(tmp_path):
     _trace_file(
         tmp_path,
-        {"via": "TerminateProcess", "sender_pid": 5120, "target_pid": 4242, "exit_code": 1, "wall": 1000.0},
+        {"via": "TerminateProcess", "sender_pid": 5120, "target_pid": 4242, "api_status": 0xC0000022, "wall": 1000.0},
     )
     found = killer.attribute(
         killer.Sources(tmp_path, run_pids=roles),
         pid=4242, exit_status=3, started_at=900.0, died_at=1000.5,
     )
-    assert found.killer is None, "exit code 3 is not the termination that passed 1"
+    assert found.killer is None, "a denied API call did not terminate the victim"
 
 
-def test_an_ntstatus_crash_outranks_a_termination_witness():
+def test_an_external_termination_can_choose_a_crash_shaped_code():
     verdict, _, _ = classify.of(
         death(exit_status=3221225477, killer=outside(signal=0, name="TerminateProcess", exit_code=3221225477))
     )
-    assert verdict == "NATIVE_CRASH"
+    assert verdict == "KILLED_BY_PROCESS"
 
 
 def test_a_recovered_windows_controller_is_explained_by_its_terminator():
@@ -708,7 +708,7 @@ def test_the_etw_sidecar_witnesses_a_termination(tmp_path):
     kill = seen[-1]
     assert kill.via == "TerminateProcess"
     assert kill.sender_pid == os.getpid()
-    assert kill.exit_code == 1
+    assert kill.api_status == 0 and kill.exit_code is None
     assert kill.sender_exe and kill.sender_exe.lower().endswith(".exe")
     assert not tracer.active
 

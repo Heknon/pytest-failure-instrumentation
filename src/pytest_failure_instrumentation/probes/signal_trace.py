@@ -96,6 +96,7 @@ class Witness:
     #: the caller chose - see :mod:`.etw_trace`.
     via: str = "signal"
     exit_code: Optional[int] = None
+    api_status: Optional[int] = None
 
     @property
     def from_kernel(self) -> bool:
@@ -639,6 +640,9 @@ def parse_record(record: dict[str, Any]) -> Optional[Witness]:
         except (KeyError, TypeError, ValueError):
             return None
         at = record.get("wall") if isinstance(record.get("wall"), (int, float)) else None
+        # Older sidecars mislabeled the API status as exit_code. It never
+        # contained the victim's requested or observed exit status.
+        api_status = record.get("api_status", record.get("exit_code"))
         return Witness(
             at=float(at) if at is not None else None,
             trace_seconds=0.0,
@@ -651,9 +655,9 @@ def parse_record(record: dict[str, Any]) -> Optional[Witness]:
             target_pid=target,
             target_comm="",
             to_group=False,
-            delivered=True,
+            delivered=api_status == 0,
             via="TerminateProcess",
-            exit_code=record.get("exit_code") if isinstance(record.get("exit_code"), int) else None,
+            api_status=api_status if isinstance(api_status, int) else None,
         )
     witness = parse_line(str(record.get("line", "")), record.get("wall"))
     if witness is None:
