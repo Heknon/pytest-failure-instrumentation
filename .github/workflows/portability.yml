@@ -1,6 +1,11 @@
 name: Portability
 
 on:
+  # A workflow_dispatch workflow must already exist on the default branch.
+  # The label trigger makes the pre-merge full gate available even on the PR
+  # that introduces this workflow: apply the `full-portability` label.
+  pull_request:
+    types: [labeled]
   # One complete cross-platform sweep per week catches platform drift without
   # charging every PR commit for four full non-Linux jobs.
   schedule:
@@ -35,7 +40,7 @@ concurrency:
 
 jobs:
   macos:
-    if: github.event_name == 'schedule' || inputs.platform == 'all' || inputs.platform == 'macos'
+    if: github.event_name == 'schedule' || github.event.label.name == 'full-portability' || inputs.platform == 'all' || inputs.platform == 'macos'
     name: macos / ${{ inputs.tests && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
     runs-on: macos-latest
     timeout-minutes: 25
@@ -51,7 +56,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
       - name: Run full suite
-        if: github.event_name == 'schedule' || inputs.tests == ''
+        if: github.event_name != 'workflow_dispatch' || inputs.tests == ''
         run: pytest -q
       - name: Run targeted tests
         if: github.event_name == 'workflow_dispatch' && inputs.tests != ''
@@ -60,7 +65,7 @@ jobs:
         run: python .github/scripts/run_targeted_tests.py
 
   windows:
-    if: github.event_name == 'schedule' || inputs.platform == 'all' || inputs.platform == 'windows'
+    if: github.event_name == 'schedule' || github.event.label.name == 'full-portability' || inputs.platform == 'all' || inputs.platform == 'windows'
     name: windows / ${{ inputs.tests && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
     runs-on: windows-latest
     timeout-minutes: 25
@@ -76,7 +81,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
       - name: Run full suite
-        if: github.event_name == 'schedule' || inputs.tests == ''
+        if: github.event_name != 'workflow_dispatch' || inputs.tests == ''
         run: pytest -q
       - name: Run targeted tests
         if: github.event_name == 'workflow_dispatch' && inputs.tests != ''

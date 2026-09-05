@@ -29,10 +29,12 @@ name must never be configured as the sole required merge check.
 
 ## Before merge or release
 
-Dispatch `Portability` on the pull-request head with `platform=all` and leave
-`tests` blank. Both complete non-Linux suites must pass. The scheduled weekly
-run provides drift detection between changes; it does not waive this pre-merge
-gate. Release workflows retain their own complete package matrix.
+Apply the `full-portability` label to the pull request. Both complete non-Linux
+suites must pass on the resulting run. After this workflow has landed on the
+default branch, manually dispatching `Portability` with `platform=all` and a
+blank `tests` input is equivalent. The scheduled weekly run provides drift
+detection between changes; it does not waive this pre-merge gate. Release
+workflows retain their own complete package matrix.
 
 Prefer the smallest targeted rerun while iterating, then pay for one complete
 cross-platform confirmation when the branch is actually ready to merge.
