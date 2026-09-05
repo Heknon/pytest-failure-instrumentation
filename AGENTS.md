@@ -93,3 +93,19 @@ both holding and releasing the GIL. Failed single-call attribution must be
 reported as a limitation; do not force sampler ticks or loosen assertions to
 make a production claim pass. Allocation tracing remains separately opt-in
 and is outside these runtime budgets.
+
+## Targeted profiling iteration
+
+When the user requests targeted-only iteration, apply `profiling-iterate` to
+the PR. Routine CI then runs lint/type checks only; `Profiling iteration`
+runs the selected macOS regression from its recorded failure artifact and
+the Windows sampler/analysis tests plus profiler benchmarks. It uses the
+same safe node-ID runner as the general failed-test toolkit. The comment
+dispatcher requires its definition on master; this PR-label entry point
+works before that tooling has been merged.
+
+Do not apply `full-portability` or rerun a complete failed job while this
+mode is active. Targeted greens are regression evidence, not a substitute
+for a full release gate. Report any unverified full-suite coverage explicitly.
+Remove the iteration label only when a full gate is wanted; the user's
+request to avoid another sweep takes precedence over the default policy.

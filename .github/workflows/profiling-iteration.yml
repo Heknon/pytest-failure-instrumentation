@@ -1,0 +1,67 @@
+name: Profiling iteration
+on:
+  pull_request:
+    types: [synchronize, labeled, reopened]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: profiling-iteration-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  macos:
+    if: contains(github.event.pull_request.labels.*.name, 'profiling-iterate') && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'profiling-iterate')
+    name: macOS / recorded timeline regression
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - uses: actions/download-artifact@v4
+        with:
+          name: failed-tests-macOS-py3.13
+          path: .prior-failures
+          repository: ${{ github.repository }}
+          run-id: 33955994789
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run recorded failures only
+        env:
+          TARGET_TESTS_FILE: .prior-failures/failed-tests.txt
+        run: python .github/scripts/run_targeted_tests.py
+  windows:
+    if: contains(github.event.pull_request.labels.*.name, 'profiling-iterate') && (github.event.action != 'labeled' || github.event.label.name == 'profiling-iterate')
+    name: Windows / sampler regressions and qualification
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - name: Focused sampler and analysis regressions
+        env:
+          TARGET_TESTS: |
+            tests/test_profile_sampler.py
+            tests/test_profile_analysis.py
+        run: python .github/scripts/run_targeted_tests.py
+      - name: Detection and overhead
+        if: success() || failure()
+        run: |
+          New-Item -ItemType Directory -Force readiness
+          python benchmarks/profile_gate.py | Tee-Object readiness/overhead.json
+          exit $LASTEXITCODE
+      - name: Native attribution
+        if: success() || failure()
+        run: python benchmarks/readiness_gate.py native --output readiness/native.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profiling-iteration-windows
+          path: readiness/
+          retention-days: 14

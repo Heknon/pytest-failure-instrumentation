@@ -152,6 +152,7 @@ def main() -> int:
         )
 
         report: dict[str, Any] = {
+            "quiet_failure_outputs": [output for output in quiet_outputs if "CPU hotspot:" in output or "CPU burst:" in output],
             "budgets": {
                 "instrumentation_ratio": INSTRUMENTATION_BUDGET,
                 "profile_ratio": PROFILE_BUDGET,

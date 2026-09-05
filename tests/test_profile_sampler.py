@@ -202,52 +202,43 @@ def test_a_tight_loop_gets_its_line_even_where_the_frame_reports_none() -> None:
     assert all(first < line <= first + body for line in lines), lines
 
 
-def test_a_timeline_window_is_a_tenth_of_a_second_however_slowly_it_ticks() -> None:
-    """The timeline is what a burst is read from, and the README calls it a
-    tenth of a second. It was five ticks, which is a tenth of a second only
-    while the sampler is getting the CPU it asked for.
+def test_a_timeline_window_is_a_tenth_of_a_second_however_slowly_it_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise elapsed-time bucketing without coupling CPU burn to scheduling.
 
-    Where it is not - a loaded machine, or a platform whose per-thread read
-    is expensive - the window stretched in proportion and took the timeline's
-    resolution with it, without saying so. At ticks 150 ms apart a burst of
-    0.6 s became one window, one window is under MIN_BURST_WINDOWS, and the
-    finding was not raised at all rather than raised less precisely. Both
-    macOS cells lost all seven of a scenario's bursts that way while a 2.5 s
-    burst in the same runs came through, which is the shape this leaves.
-
-    Driven by hand at each rate, so what is measured is the rule and not this
-    machine's scheduler.
+    The old test burnt real thread CPU then asserted an upper wall-time bound.
+    A descheduled runner could exceed that bound with no sampler regression.
+    Real clock/attribution behavior is covered by the busy/idle tests above.
     """
-    def burn(seconds: float) -> None:
-        clock = getattr(time, "thread_time", time.process_time)
-        deadline = clock() + seconds
-        while clock() < deadline:
-            sum(range(2000))
+    for gap_ns in (20_000_000, 80_000_000, 200_000_000):
+        with monkeypatch.context() as patch:
+            now = [10_000_000_000]
+            cpu = [0]
+            patch.setattr(sampling.time, "monotonic", lambda now=now: now[0] / 1e9)
+            patch.setattr(sampling.time, "process_time", lambda cpu=cpu: cpu[0] / 1e9)
+            patch.setattr(sampling.time, "process_time_ns", lambda cpu=cpu: cpu[0])
+            records: list[dict[str, Any]] = []
+            sampler = Sampler(records.append, lambda: 1, interval=0.02, worker="x")
+            sampler.clock.source = "thread-clock"
+            patch.setattr(sampler.clock, "read", lambda tids, cpu=cpu: {threading.get_native_id(): cpu[0]})
+            patch.setattr(sampler.clock, "discover", lambda known=None: [threading.get_native_id()])
+            patch.setattr(sampler._machine, "busy_permille", lambda: 0)
+            sampler.begin_phase("t::a", "setup")
+            for _ in range((600_000_000 + gap_ns - 1) // gap_ns):
+                now[0] += gap_ns
+                cpu[0] += gap_ns * 9 // 10
+                sampler._sample()
+            sampler.end_phase("setup")
+            sampler.end_test("t::a")
 
-    for gap in (0.02, 0.08, 0.2):
-        records: list[dict[str, Any]] = []
-        sampler = Sampler(records.append, lambda: 1, interval=0.02, worker="x")
-        sampler.begin_phase("t::a", "setup")
-        deadline = time.monotonic() + 0.6
-        while time.monotonic() < deadline:
-            burn(gap * 0.9)
-            sampler._sample()
-        sampler.end_phase("setup")
-        sampler.end_test("t::a")
-
-        (record,) = [entry for entry in records if entry["record"] == "test"]
-        timeline = record["timeline"]
-        # A window per tick is the floor - the sample rate sets it and no
-        # window can be shorter - so a gap over the window length gives one
-        # window per tick and nothing smaller. Under it, a tenth of a second.
-        assert len(timeline) >= 3, (gap, timeline)
-        longest = max(
-            after[0] - before[0] for before, after in zip(timeline, timeline[1:])
-        ) if len(timeline) > 1 else timeline[0][0]
-        assert longest <= max(gap, sampling.WINDOW_SECONDS) * 1000 * 2.5, (gap, longest)
-        # And the burst survives the rate, which is the point of all of it.
-        bursts = burst_analysis._bursts(record, burst_analysis.Thresholds(burst_cores=0.5))
-        assert len(bursts) == 1, (gap, len(timeline), bursts)
+            (record,) = [entry for entry in records if entry["record"] == "test"]
+            timeline = record["timeline"]
+            assert len(timeline) >= 3, (gap_ns, timeline)
+            longest = max(after[0] - before[0] for before, after in zip(timeline, timeline[1:]))
+            # First tick at/after the 100 ms boundary, allowing one tick of
+            # rounding, rather than a fixed number of sampling ticks.
+            assert longest <= max(gap_ns / 1e6, sampling.WINDOW_SECONDS * 1000) + gap_ns / 1e6 + 1
+            bursts = burst_analysis._bursts(record, burst_analysis.Thresholds(burst_cores=0.5))
+            assert len(bursts) == 1, (gap_ns, timeline, bursts)
 
 
 
@@ -783,3 +774,39 @@ def test_a_discovery_reuses_the_clocks_it_was_just_handed() -> None:
     assert clock.discover(handed) == list(handed)
     assert reads == 0, "the clocks it was handed were enough"
     assert clock.discover() and reads == 1, "and without them it still answers"
+
+
+def test_windows_clock_closes_handles_on_failed_reads() -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    closed = []
+
+    def read(handle, created, exited, kernel, user):
+        kernel._obj.value = 11
+        user._obj.value = 17
+        return handle != 2
+
+    clock = sampling._WindowsThreads.__new__(sampling._WindowsThreads)
+    clock.ctypes = ctypes
+    clock.kernel = SimpleNamespace(OpenThread=lambda access, inherit, tid: tid if tid != 3 else 0,
+                                   GetThreadTimes=read, CloseHandle=closed.append)
+    assert clock.read([0, 1, 2, 3]) == {1: 2800}
+    assert closed == [1, 2]
+
+
+def test_windows_clock_closes_handles_on_exception() -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    closed = []
+
+    def read(*args):
+        raise OSError("thread query failed")
+
+    clock = sampling._WindowsThreads.__new__(sampling._WindowsThreads)
+    clock.ctypes = ctypes
+    clock.kernel = SimpleNamespace(OpenThread=lambda *args: 123, GetThreadTimes=read, CloseHandle=closed.append)
+    with pytest.raises(OSError, match="thread query failed"):
+        clock.read([1])
+    assert closed == [123]

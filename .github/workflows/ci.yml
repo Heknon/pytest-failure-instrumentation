@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # master is the default branch here; main is kept in case it is ever
     # renamed. Without the default branch listed, the one push that most
     # needs a green tick is the one that gets none.
@@ -15,6 +16,7 @@ concurrency:
 
 jobs:
   profile-performance:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     name: profiler accuracy + overhead
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -67,6 +69,7 @@ jobs:
         run: mypy
 
   test:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # Linux is the full PR gate. Python 3.9 is exercised with the declared
     # minimum dependencies below, while 3.12 is used by the performance,
     # no-xdist and wheel jobs. Multiplying every Python version by every OS
@@ -153,6 +156,7 @@ jobs:
           retention-days: 7
 
   platform-smoke:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # Keep a real runner for each non-Linux implementation on every PR, but
     # exercise only the modules that talk directly to that OS. The complete
     # suite still runs in portability.yml weekly and on demand before merge.
@@ -205,6 +209,7 @@ jobs:
           retention-days: 7
 
   oldest-supported:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # pyproject declares pytest>=7.0 and python>=3.9. Everything else in this
     # workflow installs whatever is newest, so the floor is a claim nothing
     # runs - and a hook signature or an ini type that only exists in a later
@@ -230,6 +235,7 @@ jobs:
         run: pytest -q
 
   without-xdist:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # Two of the five kinds are not distributed problems, and the plugin has to
     # register without xdist installed - where pytest_testnodedown has no
     # hookspec at all, and an unspecced hookimpl is a registration error.
@@ -254,6 +260,7 @@ jobs:
         run: pytest -q
 
   wheel:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # The one thing no other job here can see. Every one of them installs the
     # source tree, so a test that reads a file from beside the package - or a
     # file the wheel does not ship at all - passes on a checkout and fails

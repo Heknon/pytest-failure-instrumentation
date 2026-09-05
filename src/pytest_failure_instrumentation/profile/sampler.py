@@ -128,8 +128,9 @@ class ThreadClock:
     come back in the answer, or the layout is not what this expects and the
     reader stands down rather than weight samples by somebody else's counter.
 
-    On Windows psutil's per-thread times are used; their ids are the Win32
-    thread ids ``native_id`` reports. They move in the scheduler's sixteen
+    On 64-bit Windows GetThreadTimes reads the known Win32 thread IDs
+    without releasing the GIL. psutil discovers native-only threads once a
+    second and remains the fallback. The counters move in roughly sixteen
     millisecond ticks, which is coarse against a twenty millisecond sampling
     interval but sums correctly over a test.
 
@@ -140,6 +141,7 @@ class ThreadClock:
     def __init__(self) -> None:
         self.source = "unavailable"
         self._mach: Any = None
+        self._windows: Any = None
         if IS_LINUX and hasattr(time, "clock_gettime_ns"):
             try:
                 time.clock_gettime_ns(_thread_clock_id(os.getpid()))
@@ -154,6 +156,18 @@ class ThreadClock:
                 if own in mach.read():
                     self._mach = mach
                     self.source = "mach"
+                    return
+            except Exception:
+                pass
+        if sys.platform == "win32":
+            try:
+                import psutil
+
+                windows = _WindowsThreads()
+                if threading.get_native_id() in windows.read([threading.get_native_id()]):
+                    self._windows = windows
+                    self._process = psutil.Process()
+                    self.source = "windows-thread-times"
                     return
             except Exception:
                 pass
@@ -187,6 +201,8 @@ class ThreadClock:
                 except (OSError, OverflowError, ValueError):
                     continue
             return clocks
+        if self.source == "windows-thread-times":
+            return self._windows.read(tids)
         if self.source == "mach":
             try:
                 return self._mach.read()
@@ -222,9 +238,58 @@ class ThreadClock:
                 return [int(name) for name in os.listdir("/proc/self/task")]
             except (OSError, ValueError):
                 return []
+        if self.source == "windows-thread-times":
+            try:
+                return [int(entry.id) for entry in self._process.threads()]
+            except Exception:
+                return list(known or ())
         if self.source in ("mach", "psutil"):
             return list(known if known is not None else self.read(()))
         return []
+
+
+class _WindowsThreads:
+    """Read known thread clocks without a system-wide snapshot or GIL handoff.
+
+    Handles are opened and closed in the same tick. This avoids retaining
+    exited thread objects, stale handles when IDs are reused, and shutdown
+    cleanup races. Native-only threads are discovered separately once a second.
+    PyDLL keeps the GIL; Windows x64 has one calling convention. A 32-bit
+    interpreter retains the psutil fallback instead of using a cdecl wrapper
+    for the stdcall API.
+    """
+
+    def __init__(self) -> None:
+        import ctypes
+
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            raise OSError("direct Windows thread clocks require a 64-bit interpreter")
+        self.ctypes = ctypes
+        self.kernel = ctypes.PyDLL("kernel32", use_last_error=True)
+        self.kernel.OpenThread.argtypes = (ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32)
+        self.kernel.OpenThread.restype = ctypes.c_void_p
+        self.kernel.GetThreadTimes.argtypes = (ctypes.c_void_p,) + (ctypes.POINTER(ctypes.c_uint64),) * 4
+        self.kernel.GetThreadTimes.restype = ctypes.c_int32
+        self.kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+        self.kernel.CloseHandle.restype = ctypes.c_int32
+
+    def read(self, tids: Any) -> dict[int, int]:
+        ctypes = self.ctypes
+        clocks: dict[int, int] = {}
+        for tid in tids:
+            if not tid:
+                continue
+            handle = self.kernel.OpenThread(0x0800, False, tid)
+            if not handle:
+                continue
+            try:
+                created, exited, kernel, user = (ctypes.c_uint64() for _ in range(4))
+                if self.kernel.GetThreadTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                              ctypes.byref(kernel), ctypes.byref(user)):
+                    clocks[tid] = (kernel.value + user.value) * 100
+            finally:
+                self.kernel.CloseHandle(handle)
+        return clocks
 
 
 class _MachThreads:
