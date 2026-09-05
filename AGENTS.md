@@ -18,10 +18,16 @@ When a specific macOS or Windows test fails:
 1. Diagnose the failure from the failed job log before changing code.
 2. Commit the fix to the pull-request branch.
 3. Dispatch the `Portability` workflow on that exact branch and choose the
-   affected platform. Put the failed pytest node ID in `tests`; use one node ID
-   per line if several tests failed.
+   affected platform. Put the failed workflow's numeric run ID in
+   `failed-run-id`; CI downloads that platform's seven-day `failed-tests-*`
+   artifact and runs those node IDs only. The `tests` input remains available
+   for an explicit node ID that did not come from CI.
 4. If the unchanged commit may simply have encountered runner noise, use
    GitHub's native **Re-run failed jobs** instead of creating a new commit.
+
+For local iteration, run `pytest --lf` to execute only failures remembered in
+`.pytest_cache`, or `pytest --ff` to put remembered failures first and then run
+the rest. Do not delete `.pytest_cache` while investigating a failure.
 
 A targeted run proves only that the named regression is fixed. It is not a
 replacement for the normal PR gate or the full portability gate, and its check

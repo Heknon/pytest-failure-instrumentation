@@ -1,5 +1,9 @@
 name: Portability
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   # A workflow_dispatch workflow must already exist on the default branch.
   # The label trigger makes the pre-merge full gate available even on the PR
@@ -33,6 +37,10 @@ on:
         description: "Optional pytest node IDs, one per line; blank runs the full suite"
         required: false
         type: string
+      failed-run-id:
+        description: "Optional prior Actions run ID; reruns that platform's recorded failures"
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -41,7 +49,7 @@ concurrency:
 jobs:
   macos:
     if: github.event_name == 'schedule' || github.event.label.name == 'full-portability' || inputs.platform == 'all' || inputs.platform == 'macos'
-    name: macos / ${{ inputs.tests && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
+    name: macos / ${{ (inputs.tests || inputs.failed-run-id) && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
     runs-on: macos-latest
     timeout-minutes: 25
 
@@ -55,18 +63,41 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test]"
+      - name: Download failures from prior run
+        if: github.event_name == 'workflow_dispatch' && inputs.failed-run-id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: failed-tests-macOS-py${{ inputs.python-version }}
+          path: .prior-failures
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.failed-run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run full suite
-        if: github.event_name != 'workflow_dispatch' || inputs.tests == ''
+        id: tests
+        if: github.event_name != 'workflow_dispatch' || (inputs.tests == '' && inputs.failed-run-id == '')
         run: pytest -q
       - name: Run targeted tests
-        if: github.event_name == 'workflow_dispatch' && inputs.tests != ''
+        id: targeted-tests
+        if: github.event_name == 'workflow_dispatch' && (inputs.tests != '' || inputs.failed-run-id != '')
         env:
           TARGET_TESTS: ${{ inputs.tests }}
+          TARGET_TESTS_FILE: ${{ inputs.failed-run-id != '' && '.prior-failures/failed-tests.txt' || '' }}
         run: python .github/scripts/run_targeted_tests.py
+      - name: Export failed test IDs
+        if: failure() && (steps.tests.outcome == 'failure' || steps.targeted-tests.outcome == 'failure')
+        run: python .github/scripts/export_failed_tests.py
+      - name: Preserve failed test IDs
+        if: failure() && (steps.tests.outcome == 'failure' || steps.targeted-tests.outcome == 'failure')
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-tests-macOS-py${{ inputs.python-version || '3.13' }}
+          path: .test-results/failed-tests.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   windows:
     if: github.event_name == 'schedule' || github.event.label.name == 'full-portability' || inputs.platform == 'all' || inputs.platform == 'windows'
-    name: windows / ${{ inputs.tests && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
+    name: windows / ${{ (inputs.tests || inputs.failed-run-id) && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
     runs-on: windows-latest
     timeout-minutes: 25
 
@@ -80,11 +111,34 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test]"
+      - name: Download failures from prior run
+        if: github.event_name == 'workflow_dispatch' && inputs.failed-run-id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: failed-tests-Windows-py${{ inputs.python-version }}
+          path: .prior-failures
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.failed-run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run full suite
-        if: github.event_name != 'workflow_dispatch' || inputs.tests == ''
+        id: tests
+        if: github.event_name != 'workflow_dispatch' || (inputs.tests == '' && inputs.failed-run-id == '')
         run: pytest -q
       - name: Run targeted tests
-        if: github.event_name == 'workflow_dispatch' && inputs.tests != ''
+        id: targeted-tests
+        if: github.event_name == 'workflow_dispatch' && (inputs.tests != '' || inputs.failed-run-id != '')
         env:
           TARGET_TESTS: ${{ inputs.tests }}
+          TARGET_TESTS_FILE: ${{ inputs.failed-run-id != '' && '.prior-failures/failed-tests.txt' || '' }}
         run: python .github/scripts/run_targeted_tests.py
+      - name: Export failed test IDs
+        if: failure() && (steps.tests.outcome == 'failure' || steps.targeted-tests.outcome == 'failure')
+        run: python .github/scripts/export_failed_tests.py
+      - name: Preserve failed test IDs
+        if: failure() && (steps.tests.outcome == 'failure' || steps.targeted-tests.outcome == 'failure')
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-tests-Windows-py${{ inputs.python-version || '3.13' }}
+          path: .test-results/failed-tests.txt
+          if-no-files-found: ignore
+          retention-days: 7

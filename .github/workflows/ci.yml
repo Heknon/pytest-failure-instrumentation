@@ -136,7 +136,21 @@ jobs:
       # one process, so an ordering bug between two tests still has three
       # places to show itself.
       - name: Test
+        id: tests
         run: pytest -q -n 4
+
+      - name: Export failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        run: python .github/scripts/export_failed_tests.py
+
+      - name: Preserve failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-tests-Linux-py${{ matrix.python-version }}
+          path: .test-results/failed-tests.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   platform-smoke:
     # Keep a real runner for each non-Linux implementation on every PR, but
@@ -168,6 +182,7 @@ jobs:
           python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
 
       - name: Test platform-facing code
+        id: tests
         run: >-
           pytest -q
           tests/test_probes.py
@@ -175,6 +190,19 @@ jobs:
           tests/test_stall_probe.py
           tests/test_exit_status.py
           tests/test_crash_dump_race.py
+
+      - name: Export failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        run: python .github/scripts/export_failed_tests.py
+
+      - name: Preserve failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-tests-${{ runner.os }}-py3.13
+          path: .test-results/failed-tests.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   oldest-supported:
     # pyproject declares pytest>=7.0 and python>=3.9. Everything else in this

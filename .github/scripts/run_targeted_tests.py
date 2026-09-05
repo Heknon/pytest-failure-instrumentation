@@ -9,7 +9,13 @@ from pathlib import Path
 
 
 def main() -> int:
-    targets = [line.strip() for line in os.environ.get("TARGET_TESTS", "").splitlines() if line.strip()]
+    inline = os.environ.get("TARGET_TESTS", "").strip()
+    target_file = os.environ.get("TARGET_TESTS_FILE", "").strip()
+    if bool(inline) == bool(target_file):
+        raise SystemExit("Supply exactly one of TARGET_TESTS or TARGET_TESTS_FILE")
+
+    raw = Path(target_file).read_text(encoding="utf-8") if target_file else inline
+    targets = [line.strip() for line in raw.splitlines() if line.strip()]
     if not targets:
         raise SystemExit("No test targets were supplied")
 
