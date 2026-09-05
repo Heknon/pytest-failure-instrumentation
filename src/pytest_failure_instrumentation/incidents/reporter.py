@@ -135,6 +135,15 @@ def report(payload: dict[str, Any]) -> list[Any]:
         for incident in found
         if not (isinstance(incident.worker_pid, int) and probes.is_running(incident.worker_pid))
     ]
+    # Claimed before anything is delivered, not after. The key is what stops
+    # a second reporter - or the next run to sweep this root - raising the
+    # same dead directory again, and delivery is the slow part: with the
+    # stamp at the end, everything from the marker check through the
+    # controller and worker grace periods (see the two constants above) is a
+    # window in which a second sweeper reads an unclaimed marker and starts
+    # its own copy of this work. A duplicate page for a run that is already
+    # over is the failure this key exists to prevent.
+    leftovers.stamp(directory, leftovers.REPORTED_KEY)
     attributor = Attributor(tuple(payload.get("packages") or ()))
     for incident in found:
         enrich(incident, attributor, payload.get("product_version"), session)
@@ -142,7 +151,6 @@ def report(payload: dict[str, Any]) -> list[Any]:
             target(incident)
         except Exception:  # noqa: BLE001 - the next incident is still owed
             traceback.print_exc()
-    leftovers.stamp(directory, leftovers.REPORTED_KEY)
     return found
 
 

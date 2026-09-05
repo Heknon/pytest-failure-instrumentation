@@ -17,6 +17,7 @@ from collections import Counter
 from typing import Any, Callable
 
 from .. import probes
+from ..errors import refuse_a_shared_tracer
 
 DEFAULT_HIGH_WATER_FRACTION = 0.75
 
@@ -123,9 +124,31 @@ class MemoryMonitor:
             return []
 
 
+class TracemallocSession:
+    """A tracer started and owned by this plugin."""
+
+    def __init__(self, depth: int) -> None:
+        # Asked again here, not only at setup: a conftest is free to start a
+        # tracer in a fixture or at collection, which is after the setup check
+        # and before this. See errors.refuse_a_shared_tracer.
+        refuse_a_shared_tracer()
+        tracemalloc.start(depth)
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+
+
 def enable_tracemalloc(depth: int) -> bool:
-    if depth <= 0 or tracemalloc.is_tracing():
+    """Enable watchdog tracing without replacing an existing tracer."""
+    if depth <= 0:
         return tracemalloc.is_tracing()
+    if tracemalloc.is_tracing():
+        return True
     try:
         tracemalloc.start(depth)
         return True

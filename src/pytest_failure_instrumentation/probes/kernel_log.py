@@ -126,10 +126,19 @@ class OomKill:
     shmem_rss_kb: Optional[int]
     uid: Optional[int]
     oom_score_adj: Optional[int]
+    #: The heaviest ``KEPT_TASKS`` rows, for the reader: what goes on the
+    #: incident is the top few of these.
     tasks: list[OomTask] = field(default_factory=list)
-    #: The rows the table held before ``KEPT_TASKS`` trimmed it, and the sum of
-    #: their RSS - so the fleet arithmetic is over the whole table whatever was
-    #: kept for the reader.
+    #: Every row the table held, for the arithmetic. The fleet figures - how
+    #: many of the run's processes the kernel weighed, their median size, the
+    #: victim's rank among all of them - are only true over the whole table,
+    #: and which rows belong to the run is not known here: a worker holding
+    #: less memory than four hundred other tasks is still one of ours, and
+    #: dropping it makes the run look both smaller and heavier than it was.
+    #: The parse materialises the whole table anyway, so keeping it costs no
+    #: peak memory; the object is dropped once the record is built.
+    all_tasks: list[OomTask] = field(default_factory=list)
+    #: The rows the table held, and the sum of their RSS.
     tasks_considered: int = 0
     tasks_rss_pages: int = 0
     lines: list[str] = field(default_factory=list)
@@ -176,6 +185,18 @@ def read(since: Optional[float] = None, elevate: bool = False) -> KernelLogReadi
     else:
         refusals.append("sudo dmesg: not tried, failure_elevate is off")
     return KernelLogReading([], "unavailable", "; ".join(refusals))
+
+
+def narrowed(reading: KernelLogReading, since: Optional[float]) -> KernelLogReading:
+    """The same reading, bounded to a later window.
+
+    A reading taken for one process of a run serves every other process of it,
+    which started later: the kills are the same lines, and the only difference
+    is where the window opens. Narrowing an existing reading is what makes one
+    read of the log answer for a whole cascade of deaths - see
+    ``killer.Sources.kernel_log_reading``.
+    """
+    return KernelLogReading(_since(reading.kills, since), reading.source, reading.detail)
 
 
 def _since(kills: list[OomKill], since: Optional[float]) -> list[OomKill]:
@@ -229,6 +250,15 @@ def _read_kmsg() -> tuple[Optional[list[tuple[Optional[float], str]]], str]:
             lines.append((boot + int(match.group("usec")) / 1e6, match.group("message")))
     finally:
         os.close(fd)
+    if not lines:
+        # An open that succeeds and reads nothing is not an empty ring buffer -
+        # a fresh open starts at the oldest record the kernel still holds, and
+        # a running kernel always holds some. It is /dev/kmsg bound to
+        # /dev/null, which systemd-nspawn and a few container runtimes do.
+        # Answering "read, 0 lines" would end the ladder here and leave the
+        # journal and dmesg untried, so an OOM kill goes unfound while the
+        # incident says the log was consulted.
+        return None, "the device read as empty, so it is not the kernel's ring buffer"
     return lines, ""
 
 
@@ -289,6 +319,12 @@ def _read_dmesg(sudo: bool = False) -> tuple[Optional[list[tuple[Optional[float]
             lines.append((None, raw))  # a dmesg built without timestamps
         else:
             lines.append((boot + float(match.group("seconds")), match.group("message")))
+    if not lines:
+        # The same as for the device above, and it matters for the same
+        # reason: an empty dmesg here would end the ladder before ``sudo
+        # dmesg``, which is the rung that answers when the buffer is
+        # restricted rather than absent.
+        return None, "dmesg printed nothing"
     return lines, ""
 
 
@@ -426,6 +462,7 @@ def _kill(
         uid=uid,
         oom_score_adj=int(adj_match.group("adj")) if adj_match else None,
         tasks=sorted(table, key=lambda task: task.rss_pages, reverse=True)[:KEPT_TASKS],
+        all_tasks=table,
         tasks_considered=len(table),
         tasks_rss_pages=sum(task.rss_pages for task in table),
         lines=context[-6:],

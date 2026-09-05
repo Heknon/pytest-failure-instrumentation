@@ -157,6 +157,9 @@ class ScheduleTracker:
         #: How many tests each worker has reported finishing. Half of the
         #: total for every scheduler that keeps only what is outstanding.
         self._finished: dict[str, int] = {}
+        #: The test each worker last finished, which is what tells a rerun of
+        #: it from the next test. See :meth:`saw_a_test_finish`.
+        self._last_finished: dict[str, str] = {}
         #: The last row computed for each worker, kept so that one xdist has
         #: let go of still has its final numbers. A worker that died owing
         #: thirteen tests is exactly the case a reader wants them for, and
@@ -178,16 +181,40 @@ class ScheduleTracker:
         #: equivalent, as in :mod:`.capture.state`.
         self._pwrite = getattr(os, "pwrite", None)
 
-    def saw_a_test_finish(self, worker: Optional[str]) -> None:
+    def saw_a_test_finish(self, worker: Optional[str], nodeid: Optional[str] = None) -> None:
         """A test on ``worker`` has run its last phase.
 
         Called for every one of them, and the whole per-test cost of this
         module: one dictionary increment. What is *outstanding* is read off
         the scheduler when the record is written, and the two added together
         are the total.
+
+        Once per test, which is not once per teardown. A rerun plugin runs a
+        failed test's phases again inside the same protocol, and every attempt
+        sends the controller a teardown report for the same node id - while
+        the scheduler, which is told once when the protocol ends, drops one
+        index. Counting each report put the finished half of the total above
+        what was ever handed out: 374 of 368 tests, on a suite where six were
+        rerun once. So a report naming the test this worker has just finished
+        is the same test again and is not counted. Only the last id is kept,
+        one string per worker: a rerun is always immediately after the attempt
+        it repeats, on the same worker, because it happens inside the same
+        call. Given no id at all there is nothing to compare, and every call
+        counts.
+
+        What a report alone cannot tell from a rerun is the same id collected
+        twice - ``--keep-duplicates`` - and run back to back on one worker.
+        That reads one low here, and the worker's own count, which sees the
+        protocol boundary and so can tell, floors the total back up where the
+        two are joined - see :func:`.topology._progress`.
         """
-        if worker:
-            self._finished[worker] = self._finished.get(worker, 0) + 1
+        if not worker:
+            return
+        if nodeid is not None:
+            if self._last_finished.get(worker) == nodeid:
+                return
+            self._last_finished[worker] = nodeid
+        self._finished[worker] = self._finished.get(worker, 0) + 1
 
     # -- what it produces ------------------------------------------------
 

@@ -33,14 +33,16 @@ fingerprint, which is what a consumer already groups recurrences by.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .. import probes
-from . import death
-from .death import WorkerDeathIncident
+
+if TYPE_CHECKING:
+    from .death import WorkerDeathIncident
 
 #: Written at the top of each run's own directory, and the only thing that
 #: makes a directory this plugin's to read or to delete. Matching on file
@@ -76,14 +78,27 @@ def owner_of(directory: Path) -> Optional[int]:
 
 
 def stamp(directory: Path, key: str) -> bool:
-    """Add ``key`` (the time, now) to this directory's marker."""
+    """Add ``key`` (the time, now) to this directory's marker.
+
+    Written through a temporary file and renamed over the marker, because the
+    readers of it are other runs: :func:`marker` on a half-written owner.json
+    returns None, and a directory that reads as "not ours" is one whose
+    incidents are never raised at all. The rename is atomic, so a reader sees
+    the old marker or the new one.
+    """
     record = marker(directory)
     if record is None:
         return False
     record[key] = time.time()
+    temporary = directory / f"{OWNER_FILE}.{os.getpid()}"
     try:
-        (directory / OWNER_FILE).write_text(json.dumps(record), encoding="utf-8")
+        temporary.write_text(json.dumps(record), encoding="utf-8")
+        os.replace(temporary, directory / OWNER_FILE)
     except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
         return False
     return True
 
@@ -175,6 +190,8 @@ def _deaths_in(directory: Path, elevate: bool = False) -> list[WorkerDeathIncide
     # kernel has since handed to something else would answer "alive" and
     # suppress a real report - which is the failure mode that costs a reader
     # the one incident they were waiting for.
+    from . import death
+
     incidents = []
     for events in sorted(directory.glob("*.events")):
         incident = death.recover(events, session=directory.name, elevate=elevate)

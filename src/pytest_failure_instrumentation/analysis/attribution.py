@@ -45,8 +45,18 @@ class Attributor:
         self.packages = [comparable(name.replace("-", "_")) for name in packages]
         stdlib = sysconfig.get_paths().get("stdlib", "")
         self.stdlib = comparable(stdlib) if stdlib else ""
+        # The profile analysis asks for every frame of every record - two
+        # thousand tests by four hundred frames - and the answer for a path
+        # never changes, so it is worked out once. Distinct paths are hundreds.
+        self._owners: dict[str, str] = {}
 
     def owner_of(self, path: str) -> str:
+        owner = self._owners.get(path)
+        if owner is None:
+            owner = self._owners[path] = self._classify(path)
+        return owner
+
+    def _classify(self, path: str) -> str:
         normalized = comparable(path)
         parts = normalized.split("/")
         if any(marker in normalized for marker in FRAMEWORK_MARKERS):

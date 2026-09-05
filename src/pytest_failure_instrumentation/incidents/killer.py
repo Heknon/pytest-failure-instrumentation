@@ -31,7 +31,7 @@ import signal as signal_module
 import statistics
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -197,6 +197,12 @@ class Sources:
     #: Whether the sidecar is still writing: a death noticed live may have
     #: to wait a moment for its line, one found afterwards never does.
     live: bool = True
+    #: The last kernel-log reading this run made: when it was taken, the
+    #: window it opened at, and what it found. One object serves every death
+    #: of a run - see :meth:`kernel_log_reading`.
+    _log: Optional[tuple[float, Optional[float], kernel_log.KernelLogReading]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def trace_path(self) -> Path:
@@ -205,6 +211,35 @@ class Sources:
     @property
     def witness_path(self) -> Path:
         return self.directory / CONTROLLER_EVENTS
+
+    def kernel_log_reading(
+        self, since: Optional[float], died_at: float
+    ) -> kernel_log.KernelLogReading:
+        """The log, read once for as many deaths as one reading can answer.
+
+        Reading it forks ``journalctl`` or ``dmesg`` and parses everything
+        they print, and the deaths that most need it arrive together: an OOM
+        kill takes a worker, the memory is still short, and the next goes.
+        Per death that is one fork each, in ``pytest_testnodedown``, with the
+        run waiting.
+
+        A reading answers for a death when it was taken after that death -
+        ``died_at`` is when the controller noticed it, which is already after
+        the kill the log recorded - and opened no later than the window being
+        asked for, which a run's later workers always satisfy. Anything else
+        is read afresh: a kill that happened after the last reading would not
+        be in it, and a missing OOM kill is the one mistake this whole path
+        exists to avoid.
+        """
+        cached = self._log
+        if cached is not None:
+            taken_at, opened_at, reading = cached
+            covers_start = opened_at is None or (since is not None and since >= opened_at)
+            if covers_start and taken_at >= died_at:
+                return kernel_log.narrowed(reading, since)
+        reading = kernel_log.read(since=since, elevate=self.elevate)
+        self._log = (time.time(), since, reading)
+        return reading
 
 
 @dataclass
@@ -262,7 +297,7 @@ def attribute(
                 killer = record
                 before.remove(record)
                 break
-    oom, kernel_status = _from_kernel_log(sources, roles, pid, since, until, killer)
+    oom, kernel_status = _from_kernel_log(sources, roles, pid, since, until, died_at, killer)
     return Attribution(
         killer=killer,
         oom=oom,
@@ -323,15 +358,34 @@ def _from_trace(
 
 
 def _settled(sources: Sources, pid: int) -> list[signal_trace.Witness]:
-    """The trace, once the line for this pid has had time to land."""
+    """The trace, once the line for this pid has had time to land.
+
+    Polled by size rather than re-parsed: the file holds one line per SIGKILL
+    or SIGTERM on the whole machine and is read to a 16 MB tail, so parsing it
+    twenty times a second while waiting - and again for every worker of a
+    cascade - costs more than the wait it is measuring. Nothing new can have
+    arrived while the size is unchanged.
+    """
     found = signal_trace.witnessed(sources.trace_path)
     if not sources.live:
         return found
     deadline = time.monotonic() + TRACE_SETTLE_SECONDS
+    size = _size_of(sources.trace_path)
     while not any(witness.target_pid == pid for witness in found) and time.monotonic() < deadline:
         time.sleep(TRACE_POLL_SECONDS)
+        grown = _size_of(sources.trace_path)
+        if grown == size:
+            continue
+        size = grown
         found = signal_trace.witnessed(sources.trace_path)
     return found
+
+
+def _size_of(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return -1
 
 
 def _record(
@@ -425,9 +479,10 @@ def _from_kernel_log(
     pid: Optional[int],
     since: Optional[float],
     until: float,
+    died_at: float,
     killer: Optional[SignalRecord],
 ) -> tuple[Optional[OomKillRecord], str]:
-    reading = kernel_log.read(since=since, elevate=sources.elevate)
+    reading = sources.kernel_log_reading(since, died_at)
     if reading.source == "unavailable":
         return None, f"unavailable ({reading.detail})"
     status = reading.source
@@ -464,11 +519,18 @@ def _oom_record(
     def megabytes(pages: int) -> int:
         return round(pages * page / 1024)
 
-    ours = [task for task in kill.tasks if task.pid in roles]
-    victim_pages = next((task.rss_pages for task in kill.tasks if task.pid == kill.victim_pid), None)
+    # Over the whole table the kernel weighed, not the heaviest few kept for
+    # the reader: `tasks_considered` and `tasks_rss_mb` below come from the
+    # whole table, and figures drawn from two different populations cannot be
+    # set beside each other. A run's smaller workers are exactly what falls
+    # off the trimmed end, which would leave `run_tasks` short, the median
+    # too high, and `pressure` reading "fleet" for a victim that outgrew one.
+    weighed = kill.all_tasks or kill.tasks
+    ours = [task for task in weighed if task.pid in roles]
+    victim_pages = next((task.rss_pages for task in weighed if task.pid == kill.victim_pid), None)
     rank = None
     if victim_pages is not None:
-        rank = 1 + sum(1 for task in kill.tasks if task.rss_pages > victim_pages)
+        rank = 1 + sum(1 for task in weighed if task.rss_pages > victim_pages)
     median = statistics.median(task.rss_pages for task in ours) if ours else None
     pressure: Optional[str] = None
     if len(ours) >= 2 and victim_pages is not None and median:

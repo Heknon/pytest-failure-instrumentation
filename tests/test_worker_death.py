@@ -91,8 +91,8 @@ def test_sigkill_does_not_claim_an_oom_it_cannot_prove(distributed):
         # witness to the sender, the honest answer is that something killed it
         # - and which witnesses this machine withheld is on the incident.
         assert death.verdict == "SIGKILLED"
-        assert any("no cgroup OOM event" in line for line in death.evidence)
-        assert any(line.startswith("kill witnesses:") for line in death.evidence)
+        assert any("No cgroup OOM kill was counted" in line for line in death.evidence)
+        assert any(line.startswith("Kill witnesses:") for line in death.evidence)
 
 
 def _has_pytest_timeout() -> bool:
@@ -499,7 +499,7 @@ def test_a_probe_stack_left_behind_is_dated_and_not_called_a_crash(distributed):
     assert death.crash_stack, "the probe answered, so there is a stack on file"
     assert death.crash_stack_age_seconds is not None
     assert any(
-        "not written by a dying process" in line and "before this report" in line
+        "written by a process that went on running" in line and "before this report" in line
         for line in death.evidence
     ), death.evidence
 
@@ -549,7 +549,7 @@ def test_a_real_crash_outranks_a_probe_stack_taken_earlier(distributed):
     assert death.crash_stack[0].startswith("Fatal Python error")
     assert death.blamed_frame is not None
     assert death.blamed_frame.function == "wait_then_crash"
-    assert any("wrote a fatal stack as it died" in line for line in death.evidence)
+    assert any("wrote a stack as it died" in line for line in death.evidence)
 
 
 def test_a_worker_that_dumped_nothing_is_not_given_a_stack_age(distributed):
@@ -621,10 +621,15 @@ def test_a_death_between_tests_is_not_blamed_on_the_test_that_passed(distributed
     assert death.last_test == "test_gap.py::test_finishes"
     assert death.phase is None
     assert death.tests_started == death.tests_finished == 2
-    assert any("died between tests" in line for line in death.evidence)
-    assert any("test_gap.py::test_finishes" in line for line in death.evidence)
+    assert "between tests, after finishing 2 (the last was test_gap.py::test_finishes)" in str(death).splitlines()[0]
+    # The test's clock is cleared with the test. Left running it measures the
+    # gap since a test that already passed, and the controller matches that
+    # against the run's timeouts - so an idle worker's exit is reported as
+    # TIMED_OUT, against a test that was never killed.
+    assert death.test_seconds is None and death.phase_seconds is None
+    assert death.matched_timeout is None and death.verdict != "TIMED_OUT"
     # The lead is still offered - it is the best one there is - but it says
     # which kind of guess it is rather than claiming the test was running.
-    assert "no test in flight" in str(death)
+    assert "nothing was running when it died" in str(death)
     if death.suspect_basis:
         assert "last test this worker finished" in death.suspect_basis

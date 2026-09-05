@@ -13,7 +13,6 @@ no /proc read, no allocation tracking.
 from __future__ import annotations
 
 import os
-import platform
 import sys
 import time
 from pathlib import Path
@@ -23,6 +22,7 @@ import pytest
 
 from ..config import Settings
 from ..probes import tracing
+from ..probes.platform_flags import platform_description
 from . import crash_stack
 from . import memory as memory_capture
 from . import output as output_capture
@@ -56,6 +56,12 @@ class WorkerRecorder:
         self.faulthandler_timeout = faulthandler_timeout
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
+        self.profiler: Any = None
+        self._allocation_tracer: memory_capture.TracemallocSession | None = None
+        #: The test whose protocol is open and has already been counted as
+        #: started, or None between tests. What makes a rerun not count twice
+        #: - see pytest_runtest_protocol.
+        self._counted: str | None = None
         # Filled as each resource is opened, so close() works on a recorder
         # that never finished being built.
         self._open_resources: list[Any] = []
@@ -140,7 +146,18 @@ class WorkerRecorder:
         self._tee_stood_down = False
 
         self._apply_memory_limit(settings)
+        if settings.profile_allocations:
+            # Allocation profiling resets the process-wide peak for every
+            # test, so it cannot safely share a tracer with another consumer.
+            # Start once for both profiler and watchdog, at the deeper of the
+            # two requested tracebacks, before either takes a snapshot.
+            self._allocation_tracer = self._track(
+                memory_capture.TracemallocSession(
+                    max(settings.profile_allocation_depth, settings.tracemalloc_depth)
+                )
+            )
         self._start_monitors(settings)
+        self._start_profiler(directory, worker_id, settings)
 
         # Before anything can be asked to read this process. Without it a
         # live-stack read of this worker is refused wherever Yama enforces
@@ -159,7 +176,7 @@ class WorkerRecorder:
             "worker_start",
             pid=os.getpid(),
             python=sys.version.split()[0],
-            platform=platform.platform(),
+            platform=platform_description(),
             executable=sys.executable,
             # Recorded because it is the difference between "no stack" and
             # "no stack, and here is the reason", and it is only knowable here.
@@ -208,6 +225,47 @@ class WorkerRecorder:
             self.events.record("memory_limit_refused", detail=repr(failure))
             return
         self.events.record("memory_limit_applied", limit_mb=settings.memory_limit_mb)
+
+    def _start_profiler(self, directory: Path, worker_id: str, settings: Settings) -> None:
+        """The CPU and memory sampler, when this run asked for one.
+
+        A thread of its own rather than a tick of the heartbeat: the beat is
+        once a second at its fastest, and a profile needs fifty a second to
+        see a two-second spike as anything but one sample.
+        """
+        if not settings.profile:
+            return
+        from .. import probes
+        from ..profile.sampler import ProfileLog, Sampler
+
+        log = self._track(ProfileLog(directory / f"{worker_id}.profile.jsonl", settings.run_id))
+        # Tracked after the log, so a setup that fails past this point stops
+        # the sampling thread and unhooks its collector callback before the
+        # log it writes to is closed - rather than leaving both running for
+        # the whole run under a plugin that has said it is off.
+        self.profiler = self._track(
+            Sampler(
+                log.write,
+                lambda: probes.resident_megabytes()[0],
+                interval=settings.profile_interval,
+                worker=worker_id,
+                allocations=settings.profile_allocations,
+                retained_mb=settings.profile_retained_mb,
+            )
+        )
+        self.profiler.start()
+        self.events.record("profiler_started", **self.profiler.describe())
+
+    def _profile(self, method: str, *args: Any) -> None:
+        """Hand the profiler a boundary. It is a diagnostic and this is a
+        pytest hook: whatever it raises is recorded against the worker and
+        is not the test's failure, and never the run's."""
+        if self.profiler is None:
+            return
+        try:
+            getattr(self.profiler, method)(*args)
+        except Exception as failure:  # noqa: BLE001 - a profiler must never end a run
+            self.events.record("profiler_failed", method=method, detail=repr(failure))
 
     def _start_monitors(self, settings: Settings) -> None:
         if not settings.watchdog:
@@ -262,6 +320,47 @@ class WorkerRecorder:
             on_demand_stack=on_demand,
             slow_test_seconds=self.slow_test.timeout if self.slow_test.enabled else None,
         )
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_protocol(self, item: pytest.Item, nextitem: Any) -> Any:
+        """One test, however many times its phases run inside this.
+
+        ``tests_started`` and ``tests_finished`` count tests, and the phases
+        are not a count of tests. A rerun plugin - pytest-rerunfailures,
+        flaky, and every one written the same way - implements this hook and
+        runs ``runtestprotocol`` again inside it when the test fails, so setup
+        and teardown run once per attempt while the test, its node id and its
+        slot in the scheduler's queue are one. Counting it at setup counted
+        every attempt, and a suite of 368 tests with six of them rerun once
+        was reported as 374: the controller's total is floored at this
+        counter, so an attempt counted here became a test nobody was given.
+
+        A hookwrapper is around every implementation, the rerun plugin's
+        included, so this opens and closes exactly once per test whatever
+        happens in between - which is all it is here for. The counting stays
+        in the phases, where the slot is written anyway: what this adds is
+        the boundary, so that a setup for the id already counted in *this*
+        protocol is a rerun, and the same id in the next protocol is the next
+        test (``--keep-duplicates`` collects a file twice, and both copies
+        run). The test is closed at the end of teardown, as it always was,
+        and not here: pytest's ``logfinish`` fires between the two, and a
+        worker that dies there died between tests, not in one.
+
+        The *profile* record is the exception, and closes here. It has to be
+        written after pytest lets go of the item's fixture values - otherwise
+        every function-scoped fixture's value counts as memory the test kept,
+        and its release as the next gap's - and ``runtestprotocol`` clears
+        ``funcargs`` before it returns, so anything after that will do. It
+        used to be ``logfinish``, which is the next thing to fire and is
+        inside the protocol: a rerun plugin runs the whole protocol again,
+        ``logfinish`` and all, so a test rerun twice wrote three records and
+        the profile summary reported a run of two tests as four. Here is
+        after the last attempt, whichever attempt that turns out to be.
+        """
+        self._counted = None
+        yield
+        self._counted = None
+        self._profile("end_test", item.nodeid)
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
@@ -337,10 +436,25 @@ class WorkerRecorder:
         self._tee_take(item)
         now = time.time()
         if phase == "setup":
-            self.state.tests_started += 1
+            if self._counted != nodeid:
+                # The first setup of the protocol is the test starting.
+                self._counted = nodeid
+                self.state.tests_started += 1
+            elif self.state.tests_finished > 0:
+                # A second one is a rerun of the same test, which is not a
+                # test starting - see pytest_runtest_protocol - and the
+                # finish counted at the end of its last attempt was not a
+                # finish either. It is taken back rather than never counted,
+                # because at the end of a teardown nobody yet knows whether
+                # an attempt was the last; and it is taken back rather than
+                # left, because the row is read as ``started - finished``
+                # running, and that read zero beside a call phase in the slot.
+                self.state.tests_finished -= 1
             # The whole test's clock, not the phase's: pytest-timeout and
             # faulthandler_timeout both time the item from its setup, so a
             # death is matched against a timeout by how long the *test* ran.
+            # Set on every attempt, rerun or not: an enforcer gives each
+            # attempt its own deadline, measured from that attempt's setup.
             self.state.test_started = now
         if self.heartbeat is not None:
             self.heartbeat.nodeid = nodeid
@@ -361,12 +475,14 @@ class WorkerRecorder:
         # reached it.
         if phase == "setup":
             self.slow_test.start_test()
+        self._profile("begin_phase", nodeid, phase)
         try:
             yield
         finally:
             # Give fd 2 back to pytest, with this phase's stderr copied into
             # pytest's own capture, whatever the phase did.
             self._tee_hand_back()
+        self._profile("end_phase", phase)
         if self.heartbeat is not None:
             self.heartbeat.phase = None
         if phase != "teardown":
@@ -380,9 +496,16 @@ class WorkerRecorder:
         # which the incident is then attributed, with an owner and a severity.
         # What that test was is still worth knowing, so the slot keeps it in
         # `last_nodeid`, where nothing can mistake it for the present.
+        #
+        # The two clocks go with it, and for the same reason. They are read on
+        # the controller as "how long the test had been running when this
+        # worker died" and matched against the run's timeouts - so a clock
+        # left running between tests makes an idle worker's `os._exit(1)`
+        # reach any timeout you like, and the death is reported as TIMED_OUT
+        # against a test that had already passed.
         if self.heartbeat is not None:
             self.heartbeat.nodeid = None
-        self.state.update(phase=None, nodeid=None)
+        self.state.update(phase=None, nodeid=None, phase_started=None, test_started=None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_internalerror(self, excrepr: object) -> None:
@@ -406,5 +529,10 @@ class WorkerRecorder:
     def pytest_sessionfinish(self, exitstatus: int) -> None:
         if self.heartbeat is not None:
             self.heartbeat.stop()
+        # Writes the background record, which is the CPU spent with no test
+        # in flight: what the controller reads a moment later.
+        self._profile("stop")
         self.events.record("worker_finish", exitstatus=int(exitstatus))
         self.state.update(phase=None, nodeid=None)
+        if self._allocation_tracer is not None:
+            self._allocation_tracer.close()

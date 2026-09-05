@@ -32,6 +32,7 @@ instrumentation had done more damage than the failure it came to explain.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -53,7 +54,7 @@ from ..config import SOLE_WORKER, Settings, advise, configured_timeouts
 from ..probes import signal_trace
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
-from . import collection, death, internal_error, killer, leftovers, reporter, stall, summary
+from . import killer, leftovers, reporter, summary
 from .base import Incident
 from .enrich import enrich
 from .leftovers import OWNER_FILE, prune_finished_runs
@@ -290,6 +291,8 @@ class IncidentEngine:
         #: the directory they write into exists.
         self.blocked_signals: set[int] = set()
         self.witness: controller_signals.SignalWitness | None = None
+        #: Built once, on the first death - see _kill_sources.
+        self._sources: killer.Sources | None = None
         self.witness_status = "off"
         self.tracer: signal_trace.SignalTracer | None = None
         self.controller_events: EventLog | None = None
@@ -303,6 +306,10 @@ class IncidentEngine:
         self.reporter_status = "off: failure_on_run_death is not set"
         if settings.kill_trace and self.distributed:
             self.blocked_signals = controller_signals.block()
+        #: What the profiler found, kept for the terminal summary, which runs
+        #: after session finish and is the one place a person asked to see it.
+        self.profile_report: Any = None
+        self.profile_incidents: list[Incident] = []
 
     # -- where this run's evidence goes ----------------------------------
 
@@ -537,17 +544,19 @@ class IncidentEngine:
 
     # -- raising ---------------------------------------------------------
 
-    def raise_incident(self, incident: Incident) -> None:
+    def raise_incident(self, incident: Incident) -> bool:
+        """Enrich, dedupe and deliver. True when the hook was handed it;
+        False when it was suppressed as a recurrence, or the run had closed."""
         try:
             self._enrich(incident)
         except Exception as failure:  # noqa: BLE001 - a partial incident beats none
-            incident.evidence.append(f"enrichment failed: {failure!r}")
+            incident.evidence.append(f"Enrichment failed: {failure!r}.")
 
         # The stall watcher raises from its own thread, so the counters and
         # the dedupe table are shared state.
         with self.lock:
             if self.closed:
-                return
+                return False
             count = self.seen.get(incident.fingerprint, 0) + 1
             self.seen[incident.fingerprint] = count
             if count == 1:
@@ -556,11 +565,12 @@ class IncidentEngine:
             else:
                 self.suppressed += 1
         if count > 1:
-            return
+            return False
         try:
             self.config.hook.pytest_failure_incident(incident=incident)
         except Exception as failure:  # noqa: BLE001
             print(f"[failure-instrumentation] incident hook raised: {failure!r}", flush=True)
+        return True
 
     def _enrich(self, incident: Incident) -> None:
         """Everything that is the same whatever kind this is - see :mod:`.enrich`,
@@ -612,6 +622,8 @@ class IncidentEngine:
                 try:
                     self._assess_stall(worker, silent_for)
                 except Exception as failure:  # noqa: BLE001
+                    from . import stall
+
                     with self.lock:
                         self.stalled.add(worker)
                     self.raise_incident(
@@ -619,6 +631,8 @@ class IncidentEngine:
                     )
 
     def _assess_stall(self, worker: str, silent_for: float) -> None:
+        from . import stall
+
         incident = stall.build(
             worker,
             self.directory,
@@ -989,13 +1003,27 @@ class IncidentEngine:
         log.record(event, **fields)
 
     def _kill_sources(self) -> killer.Sources:
-        return killer.Sources(
-            directory=self.directory,
-            elevate=self.settings.elevate,
-            trace_status=self.tracer.how if self.tracer is not None else "off: not started",
-            witness_status=self.witness_status,
-            run_pids=lambda: {os.getpid(): killer.CONTROLLER, **killer.roles_in(self.directory)},
-        )
+        """One object for the whole run, not one per death.
+
+        It carries the kernel-log reading between deaths - see
+        ``killer.Sources.kernel_log_reading`` - and deaths arrive together
+        precisely when that reading is expensive and identical: an OOM kill
+        takes one worker and then the next. Everything on it is settled by
+        the time the first death can happen; the pids are read afresh on each
+        call, through the callable.
+        """
+        if self._sources is None:
+            self._sources = killer.Sources(
+                directory=self.directory,
+                elevate=self.settings.elevate,
+                trace_status=self.tracer.how if self.tracer is not None else "off: not started",
+                witness_status=self.witness_status,
+                run_pids=lambda: {
+                    os.getpid(): killer.CONTROLLER,
+                    **killer.roles_in(self.directory),
+                },
+            )
+        return self._sources
 
     def _anything_records(self) -> bool:
         """Whether any process in this run is writing down what it is doing.
@@ -1162,8 +1190,11 @@ class IncidentEngine:
         # phase that is guaranteed. This is the whole per-test cost of the
         # schedule: what a worker still owes is read off the scheduler when
         # the record is written, and the two added together are its total.
+        # Once per *attempt*, strictly: a rerun plugin tears the same test
+        # down again, and the node id is what lets the tracker tell that from
+        # the next test - see ScheduleTracker.saw_a_test_finish.
         if getattr(report, "when", None) == "teardown":
-            self.schedule.saw_a_test_finish(worker)
+            self.schedule.saw_a_test_finish(worker, getattr(report, "nodeid", None))
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_xdist_node_collection_finished(self, node: Any, ids: Any) -> None:
@@ -1273,6 +1304,8 @@ class IncidentEngine:
         if waiting:
             return
         self.reported_mismatch = True
+        from . import collection
+
         try:
             incident: Incident = collection.build(
                 self.collections, self.directory, complete=not partial
@@ -1305,6 +1338,8 @@ class IncidentEngine:
         self._record_schedule()
         if not error:
             return  # a clean shutdown is not an incident
+        from . import death
+
         try:
             incident: Incident = death.build(
                 node,
@@ -1322,6 +1357,8 @@ class IncidentEngine:
         self.raise_incident(incident)
 
     def pytest_internalerror(self, excrepr: object) -> None:
+        from . import internal_error
+
         try:
             incident: Incident = internal_error.build(
                 excrepr,
@@ -1334,6 +1371,148 @@ class IncidentEngine:
                 "controller", failure, context=str(excrepr)[-2000:]
             )
         self.raise_incident(incident)
+
+    # -- the profile ---------------------------------------------------------
+
+    def _report_profile(self) -> None:
+        """Fold every worker's profile records together and raise what crosses
+        a threshold. See :mod:`..profile.analysis` for the rules."""
+        from ..profile import analysis
+        from ..profile.sampler import TEST_RECORD, read_profile_log
+        from . import profile as profile_incident
+
+        records = []
+        for path in sorted(self.directory.glob("*.profile.jsonl")):
+            records.extend(read_profile_log(path))
+        if not records:
+            self.profile_report = None
+            return
+        thresholds = analysis.Thresholds(
+            cpu_share_percent=self.settings.profile_cpu_share,
+            cpu_floor_seconds=self.settings.profile_cpu_floor_seconds,
+            retained_mb=self.settings.profile_retained_mb,
+            peak_mb=self.settings.profile_peak_mb,
+            burst_cores=self.settings.profile_burst_cores,
+            burst_seconds=self.settings.profile_burst_seconds,
+        )
+        report = analysis.analyse(records, self.attributor, thresholds)
+        self.profile_report = report
+        worker = "controller" if self.distributed else SOLE_WORKER
+        for finding in report.findings:
+            incident = profile_incident.build(finding, worker)
+            # Enriched in place by raise_incident, so the terminal prints the
+            # owner and severity the hook was handed - and only what the hook
+            # was handed: two parametrisations with one fingerprint are one
+            # finding to the hook and the run summary, so one here too.
+            if self.raise_incident(incident):
+                self.profile_incidents.append(incident)
+
+        # A flame graph for every test a finding names, and for the gaps
+        # between tests, so the flag comes with the picture behind it. With
+        # allocation tracing on, a test that climbed also gets one of its
+        # live allocations at the peak, weighted in bytes.
+        named = {nodeid for finding in report.findings for nodeid in finding.tests}
+        named.update(finding.nodeid for finding in report.findings if finding.nodeid)
+        wanted = [
+            record
+            for record in records
+            if record.get("record") != TEST_RECORD
+            or record.get("nodeid") in named
+            or record.get("memory_stacks")
+        ]
+        if not wanted:
+            return
+        folder = self.directory / "profiles"
+        folder.mkdir(exist_ok=True)
+        for record in wanted:
+            nodeid = record.get("nodeid") or f"background-{record.get('worker') or 'main'}"
+            # Readable, and unique: sanitising alone maps test_x[a/b] and
+            # test_x[a_b] to one name, and the second would overwrite the
+            # first. A hash of the full name and the worker tells them apart.
+            digest = hashlib.sha1(f"{record.get('worker')}|{nodeid}".encode()).hexdigest()[:8]
+            name = f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', str(nodeid))[:110]}-{digest}"
+            documents = {
+                f"{name}.speedscope.json": analysis.speedscope(record, str(nodeid)),
+                f"{name}.memory.speedscope.json": analysis.memory_speedscope(record, str(nodeid)),
+            }
+            for filename, document in documents.items():
+                if document is None:
+                    continue
+                try:
+                    (folder / filename).write_text(json.dumps(document), encoding="utf-8")
+                except OSError:
+                    continue
+
+    def pytest_terminal_summary(self, terminalreporter: Any) -> None:
+        """What the profiler found, where a reader is already looking.
+
+        Every other incident reaches a reader through the hook and the
+        evidence directory. A profile is asked for by somebody at a terminal,
+        and it is the one report that says nothing when nothing is wrong -
+        which is worth a line, since silence otherwise reads as "did not run".
+        """
+        report = getattr(self, "profile_report", None)
+        if not self.settings.profile:
+            return
+        write = terminalreporter.write_line
+        terminalreporter.section("failure-instrumentation profile", sep="=")
+        if report is None:
+            write("No profile records were written: nothing in this run was sampling.")
+            return
+        cores = report.process_cpu_s / report.wall_s if report.wall_s else 0.0
+        several = len(report.workers) > 1
+
+        def seconds(value: float) -> str:
+            return f"{value:.1f} s" if value < 10 else f"{value:.0f} s"
+
+        write(
+            f"Profile: {report.tests} test{'s' if report.tests != 1 else ''}, {seconds(report.wall_s)} of "
+            f"{'worker time (summed across workers)' if several else 'wall time'}, "
+            f"{seconds(report.process_cpu_s)} CPU ({cores:.2f} cores on average)"
+            + (f", {report.gc_s:.1f} s of it in garbage collection" if report.gc_s >= 0.1 else "")
+            + (f", {report.native_cpu_s:.1f} s of it in threads with no Python stack" if report.native_cpu_s >= 0.1 else "")
+        )
+        if not report.cpu_weighted:
+            write("  CPU could not be read at all on this platform: samples are weighted by wall time instead.")
+        elif not report.per_thread:
+            write(
+                "  CPU could not be read per thread on this platform: all CPU is attributed to the "
+                "thread running the test."
+            )
+        if report.allocations:
+            write(
+                "  Allocation tracing was on: CPU figures include the tracer's cost, so no CPU "
+                "findings are raised."
+            )
+        for worker, facts in sorted(report.workers.items()):
+            peak = f"peak {facts['peak_mb']} MB" if facts["peak_mb"] is not None else "peak unknown"
+            end = f", {facts['end_mb']} MB at the end" if facts["end_mb"] is not None else ""
+            write(
+                f"  worker {worker}: {facts['tests']} test{'s' if facts['tests'] != 1 else ''}, "
+                f"{seconds(facts['cpu_s'])} CPU, {peak}{end}"
+            )
+        # With tracing on the table is the tracer's own cost, not the tests'.
+        if report.functions and not report.allocations:
+            write("Functions using the most CPU:")
+            total = report.sampled_cpu_s + report.native_cpu_s
+            for cost in report.functions[:8]:
+                share = 100.0 * (cost.cpu_ns / 1e9) / total if total else 0.0
+                count = len(cost.tests)
+                where = f"in {count} test{'s' if count != 1 else ''}"
+                if cost.gap_cpu_ns:
+                    where = f"{where} and between tests" if cost.tests else "between tests"
+                write(
+                    f"  {share:5.1f}%  {cost.cpu_ns / 1e9:6.2f} s  {cost.function}  {Path(cost.file).name}"
+                    f"  [{cost.owner}]  {where}"
+                )
+        findings = list(self.profile_incidents)
+        if not findings:
+            write("No findings: nothing crossed the thresholds.")
+            return
+        write(f"{len(findings)} finding{'s' if len(findings) != 1 else ''}:")
+        for incident in findings:
+            write("")
+            write(str(incident))
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         # Every wait the watcher can be inside is against this event, so it
@@ -1362,6 +1541,14 @@ class IncidentEngine:
         # arrives. Report what was seen rather than nothing at all, flagged as
         # incomplete so the worker counts are not read as the whole picture.
         self._report_mismatch(partial=True)
+        # Before the summary, so the summary counts what the profiler raised.
+        # The workers' records are on disk by now: a worker writes its last
+        # one in its own session finish, which xdist waits for before this.
+        if self.settings.profile:
+            try:
+                self._report_profile()
+            except Exception as failure:  # noqa: BLE001 - a lost profile beats a lost run
+                print(f"[failure-instrumentation] profile analysis failed: {failure!r}", flush=True)
         self.raise_incident(
             summary.build(
                 exitstatus,
