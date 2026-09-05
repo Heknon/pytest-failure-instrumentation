@@ -598,6 +598,10 @@ class Sampler:
         if self._thread.ident is not None:
             return  # already running; a second start would raise
         self._refresh_threads()
+        # Raw _thread threads may have frames without threading.Thread
+        # objects. The initial kernel snapshot already covers those frames;
+        # only a later change needs another discovery for an unknown ident.
+        self._known_idents = frozenset(sys._current_frames())
         self._all_tids = self.clock.discover()
         self._discovered = True
         self._last_clock = self.clock.read(self._tids_to_read())
