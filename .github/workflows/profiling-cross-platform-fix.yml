@@ -1,0 +1,50 @@
+name: Profiling cross-platform fix
+
+on:
+  push:
+    branches: [fix/profiling-cross-platform-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  failing-tests:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.13"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Run previously failing profiling tests
+        run: >-
+          pytest -q
+          tests/test_profile.py::TestMemory::test_memory_a_test_keeps_is_retained_and_placed_in_its_phase
+          tests/test_profile.py::TestBursts::test_a_long_burst_in_a_waiting_test_is_named_with_when_it_started
+          tests/test_profile.py::TestAllocationTracing::test_tracing_names_the_holders_and_writes_a_memory_flame_graph
