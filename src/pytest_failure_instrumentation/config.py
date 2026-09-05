@@ -238,13 +238,6 @@ class Settings:
     #: fires when nothing is wrong, so it is the only one a run pays for
     #: continuously - see :mod:`.sampling`.
     sample_seconds: float = 0.0
-    #: Live resource history is independent of worker-sample hooks/profiling.
-    #: Zero preserves the existing default runtime cost and wire contracts.
-    resources_seconds: float = 0.0
-    resources_max_mb: float = 256
-    resources_roots: tuple[str, ...] = ()
-    resources_scan_seconds: float = 60.0
-    resources_max_files: float = 50000
     #: Serve the stack of any local process over HTTP, for a UI watching a run
     #: - see :mod:`.stack_server`. Off by default: opening a listening socket
     #: is not something a plugin installed for crash reporting should start
@@ -328,6 +321,14 @@ class Settings:
     #: Seconds a burst must last to be raised on its own. Shorter bursts
     #: are raised only when the same code bursts across many tests.
     profile_burst_seconds: float = 2.0
+
+    #: Live resource history is independent of worker-sample hooks/profiling.
+    #: Zero preserves the existing default runtime cost and wire contracts.
+    resources_seconds: float = 0.0
+    resources_max_mb: float = 256
+    resources_roots: tuple[str, ...] = ()
+    resources_scan_seconds: float = 60.0
+    resources_max_files: float = 50000
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "directory", Path(self.directory))

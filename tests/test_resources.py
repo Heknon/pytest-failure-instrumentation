@@ -374,3 +374,18 @@ def test_timestamps_can_move_backwards_without_losing_range_matches(tmp_path):
     store.append(batch(120))
     result = read_history(tmp_path, start=75, end=90)
     assert [b["observed_at"] for b in result["batches"]] == [80]
+
+
+def test_settings_keeps_all_existing_positional_arguments():
+    from dataclasses import fields
+
+    defaults = Settings()
+    legacy = [field.name for field in fields(Settings) if not field.name.startswith("resources_")]
+    assert [field.name for field in fields(Settings)][:len(legacy)] == legacy
+    values = [getattr(defaults, name) for name in legacy]
+    values[legacy.index("stack_server")] = True
+    values[legacy.index("stack_server_port")] = 4321
+    restored = Settings(*values)
+    assert restored.stack_server is True
+    assert restored.stack_server_port == 4321
+    assert restored.resources_seconds == 0
