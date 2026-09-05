@@ -10,19 +10,35 @@ import json
 import math
 import os
 import shutil
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 
 NAME = "resources-live"
 MAX_LINE = 2 * 1024 * 1024
 MAX_REPLY = 2 * 1024 * 1024
+T = TypeVar("T")
+
+
+def _sharing_retry(operation: Callable[[], T]) -> T:
+    # Windows can briefly deny either side of an atomic replacement while
+    # another process has the manifest open. Bound the delay to 30 ms.
+    for attempt in range(4):
+        try:
+            return operation()
+        except PermissionError:
+            if attempt == 3:
+                raise
+            time.sleep(0.01)
+    raise AssertionError("unreachable")
 
 
 def atomic_json(path: Path, value: Any) -> None:
     temporary = path.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
         json.dump(value, stream, separators=(",", ":"), allow_nan=False)
-    os.replace(temporary, path)
+    _sharing_retry(lambda: os.replace(temporary, path))
 
 
 class ResourceHistory:
@@ -83,7 +99,7 @@ def read_history(directory: Path, *, after: int = 0, limit: int = 120,
         raise ValueError("from must not exceed to")
     root = directory / NAME
     try:
-        manifest = json.loads((root / "manifest.json").read_text())
+        manifest = json.loads(_sharing_retry(lambda: (root / "manifest.json").read_text()))
     except ValueError as error:
         raise OSError("invalid resource manifest") from error
     # Gate post-run reads even if cleanup was interrupted. PID creation time

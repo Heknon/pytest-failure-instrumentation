@@ -389,3 +389,40 @@ def test_settings_keeps_all_existing_positional_arguments():
     assert restored.stack_server is True
     assert restored.stack_server_port == 4321
     assert restored.resources_seconds == 0
+
+
+def test_manifest_sharing_violations_are_retried_and_bounded(tmp_path, monkeypatch):
+    from pytest_failure_instrumentation.capture import resource_history as module
+
+    store = history(tmp_path)
+    original_replace = os.replace
+    original_read = Path.read_text
+    calls = {"replace": 0, "read": 0}
+
+    def replace(source, target):
+        calls["replace"] += 1
+        if calls["replace"] == 1:
+            raise PermissionError("sharing violation")
+        return original_replace(source, target)
+
+    def read(path, *args, **kwargs):
+        if path.name == "manifest.json":
+            calls["read"] += 1
+            if calls["read"] == 1:
+                raise PermissionError("sharing violation")
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "replace", replace)
+    monkeypatch.setattr(Path, "read_text", read)
+    store.append(batch())
+    assert read_history(tmp_path)["batches"][0]["sequence"] == 1
+    assert calls == {"replace": 2, "read": 2}
+    attempts = []
+
+    def denied():
+        attempts.append(1)
+        raise PermissionError("persistent denial")
+
+    with pytest.raises(PermissionError, match="persistent denial"):
+        module._sharing_retry(denied)
+    assert len(attempts) == 4
