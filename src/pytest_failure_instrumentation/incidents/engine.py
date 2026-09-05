@@ -259,6 +259,7 @@ class IncidentEngine:
         self.closed = False
         self.watcher: threading.Thread | None = None
         self.sampler: threading.Thread | None = None
+        self.resources: Any = None
         self.seen: dict[str, int] = {}
         self.raised = 0
         self.suppressed = 0
@@ -560,6 +561,12 @@ class IncidentEngine:
                 self.suppressed += 1
         if count > 1:
             return False
+        if self.resources is not None:
+            self.resources.event({"kind": "incident", "incident_kind": incident.kind,
+                                  "fingerprint": incident.fingerprint,
+                                  "worker": getattr(incident, "worker", None),
+                                  "pid": getattr(incident, "pid", None),
+                                  "verdict": getattr(incident, "verdict", None)})
         try:
             self.config.hook.pytest_failure_incident(incident=incident)
         except Exception as failure:  # noqa: BLE001
@@ -735,6 +742,15 @@ class IncidentEngine:
         self.records_here = self.recorder is not None
         self._prepare_directory()
         self._start_kill_witnesses()
+        if self.settings.resources_seconds > 0:
+            from ..resource_sampling import ResourceSampler
+
+            try:
+                self.resources = ResourceSampler(self.directory, self.session_id, self.settings)
+                self.config.add_cleanup(self.resources.close)
+                self.resources.start()
+            except Exception as failure:  # noqa: BLE001 - diagnostics must not break pytest
+                print(f"[failure-instrumentation] resources unavailable: {failure!r}", flush=True)
 
         # Whether or not this is distributed: a single-process run has a stack
         # worth serving too, and it is the one this process can read for free.
@@ -1499,6 +1515,8 @@ class IncidentEngine:
         # preventing is an incident raised *after* the run summary - into a
         # consumer that has finished writing, or into interpreter shutdown.
         self.stop.set()
+        if self.resources is not None:
+            self.resources.close()
         if self.watcher is not None:
             self.watcher.join(timeout=WATCHER_JOIN_SECONDS)
         if self.sampler is not None:

@@ -20,3 +20,21 @@ The budgets are regression limits, not universal performance guarantees:
 
 The CI result includes every raw timing and median in its JSON output. Change
 a budget only with measurements that explain why the product contract changed.
+
+
+## Live resource collection
+
+Run the opt-in resource comparison independently of other test workloads:
+
+```sh
+python benchmarks/resource_cost.py --workers 80 --cases 2400 --pairs 2 --output resource-cost.json
+```
+
+It alternates baseline and resources-enabled runs with the live server enabled
+in both, using real xdist processes and temporary file I/O. The report includes
+elapsed time, test-duration median/p99, shutdown cost, sample duration/errors,
+and observed process coverage. Missing worker samples or failed resource cleanup
+fail the command. The 120-second added test-p99 bound is a synthetic backstop,
+not proof of customer-suite p99 behaviour. File-inventory costs should be tested
+separately with representative configured roots; the benchmark does not enable
+recursive directory inventories. Do not add this 80-worker job to every commit.

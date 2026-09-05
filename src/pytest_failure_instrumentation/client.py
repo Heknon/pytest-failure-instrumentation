@@ -27,7 +27,7 @@ import time
 from collections.abc import Sequence
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .live_view import LiveStackServer
 from .stack_server import AUTH_HEADER, AUTH_SCHEME
@@ -236,6 +236,68 @@ class WorkersSnapshot(_Wire):
 # --- what goes wrong ---------------------------------------------------
 
 
+class ResourceMeasurements(_Wire):
+    metrics: dict[str, Optional[float]] = Field(default_factory=dict)
+    unavailable: dict[str, str] = Field(default_factory=dict)
+
+
+class ResourceProcess(ResourceMeasurements):
+    pid: int
+    created_at: float
+    name: str = ""
+    parent_pid: int = 0
+    worker: Optional[str] = None
+    role: str = ""
+    worker_exited: bool = False
+    nodeid: Optional[str] = None
+    phase: Optional[str] = None
+    observed_at: Optional[float] = None
+
+
+class ResourceBatch(_Wire):
+    sequence: int
+    observed_at: float
+    elapsed_s: float
+    host: ResourceMeasurements
+    cgroup: ResourceMeasurements
+    processes: list[ResourceProcess] = Field(default_factory=list)
+    disks: list[dict[str, Any]] = Field(default_factory=list)
+    consumers: list[dict[str, Any]] = Field(default_factory=list)
+    files: dict[str, Any] = Field(default_factory=dict)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    collector: dict[str, Any] = Field(default_factory=dict)
+    disk_unavailable: dict[str, str] = Field(default_factory=dict)
+    inventory_unavailable: dict[str, str] = Field(default_factory=dict)
+    inventory_age_s: float = 0
+
+
+class ResourceHistory(_Wire):
+    schema_version: int = 1
+    session: str
+    controller_pid: int
+    controller_created_at: float
+    started_at: float
+    system: str = ""
+    python: str = ""
+    scope: str = ""
+    pid_scope: str = "local"
+    pytest_pid: Optional[int] = None
+    product_version: str = ""
+    worker_count: Optional[int] = None
+    cgroups: dict[str, str] = Field(default_factory=dict)
+    limits: dict[str, int] = Field(default_factory=dict)
+    sample_seconds: float
+    max_bytes: int
+    history_bytes: int = 0
+    earliest_sequence: Optional[int] = None
+    latest_sequence: int = 0
+    next_after: int = 0
+    has_more: bool = False
+    cursor_expired: bool = False
+    history_truncated: bool = False
+    batches: list[ResourceBatch] = Field(default_factory=list)
+
+
 class FailureServerError(Exception):
     """Anything that stopped a call from producing an answer."""
 
@@ -417,6 +479,25 @@ class FailureServerClient:
         return WorkersSnapshot.model_validate(
             await self._get("/workers", params=params, timeout=timeout)
         )
+
+    async def resources(
+        self, session: str, *, after: int = 0, limit: int = 120,
+        start: Optional[float] = None, end: Optional[float] = None,
+        worker: Optional[str] = None, latest: bool = False,
+        timeout: Optional[float] = None,
+    ) -> ResourceHistory:
+        """Read active-run history. Pass next_after to fetch the next page.
+
+        History exists independently of browser polling. This never starts a
+        probe, stack read or directory scan. A finished/disabled run is 404.
+        """
+        params: dict[str, Any] = {"session": session, "after": after, "limit": limit}
+        for name, value in (("from", start), ("to", end), ("worker", worker)):
+            if value is not None:
+                params[name] = value
+        if latest:
+            params["latest"] = "true"
+        return ResourceHistory.model_validate(await self._get("/resources", params=params, timeout=timeout))
 
     async def callstack(
         self,

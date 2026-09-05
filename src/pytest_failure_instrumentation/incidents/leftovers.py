@@ -222,6 +222,10 @@ def prune_finished_runs(root: Path) -> None:
             owner = owner_of(path)
             if owner is None or probes.is_running(owner):
                 continue
+            # Live resource history has no post-run retention contract.
+            # Remove only its own subtree, even when unreported incidents
+            # must remain for recovery. Never touch an active owner's data.
+            shutil.rmtree(path / "resources-live", ignore_errors=True)
             if not record or not (record.get(FINISHED_KEY) or record.get(REPORTED_KEY)):
                 continue  # retain unreported evidence, including failed callbacks
             shutil.rmtree(path, ignore_errors=True)

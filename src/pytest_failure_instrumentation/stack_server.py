@@ -127,7 +127,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from urllib.parse import parse_qs, urlparse
 
 from .probes import process, stacks
@@ -303,6 +303,7 @@ class _Server(ThreadingHTTPServer):
         #: session's own, since /workers describes the machine rather than
         #: whichever run happens to be hosting.
         self.evidence_root = evidence_root
+        self.resource_readers = threading.BoundedSemaphore(2)
         #: What a request must carry, or "" for a server that asks nothing.
         #: Supplied by whoever started the run and never written down - see
         #: the module docstring.
@@ -478,8 +479,56 @@ class _Handler(BaseHTTPRequestHandler):
             self._stack(query)
         elif path == "/workers":
             self._workers(query)
+        elif path == "/resources":
+            self._resources(query)
         else:
             self._reply(404, {"error": "no such endpoint", "endpoints": ENDPOINTS})
+
+    def _resources(self, query: dict[str, list[str]]) -> None:
+        from .capture.resource_history import read_history
+
+        server = cast(_Server, self.server)
+        root = server.evidence_root
+        if root is None:
+            self._reply(503, {"error": "no evidence directory"})
+            return
+        session = (query.get("session") or [""])[0]
+        # Same shared-server semantics as /workers, with an explicit session
+        # so gw0 from two concurrent runs cannot collide. No user-built path.
+        try:
+            directory = next((p for p in root.iterdir() if p.is_dir() and p.name == session), None)
+        except OSError:
+            directory = None
+        if not session:
+            self._reply(400, {"error": "session is required (from /workers)"})
+            return
+        if directory is None:
+            self._reply(404, {"error": "no active resource history for this session"})
+            return
+        if not server.resource_readers.acquire(blocking=False):
+            self._reply(503, {"error": "resource reader busy; retry later"})
+            return
+        try:
+            def option(name: str) -> Optional[str]:
+                values = query.get(name)
+                return values[0] if values else None
+
+            after = int(option("after") or "0")
+            limit = int(option("limit") or "120")
+            raw_start, raw_end = option("from"), option("to")
+            start = float(raw_start) if raw_start is not None else None
+            end = float(raw_end) if raw_end is not None else None
+            result = read_history(directory, after=after, limit=limit, start=start, end=end,
+                                  worker=option("worker"), latest=option("latest") == "true")
+            self._reply(200, result)
+        except (ValueError, TypeError):
+            self._reply(400, {"error": "invalid resource range: after>=0, limit=1..500, finite from<=to"})
+        except FileNotFoundError:
+            self._reply(404, {"error": "resource collection disabled, not started, or run finished"})
+        except OSError:
+            self._reply(503, {"error": "resource history temporarily unavailable"})
+        finally:
+            server.resource_readers.release()
 
     def _addressed_to_this_server(self) -> bool:
         """Whether ``Host`` names an address this server actually answers on.
@@ -795,6 +844,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 ENDPOINTS = {
     "/identity": "who is serving this port",
+    "/resources?session=<session>": "bounded live resource history; after/limit/from/to/worker/latest filters",
     "/workers": "every run on this machine, and what each worker is doing",
     "/workers?worker=gw0,gw3": "only those workers; repeat the parameter or comma-separate",
     "/stack?pid=N": "the current stack of every thread in process N",

@@ -238,6 +238,13 @@ class Settings:
     #: fires when nothing is wrong, so it is the only one a run pays for
     #: continuously - see :mod:`.sampling`.
     sample_seconds: float = 0.0
+    #: Live resource history is independent of worker-sample hooks/profiling.
+    #: Zero preserves the existing default runtime cost and wire contracts.
+    resources_seconds: float = 0.0
+    resources_max_mb: float = 256
+    resources_roots: tuple[str, ...] = ()
+    resources_scan_seconds: float = 60.0
+    resources_max_files: float = 50000
     #: Serve the stack of any local process over HTTP, for a UI watching a run
     #: - see :mod:`.stack_server`. Off by default: opening a listening socket
     #: is not something a plugin installed for crash reporting should start
@@ -335,6 +342,25 @@ class Settings:
             "sample_seconds",
             0.0 if self.sample_seconds <= 0 else max(MIN_SAMPLE_SECONDS, float(self.sample_seconds)),
         )
+        import math
+
+        for name, minimum, maximum, fallback in (
+            ("resources_seconds", 0.0, 3600.0, 0.0),
+            ("resources_max_mb", 8, 1024, 256),
+            ("resources_scan_seconds", 10.0, 86400.0, 60.0),
+            ("resources_max_files", 100, 100000, 50000),
+        ):
+            value = float(getattr(self, name))
+            value = min(maximum, max(minimum, value)) if math.isfinite(value) else fallback
+            if name == "resources_seconds" and value > 0:
+                value = max(1.0, value)
+            object.__setattr__(self, name, int(value) if name in ("resources_max_mb", "resources_max_files") else value)
+        roots = self.resources_roots
+        if isinstance(roots, str):
+            roots = (roots,)
+        object.__setattr__(self, "resources_roots", tuple(dict.fromkeys(
+            str(Path(root).expanduser().absolute()) for root in roots if str(root).strip()
+        ))[:8])
         object.__setattr__(self, "tracer", self._usable_tracer())
         object.__setattr__(
             self,
@@ -716,6 +742,15 @@ def add_options(parser: pytest.Parser) -> None:
         "lease id.",
         default="true",
     )
+    for name, default, help_text in (
+        ("failure_resources_seconds", "0", "Record live resources every N seconds (0 disables; minimum 1)."),
+        ("failure_resources_max_mb", "256", "Active resource history disk budget in MiB (8..1024)."),
+        ("failure_resources_scan_seconds", "60", "Seconds between completed directory scans (minimum 10)."),
+        ("failure_resources_max_files", "50000", "Entry budget per configured directory scan (100..100000)."),
+    ):
+        parser.addini(name, help=help_text, default=default)
+    parser.addini("failure_resources_roots", type="linelist", default=[],
+                  help="Explicit directories to inventory for file accumulation; at most eight. No roots by default.")
     parser.addini(
         "failure_sample_seconds",
         help="Push a worker sample to pytest_failure_worker_sample this often, "
@@ -1128,6 +1163,11 @@ def resolve(config: pytest.Config) -> Settings:
         on_run_death=str(_ini(config, "failure_on_run_death", "") or "").strip() or None,
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
+        resources_seconds=_number(config, "failure_resources_seconds", 0.0),
+        resources_max_mb=_number(config, "failure_resources_max_mb", 256),
+        resources_scan_seconds=_number(config, "failure_resources_scan_seconds", 60),
+        resources_max_files=_number(config, "failure_resources_max_files", 50000),
+        resources_roots=tuple(_ini(config, "failure_resources_roots", []) or []),
         stack_server=_flag(config, "failure_stack_server", False) or named_on_cli,
         stack_server_port=(
             chosen_port
