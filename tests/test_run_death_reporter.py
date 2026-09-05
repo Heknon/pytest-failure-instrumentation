@@ -158,12 +158,17 @@ def test_a_run_that_finished_is_not_reported_as_killed(tmp_path):
     assert leftovers.REPORTED_KEY not in leftovers.marker(directory)
 
 
-def test_a_callable_that_raises_costs_the_report_nothing(tmp_path, capsys):
+def test_a_failed_callback_preserves_evidence_for_retry(tmp_path, capsys):
     directory = dead_run(tmp_path)
     reported = reporter.report(payload_for(directory, refuse))
-    assert len(reported) == 1
+    assert reported == []
     assert "the alerting service is down" in capsys.readouterr().err
-    assert leftovers.marker(directory).get(leftovers.REPORTED_KEY)
+    assert not leftovers.marker(directory).get(leftovers.REPORTED_KEY)
+    leftovers.prune_finished_runs(tmp_path)
+    assert directory.exists()
+    CALLS.clear()
+    assert len(reporter.report(payload_for(directory, functools.partial(remember, "retry")))) == 1
+    assert len(CALLS) == 1
 
 
 def test_the_entry_point_reads_the_payload_and_never_raises(tmp_path):
@@ -238,7 +243,7 @@ def test_a_killed_run_is_reported_by_its_sidecar_before_any_next_run(runner):
     runner.pytester.makepyfile(alerts=ALERTS_MODULE, test_sleep=SLEEPER, test_quick="def test_quick():\n    assert True\n")
     runner.pytester.makeconftest(CONFTEST_WITH_REPORTER)
     inner = subprocess.Popen(
-        [sys.executable, "-m", "pytest", "-n", "2", "test_sleep.py", "-p", "no:cacheprovider"],
+        [sys.executable, "-m", "pytest", "-n", "2", "-o", "failure_kill_trace=false", "test_sleep.py", "-p", "no:cacheprovider"],
         cwd=runner.pytester.path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     try:
@@ -262,8 +267,8 @@ def test_a_killed_run_is_reported_by_its_sidecar_before_any_next_run(runner):
         (incident.worker, incident.verdict) for incident in reported
     ]
     (controller,) = reported
-    assert controller.verdict == f"SIGNAL_{int(signal.SIGTERM)}"
-    assert controller.killer is not None and controller.killer.sender_pid == os.getpid()
+    assert controller.verdict == "UNKNOWN"
+    assert controller.killer is None
     assert controller.recovered_from_run
     assert "reported 1 incident" in log.read_text(encoding="utf-8")
 
@@ -355,7 +360,9 @@ CLAIMED: list[bool] = []
 
 
 def note_the_claim(directory: Path, incident) -> None:
-    CLAIMED.append(bool(leftovers.marker(directory).get(leftovers.REPORTED_KEY)))
+    with leftovers.claim(directory) as acquired:
+        CLAIMED.append(not acquired)
+    assert not leftovers.marker(directory).get(leftovers.REPORTED_KEY)
 
 
 def test_the_directory_is_claimed_before_a_single_incident_is_delivered(tmp_path):

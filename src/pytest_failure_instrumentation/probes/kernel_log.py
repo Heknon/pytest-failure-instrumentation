@@ -30,7 +30,7 @@ What comes back is the *matching* record, never the fact that the log holds
 one: a machine running many suites has many kills in its log, and the pid, the
 time and the cgroup are what tie one of them to one of ours. Inside a pid
 namespace the pid the kernel prints is the host's and matches nothing here, so
-the memcg path is offered as the second key.
+a matching cgroup alone is insufficient to name this process as the victim.
 
 Nothing here raises, and nothing here reports a value without saying which
 rung produced it.
@@ -42,6 +42,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -228,7 +229,8 @@ def _read_kmsg() -> tuple[Optional[list[tuple[Optional[float], str]]], str]:
     boot = _boot_epoch()
     lines: list[tuple[Optional[float], str]] = []
     try:
-        while True:
+        deadline = time.monotonic() + 0.5
+        while len(lines) < 10000 and time.monotonic() < deadline:
             try:
                 raw = os.read(fd, 8192)
             except BlockingIOError:
@@ -262,6 +264,20 @@ def _read_kmsg() -> tuple[Optional[list[tuple[Optional[float], str]]], str]:
     return lines, ""
 
 
+def _bounded_command(command: list[str]) -> subprocess.CompletedProcess[bytes]:
+    """Bound command duration and bytes loaded into Python memory."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        done = subprocess.run(command, stdout=out, stderr=err, timeout=2)
+        out.seek(0, 2)
+        size = out.tell()
+        out.seek(max(0, size - 4 * 1024 * 1024))
+        data = out.read(4 * 1024 * 1024)
+        if size > 4 * 1024 * 1024:
+            data = data.partition(b"\n")[2]
+        err.seek(0)
+        return subprocess.CompletedProcess(command, done.returncode, data, err.read(4096))
+
+
 def _read_journal(
     since: Optional[float] = None,
 ) -> tuple[Optional[list[tuple[Optional[float], str]]], str]:
@@ -271,11 +287,11 @@ def _read_journal(
     can be months long, and a death is only ever explained by the last few
     minutes of it.
     """
-    command = ["journalctl", "-k", "-o", "json", "--no-pager", "-q"]
+    command = ["journalctl", "-k", "-o", "json", "--no-pager", "-q", "-n", "10000"]
     if since is not None:
         command.append(f"--since=@{int(since) - 1}")
     try:
-        result = subprocess.run(command, capture_output=True, timeout=20)
+        result = _bounded_command(command)
     except (OSError, subprocess.SubprocessError) as failure:
         return None, _why(failure)
     if result.returncode != 0:
@@ -306,7 +322,7 @@ def _read_journal(
 def _read_dmesg(sudo: bool = False) -> tuple[Optional[list[tuple[Optional[float], str]]], str]:
     command = (["sudo", "-n"] if sudo else []) + ["dmesg"]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=20)
+        result = _bounded_command(command)
     except (OSError, subprocess.SubprocessError) as failure:
         return None, _why(failure)
     if result.returncode != 0:

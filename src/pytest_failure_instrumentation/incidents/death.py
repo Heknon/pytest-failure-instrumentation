@@ -314,7 +314,6 @@ def build(
     baseline_oom_kills: int | None,
     run_id: str | None = None,
     sources: Optional[killer.Sources] = None,
-    timeouts: Optional[dict[str, float]] = None,
 ) -> WorkerDeathIncident:
     died_at = time.time()
     worker = node.gateway.id
@@ -361,7 +360,7 @@ def build(
         crash_stack_age_seconds=_age_of(crash_file) if dump else None,
         high_water=event_log.high_water_marks(events)[-1:] or None,
     )
-    _time_the_test(incident, state, died_at, timeouts)
+    _time_the_test(incident, state, died_at)
     incident.recent_output = output_capture.read_tail(directory / f"{worker}.output")
     if sources is not None:
         _attach_witnesses(
@@ -407,14 +406,13 @@ def _time_the_test(
     incident: WorkerDeathIncident,
     state: dict[str, Any],
     died_at: float,
-    timeouts: Optional[dict[str, float]],
 ) -> None:
     """How long the test had run, and whether that reached a timeout.
 
     The worker and the controller share a wall clock - one machine - so the
     controller's ``died_at`` minus the worker's own ``test_started`` is how
-    long the test had been running when it died. A death that reached a
-    configured timeout is the enforcer's, whatever exit code it wears.
+    long the test had been running when it died. Only the effective limits
+    saved by that worker count; elapsed time is correlation, not proof.
     """
     test_started = state.get("test_started")
     phase_started = state.get("phase_started")
@@ -422,20 +420,21 @@ def _time_the_test(
         incident.test_seconds = round(max(0.0, died_at - test_started), 1)
     if isinstance(phase_started, (int, float)):
         incident.phase_seconds = round(max(0.0, died_at - phase_started), 1)
-    if not timeouts or incident.test_seconds is None:
+    if not incident.phase or not incident.test_in_flight:
         return
-    # The smallest timeout the test reached, and what enforces it. Smallest,
-    # because whichever fires first is the one that ended it; a second's slack
-    # for the enforcer's own latency and the two clocks' rounding.
-    reached = {
-        name: value
-        for name, value in timeouts.items()
-        if incident.test_seconds >= value - 1.0
-    }
+    reached = []
+    for deadline in state.get("timeout_settings") or []:
+        if not isinstance(deadline, dict):
+            continue
+        start = phase_started if deadline.get("scope") == "call" else test_started
+        if deadline.get("scope") == "call" and incident.phase != "call":
+            continue
+        seconds = deadline.get("seconds")
+        if (isinstance(start, (int, float)) and isinstance(seconds, (int, float))
+                and seconds > 0 and died_at - start >= seconds):
+            reached.append((str(deadline.get("source")), float(seconds)))
     if reached:
-        incident.timeout_source, incident.matched_timeout = min(
-            reached.items(), key=lambda item: item[1]
-        )
+        incident.timeout_source, incident.matched_timeout = min(reached, key=lambda pair: pair[1])
 
 
 def _age_of(path: Path) -> float | None:

@@ -288,6 +288,7 @@ def test_capture_off_by_default_keeps_no_file(distributed):
     assert not list((distributed.pytester.path / ".pytest-failures").glob("*/gw*.output"))
 
 
+@posix_only
 @needs_xdist
 def test_capture_on_is_recorded_on_the_worker_log(distributed):
     distributed.pytester.makepyfile(test_suite="def test_one():\\n    assert True\\n")

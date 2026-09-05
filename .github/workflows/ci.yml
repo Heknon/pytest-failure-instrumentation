@@ -193,6 +193,7 @@ jobs:
           tests/test_stall_probe.py
           tests/test_exit_status.py
           tests/test_crash_dump_race.py
+          tests/test_kill_readiness.py
 
       - name: Export failed test IDs
         if: failure() && steps.tests.outcome == 'failure'

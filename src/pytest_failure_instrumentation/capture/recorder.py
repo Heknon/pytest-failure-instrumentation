@@ -456,6 +456,9 @@ class WorkerRecorder:
             # Set on every attempt, rerun or not: an enforcer gives each
             # attempt its own deadline, measured from that attempt's setup.
             self.state.test_started = now
+            from .timeouts import effective
+
+            self.state.timeout_settings = effective(item) if item is not None else []
         if self.heartbeat is not None:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase

@@ -132,7 +132,7 @@ def test_a_worker_killed_by_pytest_timeout_reads_as_a_timeout(distributed):
         "test_hang.py", timeout=120,
     )
     death = distributed.only(incidents, "worker_death")
-    assert death.verdict == "TIMED_OUT", death.evidence
+    assert death.verdict == "POSSIBLE_TIMEOUT", death.evidence
     assert death.test_in_flight == "test_hang.py::test_hangs"
     assert death.matched_timeout == 3.0 and death.timeout_source == "pytest-timeout"
     assert death.test_seconds is not None and death.test_seconds >= 3.0
@@ -627,7 +627,7 @@ def test_a_death_between_tests_is_not_blamed_on_the_test_that_passed(distributed
     # against the run's timeouts - so an idle worker's exit is reported as
     # TIMED_OUT, against a test that was never killed.
     assert death.test_seconds is None and death.phase_seconds is None
-    assert death.matched_timeout is None and death.verdict != "TIMED_OUT"
+    assert death.matched_timeout is None and death.verdict != "POSSIBLE_TIMEOUT"
     # The lead is still offered - it is the best one there is - but it says
     # which kind of guess it is rather than claiming the test was running.
     assert "nothing was running when it died" in str(death)

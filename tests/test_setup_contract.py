@@ -298,7 +298,7 @@ def test_a_finished_runs_directory_is_pruned_and_a_live_one_is_not(tmp_path):
     finished = tmp_path / "run-finished"
     for path, pid in ((live, os.getpid()), (finished, 999999)):
         path.mkdir()
-        (path / "owner.json").write_text(json.dumps({"pid": pid}), encoding="utf-8")
+        (path / "owner.json").write_text(json.dumps({"pid": pid, "finished_at": 1}), encoding="utf-8")
         (path / "gw0.events").write_text("evidence\n", encoding="utf-8")
 
     prune_finished_runs(tmp_path)

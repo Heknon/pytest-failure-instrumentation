@@ -24,10 +24,10 @@ whichever run happened to notice is worse than never reporting them at all.
 Only a run that is over *and* never stamped that mark has anything here to
 report, which is exactly the set of runs that could not report for themselves.
 
-Two runs starting at the same moment can both find the same corpse, since the
-directory is only removed after it has been read. That is a duplicate rather
-than a wrong answer: both carry the dead run's own ``run_id`` and the same
-fingerprint, which is what a consumer already groups recurrences by.
+Reporters and recovery share an OS lock with pruning. Successful callbacks
+are checkpointed individually; failures leave evidence for another attempt.
+Delivery is at least once: consumers should deduplicate by run/fingerprint
+because a process can die between callback success and its checkpoint.
 """
 
 from __future__ import annotations
@@ -35,9 +35,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .. import probes
 
@@ -50,6 +53,7 @@ if TYPE_CHECKING:
 #: ``failure_directory`` is a natural thing to point at an existing artifacts
 #: directory.
 OWNER_FILE = "owner.json"
+LOCK_FILE = ".recovery.lock"
 
 #: The key a run stamps into its marker at session finish. Its *absence* is
 #: the finding - see the module docstring - which is why it is spelled once
@@ -77,6 +81,87 @@ def owner_of(directory: Path) -> Optional[int]:
     return int(pid) if isinstance(pid, int) else None
 
 
+@contextmanager
+def claim(directory: Path) -> Iterator[bool]:
+    """Nonblocking OS lock shared by reporters, recovery and pruning.
+
+    One persistent lock file per evidence root avoids unlink/recreate races.
+    The OS releases it even when the claimant is killed. Separate file opens
+    also exclude concurrent threads in one process.
+    """
+    try:
+        handle = (directory.parent / LOCK_FILE).open("a+b")
+    except OSError:
+        yield False
+        return
+    acquired = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            if handle.seek(0, 2) == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                pass
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                pass
+        yield acquired
+    finally:
+        if acquired and sys.platform == "win32":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        handle.close()
+
+
+def deliver(directory: Path, found: list[Any], target: Callable[[Any], Any]) -> list[Any]:
+    """Caller holds claim(). Checkpoint each successful delivery for retries.
+
+    At least once: a kill between callback success and its checkpoint may
+    replay that incident, so consumers should deduplicate by run/fingerprint.
+    """
+    record = marker(directory)
+    if record is None:
+        return []
+    completed = set(record.get("delivered_incidents") or [])
+    delivered = []
+    for incident in found:
+        key = f"{incident.kind}:{incident.worker}:{incident.worker_pid}"
+        if key in completed:
+            continue
+        target(incident)
+        completed.add(key)
+        record["delivered_incidents"] = sorted(completed)
+        if not _write_marker(directory, record):
+            raise OSError("could not checkpoint incident delivery")
+        delivered.append(incident)
+    if not stamp(directory, REPORTED_KEY):
+        raise OSError("could not mark run as reported")
+    return delivered
+
+
+def deliver_left_behind(root: Path, mine: Path, target: Callable[[Any], Any],
+                        elevate: bool = False) -> None:
+    for directory in run_directories(root):
+        if directory == mine:
+            continue
+        with claim(directory) as acquired:
+            if acquired:
+                found = _deaths_in(directory, elevate)
+                if found:
+                    deliver(directory, found, target)
+
+
 def stamp(directory: Path, key: str) -> bool:
     """Add ``key`` (the time, now) to this directory's marker.
 
@@ -90,6 +175,10 @@ def stamp(directory: Path, key: str) -> bool:
     if record is None:
         return False
     record[key] = time.time()
+    return _write_marker(directory, record)
+
+
+def _write_marker(directory: Path, record: dict[str, Any]) -> bool:
     temporary = directory / f"{OWNER_FILE}.{os.getpid()}"
     try:
         temporary.write_text(json.dumps(record), encoding="utf-8")
@@ -126,10 +215,16 @@ def prune_finished_runs(root: Path) -> None:
     whether a killed run is reported once or not at all.
     """
     for path in run_directories(root):
-        owner = owner_of(path)
-        if owner is None or probes.is_running(owner):
-            continue
-        shutil.rmtree(path, ignore_errors=True)
+        with claim(path) as acquired:
+            if not acquired:
+                continue
+            record = marker(path)
+            owner = owner_of(path)
+            if owner is None or probes.is_running(owner):
+                continue
+            if not record or not (record.get(FINISHED_KEY) or record.get(REPORTED_KEY)):
+                continue  # retain unreported evidence, including failed callbacks
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def deaths_left_behind(
@@ -185,11 +280,17 @@ def _deaths_in(directory: Path, elevate: bool = False) -> list[WorkerDeathIncide
     if record.get(REPORTED_KEY):
         return []  # the sidecar's reporter raised its incidents already
 
-    # The run is over, so every process in it is over: nothing needs asking
-    # about the individual pids, and asking would make it worse. A pid the
-    # kernel has since handed to something else would answer "alive" and
-    # suppress a real report - which is the failure mode that costs a reader
-    # the one incident they were waiting for.
+    # A controller may die while its workers still run. Preserve the whole
+    # run until every recorded worker is gone. PID reuse can defer recovery,
+    # which is safer than reporting a live process as dead.
+    for state_path in directory.glob("*.state"):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            pid = state.get("pid")
+            if isinstance(pid, int) and probes.is_running(pid):
+                return []
+        except (OSError, ValueError, AttributeError):
+            continue
     from . import death
 
     incidents = []

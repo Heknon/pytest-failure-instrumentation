@@ -173,7 +173,8 @@ def _timeout_line(incident: WorkerDeathIncident) -> str:
     return (
         f"The test had been running {incident.test_seconds}s{where} when the worker "
         f"died, at or beyond the configured {incident.timeout_source} of "
-        f"{incident.matched_timeout}s: a timeout enforcer ended it."
+        f"{incident.matched_timeout}s. The exit is consistent with that deadline; "
+        "elapsed time does not prove that the timeout enforcer caused it."
     )
 
 
@@ -192,11 +193,6 @@ def _killed(incident: WorkerDeathIncident, close: Closer) -> tuple[str, str, lis
     """
     if incident.oom is not None:
         return "OOM_KILLED", "high", close(oom_evidence(incident), with_memory=True)
-    if incident.cgroup_oom_kills_since_start:
-        return "OOM_KILLED", "high", close([
-            "The cgroup's OOM kill counter rose during this run, so the kill "
-            "came from the cgroup's memory limit."
-        ], with_memory=True)
     killer = incident.killer
     if killer is not None:
         if killer.origin == "kernel":
@@ -221,6 +217,11 @@ def _killed(incident: WorkerDeathIncident, close: Closer) -> tuple[str, str, lis
         return "KILLED_BY_PROCESS", "high", close([
             f"SIGKILL was sent by {killer.who()}: something outside this run stopped it - "
             "a job cancellation, a timeout enforcer, an orchestrator, or a hand on the keyboard."
+        ], with_memory=True)
+    if incident.cgroup_oom_kills_since_start:
+        return "SIGKILLED", "medium", close([
+            "The cgroup OOM counter rose during this run, but does not identify this "
+            "victim. OOM is a possibility; no witness established the cause of this kill."
         ], with_memory=True)
     term = _latest_term(incident)
     if term is not None:
@@ -371,7 +372,7 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             return "NATIVE_CRASH", "high", close(output + sender_evidence(incident))
         if hasattr(signal, "SIGALRM") and received == signal.SIGALRM and incident.matched_timeout:
             # pytest-timeout's signal method raises SIGALRM at the deadline.
-            return "TIMED_OUT", "high", close([_timeout_line(incident)])
+            return "POSSIBLE_TIMEOUT", "medium", close([_timeout_line(incident)])
         if received in status_table.DELIBERATE_SIGNALS:
             return f"SIGNAL_{received}", "high", close(sender_evidence(incident) + [
                 "A stop request rather than a fault, so it is informational."
@@ -415,7 +416,7 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             # this reason; the guard is here because a verdict of TIMED_OUT
             # names a test and blames its owner, and must not rest on one
             # slot being cleared somewhere else.
-            return "TIMED_OUT", "high", close([_timeout_line(incident)])
+            return "POSSIBLE_TIMEOUT", "medium", close([_timeout_line(incident)])
         # Zero included. A worker that left the run without being asked to has
         # gone wrong whatever number it exited with, and os._exit(0) inside a
         # test is a real way to do it - reported as UNKNOWN it reads as a

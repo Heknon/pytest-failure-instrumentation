@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytest-failure-instrumentation"
-version = "0.9.0"
+version = "0.10.0"
 description = "Attribute the pytest failures that leave no trace: process deaths, stalls, internal errors and xdist collection mismatches"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -41,7 +41,7 @@ classifiers = [
 dependencies = ["pytest>=7.0", "pydantic>=2.0", "psutil>=5.9", "py-spy>=0.3"]
 
 [project.optional-dependencies]
-test = ["pytest-xdist>=3.0"]
+test = ["pytest-xdist>=3.0", "pytest-timeout>=2.3"]
 # Kept so that an existing pin on [psutil] keeps resolving. It is a required
 # dependency now, so this extra adds nothing.
 psutil = ["psutil>=5.9"]

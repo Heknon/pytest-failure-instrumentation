@@ -183,14 +183,8 @@ class Settings:
     #: gets read and the terminal is not, which is most of CI.
     crash_stack: bool = False
     #: Whether this run witnesses who signals its processes - see
-    #: :mod:`.incidents.killer`. Two witnesses, and the setting covers both.
-    #: The controller blocks SIGTERM and reads the ``siginfo`` of the one it
-    #: receives, which names the orchestrator that is stopping the run and
-    #: needs no privilege. And where the run is root, or :attr:`elevate` lets
-    #: it become root, a sidecar watches the kernel's ``signal_generate``
-    #: tracepoint and names the sender of every SIGKILL and SIGTERM to any
-    #: process of the run - the only way a SIGKILL's sender can be known.
-    #: Controller-only: a worker's part in it is to undo the inherited block.
+    #: :mod:`.incidents.killer`. Kernel tracing uses Linux tracefs or Windows
+    #: ETW where permitted; it never changes signal masks or handlers.
     kill_trace: bool = True
     #: Whether this run may spend ``sudo -n`` on the sources that need root:
     #: the kernel log where ``/dev/kmsg`` and the journal are closed to this
@@ -660,11 +654,8 @@ def add_options(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "failure_kill_trace",
-        help="Witness who signals this run's processes. The controller records "
-        "the sender of any SIGTERM it receives, which needs no privilege; and "
-        "where the run is root, or failure_elevate lets it sudo, a sidecar "
-        "watches the kernel's signal_generate tracepoint and names the sender "
-        "of every SIGKILL and SIGTERM to any process of the run. On by default.",
+        help="Witness who kills this run's processes using Linux tracefs or Windows ETW "
+        "where permitted. Preserves signal masks and handlers. On by default.",
         default="true",
     )
     parser.addini(
@@ -1016,47 +1007,6 @@ def _number(config: pytest.Config, name: str, fallback: float) -> float:
             f"{name}={raw!r} is not a number; using {fallback} instead",
         )
         return fallback
-
-
-def configured_timeouts(config: pytest.Config) -> dict[str, float]:
-    """Every per-test timeout this run has configured, by the name of what
-    enforces it.
-
-    A worker a timeout enforcer kills looks like a plain ``os._exit(1)`` from
-    the outside - which is exactly what pytest-timeout's thread method and
-    faulthandler's ``exit_on_timeout`` both do. What separates that from an
-    ordinary self-exit is that the test had been running at or beyond one of
-    these when it died, so the death is matched against them by duration.
-
-    Read on the controller, which is where the death is built and where the
-    config is. pytest-timeout's is per-test and can be raised by a marker,
-    which is not visible here; the global value is the floor, and a death that
-    matches it is named, one that only matches a marker's larger value is left
-    to read as a self-exit rather than guessed at.
-    """
-    timeouts: dict[str, float] = {}
-    faulthandler = pytest_faulthandler_timeout(config)
-    if faulthandler > 0:
-        timeouts["faulthandler_timeout"] = faulthandler
-    # pytest-timeout registers a ``--timeout`` option and a ``timeout`` ini;
-    # both raise if the plugin is not loaded, which is how its absence is
-    # told from a zero. The plugin registers under the name "timeout", not
-    # "pytest_timeout", so the option is asked for rather than the plugin.
-    for reader in (
-        lambda: config.getoption("timeout", None),
-        lambda: config.getini("timeout"),
-    ):
-        try:
-            value = reader()
-        except (ValueError, KeyError, TypeError):
-            continue
-        if value:
-            try:
-                timeouts["pytest-timeout"] = float(value)
-            except (TypeError, ValueError):
-                pass
-            break
-    return timeouts
 
 
 def pytest_faulthandler_timeout(config: pytest.Config) -> float:

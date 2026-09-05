@@ -91,6 +91,10 @@ class StderrTee:
         try:
             if self._is_our_file(STDERR_FD):
                 return
+            if self._passthrough is not None:
+                self.hand_back()
+                if self._passthrough is not None:
+                    return
             self._trim()
             current = os.dup(STDERR_FD)
             self._passthrough = current
@@ -100,41 +104,38 @@ class StderrTee:
             pass
 
     def hand_back(self) -> None:
-        """Give fd 2 back to pytest, after copying this phase's bytes to it.
-
-        Runs at the end of each phase, before pytest reads its own capture
-        file to build the report, so pytest sees everything written to fd 2
-        during the phase and its captured-output-on-failure is unchanged.
-        """
+        """Restore fd 2 even if copying fails; never allocate a phase-sized buffer."""
         if not self.active or self._file is None or self._passthrough is None:
             return
+        passthrough = self._passthrough
+        # Restore first. If restoration itself fails, retain the handle so
+        # close() can retry instead of throwing away the only recovery path.
         try:
-            written = self._read_from(self._phase_offset)
-            if written:
-                os.write(self._passthrough, written)
-            os.dup2(self._passthrough, STDERR_FD)
+            os.dup2(passthrough, STDERR_FD)
         except OSError:
-            pass
-        finally:
-            passthrough = self._passthrough
-            self._passthrough = None
-            if passthrough is not None:
-                try:
-                    os.close(passthrough)
-                except OSError:
-                    pass
-
-    def _read_from(self, offset: int) -> bytes:
-        if self._file is None:
-            return b""
+            self.reason = "degraded: stderr restoration failed"
+            return
+        self._passthrough = None
         try:
             end = os.lseek(self._file, 0, os.SEEK_END)
-            if end <= offset:
-                return b""
-            os.lseek(self._file, offset, os.SEEK_SET)
-            return os.read(self._file, end - offset)
+            with self.path.open("rb") as source:
+                source.seek(self._phase_offset)
+                remaining = max(0, end - self._phase_offset)
+                while remaining:
+                    chunk = source.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(passthrough, view)
+                        if written <= 0:
+                            raise OSError("stderr copy made no progress")
+                        view = view[written:]
         except OSError:
-            return b""
+            self.reason = "degraded: stderr copy failed"
+        finally:
+            os.close(passthrough)
 
     def _trim(self) -> None:
         """Keep the file to its last ``limit`` bytes. Only between phases, so a
@@ -174,8 +175,10 @@ class StderrTee:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         self.hand_back()  # if a phase was open, give fd 2 back and flush it
+        if self._passthrough is not None:
+            return  # preserve the recovery handle and allow another close()
+        self._closed = True
         self.active = False
         if self._file is not None:
             try:

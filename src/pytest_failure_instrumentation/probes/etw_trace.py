@@ -554,6 +554,7 @@ def _report(payload: dict[str, Any], output: str) -> None:
 
     directory = os.path.dirname(os.path.abspath(output))
     with open(os.path.join(directory, "reporter.log"), "ab") as log:
+        child = None
         try:
             child = subprocess.Popen(
                 [payload.get("python") or sys.executable, "-c", REPORTER],
@@ -562,11 +563,13 @@ def _report(payload: dict[str, Any], output: str) -> None:
                 creationflags=CREATE_NO_WINDOW,
             )
             assert child.stdin is not None
-            child.stdin.write(json.dumps(payload).encode("utf-8"))
-            child.stdin.close()
-            child.wait(timeout=REPORTER_TIMEOUT)
+            child.communicate(input=json.dumps(payload).encode("utf-8"), timeout=REPORTER_TIMEOUT)
         except Exception as failure:  # noqa: BLE001 - the log is the only reader
             log.write(f"the reporter could not be run: {failure!r}\n".encode())
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait()
 
 
 def _listen(on_message: Callable[[dict[str, Any]], None]) -> bool:
@@ -664,7 +667,8 @@ def serve(session: str, output: str, mode: str = "trace") -> int:
         # EOF: give the events already queued a moment to be flushed and
         # written, the run's own termination among them, before the session
         # is torn down.
-        time.sleep(1.5)
+        if not told_to_stop:
+            time.sleep(1.5)
     finally:
         try:
             close(consumer)

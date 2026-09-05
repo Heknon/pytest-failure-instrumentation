@@ -109,6 +109,7 @@ class WorkerState:
         #: reads the death can subtract its own now from them.
         self.phase_started: float | None = None
         self.test_started: float | None = None
+        self.timeout_settings: list[dict[str, Any]] = []
         # Opened once; the descriptor lives for the process lifetime so a
         # write costs one syscall and survives interpreter shutdown.
         # O_BINARY matters on Windows: without it os.write translates "\n"
@@ -197,6 +198,7 @@ class WorkerState:
                 "phase": self.phase,
                 "phase_started": self.phase_started,
                 "test_started": self.test_started,
+                "timeout_settings": self.timeout_settings,
                 "tests_started": self.tests_started,
                 "tests_finished": self.tests_finished,
             }

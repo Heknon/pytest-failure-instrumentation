@@ -72,11 +72,11 @@ caught, blocked or handled.
 
 And the exit status is `-9` for *all* of it: the kernel OOM killer, a cgroup
 limit, a cancelled CI job, a `kill -9` from a stray script. There is no
-distinct code for "out of memory". The only in-process evidence that separates
-them is the cgroup v2 `memory.events` `oom_kill` counter, which is why
-`OOM_KILLED` is claimed only when that counter moved during this run, and
-`SIGKILLED` — "something killed it, and here is what that could have been" —
-when it did not.
+distinct code for "out of memory". A cgroup counter increase shows that some
+process in the group was OOM-killed; it does not identify this worker.
+`OOM_KILLED` requires a kernel record naming the victim in the death window.
+Without that evidence, the incident retains `SIGKILLED` and reports the counter
+as context. Direct signal evidence takes precedence over that correlation.
 
 ### The failures that reach no hook at all
 
@@ -399,8 +399,8 @@ reports what the incident found rather than what a `-9` looks like.
 
 | Verdict | Told apart by |
 |---|---|
-| `TIMED_OUT` | a self-exit or SIGALRM with a test *in flight* that had run to a configured `timeout` / `faulthandler_timeout`. A worker that died between tests reached no timeout, whatever the clock says |
-| `OOM_KILLED` | `-9` **and** the kernel log names this pid as the OOM killer's victim, or the cgroup OOM counter moved |
+| `POSSIBLE_TIMEOUT` | a self-exit or SIGALRM that reached its effective terminating deadline. Medium-confidence correlation, not proof |
+| `OOM_KILLED` | `-9` **and** the kernel log names this pid as the OOM killer's victim, within the death window |
 | `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process outside the run send it — the sender is named |
 | `KILLED_BY_RUN` | `-9` sent by another process of this run: the controller (execnet terminating a worker that would not exit) or a sibling worker |
 | `SELF_KILLED` | `-9` the worker sent to itself |
@@ -789,31 +789,19 @@ in for a watched worker, and it is why the dump is evidence in its own right.
 
 ## A worker that timed out
 
-pytest-timeout and pytest's own `faulthandler_timeout` both end a hung worker
-by exiting it — the thread method calls `os._exit(1)`, the signal method raises
-`SIGALRM` — which from the outside is a plain `SELF_EXIT` or a bare signal,
-indistinguishable from any other. Under a hundred workers contending for the
-CPU, a test that takes two seconds unloaded can take forty, and the enforcer
-ends it: this is one of the commonest deaths a large parallel suite has, and it
-read as a mystery exit.
+The worker saves each test's effective timeout settings, including marker
+overrides, disabled timeouts and call-only scope. Call-only deadlines use the
+call clock; other deadlines use the test clock. A plain `faulthandler_timeout`
+only dumps stacks and is excluded unless pytest also enables
+`faulthandler_exit_on_timeout`.
 
-The state slot records when each test began, so the controller — same machine,
-same wall clock — knows how long the test had been running when the worker
-died. A death that reached a configured timeout is `TIMED_OUT`, naming the
-duration, the phase and which enforcer's limit it hit:
-
-```
-[worker_death] TIMED_OUT  severity=critical  owner=product
-    worker=gw7  in flight test_slow.py::test_waits  phase=call  started=3 finished=2
-    · died while running test_slow.py::test_waits (call)
-    · exit status 1 - process exited with code 1 (pid 4821, via waitid)
-    · the test had been running 30.4s in the call phase when the worker died, at or beyond the configured pytest-timeout of 30.0s: a timeout enforcer ended it
-```
-
-The global `--timeout` / ini value is the floor; a death that only reaches a
-larger per-test marker's timeout is left as a self-exit rather than guessed at,
-and every self-exit now carries how long the test had run so a reader can see
-whether it was near a limit.
+A self-exit or SIGALRM after an effective deadline is `POSSIBLE_TIMEOUT` with
+medium confidence. Timing is consistent with an enforcer, but does not prove
+that it caused the exit. An explicit exit can occur after the same deadline.
+`matched_timeout`, `timeout_source`, `test_seconds` and `phase_seconds` expose
+the comparison. Marker values replace the global limit, including `timeout(0)`;
+a test with a raised limit is not judged against the smaller global value.
+Older evidence without effective settings is left unclassified as a timeout.
 
 ## What the worker last said
 
@@ -935,49 +923,22 @@ the one that answered recorded on the incident: `/dev/kmsg`, open to everyone
 where `kernel.dmesg_restrict` is 0 and only to `CAP_SYSLOG` where it is 1
 (Ubuntu since 20.04, Fedora); `journalctl -k`, for members of `adm` or
 `systemd-journal`; `dmesg`; and with `failure_elevate`, `sudo -n dmesg`.
-Inside a pid namespace the pid the kernel prints is the host's and matches
-nothing here, so the cgroup path and the moment are the second key, and the
-incident says it matched that way.
+Inside a pid namespace, host PIDs may not match the worker's PID. A shared
+cgroup and nearby timestamp cannot identify a victim, so that case remains
+unknown unless a direct witness identifies it. Undelivered signal-generation
+events are ignored, and a catchable SIGTERM by itself does not prove death.
 
-**The controller witnesses the SIGTERM that came first, with no privilege at
-all.** `docker stop`, a kubelet eviction, `systemd stop`, `timeout(1)`,
-GitLab's and Jenkins' cancellation, `earlyoom` — all of them send SIGTERM
-before SIGKILL, and a SIGTERM is an ordinary catchable signal whose `siginfo`
-names the sender. Python's `signal.signal` handler is handed no siginfo, so the
-controller blocks SIGTERM at `pytest_configure` — before xdist spawns anything
-that would inherit it unblocked — and one thread waits on it with
-`sigtimedwait`, which returns the sender's pid and uid. It writes those down
-with the sender's comm and command line, then re-raises the signal with its
-default disposition, so the run dies exactly as it would have; one line in
-`controller.events` is the whole difference. A SIGKILL that lands ten seconds
-after "SIGTERM from `Runner.Listener`" is `KILLED_AFTER_SIGTERM`, and a worker
-found dead afterwards whose controller had been told to stop is `RUN_STOPPED`
-rather than `UNKNOWN`.
+**Signal delivery is preserved.** The plugin does not block SIGTERM, replace
+handlers or alter inherited masks in either controllers or workers. Where
+permitted, tracefs records signal senders without intercepting delivery.
+Without kernel tracing, an unprivileged controller death can be recovered as
+`UNKNOWN`, with the unavailable evidence stated explicitly. Historical
+controller records remain readable.
 
-The controller's own death is recovered too, which it was not before. A
-cancelled job is a controller sent SIGTERM while its workers go on to finish
-cleanly — execnet sends each of them SIGINT once the controller is gone — so
-there was no worker death to find and a cancelled run was a run about which
-nothing was ever said. The next run now reads the marker and the controller's
-log and raises one incident for it:
-
-```
-[worker_death] SIGNAL_15  severity=informational  owner=unknown
-    recovered from run-f166b8f37c43, which ended without reaching session finish
-    worker=controller  no test in flight  started=0 finished=0
-    · the controller ended without reaching session finish; its workers were left to finish on their own
-    · exit status unavailable (pid 2866): the parent was the run that died; what follows is from a witness instead
-    · no exit status, but the kernel's signal trace saw SIGTERM sent to pid 2866
-    · a shutdown request - CI cancellation, a timeout enforcer, or an orchestrator stopping the run
-    · SIGTERM was sent by gitlab-runner (pid 812), outside this run - `gitlab-runner run`
-    · nothing to triage unless the run was not meant to be stopped
-```
-
-Only the controller does this, because a blocked mask is inherited by
-children: the controller's children are the workers, each of which unblocks
-first thing at its own start, and a run with no workers — whose children are a
-test's own subprocesses — does not block at all. A SIGTERM somebody has
-already installed a handler for is left to them.
+Live worker deaths share cached trace parsing and kernel-log snapshots. Slow
+kernel-log reads run off the controller thread, with a single short wait per
+refresh across a death cascade. Snapshot age is reported; an empty snapshot
+does not prove that no OOM kill occurred.
 
 ### Reporting a killed run from the sidecar
 
@@ -987,7 +948,8 @@ directory recovers it — but on a runner with a fresh workspace per job there
 is no next run, and a cancelled or OOM-killed job was a job about which
 nothing was ever said.
 
-The sidecar is the survivor. It holds the read end of a pipe only the
+A sidecar can survive the controller. On POSIX it starts in a separate session,
+but it can still be killed with the container, cgroup or host. It holds the read end of a pipe only the
 controller can write, so the controller dying — whatever killed it — is EOF
 on that pipe; a controller that reaches session finish writes `stop` first.
 EOF without it is a death, and the sidecar then starts a *reporter*: a child
@@ -1033,23 +995,21 @@ lives. The environment travels down the two pipes and never touches disk.
 nothing; it starts the reporter as the user that started the run, with that
 user's groups and environment. Its output goes to `reporter.log` in the run's
 directory, and nothing it does can reach a run that is already over. Once
-reported, the run's marker is stamped so a later run over the directory —
-a retried job with the same `PYTEST_RUN_ID` — does not raise it a second time.
+reported, the run's marker is stamped so a later recovery skips it. Reporters,
+recovery and pruning share an OS lock. Each successful callback is checkpointed;
+a failed callback leaves the remaining evidence for a later attempt. Delivery
+is **at least once**: consumers should deduplicate by run ID and fingerprint
+because a kill between callback success and its checkpoint can replay it.
+The reporter's five-minute deadline includes input delivery; an overdue child
+is killed and reaped. A successful callback means it returned without raising,
+not that an external service durably stored the incident.
 
-**It needs no privilege.** Where nothing can be traced the sidecar still
-starts, in a watch-only mode that exists for the reporter alone; the incident
-then carries whatever the unprivileged witnesses saw, which for a cancellation
-is the controller's own record of who sent SIGTERM.
-
-**What stays unknown is small, and named.** A SIGKILL with no SIGTERM before
-it, no OOM record, and no tracepoint is a direct kill of one process by
-something running as your uid or root — and the incident's `kill witnesses:`
-line says which of the three sources was unavailable and why:
-`kernel log unavailable (kmsg: permission denied (kernel.dmesg_restrict=1); journal: No journal files were found; dmesg: ...; sudo dmesg: not tried, failure_elevate is off); signal tracepoint off: tracefs needs root; set failure_elevate to use sudo`.
-That is still an unknown, but it names exactly which truth was withheld and
-by what — which is the difference between a guess and a finding that happens
-to be negative. On a runner that has root or sudo, set `failure_elevate` and
-the residue closes.
+**Watch-only reporting needs no privilege.** Where tracing is unavailable, the
+sidecar still starts when a reporter is configured. It reports durable state
+and explicitly leaves the sender unknown. If the sidecar also dies, recovery
+requires a later run over the retained evidence directory. Kernel sources may
+be unavailable even with elevated privileges; the incident names the sources
+that answered and those that did not.
 
 **Windows keeps the same record through ETW.** There are no signals; a kill
 is one process calling `TerminateProcess` on another, with whatever exit code
@@ -2233,7 +2193,7 @@ accepted and inert.
 | `failure_stall_seconds` | `300` | Silence before a stall is assessed |
 | `failure_stack_probe` | `true` | Ask a diagnosed stalled worker for a fresh stack (POSIX) |
 | `failure_crash_stack` | `false` | Keep the fatal stack of a run that has *no workers*, instead of leaving it on the stderr pytest points it at. A worker keeps its own either way |
-| `failure_kill_trace` | `true` | Witness who signals this run's processes: the controller records the sender of a SIGTERM it receives, and where the run is root (or may sudo) a sidecar on the kernel's `signal_generate` tracepoint names the sender of every SIGKILL and SIGTERM. See [Who killed it](#who-killed-it) |
+| `failure_kill_trace` | `true` | Observe kills using Linux tracefs or Windows ETW where permitted, while preserving signal masks and handlers. See [Who killed it](#who-killed-it) |
 | `failure_elevate` | `false` | Allow `sudo -n` for the witnesses that need root: `dmesg` where `/dev/kmsg` and the journal are closed, and the tracepoint above |
 | `failure_capture_output` | `false` | Keep the last few KB of each worker's captured stderr, so a native crash message survives the kill that swallows it. See [What the worker last said](#what-the-worker-last-said) |
 | `failure_on_run_death` | — | A dotted path `package.module:attribute` to a callable the sidecar calls with each incident of a run whose controller was killed, so a killed run is reported at once. From Python, `install(config, on_run_death=functools.partial(...))`. See [Reporting a killed run from the sidecar](#reporting-a-killed-run-from-the-sidecar) |
@@ -2321,7 +2281,7 @@ its directory says so.
 | Who sent the SIGKILL (signal tracepoint, root or sudo) | yes | no | — |
 | Who called `TerminateProcess` (ETW audit event, administrator) | — | — | yes |
 | The OOM killer's own record of the victim and the fleet (kernel log) | yes | n/a | n/a — no OOM killer |
-| Who sent the SIGTERM that came first (controller siginfo) | yes | no | n/a — no warning shot |
+| SIGTERM sender without kernel tracing | unknown | unknown | n/a |
 | Profiler: CPU per thread | thread clocks | mach `thread_info` | psutil (16 ms ticks) |
 | Profiler: live heap, to tell freed-but-mapped from kept | glibc `mallinfo2` | no | no |
 | Profiler: arenas, to tell `MALLOC_ARENA_MAX` from fragmentation | glibc `malloc_info` | no | no |

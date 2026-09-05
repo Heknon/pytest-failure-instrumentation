@@ -56,15 +56,15 @@ def rendered(**fields) -> str:
 
 
 @posix_only
-def test_the_cgroup_counter_is_what_licenses_an_oom_verdict():
+def test_the_cgroup_counter_is_correlation_not_victim_identification():
     verdict, confidence, evidence = verdict_of(
         exit_status=-signal.SIGKILL,
         cgroup_oom_kills_since_start=1,
         rss_mb_at_death=3900,
         cgroup=CgroupMemory(max_mb=4096),
     )
-    assert verdict == "OOM_KILLED"
-    assert confidence == "high"
+    assert verdict == "SIGKILLED"
+    assert confidence == "medium"
     assert any("cgroup OOM kills during this run: 1" in line for line in evidence)
     assert any("of a 4096 MB cgroup limit" in line for line in evidence)
 
@@ -212,7 +212,7 @@ def test_a_self_exit_at_a_configured_timeout_is_a_timeout():
     )
     # pytest-timeout's thread method os._exit(1)s a hung worker, which is
     # otherwise a plain SELF_EXIT.
-    assert (verdict, confidence) == ("TIMED_OUT", "high")
+    assert (verdict, confidence) == ("POSSIBLE_TIMEOUT", "medium")
     assert any("running 30.4s in the call phase" in line for line in evidence)
     assert any("configured pytest-timeout of 30.0s" in line for line in evidence)
 
@@ -236,8 +236,8 @@ def test_a_sigalrm_at_a_timeout_is_a_timeout_not_a_bare_signal():
         exit_status=-signal.SIGALRM, test_seconds=60.2, phase="call",
         matched_timeout=60.0, timeout_source="pytest-timeout",
     )
-    assert (verdict, confidence) == ("TIMED_OUT", "high")
-    assert any("timeout enforcer ended it" in line for line in evidence)
+    assert (verdict, confidence) == ("POSSIBLE_TIMEOUT", "medium")
+    assert any("does not prove" in line for line in evidence)
 
 
 @posix_only
@@ -246,7 +246,7 @@ def test_a_faulthandler_timeout_exit_is_a_timeout():
         exit_status=1, test_seconds=900.5, phase="teardown",
         matched_timeout=900.0, timeout_source="faulthandler_timeout",
     )
-    assert verdict == "TIMED_OUT"
+    assert verdict == "POSSIBLE_TIMEOUT"
     assert any("faulthandler_timeout" in line for line in evidence)
 
 

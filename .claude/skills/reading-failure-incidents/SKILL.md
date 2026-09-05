@@ -129,11 +129,11 @@ replaces it:
 
 | Verdict | Means | Points at |
 |---|---|---|
-| `OOM_KILLED` | `-9` **and** the kernel log names this pid as the victim, or the cgroup OOM counter moved during this run | memory. Read `oom.pressure`: `fleet` means the run's processes exceeded the limit together (fewer workers or more memory); `own weight` means this one was far above its peers (the test in flight) |
+| `OOM_KILLED` | `-9` **and** the kernel log names this pid as the victim, within its death window during this run | memory. Read `oom.pressure`: `fleet` means the run's processes exceeded the limit together (fewer workers or more memory); `own weight` means this one was far above its peers (the test in flight) |
 | `KILLED_BY_PROCESS` | `-9`, and the kernel's signal tracepoint saw a process *outside the run* send it | nobody's code. `killer` names the sender - a CI runner cancelling, a timeout enforcer, a hand on the keyboard. Informational, and no test is suspected |
 | `KILLED_BY_RUN` | `-9` from another process of this run | the controller (execnet terminating a worker that did not exit in time) or a sibling worker - a test that kills processes |
 | `SELF_KILLED` | `-9` the worker sent to itself | the test in flight: an `os.kill(os.getpid(), SIGKILL)` or a library doing the same |
-| `TIMED_OUT` | a self-exit (code 1) or SIGALRM, and the test had run to a configured `timeout` or `faulthandler_timeout` | the hung test in flight - `matched_timeout` and `timeout_source` name the limit and enforcer, `test_seconds` how long it ran. Under heavy xdist parallelism a starved-slow test hitting the timeout is the common one |
+| `POSSIBLE_TIMEOUT` | a self-exit (code 1) or SIGALRM that reached its effective terminating timeout; medium-confidence correlation, not proof | the hung test in flight - `matched_timeout` and `timeout_source` name the limit and enforcer, `test_seconds` how long it ran. Under heavy xdist parallelism a starved-slow test hitting the timeout is the common one |
 | `KILLED_BY_KERNEL` | `-9` with `si_code` `SI_KERNEL`, and no readable OOM log | the OOM killer, most likely; `kill_sources.kernel_log` says why the log could not be read |
 | `KILLED_AFTER_SIGTERM` | `-9`, and the controller had been sent SIGTERM shortly before | the run was being stopped; `signals_before_death` names who asked. Informational, no test suspected |
 | `RUN_STOPPED` | a recovered run whose controller was sent SIGTERM before this process's last heartbeat | the same - the process ended with the run rather than on its own |
@@ -158,7 +158,7 @@ captured (the setting was off) or the worker was silent - the `last stderr:`
 evidence line is present only when there was something to show.
 
 **`test_seconds`, `matched_timeout`, `timeout_source`** time the death against
-the run's timeouts - see `TIMED_OUT` above. `test_seconds` is on every death
+the run's timeouts - see `POSSIBLE_TIMEOUT` above. `test_seconds` is on every death
 with a test in flight, so a `SELF_EXIT` can be seen to be near a limit even
 when it did not quite reach one.
 
@@ -545,3 +545,9 @@ that was never shown.
 `.pytest-failures/` on the runner holds whole collections and raw dumps, and
 that machine is usually gone by the time anyone reads the alert — which is why
 everything above travels in the incident itself.
+
+Recovery callbacks are checkpointed after success under an OS lock. Failed
+deliveries retain evidence for retry; deduplicate by run ID and fingerprint
+because delivery is at least once. The plugin preserves signal masks and
+handlers. Without kernel tracing, a SIGTERM sender remains unknown. A cgroup
+OOM counter increase alone does not identify this worker as the victim.

@@ -48,9 +48,8 @@ import pytest
 from .. import probes
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
-from ..capture import signals as controller_signals
 from ..capture.events import EventLog
-from ..config import SOLE_WORKER, Settings, advise, configured_timeouts
+from ..config import SOLE_WORKER, Settings, advise
 from ..probes import signal_trace
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
@@ -194,10 +193,6 @@ class IncidentEngine:
         self.settings = settings
         self.attributor = Attributor(settings.packages)
         self.baseline_oom_kills = probes.cgroup_oom_kills()
-        #: The per-test timeouts this run enforces, read once - see
-        #: :func:`..config.configured_timeouts`. A death that ran at or beyond
-        #: one of these was a timeout, not a mystery self-exit.
-        self._timeouts = configured_timeouts(config)
         self.distributed = bool(
             config.pluginmanager.hasplugin("xdist")
             and config.getoption("dist", "no") != "no"
@@ -281,16 +276,7 @@ class IncidentEngine:
         #: anything - but session start and finish are here, and giving it a
         #: plugin of its own would be two objects with one lifetime.
         self.stacks: Any = None
-        #: The witnesses to who kills a process of this run - see
-        #: :mod:`.killer`. The SIGTERM block is taken *here*, at configure,
-        #: because a thread created after it inherits it and one created
-        #: before does not, and xdist's gateway threads are created at
-        #: session start. Only a run with workers takes it: a run with none
-        #: runs tests in this process, and a test's subprocesses must not be
-        #: born with SIGTERM blocked. The threads and the sidecar start once
-        #: the directory they write into exists.
-        self.blocked_signals: set[int] = set()
-        self.witness: controller_signals.SignalWitness | None = None
+        # Kernel tracing observes kills without altering signal delivery.
         #: Built once, on the first death - see _kill_sources.
         self._sources: killer.Sources | None = None
         self.witness_status = "off"
@@ -304,8 +290,9 @@ class IncidentEngine:
         #: Whether the sidecar will report this run's death itself, and if
         #: not, why - see :mod:`.reporter` and :meth:`_reporter_payload`.
         self.reporter_status = "off: failure_on_run_death is not set"
-        if settings.kill_trace and self.distributed:
-            self.blocked_signals = controller_signals.block()
+        # Do not intercept SIGTERM: masks escape into subprocesses and a Python
+        # handler delays termination while the GIL is held. Kernel witnesses
+        # identify senders without changing the process being observed.
         #: What the profiler found, kept for the terminal summary, which runs
         #: after session finish and is the one place a person asked to see it.
         self.profile_report: Any = None
@@ -459,7 +446,8 @@ class IncidentEngine:
             ignore = root / GITIGNORE_FILE
             if ignore.exists():
                 return
-            if any(leftovers.marker(path) is None for path in root.iterdir()):
+            if any(leftovers.marker(path) is None for path in root.iterdir()
+                   if path.name != leftovers.LOCK_FILE):
                 return  # something here is not ours; see the docstring
             ignore.write_text(GITIGNORE_BODY, encoding="utf-8")
         except OSError:
@@ -500,14 +488,18 @@ class IncidentEngine:
         run reports what it finds before it has anything of its own to say.
         """
         try:
-            found = leftovers.deaths_left_behind(
-                self.settings.directory, self.directory, elevate=self.settings.elevate
+            leftovers.deliver_left_behind(
+                self.settings.directory, self.directory, self._deliver_recovered,
+                elevate=self.settings.elevate,
             )
         except Exception as failure:  # noqa: BLE001 - never break a starting run
             advise(f"the previous runs' evidence could not be read: {failure!r}")
-            return
-        for incident in found:
-            self.raise_incident(incident)
+
+
+    def _deliver_recovered(self, incident: Incident) -> None:
+        """Let callback failure escape to recovery so its evidence remains retryable."""
+        self._enrich(incident)
+        self.config.hook.pytest_failure_incident(incident=incident)
 
     def _warn_if_a_live_session_already_owns_this_directory(self) -> None:
         """Two runs may share a directory on purpose - but not at once.
@@ -818,37 +810,23 @@ class IncidentEngine:
     def _start_kill_witnesses(self) -> None:
         """Start what will say who kills a process of this run.
 
-        Two witnesses - see :mod:`.killer`. The controller's own SIGTERM
-        witness needs the block taken at configure and a file to write into;
-        the tracepoint sidecar needs root, or the permission to become root.
-        Whichever cannot start says why, and that reason is written down
-        here and repeated on every incident that would have used it, so a
-        ``SIGKILLED`` names the witness this machine withheld rather than
-        leaving an absence.
-
-        Nothing in here may end the run. A witness that fails to start is a
-        status string; the block it would have watched is released, so the
-        one thing a failed witness could cost - a SIGTERM nobody delivers -
-        cannot happen.
+        Kernel tracing never changes signal masks or handlers. Unavailable
+        tracing is recorded on incidents rather than affecting cancellation.
         """
         try:
             self._start_kill_witnesses_or_fail()
         except Exception as failure:  # noqa: BLE001 - see the docstring
             self.witness_status = f"off: failed ({failure!r})"
-            self.witness = None
-            self._release_signals()
 
     def _start_kill_witnesses_or_fail(self) -> None:
         if not self.settings.kill_trace:
             self.witness_status = "off: failure_kill_trace is off"
-            self._release_signals()
             # No witnesses - but a reporter, if one is configured, is a
             # separate promise, and needs only a sidecar that watches.
             self._start_reporter_only()
             return
         if not self._anything_records() or not self.directory.is_dir():
             self.witness_status = "off: nothing in this run records, so there is nowhere to write"
-            self._release_signals()
             return
         try:
             self.controller_events = EventLog(self.directory / killer.CONTROLLER_EVENTS)
@@ -856,23 +834,9 @@ class IncidentEngine:
             self.controller_events = None
             self.witness_status = f"off: the controller's log could not be opened ({failure!r})"
         if self.controller_events is not None:
-            if self.blocked_signals:
-                self.witness = controller_signals.SignalWitness(
-                    self._record, self.blocked_signals
-                )
-                self.witness.start()
-                self.witness_status = "on"
-            elif not self.distributed:
-                self.witness_status = (
-                    "off: a run with no workers runs its tests here, and a blocked "
-                    "SIGTERM would be inherited by every subprocess they start"
-                )
-            elif not controller_signals.supported():
-                self.witness_status = "off: this platform has no sigtimedwait"
-            else:
-                self.witness_status = "off: SIGTERM already had a handler when this run configured"
-        if not self.witness:
-            self._release_signals()
+            self.witness_status = (
+                "off: signal delivery is preserved; sender attribution requires kernel tracing"
+            )
         payload = self._reporter_payload()
         self.tracer = signal_trace.SignalTracer(
             self.directory / signal_trace.TRACE_FILE,
@@ -968,27 +932,12 @@ class IncidentEngine:
     def _stop_kill_witnesses(self) -> None:
         for step in (
             lambda: self.tracer.stop() if self.tracer is not None else None,
-            lambda: self.witness.stop() if self.witness is not None else None,
-            self._release_signals,
             lambda: self.controller_events.close() if self.controller_events is not None else None,
         ):
             try:
                 step()
             except Exception:  # noqa: BLE001 - session finish must not fail here
                 continue
-
-    def _release_signals(self) -> None:
-        """Give SIGTERM back its default delivery, from the main thread."""
-        try:
-            controller_signals.unblock(self.blocked_signals)
-        finally:
-            self.blocked_signals = set()
-
-    def _check_the_witness_is_listening(self) -> None:
-        """A blocked SIGTERM with nobody waiting for it is a run that cannot
-        be stopped. Cheap enough to ask on every test report."""
-        if self.witness is not None and self.witness.failed and self.blocked_signals:
-            self._release_signals()
 
     def _record(self, event: str, **fields: Any) -> None:
         """A line in the controller's own log, stamped with the run id as it
@@ -1169,7 +1118,6 @@ class IncidentEngine:
         self._record_schedule()
 
     def pytest_runtest_logreport(self, report: Any) -> None:
-        self._check_the_witness_is_listening()
         node = getattr(report, "node", None)
         if node is None:
             # No node means the report was produced here rather than relayed
@@ -1348,7 +1296,6 @@ class IncidentEngine:
                 self.baseline_oom_kills,
                 self.run_id,
                 sources=self._kill_sources(),
-                timeouts=self._timeouts,
             )
         except Exception as failure:  # noqa: BLE001
             incident = death.WorkerDeathIncident.degraded(

@@ -30,6 +30,7 @@ import os
 import signal as signal_module
 import statistics
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -212,34 +213,72 @@ class Sources:
     def witness_path(self) -> Path:
         return self.directory / CONTROLLER_EVENTS
 
+    _trace_cache: Optional[tuple[tuple[int, int, int], list[signal_trace.Witness]]] = field(
+        default=None, init=False, repr=False)
+    _trace_waited_at: float = field(default=-100.0, init=False, repr=False)
+    _refresh: Optional[threading.Thread] = field(default=None, init=False, repr=False)
+    _ready: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _last_attempt: float = field(default=-100.0, init=False, repr=False)
+
     def kernel_log_reading(
         self, since: Optional[float], died_at: float
     ) -> kernel_log.KernelLogReading:
-        """The log, read once for as many deaths as one reading can answer.
+        """Share a snapshot across a cascade; live log I/O is off the controller.
 
-        Reading it forks ``journalctl`` or ``dmesg`` and parses everything
-        they print, and the deaths that most need it arrive together: an OOM
-        kill takes a worker, the memory is still short, and the next goes.
-        Per death that is one fork each, in ``pytest_testnodedown``, with the
-        run waiting.
-
-        A reading answers for a death when it was taken after that death -
-        ``died_at`` is when the controller noticed it, which is already after
-        the kill the log recorded - and opened no later than the window being
-        asked for, which a run's later workers always satisfy. Anything else
-        is read afresh: a kill that happened after the last reading would not
-        be in it, and a missing OOM kill is the one mistake this whole path
-        exists to avoid.
+        One short wait per refresh, never a wait per worker. A snapshot cannot
+        prove that a later kill did not happen, so its age is explicit and
+        absence never produces an OOM verdict. Recovery has no live scheduler
+        and can read synchronously.
         """
+        if not self.live:
+            cached = self._log
+            if cached is None or cached[0] < died_at or (
+                cached[1] is not None and (since is None or since < cached[1])
+            ):
+                self._log = (time.time(), since, kernel_log.read(since=since, elevate=self.elevate))
+            cached = self._log
+            assert cached is not None
+            return kernel_log.narrowed(cached[2], since)
+        started = False
+        with self._lock:
+            if (self._refresh is None or not self._refresh.is_alive()) and (
+                time.monotonic() - self._last_attempt >= 2.0
+            ):
+                self._last_attempt = time.monotonic()
+                self._ready.clear()
+                def refresh() -> None:
+                    try:
+                        reading = kernel_log.read(since=None, elevate=self.elevate)
+                        self._log = (time.time(), None, reading)
+                    except Exception as failure:  # noqa: BLE001 - diagnostic I/O must not escape
+                        self._log = (time.time(), None, kernel_log.KernelLogReading(
+                            [], "unavailable", f"kernel log collection failed ({failure!r})"))
+                    finally:
+                        self._ready.set()
+                self._refresh = threading.Thread(target=refresh, daemon=True,
+                                                 name="failure-kernel-log")
+                self._refresh.start()
+                started = True
+        if started:
+            self._ready.wait(0.1)
         cached = self._log
-        if cached is not None:
-            taken_at, opened_at, reading = cached
-            covers_start = opened_at is None or (since is not None and since >= opened_at)
-            if covers_start and taken_at >= died_at:
-                return kernel_log.narrowed(reading, since)
-        reading = kernel_log.read(since=since, elevate=self.elevate)
-        self._log = (time.time(), since, reading)
-        return reading
+        if cached is None:
+            return kernel_log.KernelLogReading([], "unavailable", "kernel log collection pending")
+        reading = kernel_log.narrowed(cached[2], since)
+        age = max(0.0, died_at - cached[0])
+        return kernel_log.KernelLogReading(reading.kills, reading.source,
+                                          f"{reading.detail}; snapshot age {age:.1f}s")
+
+    def trace_reading(self) -> list[signal_trace.Witness]:
+        try:
+            info = self.trace_path.stat()
+            key = (info.st_ino, info.st_size, info.st_mtime_ns)
+        except OSError:
+            return []
+        if self._trace_cache is None or self._trace_cache[0] != key:
+            self._trace_cache = (key, signal_trace.witnessed(self.trace_path))
+        return self._trace_cache[1]
 
 
 @dataclass
@@ -326,6 +365,8 @@ def _from_trace(
         return None, []
     records: list[SignalRecord] = []
     for witness in _settled(sources, pid):
+        if not witness.delivered:
+            continue
         if witness.at is not None and (witness.at > until or (since and witness.at < since)):
             continue
         if witness.target_pid == pid:
@@ -350,10 +391,11 @@ def _from_trace(
             ):
                 killer = record
                 break
-        elif fatal is None or record.signal == fatal:
+        elif (exit_status is None and record.signal == 9) or (fatal is not None and record.signal == fatal):
             killer = record
             break
-    before = [record for record in records if record is not killer]
+    before = [record for record in records if record is not killer
+              and record.at is not None and died_at - TERM_WINDOW_SECONDS <= record.at <= died_at]
     return killer, before
 
 
@@ -366,9 +408,10 @@ def _settled(sources: Sources, pid: int) -> list[signal_trace.Witness]:
     cascade - costs more than the wait it is measuring. Nothing new can have
     arrived while the size is unchanged.
     """
-    found = signal_trace.witnessed(sources.trace_path)
-    if not sources.live:
+    found = sources.trace_reading()
+    if not sources.live or time.monotonic() - sources._trace_waited_at < 2.0:
         return found
+    sources._trace_waited_at = time.monotonic()
     deadline = time.monotonic() + TRACE_SETTLE_SECONDS
     size = _size_of(sources.trace_path)
     while not any(witness.target_pid == pid for witness in found) and time.monotonic() < deadline:
@@ -377,7 +420,7 @@ def _settled(sources: Sources, pid: int) -> list[signal_trace.Witness]:
         if grown == size:
             continue
         size = grown
-        found = signal_trace.witnessed(sources.trace_path)
+        found = sources.trace_reading()
     return found
 
 
@@ -485,22 +528,16 @@ def _from_kernel_log(
     reading = sources.kernel_log_reading(since, died_at)
     if reading.source == "unavailable":
         return None, f"unavailable ({reading.detail})"
-    status = reading.source
+    status = f"{reading.source} ({reading.detail})"
     match: Optional[kernel_log.OomKill] = None
     matched_by = "pid"
     if pid is not None:
         for kill in reading.kills:
-            if kill.victim_pid == pid and (kill.at is None or kill.at <= until):
+            if (kill.victim_pid == pid and kill.at is not None
+                    and (since is None or kill.at >= since) and kill.at <= until):
                 match = kill
-    if match is None:
-        # Inside a pid namespace the log names a pid nothing here knows. The
-        # cgroup and the moment are what is left, and they are stated as
-        # such rather than dressed up as a pid match.
-        own = kernel_log.own_cgroup()
-        if own:
-            for kill in reading.kills:
-                if kill.task_memcg == own and kill.at is not None and until - 60 <= kill.at <= until:
-                    match, matched_by = kill, "cgroup and time"
+    # A cgroup/time match does not identify a process in another PID
+    # namespace. Do not promote another victim's kill to this worker's death.
     if match is None:
         return None, status
     return _oom_record(match, matched_by, roles, pid, status, killer), status

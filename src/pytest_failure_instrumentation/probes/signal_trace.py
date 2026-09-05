@@ -238,18 +238,20 @@ def report(payload):
             extra["extra_groups"] = os.getgrouplist(pwd.getpwuid(uid).pw_name, gid)
         except (KeyError, OSError, ImportError):
             pass
+    child = None
     try:
         child = subprocess.Popen(
             [payload.get("python") or sys.executable, "-c", REPORTER],
             stdin=subprocess.PIPE, stdout=log, stderr=log,
             cwd=payload.get("rootdir") or None, env=payload.get("env") or None, **extra
         )
-        child.stdin.write(json.dumps(payload).encode("utf-8"))
-        child.stdin.close()
-        child.wait(timeout=REPORTER_TIMEOUT)
+        child.communicate(input=json.dumps(payload).encode("utf-8"), timeout=REPORTER_TIMEOUT)
     except Exception as failure:
         log.write(("the reporter could not be run: %r\n" % (failure,)).encode("utf-8"))
     finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait()
         log.close()
 
 
@@ -330,7 +332,7 @@ try:
             chunk = os.read(0, 65536)
             if not chunk:
                 orphaned = not told_to_stop
-                closing_at = time.monotonic() + (0.5 if tracing else 0.0)
+                closing_at = time.monotonic() + (0.5 if tracing and orphaned else 0.0)
                 watched = [pipe] if tracing else []
                 if not tracing:
                     break
@@ -474,6 +476,7 @@ class SignalTracer:
             # Ctrl-C: the sidecar ends when its stdin does.
             creation["creationflags"] = 0x08000000 | 0x00000200
         else:
+            creation["start_new_session"] = True
             instance = f"{INSTANCE_PREFIX}{os.getpid()}"
             event_filter = "||".join(f"sig=={number}" for number in self.signals)
             owner = f"{os.getuid()}:{os.getgid()}"
