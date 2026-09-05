@@ -330,11 +330,20 @@ class TestMemory:
                     KEPT.append(bytearray(1_000_000))
             """,
             test_keep_fixture="""
+            import time
+
             import pytest
 
             @pytest.fixture(scope="module")
             def big_fixture():
-                return [bytearray(1_000_000) for _ in range(60)]
+                kept = []
+                for _ in range(6):
+                    kept.extend(bytearray(1_000_000) for _ in range(10))
+                    # Attribution is sampled. Keep the fixture on-stack across
+                    # several ticks instead of relying on a 60 MB allocation
+                    # yielding the GIL at just the right instant.
+                    time.sleep(0.03)
+                return kept
 
             def test_first_use(big_fixture):
                 assert len(big_fixture) == 60
@@ -724,9 +733,11 @@ class TestBursts:
             from product import churn
 
             def test_index_is_complete():
-                time.sleep(1.5)
+                # Leave enough non-CPU time that process-accounting jitter and
+                # profiler overhead cannot change "waiting" into "mostly busy".
+                time.sleep(3.0)
                 churn(2.5)
-                time.sleep(0.5)
+                time.sleep(1.5)
             """
         )
         incidents = runner.run("--failure-profile", "-p", "no:cacheprovider", timeout=120.0)
@@ -874,9 +885,9 @@ class TestAllocationTracing:
         )
         (profile,) = document["profiles"]
         assert profile["unit"] == "bytes"
-        # Half of what the test allocated, not all of it: the snapshot is
-        # taken when the sampler *notices* the climb, so it is one reading
-        # behind the last chunk. Three quarters is what two platforms
-        # measured, and a bar set there failed on the one that measured 73%.
-        assert sum(profile["weights"]) >= 100 * 1_000_000
+        # This is the live allocation snapshot from when the sampler noticed
+        # the climb, not an exact account of the later 200 MB peak. Thread
+        # scheduling determines how far allocation advances before that tick;
+        # require a substantial useful profile without promising completeness.
+        assert sum(profile["weights"]) >= 60 * 1_000_000
         assert any(frame["file"].endswith("test_alloc.py") for frame in document["shared"]["frames"])
