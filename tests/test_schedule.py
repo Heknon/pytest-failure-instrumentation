@@ -24,7 +24,7 @@ from pytest_failure_instrumentation import schedule, topology
 from pytest_failure_instrumentation.capture.state import read_state
 from pytest_failure_instrumentation.schedule import ScheduleTracker
 
-from .conftest import ENABLE_FLAG, needs_xdist
+from .conftest import ENABLE_FLAG, RERUN_CONFTEST, needs_xdist
 
 
 class Gateway:
@@ -137,6 +137,42 @@ def test_what_a_worker_has_run_is_counted_rather_than_inferred():
         scheduler.complete("gw0")
 
     assert rows(tracker, scheduler)["gw0"] == {"assigned": 4, "completed": 3, "pending": 1}
+
+
+def test_a_rerun_of_the_same_test_is_not_a_second_finish():
+    """A rerun plugin tears the same test down once per attempt, and every
+    attempt's teardown report reaches the controller - while the scheduler is
+    told once, when the protocol ends, and drops one index. Counted per
+    report, the finished half of the total climbed past what was ever handed
+    out: 374 of 368 tests, on a suite with six rerun once."""
+    scheduler = Pending(collection=range(3), pending=[], gw0=[0, 1, 2])
+    tracker = ScheduleTracker("load")
+
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")  # the rerun
+    scheduler.complete("gw0")
+
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2}
+
+    # The next test is the next test, and a rerun on another worker is that
+    # worker's own affair.
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_next")
+    tracker.saw_a_test_finish("gw1", "test_a.py::test_flaky")
+    scheduler.complete("gw0")
+
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 2, "pending": 1}
+
+
+def test_a_finish_with_no_id_to_compare_is_counted():
+    """Nothing to tell a rerun by means nothing is told apart."""
+    scheduler = Pending(collection=range(2), pending=[], gw0=[0, 1])
+    tracker = ScheduleTracker("load")
+
+    tracker.saw_a_test_finish("gw0")
+    tracker.saw_a_test_finish("gw0")
+    scheduler.complete("gw0", 2)
+
+    assert rows(tracker, scheduler)["gw0"]["completed"] == 2
 
 
 def test_a_stolen_test_stops_being_this_worker_s_total():
@@ -731,3 +767,54 @@ def test_a_real_run_accounts_for_every_test(pytester, dist):
     for row in described["workers"]:
         assert row["tests_assigned"] == record["workers"][row["worker"]]["assigned"]
         assert (row["tests_running"], row["tests_queued"]) == (0, 0)
+
+
+#: Six tests, two of which fail the first time they run and pass the second.
+RERUN_SUITE = """
+from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.parametrize("i", range(6))
+def test_thing(i):
+    if i in (1, 4):
+        seen = Path(f"seen-{i}")
+        if not seen.exists():
+            seen.write_text("x")
+            assert False, "the first attempt fails"
+"""
+
+
+@needs_xdist
+def test_a_rerun_is_one_test_however_many_times_it_runs(pytester):
+    """The bug as it was reported: the workers endpoint said 374 of 368 tests
+    had been distributed. Six had been rerun once, and both sides counted an
+    attempt as a test - the controller from the teardown reports, of which a
+    rerun sends another, and the worker from its own setup phase, which a
+    rerun runs again. The controller's total is floored at the worker's
+    count, so either alone was enough."""
+    evidence = pytester.path / "evidence"
+    pytester.makeconftest(RERUN_CONFTEST)
+    pytester.makepyfile(test_suite=RERUN_SUITE)
+    pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
+
+    result = pytester.runpytest_subprocess(ENABLE_FLAG, "-n2", "--dist=load")
+    result.assert_outcomes(passed=6)
+    # The reruns this is about happened: both tests failed once and the run
+    # still passed everything.
+    assert all((pytester.path / f"seen-{i}").exists() for i in (1, 4))
+    assert "rerun" in result.stdout.str()
+
+    (run,) = [path for path in evidence.iterdir() if path.is_dir()]
+    record = schedule.read(run)
+    assert record["collected"] == 6
+    assert sum(row["assigned"] for row in record["workers"].values()) == 6, record["workers"]
+    for worker, row in record["workers"].items():
+        assert row["completed"] == row["assigned"], (worker, row)
+        # And the worker's own count agrees: it was never given a test twice.
+        slot = read_state(run / f"{worker}.state")
+        assert slot["tests_started"] == slot["tests_finished"] == row["assigned"], (worker, row, slot)
+
+    described = topology.run(run)
+    assert sum(row["tests_assigned"] for row in described["workers"]) == 6, described["workers"]

@@ -1,0 +1,64 @@
+name: Profile readiness
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: profile-readiness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stress:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'full-portability'
+    name: Linux / 80-worker qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - name: Measure repeated baseline and profile runs
+        run: python benchmarks/readiness_gate.py stress --output readiness/stress.json
+      - name: Preserve measurements and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-readiness-linux
+          path: readiness/
+          retention-days: 14
+
+  windows:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'full-portability'
+    name: Windows / overhead and native attribution
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - name: Gate detection and overhead
+        run: |
+          New-Item -ItemType Directory -Force readiness
+          python benchmarks/profile_gate.py | Tee-Object readiness/overhead.json
+          exit $LASTEXITCODE
+      - name: Native attribution diagnostic (accepted limitation)
+        if: success() || failure()
+        run: python benchmarks/readiness_gate.py native --native-diagnostic --output readiness/native.json
+      - name: Preserve measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-readiness-windows
+          path: readiness/
+          retention-days: 14

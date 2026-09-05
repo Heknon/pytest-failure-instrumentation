@@ -17,7 +17,7 @@ def beats(*pairs):
 def test_no_beats_is_silent_not_blocked():
     verdict = stall.assess([], now=100.0, silent_for=60.0, interval=5.0)
     assert verdict.state == "SILENT"
-    assert "never wrote a heartbeat" in verdict.reason
+    assert "No heartbeat was written" in verdict.reason
 
 
 def test_burning_cpu_is_not_a_stall():
@@ -50,7 +50,7 @@ def test_confirmation_with_no_new_beat_is_frozen():
         beats((50.0, 5.0), (60.0, 5.0)), previous_last=60.0, now=106.0, silent_for=60.0
     )
     assert verdict.state == "FROZEN"
-    assert "holding the GIL" in verdict.reason
+    assert "holds the GIL" in verdict.reason
 
 
 def test_confirmation_with_a_new_beat_falls_through_to_cpu():

@@ -14,13 +14,11 @@ failures cannot say for themselves, works out whose code is responsible, and
 hands you one structured incident per problem.
 
 ```
-[worker_death] NATIVE_CRASH  severity=critical  owner=product
-    blamed on engine.py:6 in native_call
-    worker=gw1  in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
-    · died while running test_crashes.py::test_crashes (call)
-    · exit status -11 - SIGSEGV: segmentation fault in native code (pid 805, via waitid)
-    · the worker wrote a stack before dying
-    · segmentation fault in native code
+Worker gw1 crashed with SIGSEGV (segmentation fault in native code) while running test_crashes.py::test_crashes (call), in native_call (engine.py:6)   [worker_death NATIVE_CRASH, product, critical]
+    Exit status -11 read via waitid (pid 805).
+    The worker wrote a stack as it died.
+    Look at: test_crashes.py::test_crashes.
+    Measured: 1 test started and 0 finished on this worker.
 ```
 
 ## The problem
@@ -155,23 +153,21 @@ This is what the plugin reports for it — two incidents, because two things wen
 wrong:
 
 ```
-[worker_death] SIGKILLED  severity=needs-triage  owner=unknown
-    worker=gw1  no test in flight  started=0 finished=0
-    · died before running any test (startup or collection)
-    · exit status -9 - SIGKILL: uncatchable kill (OOM killer or external kill) (pid 21780, via waitid)
-    · resident memory 31 MB at last checkpoint
-    · SIGKILL with no cgroup OOM event: a host-level OOM killer, a container or CI cancellation, or an external kill
+Worker gw1 was killed with SIGKILL before running any test   [worker_death SIGKILLED, unknown, needs-triage]
+    Exit status -9 read via waitid (pid 21780).
+    No cgroup OOM kill was counted during this run. SIGKILL cannot be caught, and is sent by a host OOM killer, a container or CI cancellation, or a kill command.
+    Measured: 31 MB resident at the last heartbeat. 0 tests started and 0 finished on this worker.
 
-[internal_error] INTERNAL_ERROR  severity=high  owner=runtime  run-ending
-    blamed on loadscope.py:275 in _assign_work_unit
-    KeyError: <WorkerController gw1>
-    · raised on the controller itself and captured first-hand
-    · raised above informational: a framework-owned defect that ended the run - no test is at fault, so nothing else will surface it
+pytest hit an internal error: KeyError: <WorkerController gw1>, in _assign_work_unit (loadscope.py:275)   [internal_error INTERNAL_ERROR, runtime, high, run-ending]
+    Raised on the controller and captured first-hand.
+    pytest ends the session on an internal error.
+    Look at: the full traceback, kept in the incident's detail field.
+    Severity high rather than informational: a defect in the framework ended the run, and no test is at fault, so nothing else reports it.
 ```
 
-`owner=runtime` is the load-bearing part. No test is at fault and no worker is
-at fault, so nothing else in the run will ever surface this — which is exactly
-why it is the one case where a framework defect is raised *above*
+The `runtime` owner in the tag is the load-bearing part. No test is at fault
+and no worker is at fault, so nothing else in the run will ever surface this —
+which is exactly why it is the one case where a framework defect is raised *above*
 informational.
 
 ## Install
@@ -357,6 +353,37 @@ never read as a healthy one.
 anybody, the test that was in flight is a lead worth recording — but a guess
 must never sit in the column a reader takes for a finding.
 
+### How an incident reads
+
+`str(incident)` is the alert text, and every kind renders to one shape. It is
+a convention rather than a style, and `tests/test_message_convention.py`
+holds every kind to it:
+
+1. **The first line says what happened, in words**, specific to this instance:
+   which worker, which signal, which test, which function. It ends with a tag
+   `[kind VERDICT, owner, severity]` to grep for and route on, with
+   `run-ending` appended when the session died with it. A `run_summary` has
+   no owner slot, because nothing failed.
+2. **If no stack named anybody**, one line says where the owner came from:
+   `No stack was captured; the owner is taken from the test that was running,
+   test_pool.py (customer-code).` A lead, marked as one.
+3. **Every other line is exactly one of three things.** A *measurement*: what
+   was observed, and where the figure came from when that matters (`Exit
+   status -11 read via waitid`). What that measurement *means by
+   construction*: what follows from how it was taken, or from a fact about
+   the OS, the runtime or xdist (`SIGKILL cannot be caught`, `xdist addresses
+   tests by position`). Or a *place to look*: `Look at:` a file and line, a
+   test, a setting, a flag. Several numbers share one `Measured:` line at the
+   end, labelled.
+
+What is deliberately absent: any guess at a cause in your code, and any fix
+to it. The analysis is arithmetic over evidence; it knows that a thread other
+than the test's used the CPU, not that the thread is a poller you forgot
+about. A line that named the poller would be right often enough to be
+trusted and wrong often enough to matter. Sentences are short, start with a
+capital and end with a full stop; nothing is a field dump, nothing argues for
+the finding, and nothing is said twice.
+
 ### Handing one to an agent
 
 An incident is written to be read without context, which is most of what an LLM
@@ -436,26 +463,25 @@ Sixty workers never produce sixty collections. They produce two or three
 *variants*, so this reports one row per variant, measured against the largest:
 
 ```
-[collection_mismatch] COLLECTION_MEMBERSHIP_DIFFERS  severity=needs-triage  owner=unknown  run-ending
-    no stack; suspect customer-code (owner of a module the workers disagreed about (test_collect.py))
-    2 workers produced 2 different collections
-    baseline: 1 worker collected 3 tests, and everything below is measured against that list
-    1 worker is missing 1 test, in test_collect.py (gw1)
+Workers collected different tests: 2 workers produced 2 different collections   [collection_mismatch COLLECTION_MEMBERSHIP_DIFFERS, unknown, needs-triage, run-ending]
+    No stack was captured; the owner is taken from a module the workers disagreed about, test_collect.py (customer-code).
+    Baseline: 1 worker collected 3 tests; the rows below are measured against that list.
+    1 worker is missing 1 test, in test_collect.py (gw1).
         - test_collect.py::test_two
-    whole collections written to .pytest-failures; the difference above travels in the incident
-    · xdist addresses tests by position rather than by id, so any difference between the lists is fatal - a reordering as much as a missing test
-    · the initial collections disagreed, so the run was aborted
+    xdist addresses tests by position rather than by id, so any difference between the lists stops it: a reordering as much as a missing test.
+    The initial collections disagreed, so xdist aborted the run.
+    Look at: the full id lists in .pytest-failures/run-3f9a1c2d.
 ```
 
 At sixty workers it stays the same shape, because the row count follows the
 number of *variants* rather than the number of workers:
 
 ```
-    58 workers produced 3 different collections
-    baseline: 55 workers collected 300 tests, and everything below is measured against that list
-    2 workers are missing 1 test, in test_payments.py (gw41, gw58)
+Workers collected different tests: 58 workers produced 3 different collections   [collection_mismatch COLLECTION_MEMBERSHIP_DIFFERS, unknown, needs-triage, run-ending]
+    Baseline: 55 workers collected 300 tests; the rows below are measured against that list.
+    2 workers are missing 1 test, in test_payments.py (gw41, gw58).
         - test_payments.py::test_case_017
-    1 worker has 6 extra tests, in test_legacy.py (gw17)
+    1 worker has 6 extra tests, in test_legacy.py (gw17).
         + test_legacy.py::test_extra_0
         + test_legacy.py::test_extra_1
         + test_legacy.py::test_extra_2
@@ -492,14 +518,17 @@ would otherwise be one near-identical block per worker — and prints what each
 of a few workers actually collected:
 
 ```
-[collection_mismatch] COLLECTION_PARAMETERS_UNSTABLE  severity=needs-triage  run-ending
-    6 workers produced 6 different collections
-    the tests are the same on every worker - only the parameter values differ, so these are not tests appearing and disappearing
+Workers collected the same tests with different parameter values: 6 workers produced 6 different collections   [collection_mismatch COLLECTION_PARAMETERS_UNSTABLE, unknown, needs-triage, run-ending]
+    The same tests exist on every worker; only the parameter values in their ids differ.
         test_billing.py::test_invoice
             gw0 collected acct-1791, acct-3471, acct-6305, acct-7468
             gw1 collected acct-2186, acct-2542, acct-6991, acct-9779
             gw2 collected acct-1614, acct-1950, acct-4517, acct-9313
-    compare those values: a parametrize evaluated at collection time - a random number, a timestamp, an unordered set, a call to something live - gives every worker a different id for the same test, and xdist requires the ids to match
+    Ids that differ per worker were computed at collection time from something that differs per process, and xdist requires the ids to match.
+    Look at: the parametrize arguments of those tests.
+    xdist addresses tests by position rather than by id, so any difference between the lists stops it: a reordering as much as a missing test.
+    Stripping the parameters from the ids makes every worker's collection identical.
+    The initial collections disagreed, so xdist aborted the run.
 ```
 
 The values are the diagnosis. Naming the test says where to look; three rows
@@ -734,14 +763,14 @@ report for itself, and each process in it that started a session and never
 finished one is a death:
 
 ```
-[worker_death] UNKNOWN  severity=needs-triage  owner=unknown
-    no stack; suspect customer-code (owner of the test in flight (test_pool.py))
-    recovered from run-8f21c0b4e5d7, which ended without reaching session finish
-    worker=main  in flight test_pool.py::test_writes  phase=call  started=12 finished=11
-    · died while running test_pool.py::test_writes (call)
-    · exit status unavailable (pid 21780): nothing was left to read it. Only a parent may, the parent was the run that died, and by the time this evidence was found the process was gone - so an OOM kill, a segfault and an os._exit cannot be told apart here
-    · resident memory 412 MB at last checkpoint
-    · no stack was kept here: this run had no workers, so its fatal dump went to the terminal pytest's faulthandler plugin writes to rather than into a file - set failure_crash_stack to keep a copy instead
+Worker main of run run-8f21c0b4e5d7 died while running test_pool.py::test_writes (call); its exit status could not be read   [worker_death UNKNOWN, unknown, needs-triage]
+    No stack was captured; the owner is taken from the test that was running, test_pool.py (customer-code).
+    Found in the evidence of run run-8f21c0b4e5d7, which ended without reaching session finish; it was last seen alive at 2026-09-04 09:12:41. The death is somewhere after that.
+    Exit status unavailable (pid 21780): only the parent process could read it, and the parent was the run that died. An OOM kill, a segfault and an os._exit cannot be told apart without it.
+    Look at: test_pool.py::test_writes.
+    No stack was kept: this run had no workers, so its fatal dump went to the terminal that pytest's faulthandler plugin writes to.
+    Look at: failure_crash_stack, which keeps a copy in the evidence directory.
+    Measured: 412 MB resident at the last heartbeat. 12 tests started and 11 finished on this worker.
 ```
 
 `recovered_from_run` leads the block, because a reader who takes this for the
@@ -1348,6 +1377,18 @@ of a test rather than the end of one keeps that worker out of its own window;
 what is left is the rarer case of another worker's two messages straddling this
 one's, and it lasts until the next test starts somewhere.
 
+**A rerun is the same test, not another one.** pytest-rerunfailures, flaky
+and every plugin written the same way run a failed test's phases again inside
+the same protocol, so setup and teardown happen once per attempt while the
+test, its node id and its slot in the scheduler's queue are one. Both counters
+count the test: the worker counts a start at the first setup of a protocol and
+not at a second, and takes back the finish it counted at the end of the attempt
+that turned out not to be the last, so a rerun in flight reads as one running;
+the controller counts a teardown report that names the test the worker has just
+finished as that test again. Before that, a run of 368 tests with six rerun once
+was reported as 374 — every attempt a test, and the total floored at the
+worker's count so that an attempt became a test nobody was given.
+
 **A crashed worker keeps its row, so the rows can add up to more than the run.**
 xdist drops a dead worker's queue back into the global one and starts a
 replacement under a new id, and the test it died *in* is reported failed rather
@@ -1375,11 +1416,9 @@ running" look identical, which is the exact misreading this package exists to
 prevent:
 
 ```
-[stack_server_unavailable] PORT_TAKEN  severity=informational  owner=runtime
-    no live stacks this run: 127.0.0.1 could not serve on port 8080
-    port 8080 is held by something that is not a stack server (Address already in use);
-    pass --callstack-port with an unused port, or leave it off entirely and let one be drawn
-    · the run itself is unaffected; what is missing is the live view
+No live stack view this run: 127.0.0.1 could not serve on port 8080   [stack_server_unavailable PORT_TAKEN, runtime, informational]
+    Port 8080 is held by something that is not a stack server (Address already in use); pass --callstack-port with an unused port, or leave it off entirely and let one be drawn.
+    The run itself is unaffected; only the live view is missing.
 ```
 
 Two verdicts, because they have different remedies. `PORT_TAKEN` is a stranger
@@ -1393,7 +1432,7 @@ kind gets filtered out entirely. It is reported once per address per run, not
 once per retry, though a named port held by a stranger is re-probed for the
 life of the run.
 
-`owner=runtime`, `severity=informational`: no test is at fault and nothing is
+Owner `runtime`, severity `informational`: no test is at fault and nothing is
 broken. What is lost is a diagnostic, and somebody has to decide whether to
 reconfigure it.
 
@@ -1693,6 +1732,340 @@ read another running as the same user at the same integrity level, so the
 descendant rule above simply does not apply. Reading an *elevated* process from
 an unelevated one needs `SeDebugPrivilege`.
 
+## Profiling
+
+Everything above waits for something to go wrong. `--failure-profile` waits for
+nothing: it samples the process running the tests for the whole run and, at
+the end, names the functions that burnt the CPU and the tests that kept the
+memory — as incidents, through the same hook, because "your image comparison
+is 38% of the run" is a finding you want flagged the way a segfault is.
+
+```console
+pytest --failure-profile
+```
+
+or `failure_profile = true` in ini for every run. Off by default: it is the
+one thing here with a running cost on every healthy test, rather than only on
+a run that went wrong. What that cost is, is not a claim — `benchmarks/profile_gate.py`
+measures it on the same fixed-CPU workload with and without the sampler and
+fails the build past 1.10x serially and 1.12x on four xdist workers, and CI
+runs it on every push. See "Cost".
+
+### What it measures
+
+A thread of its own wakes fifty times a second on each worker, reads every
+thread's stack, and charges the CPU each thread burnt since the last wake to
+the stack it is in now. **Weighted by CPU, not by wall time.** A thread asleep
+in `recv` weighs nothing and vanishes; a thread spinning on a poll becomes the
+widest thing in the profile. That is the difference between "where did the
+time go" and "where did the cores go", and only the second answers why a
+worker sits at 30%.
+
+The per-thread counters come from `clock_gettime` on each thread's CPU clock,
+which reads in a few hundred nanoseconds and — this is the part that matters —
+without releasing the GIL. A sampler that opens a file per thread per sample
+releases the GIL on every read and then waits a whole switch interval to get it
+back from a busy test; measured, that ran a fifty-hertz sampler at eight.
+
+A function is named the way it is written — `Poller.run`, not `run`, and a
+comprehension under the function it is written in rather than as a `<listcomp>`
+nobody wrote. 3.11 and later carry that name on the code object; on 3.9 and
+3.10, which this package supports, it is worked out once per function from the
+module that defines it, at the end of a test rather than on the sampling path.
+
+Each stack is charged to the first frame, walking outward from the innermost,
+that belongs to somebody: your packages or the customer's tests first, a
+dependency failing that, the runtime failing everything. So two million calls
+into a C pixel accessor are charged to *your* `is_images_different`, and a
+second spent in `json/encoder.py` is charged to *your* `render_report`, below
+the json encoder. Threads Python has no stack for — a thread pool a C extension
+started — are counted by their kernel names, so CPU outside the interpreter is
+reported rather than quietly dropped.
+
+Per test it also records resident memory at every phase boundary, the peak
+between them, Python's live-object count, and — on glibc — how much of the
+heap is actually in use, so memory a test *freed* that the allocator kept
+mapped is told from memory that is still alive.
+
+And it keeps a **timeline**: every tenth of a second, the CPU the process
+burnt in that window and how busy the whole machine was. A share of the run's
+CPU is the wrong question for a suite that waits on I/O ninety-nine seconds in
+a hundred — the hundredth that pins a core is invisible in it — and the
+timeline is where that hundredth shows as a step with a start, a length and a
+height.
+
+A tenth of a second of *wall time*, and a window never spans less than one
+sample — so where the sampler cannot tick that often, because the machine is
+loaded or the platform's per-thread read is expensive, the timeline is as fine
+as the sample rate allows and no coarser. It used to be five samples, which is
+a tenth of a second only while the sampler is getting the CPU it asked for: at
+ticks 150 ms apart a burst of 0.6 s became one window, one window is below the
+two a burst needs, and the finding was not raised at all rather than raised
+less precisely.
+
+### What it raises
+
+Three kinds, all `severity=informational` whoever owns them, because nothing
+failed.
+
+**`cpu_hotspot`** — one per function over `failure_profile_cpu_share` percent
+of the run's CPU (and at least half a second of it). The verdict says what kind
+of cost it is:
+
+| Verdict | Means |
+|---|---|
+| `PYTHON_CODE` | the function's own lines are hot: a Python loop, or C calls made from them that leave no frame |
+| `LIBRARY_CALL` | the cost is under a library or runtime call it makes, which is named |
+| `BACKGROUND_THREAD` | the CPU is on a thread that is not running the test — a poller, a watcher — and is paid whatever test is in flight |
+| `GC_PRESSURE` | the collector took more than a tenth of the run, and here are the tests that drove it |
+| `NATIVE_THREADS` | CPU in threads Python has no stack for, by kernel thread name |
+
+**`cpu_burst`** — from the timeline. A window is busy when the process burnt
+`failure_profile_burst_cores` cores' worth of CPU over it, and a burst is a
+run of busy windows. Each finding carries the stack that was there for most of
+the burst, blamed like a hotspot:
+
+| Verdict | Means |
+|---|---|
+| `LONG_BURST` | one test held a core for `failure_profile_burst_seconds` or longer, with when it started, which phase, and how much of the test's CPU is in that one stretch |
+| `RECURRING_BURST` | the same function burst in five or more tests, whatever the length of each — a fixture, or a helper doing per call what it could do once. One finding, with the total |
+| `BACKGROUND_BURST` | a thread that is not running the test held a core — between tests or under one. What a worker at a steady percentage with nothing to blame is doing |
+| `CONTENDED` | the machine was over 90% busy for most of the run and the workers got slices of a core while it was. Twenty workers on four cores; nothing on any stack explains it and the machine's own figure does |
+
+**`memory_profile`** — per test, against `failure_profile_retained_mb`:
+
+| Verdict | Means |
+|---|---|
+| `RETAINED_AFTER_TEST` | the worker was left holding more than it started with, still in use, with the phase it arrived in — `setup` is a fixture |
+| `HEAP_NOT_RETURNED` | it was left holding more, but none of it is in use: the allocator kept freed pages mapped. Fragmentation, not a leak |
+| `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
+| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — two megabytes a test, which is the shape of a leak and the one no per-test check sees |
+| `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
+| `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
+| `ALLOCATOR_RETENTION` | the worker grew by the threshold over its run and nothing is using the growth: memory the allocator was handed back and kept mapped. One finding for the run, saying which of the two causes it is — thread arenas each keeping what they freed, which `MALLOC_ARENA_MAX=2` fixes, or one main heap fragmented by small survivors, which `malloc_trim` fixes and the arena variable does not |
+
+A memory finding about one test also carries **the code that was running
+while the memory climbed**, blamed and attributed the way a crash is. The
+sampler charges every rise it sees in resident memory to the test thread's
+stack at that moment — or to the stack it was in a tick earlier, when the
+code running at the reading is the runtime's own, which is what a test body
+that allocated and returned within one reading looks like from outside. A
+climb with nobody's code on either stack is reported as unplaced rather than
+blamed on pytest. So a test that reads a file whole instead of streaming it
+comes back as:
+
+```
+Memory over the ceiling: tests/test_loading.py::test_loads_the_export reached 1532 MB, ceiling is 1200 MB   [memory_profile PEAK_OVER_CEILING, product, informational]
+    Memory rose by 1611 MB, summed over every reading that found it higher; all of that increase happened while load_everything (loader.py:15) was running, called from test_loads_the_export (test_loading.py:11).
+    The memory was released before the test ended.
+    Look at: loader.py:15
+    Measured: process 377 MB before, 1532 MB peak, 395 MB after. Ceiling from failure_profile_peak_mb.
+```
+
+What a test *kept* is measured as the larger of the resident step and the
+live-heap step. Resident memory understates it whenever the test fills pages
+an earlier test freed and the allocator held on to, and the heap figure is not
+fooled by that.
+
+The live heap is glibc's `mallinfo2` and nothing else (see the platform table).
+Where there is none — macOS, Windows, musl — resident memory that stayed up is
+all there is to go on, so a test that freed what it allocated but left the
+pages mapped reads as `RETAINED_AFTER_TEST` rather than `HEAP_NOT_RETURNED` or
+`TRANSIENT_PEAK`. The size and the phase are right either way; what cannot be
+had there is the sentence that separates a leak from fragmentation, and
+`ALLOCATOR_RETENTION` is not raised at all. Rerunning with
+`--failure-profile-allocations` is the answer on those platforms: tracemalloc
+measures Python's own live allocations everywhere.
+
+The worker that "freed everything and still sits at four gigabytes" is the
+one case none of the per-test rules can name, because no test did it: a few
+megabytes of freed-but-mapped memory per test, over a long worker, is under
+every threshold and in use by nothing. `ALLOCATOR_RETENTION` is the rule over
+the whole worker. Every record carries glibc's own account of its arenas —
+how many, how much free memory sits in each, how much of that a
+`malloc_trim` would return — read through `malloc_info` at test boundaries,
+and when resident memory has grown by the threshold more than the live heap
+did and the allocator's free figure accounts for the gap, the finding says
+where the free memory is:
+
+```
+Memory held by the allocator: worker main has 289 MB that tests freed and the C allocator has not returned to the OS   [memory_profile ALLOCATOR_RETENTION, runtime, informational]
+    No Python object holds this memory. It is inside glibc's heaps, mapped and unused.
+    144 MB of the 289 MB is in the main heap, 145 MB in thread arenas. 11 arenas existed for up to 10 threads on 4 cores.
+    Biggest single steps: tests/test_arenas.py::test_ingest_batch[0] (140 MB on main).
+    glibc keeps freed memory mapped inside each arena, and gives every thread that allocates an arena of its own, up to eight per core. MALLOC_ARENA_MAX limits how many thread arenas exist.
+    Measured: process 42 MB at the start, 881 MB at the end, up 839 MB over 73 tests with 466 MB of that in use.
+```
+
+A test that left a threshold's worth of it in one step would have been
+`HEAP_NOT_RETURNED` on its own; under the worker's finding it is one of the
+steps rather than a row of its own, since it is the same memory and the same
+fix.
+
+Free memory mostly in the main arena is the other cause — one heap
+fragmented by small survivors between the big allocations — and the finding
+says so instead, with what `malloc_trim(0)` would hand back right now, because
+`MALLOC_ARENA_MAX` does nothing for that one. glibc only, like the live-heap
+reading; elsewhere the finding is never raised.
+
+### Allocation tracing
+
+The sampler sees the stack that was *running* while memory climbed, which is
+usually the answer and sometimes is not: a loader that hands its result to a
+cache is running when the memory arrives and is not what holds it. For that
+rerun the tests the plain profile named with
+
+```console
+pytest --failure-profile-allocations tests/test_loading.py
+```
+
+which switches tracemalloc on for the run — every platform, no attaching, no
+debugger — and adds to each finding the lines holding the memory at the peak
+and the lines holding what the test kept, and to a `STEADY_GROWTH` finding
+the lines holding what the worker accumulated over the whole session. The
+memory figures then come from tracemalloc itself (Python allocations only,
+the tracer's own tables left out), because the tracer churns the allocator
+enough to leave resident memory up after a test freed everything. Every test
+that climbed also gets a **memory flame graph**: its live allocations at the
+peak, by traceback, weighted in bytes, beside its CPU one.
+
+The growth finding above, rerun that way over the two modules it names:
+
+```
+Memory growing across tests: worker main kept 289 MB in use over 48 tests, about 6 MB per test   [memory_profile STEADY_GROWTH, customer-code, informational]
+    No single test kept enough to be reported on its own. 48 of the 48 tests each ended with more in use than they started with.
+    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests).
+    Held at the end of the worker: 190.7 MB allocated at test_memory.py:52, called from python.py:167, _callers.py:121, _manager.py:120.
+    Held at the end of the worker: 145.9 MB allocated at test_memory.py:28, called from python.py:167, _callers.py:121, _manager.py:120.
+    Held at the end of the worker: 122.1 MB allocated at test_drift.py:13, called from python.py:167, _callers.py:121, _manager.py:120.
+    Measured: traced memory 290 MB before the first of these tests, 460 MB after the last. Biggest single step 24 MB. +20,264 Python objects per test.
+```
+
+Three lines, each an `append` to something module-level. A tracemalloc
+frame knows the file and line and not the function, which is why those lines
+carry no function name.
+
+**Nothing else may be tracing.** `tracemalloc` has one set of tables per
+process, and a second owner of them gets the first one's frames at the first
+one's depth: both profilers then report numbers that are neither's. So a run
+asked for `--failure-profile-allocations` while a tracer is already going —
+another allocation profiler, `PYTHONTRACEMALLOC`, `-X tracemalloc`, a
+`tracemalloc.start()` in a `conftest.py` — stops with a usage error naming the
+depth it found, rather than starting. It is the one thing in this package that
+ends a run instead of warning and carrying on, and it is deliberate: everything
+else here reports a failure that has already happened, where being quietly
+degraded is better than being absent, and this one *is* the measurement, where
+being quietly wrong is worse than not running. The plain `--failure-profile`
+never touches the tracer and never raises this; neither does
+`failure_tracemalloc_depth`, which attaches to whatever is already tracing.
+
+Tracing costs three to six times on allocation-heavy code and far more on a
+tight loop of small objects, which is why it is a rerun and not the nightly —
+and why a traced run raises **no CPU findings**: its CPU figures are the
+tracer's as much as the tests', and the summary says so. Memory is what it is
+for. `failure_profile_allocation_depth` is how many frames each allocation
+keeps.
+
+This is what the example suite under
+[`examples/profiling`](examples/profiling) prints, trimmed:
+
+```
+CPU hotspot: load_everything (loader.py:15) used 11% of this run's CPU, 1.9 s   [cpu_hotspot PYTHON_CODE, product, informational]
+    The time is in this function's own lines, not in calls it makes. Mostly line 15 (68%), line 16 (32%).
+    Seen in 1 test: tests/test_loading.py::test_loads_the_export.
+    Look at: loader.py:15
+
+CPU on a background thread: 'status-poller' used 11% of this run's CPU, 1.9 s, in Poller._run (poller.py:30)   [cpu_hotspot BACKGROUND_THREAD, product, informational]
+    This thread is not the one running tests, so it uses this CPU whichever test is executing.
+    Seen in 13 tests: tests/test_polling.py::test_with_the_poller_running, tests/test_polling.py::test_another_with_the_poller_running, tests/test_sessions.py::test_request_answers[1] and 10 more, and between tests.
+    Look at: poller.py:30
+
+Memory kept after test: tests/test_memory.py::test_big_fixture ended with 143 MB more in use than it started with   [memory_profile RETAINED_AFTER_TEST, customer-code, informational]
+    Memory rose by 166 MB, summed over every reading that found it higher; all of that increase happened while big_fixture (test_memory.py:34) was running, called from call_fixture_func (fixtures.py:1005).
+    The increase happened during setup, so a fixture allocated it, and it was still in use after teardown.
+    Look at: test_memory.py:34 and what holds its result after the test.
+    Measured: process 512 MB before, 655 MB after. Live heap +143 MB. +429 Python objects.
+
+Memory growing across tests: worker main kept 295 MB in use over 71 tests, about 4.2 MB per test   [memory_profile STEADY_GROWTH, unknown, informational]
+    No stack was captured; the owner is taken from the test's file, tests/test_allocation.py (customer-code).
+    No single test kept enough to be reported on its own. 52 of the 71 tests each ended with more in use than they started with.
+    Most of it during: tests/test_memory.py::test_leaks_a_little (167 MB over 7 tests), tests/test_drift.py::test_response_is_cached (122 MB over 40 tests), tests/test_arenas.py::test_ingest_batch (6 MB over 4 tests).
+    Look at: rerun those tests with --failure-profile-allocations to see which lines hold the memory.
+    Measured: process 43 MB before the first of these tests, 882 MB after the last. Biggest single step 24 MB. 295 MB of the 576 MB increase is in use; the rest was freed and kept by the allocator. +501 Python objects per test.
+```
+
+And the I/O-bound suite under [`examples/profiling/tests/test_polling.py`](examples/profiling/tests/test_polling.py)
+and its neighbours, where the timeline is what finds the fixture — no single
+one of its six bursts is worth a look, and a share of the CPU says nothing
+about *when* it was spent:
+
+```
+Repeated CPU burst: Session.__init__ (session.py:30) ran at full CPU for about 0.4 s in each of 6 tests, during setup   [cpu_burst RECURRING_BURST, product, informational]
+    2.5 s of CPU in total across the 6 bursts. Called from session (test_sessions.py:13).
+    Tests: tests/test_sessions.py::test_request_answers[5], tests/test_sessions.py::test_request_answers[3], tests/test_sessions.py::test_request_answers[4] and 3 more.
+    Machine load during these bursts: 26%.
+    Look at: session.py:30. It ran during setup of each of those tests.
+
+CPU burst: tests/test_index.py::test_index_is_complete ran at 1.0 cores for 2.7 s, starting 1.1 s into the test, during call   [cpu_burst LONG_BURST, product, informational]
+    Running build_index (reports.py:42), called from test_index_is_complete (test_index.py:13).
+    This burst is 87% of the test's 3.4 s of CPU. The other 1.5 s of the test's 4.8 s was waiting.
+    Machine load during the burst: 26%.
+    Look at: reports.py:42
+```
+
+The same run prints a summary at the end of the terminal output — the run's
+CPU against its wall time, what each worker peaked at, and the top functions:
+
+```
+Profile: 74 tests, 27 s of wall time, 18 s CPU (0.69 cores on average), 2.5 s of it in garbage collection
+  worker main: 74 tests, 18 s CPU, peak 1532 MB, 882 MB at the end
+Functions using the most CPU:
+   16.8%    2.98 s  build_graph  test_allocation.py  [customer-code]  in 2 tests
+   14.3%    2.53 s  render_report  reports.py  [product]  in 2 tests
+   13.6%    2.42 s  build_index  reports.py  [product]  in 1 test
+   13.4%    2.37 s  is_images_different  image_compare.py  [product]  in 3 tests
+   13.1%    2.33 s  Session.__init__  session.py  [product]  in 6 tests
+```
+
+Every finding is printed the way every incident is (see "How an incident
+reads"): a first line that says what was measured, in words, ending with a
+`[kind VERDICT, owner, severity]` tag; then lines that are each a
+measurement, what it means by how it was taken, or a place to look.
+
+It also writes a [speedscope](https://www.speedscope.app/) flame graph for every
+test a finding names, and for the gaps between tests, under
+`<run directory>/profiles/` (`<test>-<hash>.speedscope.json` for CPU, and
+with allocation tracing on `<test>-<hash>.memory.speedscope.json` for the
+allocations at its peak; the hash is of the full node id, so two names that
+sanitise alike cannot overwrite each other). The raw per-test records are in `<worker>.profile.jsonl` beside
+the rest of the evidence, timeline included.
+
+### What it cannot see
+
+Reliable native-call attribution is outside the supported profiling contract.
+Sampling from inside the process needs the GIL. A native call that holds it
+can finish before the sampler observes its Python wrapper. CPU counters still
+measure the work on a surviving thread, but its cost may be assigned to a
+previous or subsequent sampled function. A Python function that mixes Python
+and native work has the same limitation during its native portions. GIL-releasing
+native calls are easier to sample, but exact native-call attribution is not
+guaranteed either. Use the profile to investigate Python hotspots and bursts;
+do not treat a missing native caller as evidence that it used no CPU.
+
+Per-thread clocks use POSIX thread clocks on Linux, `thread_info` on macOS,
+and `GetThreadTimes` on 64-bit Windows with psutil fallback. Windows counters
+are coarse against the sampling interval. Where per-thread clocks are
+unavailable, process CPU is charged to the test thread and the report says so.
+Threads that start and exit between samples can go unseen.
+
+The native qualification probe remains a visible, non-blocking diagnostic:
+its JSON preserves failed attribution measurements. Python detection, quiet
+workloads, overhead, resource budgets, and the full test suites remain release
+gates. This is an accepted limitation, not a claim that native attribution
+was repaired. The live-heap reading that tells freed-but-mapped memory
+from kept memory is glibc only; elsewhere what a test kept is its resident
+step alone.
+
 ## One directory per run
 
 ```
@@ -1804,6 +2177,27 @@ overwhelming majority of what runs.
   family's per-test done flags — that one was measured at 1.7ms a write on a
   sixty-thousand-test `--dist loadfile` run, near two minutes of controller
   time over the run, and is now a length per scope instead (133µs, 8s).
+- Off by default, and the only thing here that costs a *passing* test
+  anything: the profiler. One thread per worker, waking fifty times a second,
+  reading each thread's CPU clock with a syscall that keeps the GIL and
+  walking its stack — and every tenth of a second, the machine's load;
+  resident memory and the live heap every other tick. Measured against plain
+  pytest on the same fixed-CPU workload by `benchmarks/profile_gate.py`,
+  which CI runs on every push and which fails past 1.05x for instrumentation
+  alone, 1.10x for serial profiling and 1.12x for profiling under four xdist
+  workers. Allocation tracing is outside those budgets on purpose: it is a
+  rerun over the tests a plain profile named, and its cost is the workload's
+  (see "Allocation tracing").
+- Per profiled test, on disk: one JSON line of about 3 KB appended to
+  `<worker>.profile.jsonl` as the test ends. It is the one thing this package
+  writes that grows with the number of tests, and the controller reads all of
+  it back at session finish — so a 20,000-test run folds 62 MB of log, which
+  is where the profiler's memory goes and when: at the end of a long run,
+  which is when a container is least likely to have it spare. The log is read
+  a line at a time rather than whole, and the strings every record repeats —
+  its frame table, which is the same paths on every test, and its keys — are
+  shared across the run rather than copied per record. Measured on 20,000
+  records: 346 MB to 145 MB, and slightly faster.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.
@@ -1849,6 +2243,16 @@ accepted and inert.
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |
 | `failure_stack_server_locals` | `true` | Whether `/stack?locals` answers with each frame's variables |
+| `failure_profile` | `false` | Sample every thread's stack and CPU for the whole run and raise what crosses the thresholds below (`--failure-profile` for one run) |
+| `failure_profile_interval` | `0.02` | Seconds between profile samples (floor 0.002) |
+| `failure_profile_cpu_share` | `5` | Percent of the run's CPU one function must hold to be raised |
+| `failure_profile_cpu_floor_seconds` | `0.5` | Seconds of CPU one function must have used before its share counts, so that a short run does not raise the first thing it sampled |
+| `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
+| `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
+| `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; tens of times slower on allocation-heavy pure-Python code, so for a rerun of the tests an untraced run named (`--failure-profile-allocations` for one run, which implies `--failure-profile`) |
+| `failure_profile_allocation_depth` | `12` | Frames kept per allocation when tracing |
+| `failure_profile_burst_cores` | `0.7` | Cores' worth of CPU a tenth-of-a-second window must hold to be part of a burst |
+| `failure_profile_burst_seconds` | `2` | Seconds a burst must last to be raised as one test's own; the same function bursting in five tests is raised whatever their length |
 
 There is deliberately **no ini setting for the token**. It comes from
 `PYTEST_CALLSTACK_TOKEN` or `--callstack-token` and nowhere else: an ini file
@@ -1918,6 +2322,10 @@ its directory says so.
 | Who called `TerminateProcess` (ETW audit event, administrator) | — | — | yes |
 | The OOM killer's own record of the victim and the fleet (kernel log) | yes | n/a | n/a — no OOM killer |
 | Who sent the SIGTERM that came first (controller siginfo) | yes | no | n/a — no warning shot |
+| Profiler: CPU per thread | thread clocks | mach `thread_info` | psutil (16 ms ticks) |
+| Profiler: live heap, to tell freed-but-mapped from kept | glibc `mallinfo2` | no | no |
+| Profiler: arenas, to tell `MALLOC_ARENA_MAX` from fragmentation | glibc `malloc_info` | no | no |
+| Profiler: bursts, drift, allocation tracing, memory flame graphs | yes | yes | yes |
 
 The last row is the frozen-interpreter fallback, and it is the one capability a
 *setting* takes away on every platform rather than a platform taking away: where
@@ -1980,6 +2388,14 @@ much as the operating system, so each gets its own job:
 - **against the declared minimums**, `pytest==7.0.1` on Python 3.9. Every other
   job installs whatever is newest, so a hook signature or an ini type that
   arrived later would pass all of them and fail on a user's pinned pytest.
+
+- **the profiler's budget**, `benchmarks/profile_gate.py`, which is a job of
+  its own because it is the one claim in this README a reader cannot check by
+  reading. It times the same fixed-CPU workload under plain pytest, under
+  instrumentation and under the profiler, serially and on four xdist workers;
+  it asks five times whether a known sustained hotspot is found, and five
+  times whether a quiet run stays free of CPU findings. Every raw timing is in
+  its JSON output. A budget moves only with the measurements that say why.
 
 `ruff` and `mypy` run as their own job, and fail first because they are cheap.
 The source carries `# noqa` and `# type: ignore` markers, which are only worth
@@ -2058,7 +2474,7 @@ PyPI rejects a distribution carrying both.
 
 ## Status
 
-All five kinds and every verdict in the tables above are covered, on all three
+All nine kinds and every verdict in the tables above are covered, on all three
 platforms, with and without xdist — a run with no workers records, serves,
 watches and is recovered through the same code paths a distributed one uses,
 and the tests drive it the same way: a real run, wedged or killed for real,

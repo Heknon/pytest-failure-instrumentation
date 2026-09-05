@@ -349,7 +349,7 @@ def test_a_kernel_kill_without_a_log_says_so():
     )
     assert (verdict, confidence) == ("KILLED_BY_KERNEL", "medium")
     assert any("SI_KERNEL" in line and "gw0" in line for line in evidence)
-    assert any("kill witnesses:" in line for line in evidence)
+    assert any("Kill witnesses:" in line for line in evidence)
 
 
 def test_the_kernel_log_outranks_every_other_witness():
@@ -367,10 +367,10 @@ def test_the_kernel_log_outranks_every_other_witness():
     verdict, confidence, evidence = classify.of(incident)
     assert (verdict, confidence) == ("OOM_KILLED", "high")
     joined = "\n".join(evidence)
-    assert "the kernel log (journal) records the OOM killer choosing pid 4242" in joined
+    assert "The kernel log (journal) records the OOM killer choosing pid 4242" in joined
     assert "the limit of cgroup /docker/abc" in joined
     assert "100 of them were this run's" in joined and "3rd largest" in joined
-    assert "fleet pressure" in joined
+    assert "Fleet pressure" in joined
     assert "[gw17]" in joined
     assert "context of python3 (pid 4240, gw0" in joined
 
@@ -392,7 +392,7 @@ def test_no_witness_at_all_says_which_were_withheld():
         ))
     )
     assert verdict == "SIGKILLED"
-    (line,) = [line for line in evidence if line.startswith("kill witnesses:")]
+    (line,) = [line for line in evidence if line.startswith("Kill witnesses:")]
     assert "dmesg_restrict=1" in line and "failure_elevate" in line
 
 
@@ -418,7 +418,7 @@ def test_a_witnessed_signal_stands_in_for_a_status_nobody_could_read():
         death(exit_status=None, recovered_from_run="run-dead", killer=outside())
     )
     assert verdict == "KILLED_BY_PROCESS"
-    assert any("no exit status, but the kernel's signal trace saw SIGKILL" in line for line in evidence)
+    assert any("No exit status was readable, but the kernel's signal trace saw SIGKILL" in line for line in evidence)
 
 
 def test_the_senders_name_is_on_a_sigterm_death_too():
@@ -925,7 +925,7 @@ def test_a_run_told_to_stop_is_recovered_with_the_senders_name(distributed):
     assert controller.killer is not None
     assert controller.killer.sender_pid == os.getpid()
     assert controller.killer.sender_role == "outside this run"
-    assert any("without reaching session finish" in line for line in controller.evidence)
+    assert "without reaching session finish" in str(controller).splitlines()[0]
     assert any("SIGTERM was sent by" in line for line in controller.evidence)
 
 

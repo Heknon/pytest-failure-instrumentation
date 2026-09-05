@@ -39,19 +39,25 @@ class RunSummaryIncident(Incident):
     #: killed by an internal error can still show 0 above; this contradicts it.
     run_ending_incidents: int = 0
 
-    def headline(self) -> str:
-        # No owner, because nothing failed: printing owner=unknown here reads
-        # as an unattributed failure rather than as a clean end of run.
-        return f"[{self.kind}] {self.verdict}  severity={self.severity}"
+    def tag(self) -> str:
+        # No owner, because nothing failed: an owner slot reading "unknown"
+        # here reads as an unattributed failure rather than as a clean end.
+        return f"[{self.kind} {self.verdict}, {self.severity}]"
 
-    def details(self) -> list[str]:
+    def summary(self) -> str:
         mode = "distributed" if self.distributed else "single process"
+        line = f"Run finished with exit status {self.exitstatus}"
         if not self.raised:
-            return [f"no incidents ({mode})"]
-        line = f"{self.raised} incident(s) over {len(self.incidents)} distinct fingerprint(s)"
+            return f"{line} and no incidents ({mode})"
+        counted = f"{self.raised} incident{'s' if self.raised != 1 else ''}"
+        distinct = len(self.incidents)
+        if distinct != self.raised:
+            counted += f" over {distinct} distinct fingerprint{'s' if distinct != 1 else ''}"
         if self.run_ending_incidents:
-            line += f", {self.run_ending_incidents} run-ending"
-        return [f"{line} ({mode})"]
+            counted += f", {self.run_ending_incidents} of them raised as run-ending"
+        if self.duplicates_suppressed:
+            counted += f", {self.duplicates_suppressed} duplicate{'s' if self.duplicates_suppressed != 1 else ''} suppressed"
+        return f"{line}: {counted} ({mode})"
 
 
 def build(
@@ -72,18 +78,12 @@ def build(
         duplicates_suppressed=suppressed,
         run_ending_incidents=run_ending,
         distributed=distributed,
-        evidence=[
-            f"run ended with exit status {exitstatus}",
-            f"{raised} incident(s) raised, {suppressed} duplicate(s) suppressed "
-            "by fingerprint",
-        ]
-        + (
+        evidence=(
             [
-                f"{run_ending} incident(s) were raised as run-ending, and the "
-                "run still reached session finish: either the condition resolved - "
-                "a wedged worker that came back is the usual one - or the exit "
-                "status above is what pytest reported before it applied "
-                "INTERNAL_ERROR"
+                f"{run_ending} incident{'s were' if run_ending != 1 else ' was'} raised as "
+                "run-ending, and the run still reached session finish: either the "
+                "condition resolved, as when a wedged worker comes back, or pytest "
+                "reported this exit status before applying INTERNAL_ERROR."
             ]
             # Only when the exit status does not already show it: pytest applies
             # INTERNAL_ERROR after some paths through sessionfinish and before

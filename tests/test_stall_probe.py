@@ -116,7 +116,7 @@ def test_a_worker_with_no_test_in_flight_is_not_blamed_on_its_last_one(tmp_path)
     assert incident.test_in_flight is None
     assert incident.last_test is None
     assert incident.confidence == "low"
-    assert any("no test was in flight" in line for line in incident.evidence)
+    assert any("No test was running" in line for line in incident.evidence)
 
 
 def test_a_wedged_test_still_earns_the_confidence_it_did(tmp_path):

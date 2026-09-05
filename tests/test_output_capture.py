@@ -113,13 +113,13 @@ def test_the_verdict_surfaces_the_last_stderr_line_on_a_crash():
         recent_output=["loading libfoo", "OpenBLAS blas_thread_init: pthread_create failed"],
     )
     _v, _c, evidence = classify.of(incident)
-    assert any("last stderr: OpenBLAS blas_thread_init: pthread_create failed" in line for line in evidence)
+    assert any("Last stderr: OpenBLAS blas_thread_init: pthread_create failed" in line for line in evidence)
 
 
 def test_an_absent_tail_is_not_read_as_silence():
     incident = WorkerDeathIncident(worker="gw1", exit_status=-6, test_in_flight="t.py::t", phase="call")
     _v, _c, evidence = classify.of(incident)
-    assert not any(line.startswith("last stderr:") for line in evidence)
+    assert not any(line.startswith("Last stderr:") for line in evidence)
 
 
 # -- for real ----------------------------------------------------------------
@@ -174,7 +174,7 @@ def test_a_native_message_reaches_the_incident_wherever_it_was_printed(distribut
     death = distributed.only(incidents, "worker_death")
     assert death.verdict == "NATIVE_CRASH"
     assert any("pthread_create failed" in line for line in death.recent_output), death.recent_output
-    assert any(line.startswith("last stderr:") for line in death.evidence)
+    assert any(line.startswith("Last stderr:") for line in death.evidence)
 
 
 @posix_only

@@ -1,0 +1,93 @@
+name: Profiling iteration
+on:
+  pull_request:
+    types: [synchronize, labeled, reopened]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: profiling-iteration-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    if: contains(github.event.pull_request.labels.*.name, 'profiling-iterate') && (github.event.action != 'labeled' || github.event.label.name == 'profiling-iterate')
+    name: Linux / CPU fallback regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - name: Repeat the CPU fallback regression
+        run: |
+          for trial in 1 2 3 4 5; do
+            python -m pytest -q tests/test_profile_sampler.py::test_without_a_per_thread_clock_the_process_cpu_goes_to_the_test_thread || exit 1
+          done
+  macos:
+    if: contains(github.event.pull_request.labels.*.name, 'profiling-macos') && (github.event.action != 'labeled' || github.event.label.name == 'profiling-macos')
+    name: macOS / recorded timeline regression
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - uses: actions/download-artifact@v4
+        with:
+          name: failed-tests-macOS-py3.13
+          path: .prior-failures
+          repository: ${{ github.repository }}
+          run-id: 33955994789
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run recorded failures only
+        env:
+          TARGET_TESTS_FILE: .prior-failures/failed-tests.txt
+        run: python .github/scripts/run_targeted_tests.py
+  windows:
+    if: contains(github.event.pull_request.labels.*.name, 'profiling-iterate') && (github.event.action != 'labeled' || github.event.label.name == 'profiling-iterate')
+    name: Windows / sampler regressions and qualification
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e '.[test]'
+      - name: Focused sampler and analysis regressions
+        env:
+          TARGET_TESTS: |
+            tests/test_profile_sampler.py
+            tests/test_profile_analysis.py
+            tests/test_probes.py::test_resident_memory_is_measurable_on_every_supported_platform
+            tests/test_probes.py::test_psapi_answers_without_psutil
+            tests/test_probes.py::test_windows_rss_falls_back_if_native_read_fails
+            tests/test_probes.py::test_windows_description_reads_os_once_without_querying_processor
+            tests/test_setup_contract.py::test_clean_controller_does_not_load_failure_specific_models
+            tests/test_models.py
+        run: python .github/scripts/run_targeted_tests.py
+      - name: Detection and overhead
+        if: success() || failure()
+        run: |
+          New-Item -ItemType Directory -Force readiness
+          python benchmarks/profile_gate.py | Tee-Object readiness/overhead.json
+          exit $LASTEXITCODE
+      - name: Native attribution diagnostic (accepted limitation)
+        if: success() || failure()
+        run: python benchmarks/readiness_gate.py native --native-diagnostic --output readiness/native.json
+      - name: Explain instrumentation startup and recording costs
+        if: success() || failure()
+        run: python benchmarks/instrumentation_cost.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profiling-iteration-windows
+          path: readiness/
+          retention-days: 14

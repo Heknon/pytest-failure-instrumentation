@@ -310,7 +310,7 @@ def test_the_reporter_needs_no_witness_at_all(runner):
     assert controller.worker == "controller"
     assert controller.verdict == "UNKNOWN"
     assert controller.killer is None
-    assert any(line.startswith("kill witnesses:") for line in controller.evidence)
+    assert any(line.startswith("Kill witnesses:") for line in controller.evidence)
 
 
 @posix_only

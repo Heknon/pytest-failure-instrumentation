@@ -14,6 +14,28 @@ is caught in development rather than writing a column nobody reads.
 
 Nothing here is imported by the worker-side capture path. Pydantic is loaded on
 the controller, and only once something has already died.
+
+**How an incident reads.** ``str(incident)`` is the alert text, and every kind
+renders to the same shape, which is the convention the whole package holds to:
+
+1. The first line says what happened, in words, specific to this instance -
+   which worker, which test, which signal, which function - and ends with a
+   tag ``[kind VERDICT, owner, severity]`` (plus ``run-ending`` when it is)
+   for grepping and routing. Never a field dump.
+2. If no stack named anybody and the owner is a lead from a test's file, one
+   line says so: ``No stack was captured; the owner is taken from ...``.
+3. Every line after that is exactly one of three things: a **measurement**
+   (what was observed, with its source when that matters), what that
+   measurement **means by construction** (what follows from how it was taken,
+   or from a fact about the runtime, the OS or xdist), or a **place to look**
+   (``Look at:`` a file, line, test, setting or flag). Nothing guesses at a
+   cause in the user's code and nothing prescribes a fix to it, because the
+   analysis is arithmetic over evidence and knows neither. Several numbers go
+   on one ``Measured:`` line at the end, labelled.
+
+Sentences are short, start with a capital and end with a full stop; there is
+no field vocabulary (``in flight``, ``beat``), no argument for the finding,
+and nothing said twice. ``tests/test_message_convention.py`` holds the shape.
 """
 
 from __future__ import annotations
@@ -42,6 +64,10 @@ class Frame(BaseModel):
 
     def __str__(self) -> str:
         return f"{Path(self.file).name}:{self.line} in {self.function}"
+
+    def named(self) -> str:
+        """``function (file.py:line)``, the way a location reads in a sentence."""
+        return f"{self.function} ({Path(self.file).name}:{self.line})"
 
 
 class CgroupMemory(BaseModel):
@@ -162,9 +188,9 @@ class Incident(BaseModel):
         return None
 
     def suspect_basis_for(self, path: str) -> str:
-        """Why that test points at whoever it points at. A guess has to say
-        what kind of guess it is."""
-        return f"owner of the test in flight ({path})"
+        """Where the lead came from, as a noun phrase that completes "the
+        owner is taken from ...". A guess has to say what kind of guess it is."""
+        return f"the test that was running, {path}"
 
     def fingerprint_parts(self) -> list[str]:
         """What makes this incident the same incident as another one.
@@ -176,26 +202,47 @@ class Incident(BaseModel):
 
     # -- rendering -------------------------------------------------------
 
-    def details(self) -> list[str]:
-        """The kind's own facts, one line each. Overridden per kind."""
-        return []
+    def summary(self) -> str:
+        """What happened, in words, specific to this instance. Overridden per
+        kind; the base wording is for an incident whose builder failed."""
+        if self.verdict == "INSTRUMENTATION_FAILED":
+            return (
+                f"The instrumentation failed while building a {self.kind.replace('_', ' ')} "
+                f"incident for {self.worker}"
+            )
+        return f"{self.kind.replace('_', ' ')} {self.verdict} on {self.worker}"
+
+    def tag(self) -> str:
+        parts = [f"{self.kind} {self.verdict}", self.owner, self.severity]
+        if self.run_ending:
+            parts.append("run-ending")
+        return "[" + ", ".join(parts) + "]"
 
     def headline(self) -> str:
-        line = (
-            f"[{self.kind}] {self.verdict}  severity={self.severity}  "
-            f"owner={self.owner}"
-        )
-        return line + "  run-ending" if self.run_ending else line
+        return f"{self.summary()}   {self.tag()}"
+
+    def details(self) -> list[str]:
+        """Lines derived from structured fields at render time - a table of
+        variants, say. Most kinds put everything in ``evidence`` instead."""
+        return []
+
+    def location_line(self) -> Optional[str]:
+        """The lead that stands in for a stack, when there was no stack."""
+        if self.blamed_frame is None and self.suspect_owner:
+            return (
+                f"No stack was captured; the owner is taken from {self.suspect_basis} "
+                f"({self.suspect_owner})."
+            )
+        return None
 
     def __str__(self) -> str:
         """The alert body. One incident, readable without opening the record."""
         lines = [self.headline()]
-        if self.blamed_frame is not None:
-            lines.append(f"blamed on {self.blamed_frame}")
-        elif self.suspect_owner:
-            lines.append(f"no stack; suspect {self.suspect_owner} ({self.suspect_basis})")
+        location = self.location_line()
+        if location:
+            lines.append(location)
         lines.extend(self.details())
-        lines.extend(f"· {item}" for item in self.evidence)
+        lines.extend(self.evidence)
         return "\n    ".join(lines)
 
     # -- failure of the instrumentation itself ---------------------------
@@ -210,8 +257,8 @@ class Incident(BaseModel):
         end the customer's run.
         """
         evidence = [
-            f"the instrumentation failed while building this incident: {failure!r}",
-            "the facts below are all that survived; the underlying failure was real",
+            f"The instrumentation failed while building this incident: {failure!r}.",
+            "The facts below are all that survived; the underlying failure was real.",
         ]
         if context:
             evidence.append(context)
