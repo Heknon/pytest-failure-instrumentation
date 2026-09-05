@@ -73,3 +73,23 @@ workflows retain their own complete package matrix.
 
 Prefer the smallest targeted rerun while iterating, then pay for one complete
 cross-platform confirmation when the branch is actually ready to merge.
+
+## Profiling release qualification
+
+The `full-portability` label also starts the separate `Profile readiness`
+workflow. It measures two alternating baseline/profile pairs with 80 Linux
+workers and 2,400 synthetic I/O-heavy tests per run, and runs the existing
+overhead gate plus native CPU attribution probes on Windows/Python 3.12.
+This is intentionally on demand; do not add it to every-commit CI. Inspect
+both workflows and their preserved JSON/log artifacts before signing off.
+
+The 80-worker qualification budgets are at most 20% median elapsed overhead,
+10 GiB summed process RSS, and 30 seconds in controller session-finish hooks.
+Summed RSS double-counts shared pages and is sampled every half second. These
+are synthetic qualification thresholds, not application performance promises.
+Native probes require 70–130% of independently timed test-thread CPU to be
+attributed to its actual Python caller, for sustained and single native calls
+both holding and releasing the GIL. Failed single-call attribution must be
+reported as a limitation; do not force sampler ticks or loosen assertions to
+make a production claim pass. Allocation tracing remains separately opt-in
+and is outside these runtime budgets.
