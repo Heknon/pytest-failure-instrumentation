@@ -738,7 +738,9 @@ def test_a_worker_terminated_from_outside_names_its_killer_on_windows(distribute
         if inner.poll() is None:
             inner.kill()
     death = distributed.only(distributed.incidents(), "worker_death")
-    assert death.verdict == "KILLED_BY_PROCESS", output.decode("utf-8", "replace")
+    assert death.verdict == "KILLED_BY_PROCESS", (
+        output.decode("utf-8", "replace") + "\n" + death.model_dump_json(indent=2)
+    )
     assert death.killer is not None and death.killer.name == "TerminateProcess"
     assert death.killer.sender_pid == os.getpid()
     assert death.killer.exit_code == int(signal.SIGTERM)

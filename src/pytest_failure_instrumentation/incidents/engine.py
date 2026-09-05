@@ -817,10 +817,35 @@ class IncidentEngine:
         Kernel tracing never changes signal masks or handlers. Unavailable
         tracing is recorded on incidents rather than affecting cancellation.
         """
+        # The profiler will need these models at finish. Prepare them while
+        # Windows starts ETW in its separate interpreter, overlapping the
+        # two cold starts. All witness operations stay on the calling thread.
+        prepare = None
+        if signal_trace.IS_WINDOWS and self.settings.profile and self.settings.kill_trace:
+            try:
+                prepare = threading.Thread(
+                    target=self._prepare_profile_models,
+                    name="failure-instrumentation-profile-models", daemon=True,
+                )
+                prepare.start()
+            except Exception:  # noqa: BLE001 - fall back to ordinary lazy imports
+                prepare = None
         try:
             self._start_kill_witnesses_or_fail()
         except Exception as failure:  # noqa: BLE001 - see the docstring
             self.witness_status = f"off: failed ({failure!r})"
+        finally:
+            if prepare is not None:
+                prepare.join()
+
+    @staticmethod
+    def _prepare_profile_models() -> None:
+        try:
+            import importlib
+
+            importlib.import_module("pytest_failure_instrumentation.incidents.profile")
+        except Exception:  # noqa: BLE001 - reporting retains its normal error handling
+            pass
 
     def _start_kill_witnesses_or_fail(self) -> None:
         if not self.settings.kill_trace:

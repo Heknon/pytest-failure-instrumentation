@@ -364,8 +364,19 @@ def _from_trace(
 ) -> tuple[Optional[SignalRecord], list[SignalRecord]]:
     if pid is None or not sources.trace_path.exists():
         return None, []
+    fatal = -exit_status if exit_status is not None and exit_status < 0 else None
+
+    def ready(witness: signal_trace.Witness) -> bool:
+        if not witness.delivered or witness.target_pid != pid:
+            return False
+        if witness.at is not None and (witness.at > until or (since and witness.at < since)):
+            return False
+        return (witness.via == "TerminateProcess"
+                or (exit_status is None and witness.signal == 9)
+                or (fatal is not None and witness.signal == fatal))
+
     records: list[SignalRecord] = []
-    for witness in _settled(sources, pid):
+    for witness in _settled(sources, pid, ready):
         if not witness.delivered:
             continue
         if witness.at is not None and (witness.at > until or (since and witness.at < since)):
@@ -378,7 +389,6 @@ def _from_trace(
             continue
         records.append(_record(witness, roles, target, died_at, pid))
     mine = [record for record in records if record.target == "this worker"]
-    fatal = -exit_status if exit_status is not None and exit_status < 0 else None
     killer: Optional[SignalRecord] = None
     for record in reversed(mine):
         if record.name == "TerminateProcess":
@@ -394,7 +404,9 @@ def _from_trace(
     return killer, before
 
 
-def _settled(sources: Sources, pid: int) -> list[signal_trace.Witness]:
+def _settled(
+    sources: Sources, pid: int, ready: Optional[Callable[[signal_trace.Witness], bool]] = None,
+) -> list[signal_trace.Witness]:
     """The trace, once the line for this pid has had time to land.
 
     Polled by size rather than re-parsed: the file holds one line per SIGKILL
@@ -409,7 +421,11 @@ def _settled(sources: Sources, pid: int) -> list[signal_trace.Witness]:
     sources._trace_waited_at = time.monotonic()
     deadline = time.monotonic() + TRACE_SETTLE_SECONDS
     size = _size_of(sources.trace_path)
-    while not any(witness.target_pid == pid for witness in found) and time.monotonic() < deadline:
+    # A rejected call, old PID reuse, or a different signal is not the event
+    # we are waiting for. Such a row must not end settling before the actual
+    # termination reaches the file.
+    ready = ready or (lambda witness: witness.target_pid == pid and witness.delivered)
+    while not any(ready(witness) for witness in found) and time.monotonic() < deadline:
         time.sleep(TRACE_POLL_SECONDS)
         grown = _size_of(sources.trace_path)
         if grown == size:

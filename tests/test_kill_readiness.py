@@ -25,6 +25,54 @@ from .test_run_death_reporter import dead_run, payload_for
 posix = pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptors/signals")
 
 
+@pytest.mark.parametrize("trace_fails", [False, True])
+def test_windows_model_preparation_overlaps_tracing_and_finishes_before_return(monkeypatch, trace_fails):
+    from pytest_failure_instrumentation.incidents.engine import IncidentEngine
+
+    engine = object.__new__(IncidentEngine)
+    engine.settings = SimpleNamespace(profile=True, kill_trace=True)
+    monkeypatch.setattr(signal_trace, "IS_WINDOWS", True)
+    preparing, tracing, finished, timed_out = (threading.Event() for _ in range(4))
+    caller = threading.get_ident()
+
+    def prepare():
+        preparing.set()
+        if not tracing.wait(2):
+            timed_out.set()
+        finished.set()
+
+    def trace():
+        assert threading.get_ident() == caller
+        assert preparing.wait(2)
+        tracing.set()
+        if trace_fails:
+            raise OSError("ETW unavailable")
+
+    engine._prepare_profile_models = prepare
+    engine._start_kill_witnesses_or_fail = trace
+    engine._start_kill_witnesses()
+    assert finished.is_set() and not timed_out.is_set()
+    if trace_fails:
+        assert "ETW unavailable" in engine.witness_status
+
+
+def test_failed_preparation_thread_does_not_disable_tracing(monkeypatch):
+    from pytest_failure_instrumentation.incidents.engine import IncidentEngine
+
+    engine = object.__new__(IncidentEngine)
+    engine.settings = SimpleNamespace(profile=True, kill_trace=True)
+    monkeypatch.setattr(signal_trace, "IS_WINDOWS", True)
+    started = []
+    engine._start_kill_witnesses_or_fail = lambda: started.append(True)
+
+    def no_thread(_):
+        raise RuntimeError("thread limit")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    engine._start_kill_witnesses()
+    assert started == [True]
+
+
 def test_dump_only_faulthandler_is_not_a_terminating_deadline():
     config = SimpleNamespace(
         pluginmanager=SimpleNamespace(hasplugin=lambda _: False),
@@ -98,6 +146,24 @@ def test_old_sigterm_is_not_a_new_deaths_cause(tmp_path):
     found, before = killer._from_trace(killer.Sources(tmp_path, live=False), {}, 456, None,
                                      0., 1005., 1000.)
     assert found is None and before == []
+
+
+@pytest.mark.parametrize("first", [
+    {"wall": 99., "api_status": 0xC0000022},
+    {"wall": 1., "api_status": 0},
+])
+def test_trace_wait_does_not_end_on_rejected_or_stale_victim_records(tmp_path, monkeypatch, first):
+    trace = tmp_path / signal_trace.TRACE_FILE
+    common = {"via": "TerminateProcess", "target_pid": 456, "sender_pid": 123}
+    trace.write_text(json.dumps({**common, **first}) + "\n")
+
+    def deliver(_):
+        with trace.open("a") as stream:
+            stream.write(json.dumps({**common, "wall": 99., "api_status": 0}) + "\n")
+
+    monkeypatch.setattr(killer.time, "sleep", deliver)
+    found, _ = killer._from_trace(killer.Sources(tmp_path, live=True), {}, 456, 15, 90., 105., 100.)
+    assert found is not None and found.sender_pid == 123
 
 
 def test_cgroup_neighbour_is_not_this_victim(tmp_path, monkeypatch):
