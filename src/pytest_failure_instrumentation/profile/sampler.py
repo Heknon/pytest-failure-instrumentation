@@ -602,8 +602,12 @@ class Sampler:
         # objects. The initial kernel snapshot already covers those frames;
         # only a later change needs another discovery for an unknown ident.
         self._known_idents = frozenset(sys._current_frames())
-        self._all_tids = self.clock.discover()
-        self._discovered = True
+        if self.clock.source != "windows-thread-times":
+            self._all_tids = self.clock.discover()
+            self._discovered = True
+        # Windows already has clocks for every known Python thread. Its
+        # system-wide native-thread scan can run on the first sampler tick,
+        # rather than holding up the test thread before sampling even starts.
         self._last_clock = self.clock.read(self._tids_to_read())
         self._last_tick = time.monotonic()
         self._last_rss = self._rss()

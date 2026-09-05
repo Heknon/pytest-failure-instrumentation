@@ -782,9 +782,14 @@ def test_a_discovery_reuses_the_clocks_it_was_just_handed(source: str) -> None:
 
 
 @pytest.mark.parametrize("has_thread_objects", [True, False])
-def test_startup_discovery_is_reused_until_the_next_scheduled_tick(monkeypatch, has_thread_objects):
+@pytest.mark.parametrize("windows", [True, False])
+def test_startup_discovery_is_reused_until_the_next_scheduled_tick(monkeypatch, has_thread_objects, windows):
     sampler = Sampler(lambda row: None, lambda: 0)
     discoveries = []
+    if windows:
+        sampler.clock.source = "windows-thread-times"
+    else:
+        sampler.clock.source = "psutil"
     own = threading.get_native_id()
 
     def discover(known=None):
@@ -798,6 +803,7 @@ def test_startup_discovery_is_reused_until_the_next_scheduled_tick(monkeypatch, 
         monkeypatch.setattr(sampler, "_refresh_threads", lambda: None)
     try:
         sampler.start()
+        assert len(discoveries) == (0 if windows else 1)
         sampler._sample()
         assert len(discoveries) == 1
         sampler._ticks = sampling.DISCOVER_EVERY

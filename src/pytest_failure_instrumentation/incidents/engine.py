@@ -53,13 +53,12 @@ from ..config import SOLE_WORKER, Settings, advise
 from ..probes import signal_trace
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
-from . import leftovers, reporter, summary
-from .base import Incident
-from .enrich import enrich
+from . import leftovers, reporter
 from .leftovers import OWNER_FILE, prune_finished_runs
 
 if TYPE_CHECKING:
     from . import killer
+    from .base import Incident
 
 #: The environment variable that names this run's evidence directory, and the
 #: only value in this package that a person hands over and the filesystem then
@@ -570,6 +569,8 @@ class IncidentEngine:
     def _enrich(self, incident: Incident) -> None:
         """Everything that is the same whatever kind this is - see :mod:`.enrich`,
         which the sidecar's reporter shares with this."""
+        from .enrich import enrich
+
         enrich(incident, self.attributor, self.settings.product_version, self.run_id)
 
     # -- liveness --------------------------------------------------------
@@ -1501,16 +1502,21 @@ class IncidentEngine:
                 self._report_profile()
             except Exception as failure:  # noqa: BLE001 - a lost profile beats a lost run
                 print(f"[failure-instrumentation] profile analysis failed: {failure!r}", flush=True)
-        self.raise_incident(
-            summary.build(
-                exitstatus,
-                self.seen,
-                self.raised,
-                self.suppressed,
-                self.run_ending,
-                self.distributed,
+        # With no receivers, a summary has no observable work to do. Keep
+        # model validation imports off clean recording-only sessions.
+        if self.config.hook.pytest_failure_incident.get_hookimpls():
+            from . import summary
+
+            self.raise_incident(
+                summary.build(
+                    exitstatus,
+                    self.seen,
+                    self.raised,
+                    self.suppressed,
+                    self.run_ending,
+                    self.distributed,
+                )
             )
-        )
         self.schedule.close()
         # After the summary: nothing of this run's dies after it that anybody
         # would report, and a witness still up while the summary was being

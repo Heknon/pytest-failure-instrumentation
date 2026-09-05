@@ -71,6 +71,7 @@ jobs:
             tests/test_probes.py::test_windows_rss_falls_back_if_native_read_fails
             tests/test_probes.py::test_windows_description_reads_os_once_without_querying_processor
             tests/test_setup_contract.py::test_clean_controller_does_not_load_failure_specific_models
+            tests/test_setup_contract.py::test_clean_recording_without_an_incident_hook_does_not_load_models
             tests/test_models.py
             tests/test_kill_readiness.py
             tests/test_kill_attribution.py::test_the_etw_sidecar_witnesses_a_termination
