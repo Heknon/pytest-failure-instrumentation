@@ -52,9 +52,9 @@ jobs:
           New-Item -ItemType Directory -Force readiness
           python benchmarks/profile_gate.py | Tee-Object readiness/overhead.json
           exit $LASTEXITCODE
-      - name: Check native CPU attribution
+      - name: Native attribution diagnostic (accepted limitation)
         if: success() || failure()
-        run: python benchmarks/readiness_gate.py native --output readiness/native.json
+        run: python benchmarks/readiness_gate.py native --native-diagnostic --output readiness/native.json
       - name: Preserve measurements
         if: always()
         uses: actions/upload-artifact@v4

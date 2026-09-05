@@ -87,11 +87,16 @@ The 80-worker qualification budgets are at most 20% median elapsed overhead,
 10 GiB summed process RSS, and 30 seconds in controller session-finish hooks.
 Summed RSS double-counts shared pages and is sampled every half second. These
 are synthetic qualification thresholds, not application performance promises.
-Native probes require 70–130% of independently timed test-thread CPU to be
-attributed to its actual Python caller, for sustained and single native calls
-both holding and releasing the GIL. Failed single-call attribution must be
-reported as a limitation; do not force sampler ticks or loosen assertions to
-make a production claim pass. Allocation tracing remains separately opt-in
+The user accepted native-call attribution as an out-of-scope limitation on
+2026-09-05, including Python wrappers around GIL-holding native calls. Keep
+native probes visible as non-blocking diagnostics with `--native-diagnostic`.
+Their 70–130% attribution measurements and failed results must remain in the
+JSON and Actions summary; never report diagnostic success as native support.
+Unexpected probe errors still fail CI. Python detection, quiet-workload checks,
+all overhead/resource budgets, and full suites remain mandatory release gates.
+Do not add an external collector or per-call instrumentation to meet a native
+attribution guarantee that is no longer part of this release's contract.
+Allocation tracing remains separately opt-in
 and is outside these runtime budgets.
 
 ## Targeted profiling iteration

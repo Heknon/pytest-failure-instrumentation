@@ -1743,17 +1743,27 @@ the rest of the evidence, timeline included.
 
 ### What it cannot see
 
-Sampling from inside the process needs the GIL, so a native call that holds it
-delays the next sample. The weighting takes care of the *amount* — the whole
-delay is charged when the sampler next runs — but not always the *place*: a
-sample that arrives late is charged to the stack seen before it rather than
-the one after, on the grounds that the CPU was burnt between the two and the
-earlier one is inside that span. Late by one sample, never wrong about the
-total. The per-thread clock is a POSIX thread clock on Linux, `thread_info`
-on macOS and psutil's thread times on Windows, where they move in the
-scheduler's sixteen-millisecond ticks and sum correctly over a test. Where
-none answers, the process's CPU is charged to the test's thread and the
-summary says so. The live-heap reading that tells freed-but-mapped memory
+Reliable native-call attribution is outside the supported profiling contract.
+Sampling from inside the process needs the GIL. A native call that holds it
+can finish before the sampler observes its Python wrapper. CPU counters still
+measure the work on a surviving thread, but its cost may be assigned to a
+previous or subsequent sampled function. A Python function that mixes Python
+and native work has the same limitation during its native portions. GIL-releasing
+native calls are easier to sample, but exact native-call attribution is not
+guaranteed either. Use the profile to investigate Python hotspots and bursts;
+do not treat a missing native caller as evidence that it used no CPU.
+
+Per-thread clocks use POSIX thread clocks on Linux, `thread_info` on macOS,
+and `GetThreadTimes` on 64-bit Windows with psutil fallback. Windows counters
+are coarse against the sampling interval. Where per-thread clocks are
+unavailable, process CPU is charged to the test thread and the report says so.
+Threads that start and exit between samples can go unseen.
+
+The native qualification probe remains a visible, non-blocking diagnostic:
+its JSON preserves failed attribution measurements. Python detection, quiet
+workloads, overhead, resource budgets, and the full test suites remain release
+gates. This is an accepted limitation, not a claim that native attribution
+was repaired. The live-heap reading that tells freed-but-mapped memory
 from kept memory is glibc only; elsewhere what a test kept is its resident
 step alone.
 

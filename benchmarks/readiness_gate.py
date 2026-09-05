@@ -232,9 +232,22 @@ def native(args):
                                 "passed": 0.70 <= attributed / actual <= 1.30})
     failures = [f'{row["function"]}/{row["shape"]}/{row["trial"]}: coverage {row["coverage"]:.1%}'
                 for row in results if not row["passed"]]
+    diagnostic = args.native_diagnostic
+    limitation = "Native-call attribution is not guaranteed, including Python wrappers around GIL-holding calls."
     write_report(args.output, {"environment": environment(), "results": results,
-                               "failures": failures, "passed": not failures})
-    return int(bool(failures))
+                               "failures": failures, "passed": not failures,
+                               "release_blocking": not diagnostic, "limitation": limitation})
+    if diagnostic:
+        summary = ("Native attribution diagnostic (not a release gate): "
+                   f"{len(results) - len(failures)}/{len(results)} probes met the attribution range. "
+                   + limitation + "\n")
+        print(summary)
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+                handle.write(summary)
+                for failure in failures:
+                    handle.write(f"- {failure}\n")
+    return 0 if diagnostic else int(bool(failures))
 
 
 def main():
@@ -244,7 +257,11 @@ def main():
     parser.add_argument("--workers", type=int, default=80)
     parser.add_argument("--cases", type=int, default=2400)
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--native-diagnostic", action="store_true",
+                        help="Report native attribution limitations without gating release; execution errors still fail")
     args = parser.parse_args()
+    if args.native_diagnostic and args.mode != "native":
+        parser.error("--native-diagnostic requires native mode")
     args.output = args.output.resolve()
     return stress(args) if args.mode == "stress" else native(args)
 
