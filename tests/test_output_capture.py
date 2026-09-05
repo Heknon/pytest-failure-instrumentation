@@ -275,11 +275,11 @@ def test_capsys_is_untouched_being_sys_level(distributed):
 def test_capture_off_by_default_keeps_no_file(distributed):
     distributed.pytester.makepyfile(
         test_crash="""
-        import ctypes
+        import os
         def test_filler():
             assert True
         def test_crashes():
-            ctypes.CDLL(None).abort()
+            os.abort()
         """
     )
     incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)

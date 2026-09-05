@@ -144,7 +144,10 @@ def roles():
     return {999: killer.CONTROLLER, 4240: "gw0", 4241: "gw1", 4242: "gw2"}
 
 
-def test_the_fleet_table_says_it_was_pressure_across_workers():
+def test_the_fleet_table_says_it_was_pressure_across_workers(monkeypatch):
+    # This Linux log fixture was recorded with 4 KiB pages, independent of
+    # the machine reading it (macOS ARM runners use 16 KiB pages).
+    monkeypatch.setattr(kernel_log, "page_kb", lambda: 4)
     (kill,) = kernel_log.parse(lines(GLOBAL_OOM))
     record = killer._oom_record(kill, "pid", roles(), 4242, "kmsg", None)
     assert record.run_tasks == 3 and record.tasks_considered == 4
