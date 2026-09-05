@@ -189,6 +189,7 @@ jobs:
         run: >-
           pytest -q
           tests/test_probes.py
+          tests/test_resources.py
           tests/test_profile_sampler.py
           tests/test_stall_probe.py
           tests/test_exit_status.py

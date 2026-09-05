@@ -1709,6 +1709,171 @@ read another running as the same user at the same integrity level, so the
 descendant rule above simply does not apply. Reading an *elevated* process from
 an unelevated one needs `SeDebugPrivilege`.
 
+## Live resource history
+
+Resource history is an **opt-in, active-run feature**. It extends the existing
+live server without changing `/workers`, `/stack`, incidents, or worker-sample
+hooks. It collects even when no browser is connected. It requires neither
+profiling nor an installed host service.
+
+```ini
+[pytest]
+addopts = --failure-instrumentation
+failure_stack_server = true
+failure_resources_seconds = 5
+failure_resources_max_mb = 256
+# Optional: only these trees are inventoried. Never scan an entire drive.
+failure_resources_roots =
+    test-output
+    downloads
+failure_resources_scan_seconds = 60
+failure_resources_max_files = 50000
+```
+
+The equivalent programmatic settings are `resources_seconds`,
+`resources_max_mb`, `resources_roots`, `resources_scan_seconds`, and
+`resources_max_files`. They belong to the controller and are not handed to
+xdist workers. The default interval is **0 (disabled)**, including when the
+callstack server is enabled. Positive intervals have a one-second minimum.
+Installing the plugin still requires the normal enable switch or `install()`.
+
+### What is collected
+
+| Scope | Measurements | Timing |
+|---|---|---|
+| Visible OS | CPU, available/total RAM, swap, paging; supported native counters below | Resource interval, normally 5 seconds |
+| Controller, workers, observed descendants | CPU time/rate, RSS, supported private commit/footprint, I/O, threads, handles/FDs | Resource interval |
+| Surrounding processes | Up to ten largest RSS consumers and ten CPU consumers; names, identities and parent PIDs | 15 seconds |
+| Linux cgroup | Resolved membership, memory limits/usage, OOM events, CPU quota/throttling, supported pressure | Resource interval |
+| Disks | Supported throughput, operation and timing counters; derived read/write latency when available | Resource interval |
+| Relevant volumes | Free/used/total space, deduplicated by device | 30 seconds, in the helper |
+| Configured directories | Logical file sizes/counts, new remaining files, growth, removed baseline paths and largest growth | Initial incremental baseline; repeat 60 seconds after a scan completes |
+| Events | Observed process arrival/disappearance and links to existing deduplicated incidents | Included in the next resource batch |
+
+Windows adds **system commit/headroom, kernel pools, handle/thread/process
+counts**, and PDH counters for paging, disk queues/latency and processor queue.
+Counter names are added through the English PDH API, independent of the OS
+UI language. Linux reads procfs PSI and VM counters, and discovers cgroup v2
+or v1 through membership and mount information. macOS adds Mach VM
+paging/compression and libproc process footprint/I/O. No shell command is
+launched per measurement and no process is suspended.
+
+These are different quantities: `private_commit_bytes` (Windows),
+`physical_footprint_bytes` (macOS), and `rss_bytes` are not interchangeable.
+RSS totals can double-count shared pages. Linux detailed USS/PSS heap-map
+walks are not performed. Process I/O accounting follows the OS API: it is
+not necessarily physical-disk traffic. Disk latency is the counter interval's
+average, not a percentile. Paging does not imply every fault required swap.
+Unsupported counters appear in `unavailable`; an unlimited cgroup limit is
+null without an unavailable reason. A first rate sample or reset is null.
+
+The scope is the **visible OS/process namespace**, not an inaccessible outer
+Windows/macOS host when pytest runs inside a VM/container. On Linux with an
+ancestor's procfs mount, `pid_scope=procfs` identifies the counter PID namespace
+and `pytest_pid` separately names the collector in pytest's namespace.
+Ownership is associated while a parent relationship is observable and retained
+through reparenting. Five-second sampling can miss short spikes; the slower
+process inventory can miss short-lived descendants. Process disappearance is
+an observation, not an invented exit code. Existing kill-attribution incidents
+remain the source of termination verdicts. This feature does not add Docker
+API access, OS log subscriptions, stack reads, allocation tracing, automatic
+file deletion, or networking diagnosis.
+
+### Reading from the current live server
+
+Use the `session` returned by `/workers`; it is mandatory because multiple
+runs on a shared server can each have a worker named `gw0`.
+
+```text
+GET /resources?session=run-abc&latest=true
+GET /resources?session=run-abc&after=0&limit=120
+GET /resources?session=run-abc&worker=gw0&from=1788600000&to=1788600300
+```
+
+Authentication and host checks are identical to `/workers`. Responses have
+`schema_version=1`, run/platform metadata, retained sequence bounds and
+`batches`. Each batch contains `sequence`, `observed_at`, `elapsed_s`, `host`,
+`cgroup`, `disks`, `processes`, `consumers`, `files`, `events`, and `collector`.
+Measurements carry `metrics` and `unavailable` maps; units are in metric names.
+CPU rates use cores (`1.0` is one fully occupied core); host `cpu_percent`
+normalizes against logical CPUs. Cgroup CPU quota remains a separate limit.
+Descendants include `worker_exited` when their observed worker is no longer
+present. This does not automatically diagnose a leaked process.
+
+`after` is an exclusive sequence cursor. Continue with `next_after` while
+`has_more` is true, or pass it on the next poll. `limit` is 1–500 batches;
+responses also have a roughly 2 MiB payload budget. Time bounds are Unix
+seconds, inclusive. `worker` filters process/event rows while preserving shared
+host conditions; it never changes collection. `latest=true` returns the newest
+published batch. There is no lossy downsampling: the client can fetch bounded
+pages without losing sampled peaks. Distinguish sampling resolution from a
+promise to catch every instantaneous peak.
+
+`history_truncated` says the start of the run was rotated out. `cursor_expired`
+says a nonzero cursor predates retained history. Missing intervals remain
+missing. Disabled, finished or unknown sessions return 404; invalid ranges
+return 400; unavailable/busy readers return 503. At most two resource queries
+are processed concurrently. Reads never start probes or file scans.
+
+```python
+from pytest_failure_instrumentation.client import FailureServerClient
+
+async with FailureServerClient(url=server_url, token=token) as client:
+    page = await client.resources(session, worker="gw0", latest=True)
+    for sample in page.batches:
+        print(sample.host.metrics, sample.processes)
+```
+
+### File tracking and bounded cost
+
+A single session-owned helper handles filesystem work so a slow directory or
+volume cannot block cheap resource samples or test hooks. It starts with the
+collector and is terminated at run end; it is not a service. With no configured
+roots it only queries relevant-volume space. Never enable remote/unreliable
+roots unless their measurement is needed.
+
+Directory walks yield after at most 500 entries or approximately 50 ms of
+work, then pause for 50 ms. A syscall itself can exceed that duration, which
+is why the helper has a bounded shutdown. Symlinks, Windows reparse points,
+and the plugin's evidence tree are excluded. Scans have an entry budget,
+counting directories as well as files; at most eight roots are accepted.
+Each disposable SQLite inventory has a 32 MiB database cap and a 1 MiB cache.
+Inventories compare **logical bytes by path**, not allocated disk blocks or
+hard-link-deduplicated storage. There is no per-test recursive scan.
+
+The initial baseline records its start/end timestamps. Tests keep running;
+this is not an atomic snapshot before the first test. Partial/error scans
+report observed counts, coverage and age, and do not infer deletions or exact
+baseline deltas. A scan does not overlap its next scan. Live updates include
+`scanning`, `complete`, `partial`, `failed` or `excluded` status; each completed
+scan includes the top 20 growing paths (path display capped at 1,024 characters).
+Paths remain associated with a **shared directory**, not confidently blamed
+on whichever parallel test happened to be running. Expected fixture/session
+retention must be considered before calling remaining files a leak.
+
+Numeric history uses rotating JSONL segments on local disk, not an in-memory
+list growing with run length. The history budget is separate from optional
+file inventories and small manifests. At most 512 processes are tracked and
+8,192 are considered during an inventory; truncation is explicit. Collection
+duration, errors, missed intervals and dropped event counts are recorded.
+There is one controller sampling thread and one filesystem helper per enabled
+session, rather than a sampler in each xdist worker. Multiple controllers keep
+separate histories; their host counters must not be summed.
+
+Normal shutdown deletes **only resource history/inventories**, preserving
+existing incident evidence. Pytest cleanup is an idempotent fallback. After
+an abrupt process/host death, a subsequent run removes abandoned live-resource
+files when the existing owner checks establish that the owner is dead, even
+if unreported incident evidence must remain. There is no archive, upload,
+post-run endpoint or promise that a stopped process can delete its own files.
+Python buffers are flushed per batch; this is not an fsync durability guarantee.
+
+All collection adds some work when enabled. Benchmark on representative
+workloads before selecting intervals or making test-duration/RAM guarantees.
+The default off path does not import or start the resource collector. A
+single-process pytest run can still stop its sampling thread by holding the
+GIL; this feature does not change the existing native-GIL limitation.
+
 ## Profiling
 
 Everything above waits for something to go wrong. `--failure-profile` waits for
@@ -2222,6 +2387,11 @@ accepted and inert.
 | `failure_capture_output` | `false` | Keep the last few KB of each worker's captured stderr, so a native crash message survives the kill that swallows it. See [What the worker last said](#what-the-worker-last-said) |
 | `failure_on_run_death` | — | A dotted path `package.module:attribute` to a callable the sidecar calls with each incident of a run whose controller was killed, so a killed run is reported at once. From Python, `install(config, on_run_death=functools.partial(...))`. See [Reporting a killed run from the sidecar](#reporting-a-killed-run-from-the-sidecar) |
 | `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
+| `failure_resources_seconds` | `0` | Live resource sample interval; off by default, minimum 1 second when enabled |
+| `failure_resources_max_mb` | `256` | Numeric live-history disk budget in MiB, clamped to 8–1024 |
+| `failure_resources_roots` | empty | Explicit directory inventory roots, at most eight |
+| `failure_resources_scan_seconds` | `60` | Delay after each directory scan, minimum 10 seconds |
+| `failure_resources_max_files` | `50000` | Entry budget per directory scan, clamped to 100–100000 |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
