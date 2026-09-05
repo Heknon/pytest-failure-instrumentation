@@ -25,6 +25,35 @@ When a specific macOS or Windows test fails:
 4. If the unchanged commit may simply have encountered runner noise, use
    GitHub's native **Re-run failed jobs** instead of creating a new commit.
 
+### AI-triggered reruns
+
+An agent with GitHub access should normally use the PR comment interface after
+it pushes a fix:
+
+```text
+/ci-rerun-failed run=33954455785 platform=macos python=3.13
+```
+
+Use the numeric ID of the failed source run, the platform that failed, and the
+same Python version as its artifact. `.github/workflows/rerun-failed.yml`
+accepts the command only on a pull request and only from a repository owner,
+member or collaborator. Before starting the paid runner it verifies the exact
+command grammar, confirms that the source run failed, confirms that its
+platform-specific artifact exists and has not expired, and resolves the
+current PR head SHA. The target job checks out that SHA without persisting Git
+credentials and runs only the recorded node IDs.
+
+After posting the command, poll the `Rerun failed tests` workflow rather than
+posting the command again. Read its job status and logs until it completes. If
+it fails, use the new run's `failed-tests-*` artifact for the next fix. Do not
+trigger duplicate paid jobs while one is queued or running.
+
+The comment workflow is defined on the default branch, as required for an
+`issue_comment` trigger. It becomes available after this CI tooling is merged;
+until then, use the reduced per-commit platform smoke jobs or GitHub's native
+failed-job rerun. The manual `Portability` interface also becomes dispatchable
+once its workflow definition exists on the default branch.
+
 For local iteration, run `pytest --lf` to execute only failures remembered in
 `.pytest_cache`, or `pytest --ff` to put remembered failures first and then run
 the rest. Do not delete `.pytest_cache` while investigating a failure.
