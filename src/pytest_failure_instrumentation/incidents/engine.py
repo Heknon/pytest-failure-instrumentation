@@ -52,7 +52,7 @@ from ..analysis.collection import CollectionTracker
 from ..config import SOLE_WORKER, Settings, advise
 from ..registration import RECORDER_NAME
 from ..schedule import ScheduleTracker, worker_of
-from . import collection, death, internal_error, leftovers, stall, summary
+from . import leftovers, summary
 from .base import UNSET_RUN_ID, Capabilities, Incident, frame_from
 from .leftovers import OWNER_FILE, prune_finished_runs
 
@@ -622,6 +622,8 @@ class IncidentEngine:
                 try:
                     self._assess_stall(worker, silent_for)
                 except Exception as failure:  # noqa: BLE001
+                    from . import stall
+
                     with self.lock:
                         self.stalled.add(worker)
                     self.raise_incident(
@@ -629,6 +631,8 @@ class IncidentEngine:
                     )
 
     def _assess_stall(self, worker: str, silent_for: float) -> None:
+        from . import stall
+
         incident = stall.build(
             worker,
             self.directory,
@@ -1082,6 +1086,8 @@ class IncidentEngine:
         if waiting:
             return
         self.reported_mismatch = True
+        from . import collection
+
         try:
             incident: Incident = collection.build(
                 self.collections, self.directory, complete=not partial
@@ -1114,6 +1120,8 @@ class IncidentEngine:
         self._record_schedule()
         if not error:
             return  # a clean shutdown is not an incident
+        from . import death
+
         try:
             incident: Incident = death.build(
                 node, error, self.directory, self.baseline_oom_kills, self.run_id
@@ -1125,6 +1133,8 @@ class IncidentEngine:
         self.raise_incident(incident)
 
     def pytest_internalerror(self, excrepr: object) -> None:
+        from . import internal_error
+
         try:
             incident: Incident = internal_error.build(
                 excrepr,

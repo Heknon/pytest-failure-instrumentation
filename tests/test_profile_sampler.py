@@ -781,6 +781,29 @@ def test_a_discovery_reuses_the_clocks_it_was_just_handed(source: str) -> None:
     assert clock.discover() and reads == 1, "and without them it still answers"
 
 
+def test_startup_discovery_is_reused_until_the_next_scheduled_tick(monkeypatch):
+    sampler = Sampler(lambda row: None, lambda: 0)
+    discoveries = []
+    own = threading.get_native_id()
+
+    def discover(known=None):
+        discoveries.append(known)
+        return [own]
+
+    monkeypatch.setattr(sampler.clock, "discover", discover)
+    monkeypatch.setattr(sampler.clock, "read", lambda tids: {own: 0})
+    monkeypatch.setattr(sampler._thread, "start", lambda: None)
+    try:
+        sampler.start()
+        sampler._sample()
+        assert len(discoveries) == 1
+        sampler._ticks = sampling.DISCOVER_EVERY
+        sampler._sample()
+        assert len(discoveries) == 2
+    finally:
+        sampler.stop()
+
+
 def test_windows_clock_closes_handles_on_failed_reads() -> None:
     import ctypes
     from types import SimpleNamespace

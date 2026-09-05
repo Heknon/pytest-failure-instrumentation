@@ -35,11 +35,12 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .. import probes
-from . import death
-from .death import WorkerDeathIncident
+
+if TYPE_CHECKING:
+    from .death import WorkerDeathIncident
 
 #: Written at the top of each run's own directory, and the only thing that
 #: makes a directory this plugin's to read or to delete. Matching on file
@@ -140,6 +141,8 @@ def _deaths_in(directory: Path) -> list[WorkerDeathIncident]:
     # kernel has since handed to something else would answer "alive" and
     # suppress a real report - which is the failure mode that costs a reader
     # the one incident they were waiting for.
+    from . import death
+
     incidents = []
     for events in sorted(directory.glob("*.events")):
         incident = death.recover(events, session=directory.name)

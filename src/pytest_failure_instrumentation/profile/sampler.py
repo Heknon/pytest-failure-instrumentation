@@ -550,6 +550,7 @@ class Sampler:
         #: Every tid the kernel listed at the last discovery, and the names
         #: of the ones Python has no thread object for.
         self._all_tids: list[int] = []
+        self._discovered = False
         self._native_names: dict[int, str] = {}
         #: The stack each thread was last seen busy in, stamped with the tick
         #: it was seen on - see LATE_TICK_FACTOR. The stamp is what keeps a
@@ -598,6 +599,7 @@ class Sampler:
             return  # already running; a second start would raise
         self._refresh_threads()
         self._all_tids = self.clock.discover()
+        self._discovered = True
         self._last_clock = self.clock.read(self._tids_to_read())
         self._last_tick = time.monotonic()
         self._last_rss = self._rss()
@@ -855,8 +857,15 @@ class Sampler:
         # is not done for every thread that comes and goes: only for one of
         # those, or on the schedule that finds a C extension's pool.
         unknown = changed and any(ident not in self._threads for ident in idents)
-        if unknown or self._ticks % DISCOVER_EVERY == 0:
+        # start() already took the initial system-wide snapshot. Repeating
+        # it on tick zero is particularly costly on Windows. A sampler used
+        # synchronously without start() still discovers on its first tick.
+        discovery_due = self._ticks % DISCOVER_EVERY == 0 and (
+            self._ticks > 0 or not self._discovered
+        )
+        if unknown or discovery_due:
             self._all_tids = self.clock.discover(clocks)
+            self._discovered = True
             missing = [tid for tid in self._all_tids if tid not in clocks]
             if missing:
                 clocks.update(self.clock.read(missing))
