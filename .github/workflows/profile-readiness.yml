@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: profile-readiness-${{ github.ref }}
+  group: profile-readiness-${{ github.ref }}-${{ github.event.label.name != 'full-portability' && github.event.label.name || 'active' }}
   cancel-in-progress: true
 
 jobs:

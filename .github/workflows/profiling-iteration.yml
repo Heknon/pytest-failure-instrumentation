@@ -6,7 +6,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: profiling-iteration-${{ github.ref }}
+  group: profiling-iteration-${{ github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'profiling-iterate' && github.event.label.name != 'profiling-macos' && github.event.label.name || 'active' }}
   cancel-in-progress: true
 jobs:
   linux:
@@ -72,6 +72,9 @@ jobs:
             tests/test_probes.py::test_windows_description_reads_os_once_without_querying_processor
             tests/test_setup_contract.py::test_clean_controller_does_not_load_failure_specific_models
             tests/test_models.py
+            tests/test_kill_readiness.py
+            tests/test_kill_attribution.py::test_the_etw_sidecar_witnesses_a_termination
+            tests/test_kill_attribution.py::test_a_worker_terminated_from_outside_names_its_killer_on_windows
         run: python .github/scripts/run_targeted_tests.py
       - name: Detection and overhead
         if: success() || failure()

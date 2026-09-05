@@ -468,8 +468,9 @@ class SignalTracer:
         if IS_WINDOWS:
             session = f"{INSTANCE_PREFIX}{os.getpid()}"
             command = [
-                sys.executable, "-c",
-                "from pytest_failure_instrumentation.probes.etw_trace import main; main()",
+                # This helper is stdlib-only. Importing it through the package
+                # would load pytest and psutil in a second interpreter first.
+                sys.executable, "-I", "-S", str(Path(__file__).with_name("etw_trace.py")),
                 session, str(self.output), mode,
             ]
             # No console window of its own, and no share in this one's
@@ -528,7 +529,7 @@ class SignalTracer:
                 return False
             if header(self.output) is not None:
                 return True
-            time.sleep(0.05)
+            time.sleep(0.01)
         return False
 
     def stop(self) -> None:

@@ -316,3 +316,19 @@ def test_reporter_deadline_covers_blocked_input_and_reaps_child(tmp_path, monkey
     assert len(children) == 1
     assert children[0].poll() is not None
     assert "TimeoutExpired" in (tmp_path / "reporter.log").read_text()
+
+
+
+def test_etw_sidecar_runs_without_the_package_or_site_dependencies(tmp_path):
+    import subprocess
+
+    from pytest_failure_instrumentation.probes import etw_trace
+
+    output = tmp_path / "trace"
+    completed = subprocess.run(
+        [sys.executable, "-I", "-S", etw_trace.__file__, "test-session", str(output), "watch"],
+        input=b'{"stop": true}\n', capture_output=True, timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr.decode()
+    assert json.loads(output.read_text())["mode"] == "watch"
+    assert not (tmp_path / "reporter.log").exists()
