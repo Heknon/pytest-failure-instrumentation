@@ -14,6 +14,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  profile-performance:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
+    name: profiler accuracy + overhead
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Gate profiler detection and overhead
+        run: python benchmarks/profile_gate.py
+
   lint:
     # Cheap, and it fails first. The source carries `# noqa` and `# type:
     # ignore` markers, which are only worth writing if something checks them.
@@ -46,23 +68,18 @@ jobs:
         run: mypy
 
   test:
-    # The probes are platform code - procfs, psapi, waitid, GetExitCodeProcess,
-    # cgroup counters - and the Windows and macOS paths cannot be exercised on
-    # a Linux runner at all. That is the whole reason this matrix exists.
-    name: ${{ matrix.os }} / py${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
+    # Linux is the full PR gate. Python 3.9 is exercised with the declared
+    # minimum dependencies below, while 3.12 is used by the performance,
+    # no-xdist and wheel jobs. Multiplying every Python version by every OS
+    # made each small fix buy two complete, thirteen-minute macOS runs.
+    name: ubuntu-latest / py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.9", "3.11", "3.13"]
-        exclude:
-          # setup-python has no 3.9 build for the arm64 macOS runners, and the
-          # x86_64 macos-13 runners that had one are retired - a job asking for
-          # them queues forever. 3.9 is covered on Linux and Windows.
-          - os: macos-latest
-            python-version: "3.9"
+        python-version: ["3.11", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +114,6 @@ jobs:
       # makes them work on a real user's machine. Set here rather than
       # assumed, and the tests report the value they observed either way.
       - name: Restrict ptrace the way a stock Linux box does
-        if: runner.os == 'Linux'
         run: |
           sudo sysctl -w kernel.yama.ptrace_scope=1
           cat /proc/sys/kernel/yama/ptrace_scope
@@ -122,9 +138,77 @@ jobs:
       # one process, so an ordering bug between two tests still has three
       # places to show itself.
       - name: Test
-        run: pytest -q ${{ runner.os == 'Linux' && '-n 4' || '' }}
+        id: tests
+        run: pytest -q -n 4
+
+      - name: Export failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        run: python .github/scripts/export_failed_tests.py
+
+      - name: Preserve failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-tests-Linux-py${{ matrix.python-version }}
+          path: .test-results/failed-tests.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+  platform-smoke:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
+    # Keep a real runner for each non-Linux implementation on every PR, but
+    # exercise only the modules that talk directly to that OS. The complete
+    # suite still runs in portability.yml weekly and on demand before merge.
+    name: ${{ matrix.os }} / platform smoke
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Show what this machine can measure
+        run: |
+          python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
+
+      - name: Test platform-facing code
+        id: tests
+        run: >-
+          pytest -q
+          tests/test_probes.py
+          tests/test_profile_sampler.py
+          tests/test_stall_probe.py
+          tests/test_exit_status.py
+          tests/test_crash_dump_race.py
+
+      - name: Export failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        run: python .github/scripts/export_failed_tests.py
+
+      - name: Preserve failed test IDs
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-tests-${{ runner.os }}-py3.13
+          path: .test-results/failed-tests.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   oldest-supported:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # pyproject declares pytest>=7.0 and python>=3.9. Everything else in this
     # workflow installs whatever is newest, so the floor is a claim nothing
     # runs - and a hook signature or an ini type that only exists in a later
@@ -150,6 +234,7 @@ jobs:
         run: pytest -q
 
   without-xdist:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # Two of the five kinds are not distributed problems, and the plugin has to
     # register without xdist installed - where pytest_testnodedown has no
     # hookspec at all, and an unspecced hookimpl is a registration error.
@@ -174,6 +259,7 @@ jobs:
         run: pytest -q
 
   wheel:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # The one thing no other job here can see. Every one of them installs the
     # source tree, so a test that reads a file from beside the package - or a
     # file the wheel does not ship at all - passes on a checkout and fails

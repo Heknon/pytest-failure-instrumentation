@@ -16,7 +16,7 @@ hooks are, so none of them can collide with anyone else's.
         alerts.send(str(incident))
 
 ``incident`` is a pydantic model, one class per kind, discriminated on
-``incident.kind``. All six are raised:
+``incident.kind``. All of them are raised:
 
 ========================= ==================================================== =============
 ``worker_death``          ``incidents.death.WorkerDeathIncident``               needs xdist
@@ -25,7 +25,17 @@ hooks are, so none of them can collide with anyone else's.
 ``internal_error``        ``incidents.internal_error.InternalErrorIncident``    any run
 ``run_summary``           ``incidents.summary.RunSummaryIncident``              any run
 ``stack_server_unavailable`` ``incidents.stack_server.StackServerIncident``     live view on
+``cpu_hotspot``           ``incidents.profile.CpuHotspotIncident``              profiling on
+``cpu_burst``             ``incidents.profile.CpuBurstIncident``                profiling on
+``memory_profile``        ``incidents.profile.MemoryProfileIncident``           profiling on
 ========================= ==================================================== =============
+
+The last three are findings rather than failures. With ``--failure-profile`` or
+``failure_profile`` on, the process running the tests samples every thread's
+stack and CPU for the whole run, and at the end the functions that burnt the
+CPU, the stretches where a core was held, and the tests that kept the memory
+arrive here - informational whoever owns them, because nothing went wrong.
+See :mod:`.profile`.
 
 Three of them reach no pytest hook of their own, which is why they need a
 source of their own: a stall is polled for, because the absence of anything

@@ -47,6 +47,30 @@ def wait_for(read, timeout: float = 10.0):
 # -- what this machine can measure ---------------------------------------
 
 
+def test_windows_description_reads_os_once_without_querying_processor(monkeypatch):
+    from pytest_failure_instrumentation.probes import platform_flags
+
+    calls = []
+
+    def os_version():
+        calls.append("os")
+        return "2025Server", "10.0.26100", "SP0", "Multiprocessor Free"
+
+    def unused_processor_query():
+        pytest.fail("Windows OS description must not query the processor")
+
+    monkeypatch.setattr(platform_flags, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform_flags.platform, "win32_ver", os_version)
+    monkeypatch.setattr(platform_flags.platform, "platform", unused_processor_query)
+    platform_flags.platform_description.cache_clear()
+    try:
+        for _ in range(3):
+            assert platform_flags.platform_description() == "Windows-2025Server-10.0.26100-SP0"
+        assert calls == ["os"]
+    finally:
+        platform_flags.platform_description.cache_clear()
+
+
 def test_resident_memory_is_measurable_on_every_supported_platform():
     """A missing figure is reported as unmeasurable rather than as fine, so an
     always-unavailable probe would be honest and useless at the same time."""
@@ -320,3 +344,80 @@ def test_the_two_liveness_questions_disagree_about_a_stranger():
     """
     assert probes.is_running(os.getpid()) is True
     assert probes.is_own_child(os.getpid()) is False
+
+
+def test_a_libc_without_mallinfo2_is_looked_up_once_not_on_every_sample(monkeypatch):
+    """find_library spawns a subprocess. The profiler reads the heap twenty-five
+    times a second, so a libc that has no mallinfo2 - glibc before 2.33, musl -
+    must be asked once and remembered, not paid for on every tick."""
+    import ctypes.util
+
+    calls = []
+    monkeypatch.setattr(memory, "_libc", None)
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: calls.append(name) or None)
+
+    assert memory._mallinfo2() is None
+    assert memory._mallinfo2() is None
+    assert memory._mallinfo2() is None
+    assert calls == ["c"]
+    assert memory._libc is False
+
+
+def test_malloc_info_is_read_per_arena_and_the_process_totals_are_not_double_counted():
+    text = """<malloc version="1">
+<heap nr="0">
+<sizes>
+  <size from="49" to="49" total="49" count="1"/>
+</sizes>
+<total type="fast" count="2" size="1048576"/>
+<total type="rest" count="4" size="3145728"/>
+<system type="current" size="8388608"/>
+<system type="max" size="8388608"/>
+<aspace type="total" size="8388608"/>
+<aspace type="mprotect" size="8388608"/>
+</heap>
+<heap nr="1">
+<sizes>
+  <unsorted from="657" to="1541489" total="1542146" count="2"/>
+</sizes>
+<total type="fast" count="0" size="0"/>
+<total type="rest" count="3" size="62914560"/>
+<system type="current" size="67108864"/>
+<system type="max" size="67108864"/>
+<aspace type="total" size="67108864"/>
+<aspace type="mprotect" size="67108864"/>
+<aspace type="subheaps" size="1"/>
+</heap>
+<total type="fast" count="2" size="1048576"/>
+<total type="rest" count="7" size="66060288"/>
+<total type="mmap" count="3" size="610304"/>
+<system type="current" size="75497472"/>
+<system type="max" size="75497472"/>
+<aspace type="total" size="75497472"/>
+<aspace type="mprotect" size="75497472"/>
+</malloc>
+"""
+    figures = memory.parse_malloc_info(text)
+    assert figures == {"arenas": 2, "free_mb": 64, "main_free_mb": 4, "mapped_mb": 72}
+    assert memory.parse_malloc_info("<malloc version=\"1\">\n</malloc>\n") is None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="glibc only")
+def test_the_allocator_figures_are_read_from_this_process_where_glibc_answers():
+    figures, source = probes.allocator_figures()
+    if source == "unavailable":
+        pytest.skip("no malloc_info in this libc")
+    assert figures is not None
+    assert figures["arenas"] >= 1
+    assert set(figures) == {"arenas", "free_mb", "main_free_mb", "mapped_mb", "trim_mb"}
+    assert figures["main_free_mb"] <= figures["free_mb"]
+
+
+def test_windows_rss_falls_back_if_native_read_fails(monkeypatch):
+    monkeypatch.setattr(memory, "IS_LINUX", False)
+    monkeypatch.setattr(memory, "IS_WINDOWS", True)
+    monkeypatch.setattr(memory, "_windows_working_set", lambda: None)
+    monkeypatch.setattr(memory, "psutil", SimpleNamespace(
+        Process=lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=10485760))
+    ))
+    assert memory.resident_megabytes() == (10, "psutil")

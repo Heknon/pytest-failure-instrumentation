@@ -114,7 +114,7 @@ def test_native_code_holding_the_gil_is_frozen_not_blocked(distributed):
     stall = distributed.only(incidents, "worker_stall")
     assert stall.verdict == "STALLED_FROZEN"
     assert stall.heartbeat_age_seconds is not None
-    assert any("holding the GIL" in line for line in stall.evidence)
+    assert any("holds the GIL" in line for line in stall.evidence)
     # The stack is still obtained even though the GIL is held: faulthandler
     # dumps from a C timer thread that does not need it.
     assert stall.stack
@@ -217,7 +217,7 @@ def test_a_stall_with_the_watchdog_off_says_so_rather_than_guessing(distributed)
     # Nothing was measured, so nothing is reported as measured.
     assert stall.cpu_rate is None
     assert stall.heartbeat_age_seconds is None
-    assert any("never wrote a heartbeat" in line for line in stall.evidence)
+    assert any("No heartbeat was written" in line for line in stall.evidence)
     # The state file is written regardless of the watchdog, so the test in
     # flight is still known.
     assert stall.test_in_flight == "test_hang.py::test_deadlocks"
@@ -260,7 +260,7 @@ def test_the_stack_reason_names_the_setting_not_the_platform(distributed):
     # The watchdog dump is still there to read, so a stack is reported anyway
     # and the reason never has to be printed.
     assert stall.stack
-    assert "no stack:" not in str(stall)
+    assert "No stack:" not in str(stall)
 
 
 def test_a_sub_second_heartbeat_setting_does_not_manufacture_a_frozen_worker(distributed):
@@ -376,7 +376,7 @@ def test_a_stack_nobody_asked_for_says_when_it_was_taken(distributed):
     stall = distributed.only(incidents, "worker_stall")
     assert stall.stack and stall.stack_probed is False
     assert stall.stack_age_seconds is not None
-    assert "by the slow-test watchdog, not taken just now" in str(stall)
+    assert "Stack from the slow-test watchdog, written" in str(stall) and "not a picture of now" in str(stall)
 
 
 def test_a_worker_wedged_longer_than_the_cadence_has_a_stack(distributed):

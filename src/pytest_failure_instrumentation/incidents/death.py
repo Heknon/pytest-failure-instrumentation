@@ -180,28 +180,17 @@ class WorkerDeathIncident(Incident):
 
     def suspect_basis_for(self, path: str) -> str:
         if self.test_in_flight:
-            return f"owner of the test in flight ({path})"
+            return f"the test that was running, {path}"
         return (
-            f"owner of the last test this worker finished ({path}); the worker "
-            "died between tests, so no test was running"
+            f"the last test this worker finished, {path}; nothing was running "
+            "when it died"
         )
 
     def fingerprint_parts(self) -> list[str]:
         return [self.kind, self.verdict, str(self.exit_status)]
 
-    def details(self) -> list[str]:
-        counted = f"started={self.tests_started} finished={self.tests_finished}"
-        if self.recovered_from_run:
-            # First, and on a line of its own, because everything after it
-            # describes a run that is already over.
-            return [
-                f"recovered from {self.recovered_from_run}, which ended without "
-                "reaching session finish"
-            ] + self._where(counted)
-        return self._where(counted)
-
-    def _where(self, counted: str) -> list[str]:
-        """Which worker, and what it was doing.
+    def summary(self) -> str:
+        """Which worker, what happened to it, what it was doing, and where.
 
         The worker leads, because it is the one fact the reader already has
         from xdist's own line - ``[gw7] node down: Not properly terminated`` -
@@ -210,13 +199,60 @@ class WorkerDeathIncident(Incident):
         nothing else, and a reader who cannot see the id cannot tell which
         ``<worker>.crash`` on the runner holds the rest of the dump.
         """
-        who = f"worker={self.worker}"
+        if self.verdict == "INSTRUMENTATION_FAILED":
+            return super().summary()
+        who = f"Worker {self.worker}"
+        if self.recovered_from_run:
+            who += f" of run {self.recovered_from_run}"
+        where = f", in {self.blamed_frame.named()}" if self.blamed_frame is not None else ""
+        if self.verdict == "UNKNOWN":
+            # The status clause reads wrong between "died" and what it was
+            # doing, so it comes after both.
+            return f"{who} died {self._what_it_was_doing()}{where}; its exit status could not be read"
+        return f"{who} {self._what_happened()} {self._what_it_was_doing()}{where}"
+
+    def _what_happened(self) -> str:
+        status = self.exit_status
+        if self.verdict == "OOM_KILLED":
+            return "was killed by the cgroup OOM killer"
+        if self.verdict == "SIGKILLED":
+            return "was killed with SIGKILL"
+        if self.verdict == "NATIVE_CRASH":
+            if status is not None and status < 0:
+                received = -status
+                name = exit_status.signal_name(received)
+                detail = exit_status.FATAL_SIGNALS.get(received)
+                return f"crashed with {name} ({detail})" if detail else f"crashed with {name}"
+            if status in exit_status.WINDOWS_STATUS:
+                return f"crashed with {exit_status.WINDOWS_STATUS[status][1]}"
+            code = f" (exit code {status})" if status is not None else ""
+            return f"crashed, leaving a fatal stack{code}"
+        if self.verdict.startswith("SIGNAL_") and status is not None and status < 0:
+            received = -status
+            name = exit_status.signal_name(received)
+            if received in exit_status.DELIBERATE_SIGNALS:
+                return f"was stopped by {name} ({exit_status.DELIBERATE_SIGNALS[received]})"
+            return f"died from {name}"
+        if self.verdict == "INTERRUPTED":
+            return "was interrupted (control-C or console shutdown)"
+        if self.verdict == "PROBABLY_SIGNALLED" and status is not None:
+            return f"exited with code {status}, the wrapper convention for signal {status - 128}"
+        if self.verdict == "SELF_EXIT":
+            return f"exited on its own with code {status}"
+        if self.verdict == "UNKNOWN":
+            return "died, and its exit status could not be read"
+        return f"died ({self.verdict})"
+
+    def _what_it_was_doing(self) -> str:
         if self.test_in_flight:
-            phase = f"  phase={self.phase}" if self.phase else ""
-            return [f"{who}  in flight {self.test_in_flight}{phase}  {counted}"]
-        if self.last_test:
-            return [f"{who}  no test in flight; last was {self.last_test}  {counted}"]
-        return [f"{who}  no test in flight  {counted}"]
+            phase = f" ({self.phase})" if self.phase else ""
+            return f"while running {self.test_in_flight}{phase}"
+        if self.tests_finished:
+            # Not "in" - the last test had already finished, and saying
+            # otherwise puts a passing test's name on a death it had no part in.
+            last = f" (the last was {self.last_test})" if self.last_test else ""
+            return f"between tests, after finishing {self.tests_finished}{last}"
+        return "before running any test"
 
 
 def build(
@@ -355,7 +391,23 @@ def recover(events_path: Path, session: str) -> Optional[WorkerDeathIncident]:
         high_water=event_log.high_water_marks(events)[-1:] or None,
     )
     incident.verdict, incident.confidence, incident.evidence = classify.of(incident)
-    incident.evidence.extend(_what_was_kept(events, dump))
+    seen = (
+        f"; it was last seen alive at "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(incident.last_seen_at))}"
+        if incident.last_seen_at
+        else ""
+    )
+    incident.evidence.insert(
+        0,
+        f"Found in the evidence of run {session}, which ended without reaching "
+        f"session finish{seen}. The death is somewhere after that.",
+    )
+    kept = _what_was_kept(events, dump)
+    if kept and incident.evidence and incident.evidence[-1].startswith("Measured:"):
+        measured = incident.evidence.pop()
+        incident.evidence.extend(kept + [measured])
+    else:
+        incident.evidence.extend(kept)
     return incident
 
 
@@ -386,8 +438,8 @@ def _what_was_kept(events: list[dict[str, Any]], dump: list[str]) -> list[str]:
     armed = [event for event in events if event.get("event") == "faulthandler_armed"]
     if armed and armed[-1].get("fatal_stack") == "stderr":
         return [
-            "no stack was kept here: this run had no workers, so its fatal dump "
-            "went to the terminal pytest's faulthandler plugin writes to rather "
-            "than into a file - set failure_crash_stack to keep a copy instead"
+            "No stack was kept: this run had no workers, so its fatal dump went to "
+            "the terminal that pytest's faulthandler plugin writes to.",
+            "Look at: failure_crash_stack, which keeps a copy in the evidence directory.",
         ]
     return []

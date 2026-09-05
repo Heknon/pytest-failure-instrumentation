@@ -644,6 +644,19 @@ def test_two_runs_sharing_a_directory_keep_their_evidence_apart(runner):
     assert (ours[0] / "gw0.state").exists()
 
 
+def test_clean_controller_does_not_load_failure_specific_models():
+    source = (
+        "import sys\n"
+        "import pytest_failure_instrumentation.incidents.engine\n"
+        "for kind in ('collection', 'death', 'stall', 'internal_error'):\n"
+        "    assert 'pytest_failure_instrumentation.incidents.' + kind not in sys.modules, kind\n"
+    )
+    finished = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True, timeout=120
+    )
+    assert finished.returncode == 0, finished.stderr
+
+
 def test_the_worker_import_path_never_loads_pydantic():
     """A promise in the package docstring, and one nothing else checks.
 

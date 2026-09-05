@@ -118,5 +118,5 @@ def test_a_previous_runs_evidence_is_not_reported_as_this_ones(runner, monkeypat
 
     failure = runner.only(incidents, "internal_error")
     assert failure.worker == "controller"
-    assert any("on the controller itself" in line for line in failure.evidence)
+    assert any("Raised on the controller" in line for line in failure.evidence)
     assert "victim broke pytest" in failure.exception

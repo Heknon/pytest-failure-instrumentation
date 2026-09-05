@@ -253,6 +253,38 @@ class Settings:
     #: Which run this is. Minted by the controller and pushed down; likewise
     #: never copied from one process's settings to another's.
     run_id: Optional[str] = None
+    #: Sample every thread's stack and CPU for the whole run, and raise what
+    #: crosses the thresholds below as ``cpu_hotspot`` and ``memory_profile``
+    #: incidents - see :mod:`.profile`. Off: it is the one thing here with a
+    #: continuous running cost on a healthy run, bounded by the profiler's
+    #: serial and xdist performance gates.
+    profile: bool = False
+    #: Seconds between samples.
+    profile_interval: float = 0.02
+    #: Percent of the run's CPU a function must hold to be raised.
+    profile_cpu_share: float = 5.0
+    #: Seconds of CPU a function must use before its share can be raised.
+    #: Prevents noise on tiny runs while remaining tunable for short profiles.
+    profile_cpu_floor_seconds: float = 0.5
+    #: Megabytes a test may keep, or climb by, before it is raised.
+    profile_retained_mb: int = 100
+    #: Resident megabytes no test may reach, whatever it started from. 0 is
+    #: off. The retained threshold catches a climb; this catches a size.
+    profile_peak_mb: int = 0
+    #: Trace allocations with tracemalloc as well, so a memory finding names
+    #: the lines holding the memory and a memory flame graph is written.
+    #: Several times slower on allocation-heavy code: for a rerun of the
+    #: tests the untraced run named, never the nightly.
+    profile_allocations: bool = False
+    #: Frames tracemalloc keeps per allocation when tracing. Deeper reaches
+    #: further up the stack and costs more per allocation.
+    profile_allocation_depth: int = 12
+    #: Cores the process must burn, over consecutive tenth-second windows,
+    #: for a stretch to be a burst.
+    profile_burst_cores: float = 0.7
+    #: Seconds a burst must last to be raised on its own. Shorter bursts
+    #: are raised only when the same code bursts across many tests.
+    profile_burst_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "directory", Path(self.directory))
@@ -278,6 +310,20 @@ class Settings:
             self, "stack_server_token", str(self.stack_server_token or "").strip()
         )
         object.__setattr__(self, "stack_server_port", int(self.stack_server_port))
+        object.__setattr__(self, "profile", bool(self.profile))
+        object.__setattr__(
+            self, "profile_interval", max(MIN_PROFILE_INTERVAL, float(self.profile_interval))
+        )
+        object.__setattr__(self, "profile_cpu_share", max(0.0, float(self.profile_cpu_share)))
+        object.__setattr__(
+            self, "profile_cpu_floor_seconds", max(0.0, float(self.profile_cpu_floor_seconds))
+        )
+        object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
+        object.__setattr__(self, "profile_peak_mb", max(0, int(self.profile_peak_mb)))
+        object.__setattr__(self, "profile_allocations", bool(self.profile_allocations))
+        object.__setattr__(self, "profile_allocation_depth", max(1, int(self.profile_allocation_depth)))
+        object.__setattr__(self, "profile_burst_cores", max(0.05, float(self.profile_burst_cores)))
+        object.__setattr__(self, "profile_burst_seconds", max(0.1, float(self.profile_burst_seconds)))
         self._warn_if_a_stall_is_judged_before_it_has_evidence()
         self._warn_if_the_port_is_not_a_port()
 
@@ -462,6 +508,20 @@ class Settings:
             # itself would decline for every run with a live view on. What
             # travels is the answer, not the evidence for it.
             "tracer_handed_down": self.tracer_in_force,
+            # The profiler runs where the tests run, so a worker needs the
+            # switch and the cadence. The thresholds are read on the
+            # controller alone and travel only so that a worker's copy of the
+            # settings is the controller's copy.
+            "profile": self.profile,
+            "profile_interval": self.profile_interval,
+            "profile_cpu_share": self.profile_cpu_share,
+            "profile_cpu_floor_seconds": self.profile_cpu_floor_seconds,
+            "profile_retained_mb": self.profile_retained_mb,
+            "profile_peak_mb": self.profile_peak_mb,
+            "profile_allocations": self.profile_allocations,
+            "profile_allocation_depth": self.profile_allocation_depth,
+            "profile_burst_cores": self.profile_burst_cores,
+            "profile_burst_seconds": self.profile_burst_seconds,
             # crash_stack is absent, and for a reason of its own: it asks
             # whether a run with no workers should take the fatal dump off its
             # terminal, and a worker has no terminal and no choice. It always
@@ -595,13 +655,77 @@ def add_options(parser: pytest.Parser) -> None:
         "(POSIX only). Can nudge a C extension blocked in a syscall.",
         default="true",
     )
+    parser.addini(
+        "failure_profile",
+        help="Sample every thread's stack and CPU for the whole run and raise "
+        "the functions that burnt the CPU and the tests that kept the memory "
+        "as cpu_hotspot and memory_profile incidents. Off by default; "
+        "--failure-profile switches it on for one run.",
+        default="false",
+    )
+    parser.addini(
+        "failure_profile_interval",
+        help="Seconds between profile samples.",
+        default="0.02",
+    )
+    parser.addini(
+        "failure_profile_cpu_share",
+        help="Percent of the run's CPU one function must hold to be raised.",
+        default="5",
+    )
+    parser.addini(
+        "failure_profile_cpu_floor_seconds",
+        help="Seconds of CPU a function must use before its share can be raised. "
+        "Lower this for short diagnostic runs.",
+        default="0.5",
+    )
+    parser.addini(
+        "failure_profile_retained_mb",
+        help="Megabytes a test may keep, or climb by, before it is raised.",
+        default="100",
+    )
+    parser.addini(
+        "failure_profile_peak_mb",
+        help="Resident megabytes no test may reach, whatever it started from; "
+        "a test that does is raised with the code that was running while "
+        "the memory climbed. 0 is off.",
+        default="0",
+    )
+    parser.addini(
+        "failure_profile_allocations",
+        help="Trace allocations with tracemalloc while profiling, so a memory "
+        "finding names the lines holding the memory and a memory flame graph "
+        "is written. Several times slower on allocation-heavy code; for a "
+        "rerun of the tests an untraced run named. Implies failure_profile. "
+        "Requires exclusive ownership of tracemalloc. "
+        "--failure-profile-allocations does the same for one run.",
+        default="false",
+    )
+    parser.addini(
+        "failure_profile_allocation_depth",
+        help="Frames tracemalloc keeps per allocation when tracing.",
+        default="12",
+    )
+    parser.addini(
+        "failure_profile_burst_cores",
+        help="Cores the process must burn over consecutive tenth-second windows "
+        "for a stretch to count as a CPU burst.",
+        default="0.7",
+    )
+    parser.addini(
+        "failure_profile_burst_seconds",
+        help="Seconds a CPU burst must last to be raised on its own.",
+        default="2",
+    )
 
 
 def _add_command_line_options(parser: pytest.Parser) -> None:
-    """The three settings worth having off the ini file.
+    """The settings worth having off the ini file.
 
     Everything else about this plugin is a property of the project and belongs
-    in ini. These are properties of *where this run happens* - which port is
+    in ini. Three of these are switches for one run - the instrumentation, the
+    profile, the allocation trace - where the ini turns them on for every run.
+    The other three are properties of *where this run happens* - which port is
     free on this machine, which interface a container needs bound, which secret
     this deployment uses - and that is not something a repository can know on
     behalf of everybody running it.
@@ -646,6 +770,29 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
         "every run ask.",
     )
     group.addoption(
+        "--failure-profile",
+        action="store_true",
+        default=False,
+        dest=PROFILE_OPTION,
+        help="Profile this run: sample every thread's stack and CPU on the "
+        "process running the tests, and raise the functions that burnt the "
+        "CPU and the tests that kept the memory as incidents. Switches the "
+        "plugin on, like --callstack-port does. failure_profile in ini does "
+        "the same for every run.",
+    )
+    group.addoption(
+        "--failure-profile-allocations",
+        action="store_true",
+        default=False,
+        dest=PROFILE_ALLOCATIONS_OPTION,
+        help="Profile this run with allocation tracing as well: every memory "
+        "finding names the lines holding the memory, and a memory flame graph "
+        "is written beside the CPU one. Several times slower on "
+        "allocation-heavy code, so for a rerun of the tests a plain --failure-profile "
+        "named. Requires exclusive ownership of tracemalloc. Implies "
+        "--failure-profile.",
+    )
+    group.addoption(
         "--callstack-port",
         type=int,
         default=None,
@@ -677,6 +824,12 @@ def _add_command_line_options(parser: pytest.Parser) -> None:
 
 #: The ``dest`` of ``--failure-instrumentation``: what ``getoption`` is asked for.
 ENABLE_OPTION = "failure_instrumentation"
+#: The ``dest`` of ``--failure-profile``.
+PROFILE_OPTION = "failure_profile_this_run"
+#: The ``dest`` of ``--failure-profile-allocations``.
+PROFILE_ALLOCATIONS_OPTION = "failure_profile_allocations_this_run"
+#: Faster than this and the sampler is most of what it measures.
+MIN_PROFILE_INTERVAL = 0.002
 
 
 def switched_on(config: pytest.Config) -> bool:
@@ -712,6 +865,10 @@ def switched_on(config: pytest.Config) -> bool:
     if _option(config, "callstack_port") is not None:
         return True
     if _option(config, "callstack_host") is not None:
+        return True
+    if _option(config, PROFILE_OPTION) or _option(config, PROFILE_ALLOCATIONS_OPTION):
+        # A request for a profile is a request for the plugin that takes it,
+        # on the same grounds as the server options above.
         return True
     workerinput: dict[str, Any] = getattr(config, "workerinput", {}) or {}
     return bool(workerinput.get("failure_settings"))
@@ -903,4 +1060,20 @@ def resolve(config: pytest.Config) -> Settings:
         stack_server_token=chosen_token or "",
         worker_count=worker_count,
         run_id=run_id,
+        # Asking for allocation tracing is asking for the profile it traces
+        # under, from the ini as from the command line.
+        profile=_flag(config, "failure_profile", False)
+        or _flag(config, "failure_profile_allocations", False)
+        or bool(_option(config, PROFILE_OPTION))
+        or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
+        profile_interval=_number(config, "failure_profile_interval", 0.02),
+        profile_cpu_share=_number(config, "failure_profile_cpu_share", 5.0),
+        profile_cpu_floor_seconds=_number(config, "failure_profile_cpu_floor_seconds", 0.5),
+        profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
+        profile_peak_mb=int(_number(config, "failure_profile_peak_mb", 0)),
+        profile_allocations=_flag(config, "failure_profile_allocations", False)
+        or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
+        profile_allocation_depth=int(_number(config, "failure_profile_allocation_depth", 12)),
+        profile_burst_cores=_number(config, "failure_profile_burst_cores", 0.7),
+        profile_burst_seconds=_number(config, "failure_profile_burst_seconds", 2.0),
     )

@@ -1,6 +1,6 @@
 ---
 name: reading-failure-incidents
-description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable). Use when an alert block starting with [worker_death], [worker_stall], [collection_mismatch], [internal_error], [run_summary] or [stack_server_unavailable] appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
+description: Read and triage an incident raised by pytest-failure-instrumentation - the enriched alerts for pytest failures that happen outside the call phase (worker death, worker stall, collection mismatch, internal error, run summary, stack server unavailable) and the profiler's findings (cpu hotspot, cpu burst, memory profile). Use when an alert whose first line ends with a [worker_death ...], [worker_stall ...], [collection_mismatch ...], [internal_error ...], [run_summary ...], [stack_server_unavailable ...], [cpu_hotspot ...], [cpu_burst ...] or [memory_profile ...] tag appears in CI output or a bug report, when a stored incident payload or pytest_failure_incident hook argument needs interpreting, or when asked what a verdict, owner, severity, confidence or fingerprint field means. Not for ordinary assertion failures, which explain themselves.
 ---
 
 # Reading a failure incident
@@ -30,22 +30,28 @@ inventing one.
 
 ## Anatomy
 
+Every kind renders to one shape:
+
 ```
-[worker_death] NATIVE_CRASH  severity=critical  owner=product
-    blamed on engine.py:6 in native_call
-    worker=gw1  in flight test_crashes.py::test_crashes  phase=call  started=1 finished=0
-    · died while running test_crashes.py::test_crashes (call)
-    · exit status -11 - SIGSEGV: segmentation fault in native code (pid 805, via waitid)
-    · the worker wrote a stack before dying
+Worker gw1 crashed with SIGSEGV (segmentation fault in native code) while running test_crashes.py::test_crashes (call), in native_call (engine.py:6)   [worker_death NATIVE_CRASH, product, critical]
+    Exit status -11 read via waitid (pid 805).
+    The worker wrote a stack as it died.
+    Look at: test_crashes.py::test_crashes.
+    Measured: 1 test started and 0 finished on this worker.
 ```
 
 | Line | Is |
 |---|---|
-| `[kind] VERDICT severity= owner=` | the headline; `run-ending` is appended when the session died with it, and `owner=` is omitted on a `run_summary`, where nothing failed |
-| `blamed on file:line in func` | `blamed_frame` — the first frame on the stack owned by somebody |
-| *or* `no stack; suspect X (basis)` | `suspect_owner` — a lead, not a finding |
-| unprefixed lines | the kind's own facts. On a `worker_death` the first of them leads with `worker=`, the xdist gateway id that matches the `[gwN] node down` line in pytest's own output (`main` for a run with no workers) |
-| `· …` lines | `evidence` — what the verdict was reached from |
+| the first line | what happened, in words, specific to this instance: which worker (the xdist gateway id that matches the `[gwN] node down` line in pytest's own output, `main` for a run with no workers), which signal, which test, which frame (`blamed_frame`, the first frame on the stack owned by somebody). It ends with the tag `[kind VERDICT, owner, severity]`, with `run-ending` appended when the session died with it; a `run_summary` has no owner slot, because nothing failed |
+| `No stack was captured; the owner is taken from …` | `suspect_owner` and `suspect_basis` — a lead, not a finding; printed only when there was no stack |
+| every other line | exactly one of three things: a **measurement** (what was observed, and where the figure came from), what it **means by construction** (what follows from how it was measured, or from a fact about the OS, the runtime or xdist), or a **place to look** (`Look at:` a file, line, test, setting or flag). Nothing guesses at a cause in the user's code, and nothing prescribes a fix to it. Several numbers share one `Measured:` line at the end |
+| indented sub-rows | a table: the diff of a collection, the parameter values each worker produced |
+
+The lines under the first are the `evidence` field, plus a few a kind derives
+from its own fields at render time (the variant rows of a collection
+mismatch, where a stall's stack came from). The convention is held by
+`tests/test_message_convention.py`, and its rationale is in
+`incidents/base.py`.
 
 ## The numbers that mislead
 
@@ -274,6 +280,158 @@ and nothing is broken. **It is never raised because another pytest session holds
 the port** — that is the shared mode working as designed, so seeing this kind
 always means a stranger or a bad address, never a colleague.
 
+### How the profiler's findings are printed
+
+The same shape as every other kind (see Anatomy), with the severity always
+`informational` because nothing failed. The location is in the first line
+for a CPU finding and in the first evidence line for a memory one.
+
+```
+CPU hotspot: load_everything (loader.py:14) used 21% of this run's CPU, 5.2 s   [cpu_hotspot PYTHON_CODE, product, informational]
+    The time is in this function's own lines, not in calls it makes. Mostly line 14 (100%).
+    Seen in 2 tests: tests/test_loading.py::test_loads_the_export, tests/test_index.py::test_index_is_complete.
+    Look at: loader.py:14
+```
+
+### `cpu_hotspot` — a function that burnt a share of the run's CPU
+
+Raised only when profiling is on (`--failure-profile` or `failure_profile`), and a
+finding rather than a failure: nothing broke, and it is `severity=informational`
+whoever owns it. `owner` is still worth reading — it says whether the function
+is yours to fix, a dependency's, or the customer's own test code.
+
+The numbers: `share_percent` is the function's share of every CPU second the
+samplers attributed over the whole run, `cpu_seconds` the same in seconds, and
+`test_count` how many tests it was seen in, with the three it cost most in
+under `tests`. The profile is weighted by CPU, not wall time: a thread waiting
+on a socket contributes nothing, so a large share means cores burnt, never
+time waited.
+
+The verdict says what kind of cost this is — it does not say the function is
+wrong:
+
+- `PYTHON_CODE`: the function's own lines are hot (`self_share_percent` near
+  100), with `hottest_lines` naming them. A per-pixel loop, a hand-rolled
+  parser: the shape a vectorised or native call replaces.
+- `LIBRARY_CALL`: the cost is under a call it makes, and `below` names the
+  library and function. The fix is in how it calls, or what it calls with.
+- `BACKGROUND_THREAD`: the CPU is on `thread`, which is not the thread running
+  the test. Paid whatever test is in flight, so a per-test view never shows it
+  — this is the usual answer to "why is this worker at 30% between tests".
+- `GC_PRESSURE`: the collector, which belongs to no frame; `tests` names the
+  tests that drove it by allocating. No `blamed_frame`, `owner=runtime`.
+- `NATIVE_THREADS`: CPU in threads Python has no stack for, named by their
+  kernel thread names in the evidence. The answer is outside the interpreter.
+
+`blamed_frame` is the first frame on the stack that belongs to somebody, walking
+out from the innermost — so a C accessor called two million times is charged
+to the function that called it, and `raw_stack()` holds the rest of that stack.
+
+### `cpu_burst` — a stretch of the run where a core was held
+
+Also profiling-only and informational, and the complement of `cpu_hotspot`:
+a share of the run's CPU says nothing about a suite that waits on I/O for
+ninety-nine seconds in a hundred and pins a core for the hundredth. The
+profiler keeps a timeline — the process's CPU every tenth of a second against
+the machine's — and a burst is a run of windows at or over
+`failure_profile_burst_cores` cores. `burst_seconds` is how long it held them,
+`cores` how many, `started_s` how far into the test (or the gap between
+tests) it began, `phase` which phase, and `machine_busy_percent` how busy the
+whole machine was meanwhile. The stack is the one that was there for most of
+the burst, blamed like a hotspot.
+
+- `LONG_BURST`: `nodeid` held a core for `failure_profile_burst_seconds` or
+  longer. The evidence says how much of the test's CPU is in this one stretch
+  and how much of its duration was waiting — a test that is 96% one burst is
+  an I/O test with a CPU step in it, and the step is the line to open.
+- `RECURRING_BURST`: the same function burst in `test_count` tests (five or
+  more), whatever the length of each; `cpu_seconds` is the total, and
+  `burst_seconds` the typical one. In `setup` it is a fixture doing the same
+  work for every test that asks; in `call` a helper doing per call what it
+  could do once. One finding for all of them, fingerprinted on the frame.
+- `BACKGROUND_BURST`: `thread` is not the one running the test — between tests
+  when `nodeid` is null, under a test otherwise. A poller, a log shipper, a
+  client's keepalive: paid whatever test is in flight.
+- `CONTENDED`: the machine was over 90% busy for `machine_busy_percent` of
+  the sampled time and a worker got `cores` of a core while it was; `workers`
+  and `cpus` say whether this run did it to itself. No frame, `owner=runtime`:
+  every test's duration in such a run includes queueing for a core, and none
+  of them is slower for a reason on its own stack.
+
+A pinned machine is also noted on a `LONG_BURST` — "this got a slice of a
+core and took longer than its CPU cost" — because a two-second burst at a
+third of a core is six hundred milliseconds of work, not two seconds of it.
+
+### `memory_profile` — a test that changed the worker's memory
+
+Also profiling-only and informational. `nodeid` is the test, `before_mb`,
+`after_mb` and `peak_mb` are resident memory around it, and `delta_mb` is what
+the verdict measures. There is no stack: a resident-memory step is a fact about
+a test, so `suspect_owner` is the owner of the test's module — unless the
+sampler saw the climb, or allocation tracing was on, in which case there is
+one; see below.
+
+- `RETAINED_AFTER_TEST`: the worker was left `delta_mb` bigger, and the memory
+  is still in use — the evidence carries the live-heap readings that say so.
+  `phase` says where it arrived: `setup` is a fixture, and a session or module
+  fixture keeps it for the rest of the run by design; `call` is the test's own
+  body, which means a cache, a module-level list, or a leak.
+- `HEAP_NOT_RETURNED`: the worker was left bigger but none of it is in use.
+  The objects were freed and the allocator kept the pages mapped. Not a leak;
+  it costs the worker's footprint, and hunting the code will find nothing.
+- `TRANSIENT_PEAK`: climbed `delta_mb` and came back. Costs peak memory, which
+  is what decides how many workers fit on a machine.
+- `STEADY_GROWTH`: `worker` drifted up by `delta_mb` over `growth.tests`
+  tests, `growth.per_test_mb` each (and `growth.objects_per_test` live
+  objects, where the count was read), none of them enough to be raised alone
+  and no single step half of the total. Two megabytes a test is what a leak
+  looks like from outside, and the one thing a per-test check never sees;
+  `nodeid` is only the first of them. The evidence says when every one is a
+  parametrisation of the same test, and — with `--failure-profile-allocations` —
+  which lines held what the worker accumulated; without it, it says to rerun
+  with that flag.
+- `WORKER_IMBALANCE`: `worker` peaked at `peak_mb` against a median of
+  `median_mb` among its siblings (`worker_rss` has all of them), and `nodeid`
+  is the test after which it first stood clear. Under xdist the worker that
+  happened to receive the heavy fixture is the one that holds it.
+- `PEAK_OVER_CEILING`: the test climbed to `peak_mb`, at or over the configured
+  ceiling, whatever it started from and whether or not it came back. The size
+  is the finding: a worker that reaches it once needs the machine to have it.
+- `ALLOCATOR_RETENTION`: `worker` grew over its whole run and nothing is using
+  the growth — `delta_mb` is memory the C allocator was handed back and kept
+  mapped, `allocator_free_mb` how much it holds that way at the end. No
+  `nodeid`, no stack, `owner=runtime`: no test did it and a leak hunt finds
+  nothing. The evidence says which of two causes it is, and they have
+  different fixes. `arenas` above a handful for `threads` threads with most of
+  the free memory in the thread arenas is glibc giving every allocating thread
+  its own arena: set `MALLOC_ARENA_MAX=2` in the workers' environment. Free
+  memory mostly in the main arena is one fragmented heap, and the evidence
+  gives `trim_mb`, what `malloc_trim(0)` would return now; the arena variable
+  does nothing for that one. `worker_rss` lists every worker it was seen on.
+
+For the verdicts about one test's climb — `RETAINED_AFTER_TEST`,
+`TRANSIENT_PEAK`, `PEAK_OVER_CEILING` and `HEAP_NOT_RETURNED` — `blamed_frame`
+and `raw_stack()` are the code that was running while the memory climbed,
+with `climb_mb` of the `climb_total_mb` seen charged to it, and `owner` is
+attributed from that stack as for a crash. That is the line to open: a loader
+that reads whole rather than streams, a fixture that builds the world. When no
+climb was seen — a step too fast for the sampler's resident-memory reading,
+which is every second tick, 40 ms apart at the default interval,
+or a worker with no stack to read — there is no frame and `suspect_owner` is
+the owner of the test's module instead.
+
+With `--failure-profile-allocations` the evidence also carries what tracemalloc saw:
+"Held at the peak: 57.2 MB allocated at loader.py:12, called from reports.py:40"
+(allocation site first) and "Still held after the test: …" for what the test kept. These name
+the *holder* where the sampled stack names the *runner*, and they differ
+exactly when a leak is one function's result kept by another. The figures are
+then tracemalloc's own — Python allocations only, the tracer's tables left
+out — and the evidence says so, with the resident figures beside them. A
+`?` in a frame line is a tracemalloc frame, which carries no function name.
+A traced run raises no `cpu_hotspot` or `cpu_burst` at all, because the
+tracer's cost is in every CPU figure; their absence from such a run means
+nothing.
+
 ## The decision each kind forces
 
 Every one of these reaches a person who has to do something before morning.
@@ -287,6 +445,9 @@ The incident usually settles it, and saying so is most of the value.
 | `internal_error` | the session is over | nobody's test is at fault, so no test-level triage will surface it — it needs the framework or plugin owner |
 | `run_summary` | the run ended cleanly | nothing, except as the control: its absence next to another incident means the controller died too |
 | `stack_server_unavailable` | the run finished normally and nobody could watch it live | reconfigure rather than retry — the same port will be taken again. Nothing about the tests is in question, so it argues for a settings change and never for a rerun |
+| `cpu_hotspot` | the run finished; this is where its CPU went | a look, not a rerun. Route by `owner`; a `BACKGROUND_THREAD` or `NATIVE_THREADS` verdict is the answer to a worker sitting at a steady percentage with nothing to blame |
+| `cpu_burst` | the run finished; this is where its CPU went *in time* | `RECURRING_BURST` in `setup` is the fixture to make session-scoped or cache; `LONG_BURST` is one test's step to open; `BACKGROUND_BURST` is the thread to find; `CONTENDED` argues for fewer workers, not for touching any test |
+| `memory_profile` | the run finished; this is what a test did to the worker's memory | `STEADY_GROWTH` and `RETAINED_AFTER_TEST` in `call` are worth a leak hunt, and `--failure-profile-allocations` on the same tests is the next run; `HEAP_NOT_RETURNED` and `TRANSIENT_PEAK` are sizing questions, not code defects; `WORKER_IMBALANCE` argues for isolating the heavy module; `ALLOCATOR_RETENTION` is an environment change — `MALLOC_ARENA_MAX=2` or a `malloc_trim`, the evidence says which — and never a test |
 
 `run_ending` is the field to automate on. An incident raised at detection can
 beat a CI timeout by the better part of an hour, and that lead time is only

@@ -13,7 +13,6 @@ no /proc read, no allocation tracking.
 from __future__ import annotations
 
 import os
-import platform
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,7 @@ import pytest
 
 from ..config import Settings
 from ..probes import tracing
+from ..probes.platform_flags import platform_description
 from . import crash_stack
 from . import memory as memory_capture
 from .events import EventLog
@@ -54,6 +54,8 @@ class WorkerRecorder:
         self.faulthandler_timeout = faulthandler_timeout
         self.heartbeat: Heartbeat | None = None
         self.monitor: memory_capture.MemoryMonitor | None = None
+        self.profiler: Any = None
+        self._allocation_tracer: memory_capture.TracemallocSession | None = None
         #: The test whose protocol is open and has already been counted as
         #: started, or None between tests. What makes a rerun not count twice
         #: - see pytest_runtest_protocol.
@@ -122,7 +124,18 @@ class WorkerRecorder:
             )
 
         self._apply_memory_limit(settings)
+        if settings.profile_allocations:
+            # Allocation profiling resets the process-wide peak for every
+            # test, so it cannot safely share a tracer with another consumer.
+            # Start once for both profiler and watchdog, at the deeper of the
+            # two requested tracebacks, before either takes a snapshot.
+            self._allocation_tracer = self._track(
+                memory_capture.TracemallocSession(
+                    max(settings.profile_allocation_depth, settings.tracemalloc_depth)
+                )
+            )
         self._start_monitors(settings)
+        self._start_profiler(directory, worker_id, settings)
 
         # Before anything can be asked to read this process. Without it a
         # live-stack read of this worker is refused wherever Yama enforces
@@ -141,7 +154,7 @@ class WorkerRecorder:
             "worker_start",
             pid=os.getpid(),
             python=sys.version.split()[0],
-            platform=platform.platform(),
+            platform=platform_description(),
             executable=sys.executable,
             # Recorded because it is the difference between "no stack" and
             # "no stack, and here is the reason", and it is only knowable here.
@@ -190,6 +203,47 @@ class WorkerRecorder:
             self.events.record("memory_limit_refused", detail=repr(failure))
             return
         self.events.record("memory_limit_applied", limit_mb=settings.memory_limit_mb)
+
+    def _start_profiler(self, directory: Path, worker_id: str, settings: Settings) -> None:
+        """The CPU and memory sampler, when this run asked for one.
+
+        A thread of its own rather than a tick of the heartbeat: the beat is
+        once a second at its fastest, and a profile needs fifty a second to
+        see a two-second spike as anything but one sample.
+        """
+        if not settings.profile:
+            return
+        from .. import probes
+        from ..profile.sampler import ProfileLog, Sampler
+
+        log = self._track(ProfileLog(directory / f"{worker_id}.profile.jsonl", settings.run_id))
+        # Tracked after the log, so a setup that fails past this point stops
+        # the sampling thread and unhooks its collector callback before the
+        # log it writes to is closed - rather than leaving both running for
+        # the whole run under a plugin that has said it is off.
+        self.profiler = self._track(
+            Sampler(
+                log.write,
+                lambda: probes.resident_megabytes()[0],
+                interval=settings.profile_interval,
+                worker=worker_id,
+                allocations=settings.profile_allocations,
+                retained_mb=settings.profile_retained_mb,
+            )
+        )
+        self.profiler.start()
+        self.events.record("profiler_started", **self.profiler.describe())
+
+    def _profile(self, method: str, *args: Any) -> None:
+        """Hand the profiler a boundary. It is a diagnostic and this is a
+        pytest hook: whatever it raises is recorded against the worker and
+        is not the test's failure, and never the run's."""
+        if self.profiler is None:
+            return
+        try:
+            getattr(self.profiler, method)(*args)
+        except Exception as failure:  # noqa: BLE001 - a profiler must never end a run
+            self.events.record("profiler_failed", method=method, detail=repr(failure))
 
     def _start_monitors(self, settings: Settings) -> None:
         if not settings.watchdog:
@@ -269,10 +323,22 @@ class WorkerRecorder:
         run). The test is closed at the end of teardown, as it always was,
         and not here: pytest's ``logfinish`` fires between the two, and a
         worker that dies there died between tests, not in one.
+
+        The *profile* record is the exception, and closes here. It has to be
+        written after pytest lets go of the item's fixture values - otherwise
+        every function-scoped fixture's value counts as memory the test kept,
+        and its release as the next gap's - and ``runtestprotocol`` clears
+        ``funcargs`` before it returns, so anything after that will do. It
+        used to be ``logfinish``, which is the next thing to fire and is
+        inside the protocol: a rerun plugin runs the whole protocol again,
+        ``logfinish`` and all, so a test rerun twice wrote three records and
+        the profile summary reported a run of two tests as four. Here is
+        after the last attempt, whichever attempt that turns out to be.
         """
         self._counted = None
         yield
         self._counted = None
+        self._profile("end_test", item.nodeid)
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> Any:
@@ -324,7 +390,9 @@ class WorkerRecorder:
         # reached it.
         if phase == "setup":
             self.slow_test.start_test()
+        self._profile("begin_phase", nodeid, phase)
         yield
+        self._profile("end_phase", phase)
         if self.heartbeat is not None:
             self.heartbeat.phase = None
         if phase != "teardown":
@@ -364,5 +432,10 @@ class WorkerRecorder:
     def pytest_sessionfinish(self, exitstatus: int) -> None:
         if self.heartbeat is not None:
             self.heartbeat.stop()
+        # Writes the background record, which is the CPU spent with no test
+        # in flight: what the controller reads a moment later.
+        self._profile("stop")
         self.events.record("worker_finish", exitstatus=int(exitstatus))
         self.state.update(phase=None, nodeid=None)
+        if self._allocation_tracer is not None:
+            self._allocation_tracer.close()
