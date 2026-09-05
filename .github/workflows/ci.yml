@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # master is the default branch here; main is kept in case it is ever
     # renamed. Without the default branch listed, the one push that most
     # needs a green tick is the one that gets none.

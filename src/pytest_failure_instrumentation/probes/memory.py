@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -27,16 +28,16 @@ def resident_megabytes() -> tuple[int | None, str]:
         except (OSError, IndexError, ValueError):
             pass
 
+    if IS_WINDOWS:
+        value = _windows_working_set()
+        if value is not None:
+            return value, "psapi"
+
     if psutil is not None:
         try:
             return round(psutil.Process().memory_info().rss / 1048576), "psutil"
         except Exception:
             pass
-
-    if IS_WINDOWS:
-        value = _windows_working_set()
-        if value is not None:
-            return value, "psapi"
 
     if IS_MACOS:
         try:
@@ -52,48 +53,49 @@ def resident_megabytes() -> tuple[int | None, str]:
     return None, "unavailable"
 
 
-def _windows_working_set() -> int | None:
-    """Current working set from psapi.
+@lru_cache(maxsize=1)
+def _windows_memory_api() -> Any:
+    """Bind once; x64 leaf reads retain the GIL to avoid sampler handoffs.
 
-    Every signature below is declared. ``GetCurrentProcess`` returns a HANDLE,
-    which is 64-bit, and ctypes defaults a return value to a 32-bit int: the
-    pseudo-handle is truncated, the call fails, and resident memory silently
-    reads as unavailable on every Windows machine without psutil.
-
-    The library is loaded into its own object rather than through
-    ``ctypes.windll``, which is process-global - declaring types on that would
-    change how somebody else's code calls the same functions.
+    x86 requires stdcall, so it retains WinDLL. Each read owns its counters;
+    the cached binding can safely be shared by the heartbeat and sampler.
     """
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    loader = ctypes.PyDLL if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.WinDLL  # type: ignore[attr-defined]
+    kernel32 = loader("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = ()
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.K32GetProcessMemoryInfo.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD,
+    )
+    kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    return kernel32, Counters
+
+
+def _windows_working_set() -> int | None:
+    """Current working set, with psutil fallback when the native read fails."""
     try:
         import ctypes
-        from ctypes import wintypes
 
-        class Counters(ctypes.Structure):
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-        kernel32.GetCurrentProcess.argtypes = ()
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.K32GetProcessMemoryInfo.argtypes = (
-            wintypes.HANDLE,
-            ctypes.POINTER(Counters),
-            wintypes.DWORD,
-        )
-        kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
-
-        counters = Counters()
-        counters.cb = ctypes.sizeof(Counters)
+        kernel32, counters_type = _windows_memory_api()
+        counters = counters_type()
+        counters.cb = ctypes.sizeof(counters_type)
         if not kernel32.K32GetProcessMemoryInfo(
             kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
         ):

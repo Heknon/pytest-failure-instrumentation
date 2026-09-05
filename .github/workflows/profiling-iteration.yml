@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   macos:
-    if: contains(github.event.pull_request.labels.*.name, 'profiling-iterate') && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'profiling-iterate')
+    if: contains(github.event.pull_request.labels.*.name, 'profiling-macos') && (github.event.action != 'labeled' || github.event.label.name == 'profiling-macos')
     name: macOS / recorded timeline regression
     runs-on: macos-latest
     timeout-minutes: 5
@@ -49,6 +49,9 @@ jobs:
           TARGET_TESTS: |
             tests/test_profile_sampler.py
             tests/test_profile_analysis.py
+            tests/test_probes.py::test_resident_memory_is_measurable_on_every_supported_platform
+            tests/test_probes.py::test_psapi_answers_without_psutil
+            tests/test_probes.py::test_windows_rss_falls_back_if_native_read_fails
         run: python .github/scripts/run_targeted_tests.py
       - name: Detection and overhead
         if: success() || failure()

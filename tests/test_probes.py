@@ -387,3 +387,13 @@ def test_the_allocator_figures_are_read_from_this_process_where_glibc_answers():
     assert figures["arenas"] >= 1
     assert set(figures) == {"arenas", "free_mb", "main_free_mb", "mapped_mb", "trim_mb"}
     assert figures["main_free_mb"] <= figures["free_mb"]
+
+
+def test_windows_rss_falls_back_if_native_read_fails(monkeypatch):
+    monkeypatch.setattr(memory, "IS_LINUX", False)
+    monkeypatch.setattr(memory, "IS_WINDOWS", True)
+    monkeypatch.setattr(memory, "_windows_working_set", lambda: None)
+    monkeypatch.setattr(memory, "psutil", SimpleNamespace(
+        Process=lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=10485760))
+    ))
+    assert memory.resident_megabytes() == (10, "psutil")

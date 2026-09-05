@@ -745,7 +745,8 @@ def test_a_function_that_cannot_be_found_keeps_its_bare_name(
     assert code in sampling._qualnames
 
 
-def test_a_discovery_reuses_the_clocks_it_was_just_handed() -> None:
+@pytest.mark.parametrize("source", [source for source in readers() if source in {"mach", "psutil"}])
+def test_a_discovery_reuses_the_clocks_it_was_just_handed(source: str) -> None:
     """Where a reader lists every thread on every read - mach and psutil -
     the clocks read a moment ago on the same tick already *are* the thread
     list, and asking again costs what the read costs.
@@ -755,9 +756,7 @@ def test_a_discovery_reuses_the_clocks_it_was_just_handed() -> None:
     thread on the machine, and a discovery tick was paying for two or three
     of those at fifty ticks a second.
     """
-    clock = ThreadClock()
-    if clock.source == "thread-clock":
-        pytest.skip("Linux reads a thread's clock by id, so discovery is its own procfs read")
+    clock = clock_with(source)
     if not clock.available:
         pytest.skip("no per-thread CPU clock on this platform")
 

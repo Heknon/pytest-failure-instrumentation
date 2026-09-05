@@ -109,3 +109,6 @@ mode is active. Targeted greens are regression evidence, not a substitute
 for a full release gate. Report any unverified full-suite coverage explicitly.
 Remove the iteration label only when a full gate is wanted; the user's
 request to avoid another sweep takes precedence over the default policy.
+
+After the recorded macOS regression passes, further Windows iterations skip it.
+Add `profiling-macos` to explicitly rerun that recorded regression.
