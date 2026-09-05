@@ -1,0 +1,85 @@
+name: Portability
+
+on:
+  # One complete cross-platform sweep per week catches platform drift without
+  # charging every PR commit for four full non-Linux jobs.
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Runner to validate
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - macos
+          - windows
+      python-version:
+        description: Python version for a targeted run
+        required: true
+        type: choice
+        default: "3.13"
+        options:
+          - "3.11"
+          - "3.13"
+      tests:
+        description: "Optional pytest node IDs, one per line; blank runs the full suite"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    if: github.event_name == 'schedule' || inputs.platform == 'all' || inputs.platform == 'macos'
+    name: macos / ${{ inputs.tests && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version || '3.13' }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run full suite
+        if: github.event_name == 'schedule' || inputs.tests == ''
+        run: pytest -q
+      - name: Run targeted tests
+        if: github.event_name == 'workflow_dispatch' && inputs.tests != ''
+        env:
+          TARGET_TESTS: ${{ inputs.tests }}
+        run: python .github/scripts/run_targeted_tests.py
+
+  windows:
+    if: github.event_name == 'schedule' || inputs.platform == 'all' || inputs.platform == 'windows'
+    name: windows / ${{ inputs.tests && 'targeted' || 'full' }} / py${{ inputs.python-version || '3.13' }}
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version || '3.13' }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run full suite
+        if: github.event_name == 'schedule' || inputs.tests == ''
+        run: pytest -q
+      - name: Run targeted tests
+        if: github.event_name == 'workflow_dispatch' && inputs.tests != ''
+        env:
+          TARGET_TESTS: ${{ inputs.tests }}
+        run: python .github/scripts/run_targeted_tests.py
