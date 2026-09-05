@@ -976,12 +976,23 @@ def pytest_configure(config):
     install(config, on_run_death=functools.partial(report_killed_run, "#ci-deaths"))
 ```
 
-or, from ini, as a dotted path with no bound arguments:
+Or, from ini, point to a module-level wrapper that accepts just the incident:
+
+```python
+# ci/alerts.py (alongside report_killed_run above)
+def report_run_death(incident):
+    report_killed_run("#ci-deaths", incident)
+```
 
 ```ini
 [pytest]
-failure_on_run_death = ci.alerts:report_killed_run
+failure_on_run_death = ci.alerts:report_run_death
 ```
+
+These function names are examples, not built-in APIs or new incident types.
+`pytest_failure_incident` remains the normal delivery hook. The separate
+`on_run_death` callback receives the same incident model from the surviving
+helper when the controller has died and can no longer invoke that hook.
 
 **The callable travels as a pickle, and that sets the rules.** A module-level
 function, or a `functools.partial` of one with picklable bound arguments;
