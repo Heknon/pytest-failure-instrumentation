@@ -79,6 +79,9 @@ jobs:
       - name: Native attribution diagnostic (accepted limitation)
         if: success() || failure()
         run: python benchmarks/readiness_gate.py native --native-diagnostic --output readiness/native.json
+      - name: Explain instrumentation startup and recording costs
+        if: success() || failure()
+        run: python benchmarks/instrumentation_cost.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
