@@ -865,9 +865,8 @@ class Sampler:
         # is not done for every thread that comes and goes: only for one of
         # those, or on the schedule that finds a C extension's pool.
         unknown = changed and any(ident not in self._threads for ident in idents)
-        # start() already took the initial system-wide snapshot. Repeating
-        # it on tick zero is particularly costly on Windows. A sampler used
-        # synchronously without start() still discovers on its first tick.
+        # Reuse start()'s snapshot when it took one. Windows defers that
+        # snapshot to this first tick, as does synchronous use without start().
         discovery_due = self._ticks % DISCOVER_EVERY == 0 and (
             self._ticks > 0 or not self._discovered
         )

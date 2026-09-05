@@ -347,7 +347,9 @@ framework defect that ends the run, above.
 timings, so one defect on twelve workers is one incident with a count.
 
 **`capabilities`** says what the machine could measure, so an absent figure is
-never read as a healthy one.
+never read as a healthy one. On Windows, its platform description records the
+kernel version and product type (for example, `Windows-Server-10.0.26100`),
+without a WMI query for a marketing release name during each worker's startup.
 
 **`suspect_owner`** is kept apart from `owner` on purpose. When no stack names
 anybody, the test that was in flight is a lead worth recording — but a guess
@@ -2020,6 +2022,10 @@ and `GetThreadTimes` on 64-bit Windows with psutil fallback. Windows counters
 are coarse against the sampling interval. Where per-thread clocks are
 unavailable, process CPU is charged to the test thread and the report says so.
 Threads that start and exit between samples can go unseen.
+
+Windows starts with CPU baselines for known Python threads and discovers
+native-only threads on the first sampling tick, then on the normal discovery
+schedule. Discovery does not block the test thread before sampling starts.
 
 The native qualification probe remains a visible, non-blocking diagnostic:
 its JSON preserves failed attribution measurements. Python detection, quiet

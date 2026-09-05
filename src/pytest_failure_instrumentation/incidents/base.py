@@ -12,8 +12,8 @@ crash-reporting path would end the very run it exists to explain. What is
 strict is the *shape*: ``extra="forbid"`` means a builder that invents a field
 is caught in development rather than writing a column nobody reads.
 
-Nothing here is imported by the worker-side capture path. Pydantic is loaded on
-the controller, and only once something has already died.
+Nothing here is imported by the worker-side capture path. The controller loads
+these models when it needs an incident or has a receiver for the run summary.
 
 **How an incident reads.** ``str(incident)`` is the alert text, and every kind
 renders to the same shape, which is the convention the whole package holds to:
