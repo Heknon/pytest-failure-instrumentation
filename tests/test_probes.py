@@ -54,18 +54,19 @@ def test_windows_description_reads_os_once_without_querying_processor(monkeypatc
 
     def os_version():
         calls.append("os")
-        return "2025Server", "10.0.26100", "SP0", "Multiprocessor Free"
+        return SimpleNamespace(platform_version=(10, 0, 26100), product_type=3, service_pack="")
 
     def unused_processor_query():
-        pytest.fail("Windows OS description must not query the processor")
+        pytest.fail("Windows OS description must not query WMI")
 
     monkeypatch.setattr(platform_flags, "IS_WINDOWS", True)
-    monkeypatch.setattr(platform_flags.platform, "win32_ver", os_version)
+    monkeypatch.setattr(platform_flags.sys, "getwindowsversion", os_version, raising=False)
+    monkeypatch.setattr(platform_flags.platform, "win32_ver", unused_processor_query)
     monkeypatch.setattr(platform_flags.platform, "platform", unused_processor_query)
     platform_flags.platform_description.cache_clear()
     try:
         for _ in range(3):
-            assert platform_flags.platform_description() == "Windows-2025Server-10.0.26100-SP0"
+            assert platform_flags.platform_description() == "Windows-Server-10.0.26100"
         assert calls == ["os"]
     finally:
         platform_flags.platform_description.cache_clear()

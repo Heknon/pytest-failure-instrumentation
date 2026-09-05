@@ -24,9 +24,9 @@ captured-output-on-failure is unchanged, and this keeps a durable copy besides,
 including of the crashing phase pytest never got to.
 
 **This is the one facility that takes over a process-wide descriptor**, opt-in
-and guarded at every step: an fd operation that fails leaves fd 2 as it was and
-records that output was not captured, rather than raising into a run it was
-only meant to watch. POSIX only.
+and guarded at every step. Failed fd operations record degraded capture rather
+than raising into the run. If restoration fails, the saved descriptor stays
+open so closing the tee can retry restoration. POSIX only.
 """
 
 from __future__ import annotations

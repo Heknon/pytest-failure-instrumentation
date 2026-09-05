@@ -7,7 +7,8 @@ run over the same evidence directory. On a CI runner that gets a fresh
 workspace for every job there is no next run, and a killed run was a run
 about which nothing was ever said.
 
-The sidecar (:mod:`..probes.signal_trace`) is the one survivor: it holds the
+The sidecar (:mod:`..probes.signal_trace`) can survive controller death, though
+a container, cgroup, or host shutdown can kill it too. It holds the
 read end of a pipe only the controller can write, so the controller dying,
 whatever killed it, is EOF on that pipe. A controller that reaches session
 finish says ``stop`` first; EOF without it is a death. The sidecar then

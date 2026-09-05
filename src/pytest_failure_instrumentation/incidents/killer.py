@@ -11,13 +11,13 @@ somewhere else, and this module goes and asks each of them:
 * **The kernel log** (:mod:`..probes.kernel_log`), where the OOM killer prints
   the victim, the constraint it hit, the cgroup, and the table of every task
   it weighed - the whole fleet at the instant of the decision.
-* **The controller's own SIGTERM** (:mod:`..capture.signals`), witnessed with
-  its ``siginfo`` and no privilege at all: the warning shot an orchestrator
-  sends before the SIGKILL it will not otherwise explain.
+* **Historical controller SIGTERM records** (:mod:`..capture.signals`), read
+  for compatibility with older evidence. Current runs preserve the caller's
+  signal masks and handlers and do not install that witness.
 
 Each answers a different question, and each can be withheld by a machine - a
 container without tracefs, ``dmesg_restrict=1`` without ``CAP_SYSLOG``, a
-platform with no ``sigtimedwait``. So the result carries not only what was
+platform without a supported trace source. So the result carries not only what was
 found but what each source *said about itself*, and a verdict that stays
 ``SIGKILLED`` names which truth was withheld and by what. That is the
 difference between a guess and a finding that happens to be negative.
@@ -43,9 +43,8 @@ from ..capture import signals as controller_signals
 from ..capture.state import read_state
 from ..probes import kernel_log, signal_trace
 
-#: The controller's own rare-event log, beside the workers'. It holds what only
-#: the controller can witness - the SIGTERM it was sent - and, for a run found
-#: dead by a later one, is the one record of who told it to stop.
+#: The controller event log, including legacy signal-witness evidence when
+#: recovering a run recorded by an older version.
 CONTROLLER_EVENTS = event_log.CONTROLLER_EVENTS
 #: The role the controller's pid is filed under, so a signal it sent - execnet
 #: terminating a worker that would not exit - reads as what it is.
@@ -74,7 +73,8 @@ class SignalRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     #: The signal number, or 0 for a Windows ``TerminateProcess``, whose
-    #: ``name`` says so and whose ``exit_code`` is what the caller chose.
+    #: ``name`` says so. ``exit_code`` is the observed victim exit status;
+    #: ``api_status`` is the termination API result reported by ETW.
     signal: int
     name: str = ""
     exit_code: Optional[int] = None

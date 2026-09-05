@@ -92,8 +92,8 @@ class Witness:
     to_group: bool
     delivered: bool
     #: ``signal`` for a Linux tracepoint line; ``TerminateProcess`` for a
-    #: Windows termination, where ``signal`` is 0 and ``exit_code`` is what
-    #: the caller chose - see :mod:`.etw_trace`.
+    #: Windows termination, where ``signal`` is 0. ETW reports ``api_status``;
+    #: it does not provide the victim's exit code - see :mod:`.etw_trace`.
     via: str = "signal"
     exit_code: Optional[int] = None
     api_status: Optional[int] = None

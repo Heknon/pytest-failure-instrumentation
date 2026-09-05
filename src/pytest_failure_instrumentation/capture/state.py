@@ -102,11 +102,10 @@ class WorkerState:
         self.last_nodeid: str | None = None
         self.phase: str | None = None
         #: When the current phase began, and when the current *test* began
-        #: (its setup). A worker killed by a timeout enforcer looks like a
-        #: plain exit; the one thing that separates it is that the test had
-        #: been running at or beyond a configured timeout when it died, and
-        #: that is what these two answer. Wall clock, so the controller that
-        #: reads the death can subtract its own now from them.
+        #: (its setup). These clocks let the controller correlate death with
+        #: the test's effective timeout; timing alone does not prove which
+        #: process or mechanism ended it. Wall clock, shared with the
+        #: controller that reads the death.
         self.phase_started: float | None = None
         self.test_started: float | None = None
         self.timeout_settings: list[dict[str, Any]] = []

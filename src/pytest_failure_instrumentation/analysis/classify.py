@@ -181,11 +181,10 @@ def _timeout_line(incident: WorkerDeathIncident) -> str:
 def _killed(incident: WorkerDeathIncident, close: Closer) -> tuple[str, str, list[str]]:
     """SIGKILL, and everything that can be said about who sent it.
 
-    In order of how much each witness proves. The kernel log names the
-    victim outright; the cgroup counter says the OOM killer took something in
-    the cgroup at the time; the tracepoint names a sender; the controller's
-    own SIGTERM says the run was being stopped. Each verdict below is licensed
-    by exactly one of those, and the last one by none.
+    A matched kernel log names the victim; a delivered trace record names
+    the sender. A cgroup counter increase only correlates this death with an
+    OOM kill somewhere in the group and cannot identify its victim. Context
+    about the controller stopping likewise does not identify this sender.
 
     Every branch ends through ``close`` with the memory figures: a SIGKILL is
     the one status an OOM kill wears, so the reader needs them whichever

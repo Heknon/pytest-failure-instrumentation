@@ -17,16 +17,21 @@ IS_LINUX = sys.platform.startswith("linux")
 
 @lru_cache(maxsize=1)
 def platform_description() -> str:
-    """Describe the OS without querying unused Windows CPU information.
+    """Describe the OS without a WMI query in every worker's startup.
 
-    platform.platform() unpacks uname's processor field before selecting its
-    Windows branch. On Python 3.12 that starts a WMI CPU query even though the
-    resulting Windows string uses only OS fields. win32_ver supplies those
-    fields directly, retaining its OS-version and service-pack fallbacks.
+    Even win32_ver() queries WMI on Python 3.12. The interpreter already
+    exposes the kernel version and product type needed for diagnostic logs;
+    use those rather than resolving a marketing release name.
     """
     if not IS_WINDOWS:
         return platform.platform()
-    release, version, service_pack, _build_type = platform.win32_ver()
+    try:
+        info = sys.getwindowsversion()  # type: ignore[attr-defined]
+        version = ".".join(str(part) for part in info.platform_version)
+        release = {1: "Workstation", 2: "DomainController", 3: "Server"}.get(info.product_type, "")
+        service_pack = info.service_pack
+    except (AttributeError, OSError):
+        release, version, service_pack, _build_type = platform.win32_ver()
     return "-".join(part.replace(" ", "_") for part in (
         "Windows", release, version, service_pack,
     ) if part)
