@@ -969,7 +969,9 @@ handle, detects controller death even if a child retains the pipe's write end.
 The controller reports the reporter as `armed` only after the sidecar acknowledges
 its payload. The acknowledgement contains a random token, never the payload.
 Owner and worker records include process creation time where available, so a
-reused PID does not hide a dead run. Legacy records and inaccessible identity
+reused PID does not hide a dead run. Missing or unreadable worker state falls
+back to the event-log PID rather than treating missing state as death.
+Legacy records and inaccessible identity
 information retain conservative PID-based checks.
 EOF without it is a death, and the sidecar then starts a *reporter*: a child
 that builds the same incidents the next run would have recovered, the

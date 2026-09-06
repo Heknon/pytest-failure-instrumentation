@@ -250,3 +250,23 @@ def test_clean_worker_completion_does_not_hide_a_confirmed_stall(pytester):
     # worker. Finishing cleanly does not invalidate that prior observation.
     assert engine.raise_incident(WorkerStallIncident(worker="gw0", verdict="STALLED_FROZEN"))
     assert len(received) == 1
+
+
+@pytest.mark.parametrize("state_contents", [None, "{torn"])
+def test_missing_worker_state_uses_event_identity_without_false_death(tmp_path, monkeypatch, state_contents):
+    directory = dead_run(tmp_path)
+    (directory / "gw0.events").write_text(json.dumps({
+        "event": "worker_start", "time": 901, "pid": os.getpid(),
+    }) + "\n")
+    if state_contents is not None:
+        (directory / "gw0.state").write_text(state_contents)
+    monkeypatch.setattr(reporter, "WORKERS_GONE_SECONDS", 0)
+    received = []
+    monkeypatch.setattr(reporter, "resolve", lambda spec: received.append)
+    assert leftovers.workers_alive(directory)
+    reported = reporter.report(payload_for(directory, "unused:target"))
+    assert [item.worker for item in reported] == ["controller"]
+    assert not reported[0].related_deaths
+    assert not leftovers.marker(directory).get(leftovers.REPORTED_KEY)
+    leftovers.prune_finished_runs(tmp_path)
+    assert directory.exists()

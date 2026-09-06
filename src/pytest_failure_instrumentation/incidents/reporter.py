@@ -111,7 +111,6 @@ def report(payload: dict[str, Any]) -> list[Any]:
     # Imported only now, on the restored path, so a dev install that lives
     # off PYTHONPATH resolves the same way it did in the controller.
     from ..analysis.attribution import Attributor
-    from ..capture.state import read_state
     from ..probes.process import same_process
     from . import leftovers
     from .enrich import enrich
@@ -120,12 +119,8 @@ def report(payload: dict[str, Any]) -> list[Any]:
     session = str(payload.get("session") or directory.name)
     _wait_until_gone(int(payload["controller_pid"]), CONTROLLER_GONE_SECONDS,
                      lambda pid: same_process(pid, payload.get("controller_created_at")))
-    worker_records = [
-        record
-        for record in (read_state(state, None) for state in directory.glob("*.state"))
-        if isinstance(record.get("pid"), int)
-    ]
-    identities = {record["pid"]: record.get("created_at") for record in worker_records}
+    identities = {record["pid"]: record.get("created_at")
+                  for record in leftovers.worker_records(directory)}
     _wait_until_all_gone(list(identities), WORKERS_GONE_SECONDS,
                          lambda pid: same_process(pid, identities[pid]))
 

@@ -125,12 +125,29 @@ def claim(directory: Path) -> Iterator[bool]:
         handle.close()
 
 
-def workers_alive(directory: Path) -> bool:
+def worker_records(directory: Path) -> list[dict[str, Any]]:
+    """Recorded worker identities, with event-log fallback for torn/missing slots."""
+    from ..capture import events as event_log
     from ..capture.state import read_state
 
-    return any(isinstance(state.get("pid"), int)
-               and same_process(state["pid"], state.get("created_at"))
-               for state in (read_state(path) for path in directory.glob("*.state")))
+    names = {path.stem for path in directory.glob("*.state")}
+    names.update(path.stem for path in directory.glob("*.events"))
+    records = []
+    for name in sorted(names):
+        state = read_state(directory / f"{name}.state")
+        if not isinstance(state.get("pid"), int):
+            events = event_log.read_events(directory / f"{name}.events")
+            pid = event_log.worker_pid(events)
+            if pid is None:
+                continue
+            state = {"pid": pid}  # Identity unavailable: retain conservative liveness.
+        records.append({**state, "worker": name})
+    return records
+
+
+def workers_alive(directory: Path) -> bool:
+    return any(same_process(state["pid"], state.get("created_at"))
+               for state in worker_records(directory))
 
 
 def delivery_key(incident: Any) -> str:
@@ -346,10 +363,9 @@ def _deaths_in(directory: Path, elevate: bool = False) -> list[WorkerDeathIncide
     from . import death
 
     incidents = []
+    states = {state["worker"]: state for state in worker_records(directory)}
     for events in sorted(directory.glob("*.events")):
-        from ..capture.state import read_state
-
-        state = read_state(events.with_suffix(".state"))
+        state = states.get(events.stem, {})
         pid = state.get("pid")
         if isinstance(pid, int) and same_process(pid, state.get("created_at")):
             continue  # Preserve this worker for later; controller death is independent.
