@@ -261,12 +261,16 @@ class IncidentEngine:
         self.sampler: threading.Thread | None = None
         self.resources: Any = None
         self.seen: dict[str, int] = {}
+        self.delivered_fingerprints: set[str] = set()
         self.raised = 0
         self.suppressed = 0
         self.run_ending = 0
         #: When this process started, stamped into the marker and kept so a
         #: rewrite of it at session finish does not report a second start.
+        from ..probes.process import creation_time
+
         self.started_at = time.time()
+        self.created_at = creation_time(os.getpid())
         #: Whether this process is the one running the tests, which is so
         #: exactly when the run has no workers. Settled at session start from
         #: :attr:`recorder` and kept, because a report arriving from a worker
@@ -468,6 +472,7 @@ class IncidentEngine:
         """
         record: dict[str, Any] = {
             "pid": os.getpid(),
+            "created_at": self.created_at,
             "session_id": self.session_id,
             "started_at": self.started_at,
         }
@@ -475,7 +480,8 @@ class IncidentEngine:
             # The absence of this is what makes a directory worth reporting
             # rather than merely deleting - see :mod:`.leftovers`.
             record[leftovers.FINISHED_KEY] = time.time()
-        (self.directory / OWNER_FILE).write_text(json.dumps(record), encoding="utf-8")
+        if not leftovers._write_marker(self.directory, record):
+            raise OSError("could not write run marker")
 
     def _report_runs_that_never_came_back(self) -> None:
         """Raise the incidents of runs that were killed before they could.
@@ -493,7 +499,7 @@ class IncidentEngine:
         try:
             leftovers.deliver_left_behind(
                 self.settings.directory, self.directory, self._deliver_recovered,
-                elevate=self.settings.elevate,
+                elevate=self.settings.elevate, prepare=self._enrich,
             )
         except Exception as failure:  # noqa: BLE001 - never break a starting run
             advise(f"the previous runs' evidence could not be read: {failure!r}")
@@ -501,7 +507,6 @@ class IncidentEngine:
 
     def _deliver_recovered(self, incident: Incident) -> None:
         """Let callback failure escape to recovery so its evidence remains retryable."""
-        self._enrich(incident)
         self.config.hook.pytest_failure_incident(incident=incident)
 
     def _warn_if_a_live_session_already_owns_this_directory(self) -> None:
@@ -552,6 +557,8 @@ class IncidentEngine:
         with self.lock:
             if self.closed:
                 return False
+            if incident.kind == "worker_stall" and incident.worker in self.workers_down:
+                return False  # A probe completed after node-down; death is authoritative.
             count = self.seen.get(incident.fingerprint, 0) + 1
             self.seen[incident.fingerprint] = count
             if count == 1:
@@ -560,6 +567,11 @@ class IncidentEngine:
             else:
                 self.suppressed += 1
         if count > 1:
+            try:
+                if incident.fingerprint in self.delivered_fingerprints:
+                    leftovers.checkpoint_live(self.directory, incident)
+            except OSError as failure:
+                print(f"[failure-instrumentation] incident checkpoint failed: {failure!r}", flush=True)
             return False
         if self.resources is not None:
             self.resources.event({"kind": "incident", "incident_kind": incident.kind,
@@ -569,6 +581,9 @@ class IncidentEngine:
                                   "verdict": getattr(incident, "verdict", None)})
         try:
             self.config.hook.pytest_failure_incident(incident=incident)
+            with self.lock:
+                self.delivered_fingerprints.add(incident.fingerprint)
+            leftovers.checkpoint_live(self.directory, incident)
         except Exception as failure:  # noqa: BLE001
             print(f"[failure-instrumentation] incident hook raised: {failure!r}", flush=True)
         return True
@@ -891,7 +906,7 @@ class IncidentEngine:
         self.tracer.start()
         if payload is not None:
             self.reporter_status = (
-                "armed" if self.tracer.active else f"off: the sidecar is not running ({self.tracer.how})"
+                "armed" if self.tracer.reporter_armed else f"off: reporter setup was not acknowledged ({self.tracer.how})"
             )
         if not self.distributed:
             # No xdist id is ever coming, so this process's own name is the
@@ -931,7 +946,7 @@ class IncidentEngine:
         )
         self.tracer.start()
         self.reporter_status = (
-            "armed" if self.tracer.active else f"off: the sidecar is not running ({self.tracer.how})"
+            "armed" if self.tracer.reporter_armed else f"off: reporter setup was not acknowledged ({self.tracer.how})"
         )
         if not self.distributed:
             self._announce_witnesses()  # a distributed run announces from configure_node
@@ -969,6 +984,7 @@ class IncidentEngine:
             "directory": str(self.directory),
             "session": self.session_id,
             "controller_pid": os.getpid(),
+            "controller_created_at": self.created_at,
             "packages": list(self.settings.packages),
             "product_version": self.settings.product_version,
             "elevate": self.settings.elevate,

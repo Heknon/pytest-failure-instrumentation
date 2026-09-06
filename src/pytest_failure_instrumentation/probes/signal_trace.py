@@ -173,7 +173,7 @@ def availability(elevate: bool) -> tuple[bool, str]:
 #: run's death (see :mod:`..incidents.reporter`). Its stdin carries the run's
 #: messages: the reporter payload after start, ``stop`` at session finish.
 SIDECAR = r'''
-import json, os, select, signal, subprocess, sys, time
+import errno, fcntl, json, os, select, signal, subprocess, sys, time
 
 instance, event_filter, output, owner, mode = sys.argv[1:6]
 ROOTS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
@@ -333,8 +333,34 @@ orphaned = False
 # event in it may be the SIGKILL that ended the run, which is the one line a
 # later run needs to say who did it.
 closing_at = None
+owner_lock = None
+try:
+    owner_lock = open(output + ".owner", "r+b")
+except OSError:
+    pass  # Legacy/directly launched sidecars still have EOF detection.
+
+
+def controller_gone():
+    if owner_lock is None:
+        return False
+    try:
+        # POSIX record locks belong to a process, not its inherited file
+        # descriptions: a forked child cannot keep its parent's lock alive.
+        fcntl.lockf(owner_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as failure:
+        if failure.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        return False  # Unavailable is not death.
+    fcntl.lockf(owner_lock, fcntl.LOCK_UN)
+    return True
+
+
 try:
     while True:
+        if closing_at is None and payload is not None and not told_to_stop and controller_gone():
+            orphaned = True
+            closing_at = time.monotonic() + (0.5 if tracing else 0.0)
+            watched = [pipe] if tracing else []
         if closing_at is not None and time.monotonic() >= closing_at:
             break
         if signal_deadline is not None and time.monotonic() >= signal_deadline:
@@ -364,8 +390,12 @@ try:
                         continue
                     if message.get("stop"):
                         told_to_stop = True
+                        closing_at = time.monotonic()
+                        watched = [pipe] if tracing else []
                     if isinstance(message.get("reporter"), dict):
                         payload = message["reporter"]
+                        if message.get("ack"):
+                            write(output + ".armed", str(message["ack"]))
         if not tracing:
             continue
         try:
@@ -406,6 +436,8 @@ finally:
         except OSError:
             pass
     out.close()
+    if owner_lock is not None:
+        owner_lock.close()
 if orphaned and payload is not None:
     report(payload)
 '''
@@ -434,6 +466,8 @@ class SignalTracer:
         #: where nothing can be traced, in a watch-only mode, because the
         #: reporter needs no privilege and a killed run needs a survivor.
         self.reporter = reporter
+        self.reporter_armed = False
+        self._owner_lock: Any = None
         self.process: Optional[subprocess.Popen[bytes]] = None
         #: The tracing status: how, or why not. Independent of whether a
         #: watch-only sidecar is running for the reporter.
@@ -456,13 +490,13 @@ class SignalTracer:
         if not self.trace:
             self.how = "off: failure_kill_trace is off"
             if self.reporter is not None and self._spawn("watch", "watch"):
-                self._send({"reporter": self.reporter})
+                self._arm_reporter()
             return self.how
         usable, how = availability(self.elevate)
         if usable:
             self.how = how if self._spawn(how, "trace") else self.how
             if self.active:
-                self._send({"reporter": self.reporter})
+                self._arm_reporter()
                 return self.how
         else:
             self.how = f"off: {how}"
@@ -470,12 +504,17 @@ class SignalTracer:
         # configured a sidecar is still owed: one that watches for the run's
         # death and nothing else, which needs no privilege at all.
         if self.reporter is not None and self._spawn(how if usable else "watch", "watch"):
-            self._send({"reporter": self.reporter})
+            self._arm_reporter()
         return self.how
 
     def _spawn(self, how: str, mode: str) -> bool:
         """Start one sidecar; True if it came up. ``self.how`` says why not."""
         creation: dict[str, Any] = {}
+        if not IS_WINDOWS and self._owner_lock is None:
+            import fcntl
+
+            self._owner_lock = Path(str(self.output) + ".owner").open("a+b")
+            fcntl.lockf(self._owner_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if IS_WINDOWS:
             session = f"{INSTANCE_PREFIX}{os.getpid()}"
             command = [
@@ -520,6 +559,24 @@ class SignalTracer:
             return False
         return True
 
+    def _arm_reporter(self) -> None:
+        if self.reporter is None:
+            return
+        import uuid
+
+        token = uuid.uuid4().hex
+        self.reporter_armed = False
+        self._send({"reporter": self.reporter, "ack": token})
+        deadline = time.monotonic() + 5.0
+        while self.active and time.monotonic() < deadline:
+            try:
+                if Path(str(self.output) + ".armed").read_text() == token:
+                    self.reporter_armed = True
+                    return
+            except OSError:
+                pass
+            time.sleep(0.01)
+
     def _send(self, message: dict[str, Any]) -> None:
         """One line to the sidecar. Lost quietly if it is gone: the run
         goes on either way."""
@@ -548,6 +605,11 @@ class SignalTracer:
             self._stop()
         except Exception:  # noqa: BLE001 - session finish must not fail here
             pass
+        finally:
+            self.reporter_armed = False
+            if self._owner_lock is not None:
+                self._owner_lock.close()
+                self._owner_lock = None
 
     def _stop(self) -> None:
         process = self.process

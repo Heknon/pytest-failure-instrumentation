@@ -9,8 +9,9 @@ about which nothing was ever said.
 
 The sidecar (:mod:`..probes.signal_trace`) can survive controller death, though
 a container, cgroup, or host shutdown can kill it too. It holds the
-read end of a pipe only the controller can write, so the controller dying,
-whatever killed it, is EOF on that pipe. A controller that reaches session
+read end of the controller pipe. EOF detects death; an independent POSIX
+process-owned lock or Windows process handle also detects it when a forked
+child retains the pipe writer. A controller that reaches session
 finish says ``stop`` first; EOF without it is a death. The sidecar then
 starts *this* module in a child of its own, hands it the payload the
 controller sent at startup, and the child builds the same incidents the next
@@ -58,6 +59,8 @@ CONTROLLER_GONE_SECONDS = 10.0
 #: past this is not a death and is not reported as one.
 WORKERS_GONE_SECONDS = 20.0
 POLL_SECONDS = 0.25
+DELIVERY_ATTEMPTS = 3
+RETRY_SECONDS = 0.25
 
 
 # -- the callable, in transit -----------------------------------------------
@@ -107,21 +110,24 @@ def report(payload: dict[str, Any]) -> list[Any]:
 
     # Imported only now, on the restored path, so a dev install that lives
     # off PYTHONPATH resolves the same way it did in the controller.
-    from .. import probes
     from ..analysis.attribution import Attributor
     from ..capture.state import read_state
+    from ..probes.process import same_process
     from . import leftovers
     from .enrich import enrich
 
     directory = Path(payload["directory"])
     session = str(payload.get("session") or directory.name)
-    _wait_until_gone(int(payload["controller_pid"]), CONTROLLER_GONE_SECONDS, probes.is_running)
-    worker_pids = [
-        int(record["pid"])
+    _wait_until_gone(int(payload["controller_pid"]), CONTROLLER_GONE_SECONDS,
+                     lambda pid: same_process(pid, payload.get("controller_created_at")))
+    worker_records = [
+        record
         for record in (read_state(state, None) for state in directory.glob("*.state"))
         if isinstance(record.get("pid"), int)
     ]
-    _wait_until_all_gone(worker_pids, WORKERS_GONE_SECONDS, probes.is_running)
+    identities = {record["pid"]: record.get("created_at") for record in worker_records}
+    _wait_until_all_gone(list(identities), WORKERS_GONE_SECONDS,
+                         lambda pid: same_process(pid, identities[pid]))
 
     with leftovers.claim(directory) as acquired:
         if not acquired:
@@ -132,19 +138,25 @@ def report(payload: dict[str, Any]) -> list[Any]:
         found = leftovers.deaths_of(directory, elevate=bool(payload.get("elevate")))
         if not found:
             return []
-        # Do not close a run while a surviving worker can still leave evidence.
-        if any(isinstance(incident.worker_pid, int) and probes.is_running(incident.worker_pid)
-               for incident in found):
-            return []
         attributor = Attributor(tuple(payload.get("packages") or ()))
+        prepared: set[int] = set()
+        def prepare(incident: Any) -> None:
+            if id(incident) not in prepared:
+                enrich(incident, attributor, payload.get("product_version"), session)
+                prepared.add(id(incident))
+        delivered: list[Any] = []
         def send(incident: Any) -> None:
-            enrich(incident, attributor, payload.get("product_version"), session)
             target(incident)
-        try:
-            return leftovers.deliver(directory, found, send)
-        except Exception:
-            traceback.print_exc()
-            return []  # checkpointed successes survive; failures remain retryable
+            delivered.append(incident)
+        for attempt in range(DELIVERY_ATTEMPTS):
+            try:
+                leftovers.deliver(directory, found, send, prepare=prepare)
+                return delivered
+            except Exception:
+                traceback.print_exc()
+                if attempt + 1 < DELIVERY_ATTEMPTS:
+                    time.sleep(RETRY_SECONDS)
+        return delivered  # checkpointed successes survive; failures remain retryable
 
 
 def _restore_import_path(payload: dict[str, Any]) -> None:

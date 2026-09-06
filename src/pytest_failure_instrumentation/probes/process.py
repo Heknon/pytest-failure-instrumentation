@@ -26,6 +26,27 @@ import psutil
 from .platform_flags import IS_WINDOWS
 
 
+def creation_time(pid: int) -> Optional[float]:
+    """Process identity, unavailable when procfs belongs to another namespace."""
+    try:
+        if os.path.exists("/proc/self") and int(os.readlink("/proc/self")) != os.getpid():
+            return None
+        return float(psutil.Process(pid).create_time())
+    except (OSError, ValueError, psutil.Error):
+        return None
+
+
+def same_process(pid: int, created: Any = None) -> bool:
+    # Keep legacy records and access denial conservative. Never signal here.
+    from .. import probes
+
+    if not probes.is_running(pid):
+        return False
+    observed = creation_time(pid)
+    return not (isinstance(created, (float, int)) and observed is not None
+                and abs(observed - created) > 0.001)
+
+
 def is_running(pid: int) -> bool:
     """Whether a process still exists. Never touches it.
 
@@ -89,6 +110,11 @@ def _is_zombie(pid: int) -> bool:
     which is cheaper than building a psutil object per worker per request.
     Everywhere else psutil answers.
     """
+    try:
+        if os.path.exists("/proc/self") and int(os.readlink("/proc/self")) != os.getpid():
+            return False  # Foreign procfs must not label a live local PID a zombie.
+    except (OSError, ValueError):
+        return False
     state = _procfs_state(pid)
     if state is not None:
         return state == b"Z"

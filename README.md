@@ -962,9 +962,15 @@ is no next run, and a cancelled or OOM-killed job was a job about which
 nothing was ever said.
 
 A sidecar can survive the controller. On POSIX it starts in a separate session,
-but it can still be killed with the container, cgroup or host. It holds the read end of a pipe only the
-controller can write, so the controller dying — whatever killed it — is EOF
-on that pipe; a controller that reaches session finish writes `stop` first.
+but it can still be killed with the container, cgroup or host. It reads the
+controller's pipe; a controller that reaches session finish writes `stop` first.
+An independent process-owned POSIX record lock, or a retained Windows process
+handle, detects controller death even if a child retains the pipe's write end.
+The controller reports the reporter as `armed` only after the sidecar acknowledges
+its payload. The acknowledgement contains a random token, never the payload.
+Owner and worker records include process creation time where available, so a
+reused PID does not hide a dead run. Legacy records and inaccessible identity
+information retain conservative PID-based checks.
 EOF without it is a death, and the sidecar then starts a *reporter*: a child
 that builds the same incidents the next run would have recovered, the
 controller's own death above all, and calls the callable you configured with
@@ -1021,12 +1027,35 @@ user's groups and environment. Its output goes to `reporter.log` in the run's
 directory, and nothing it does can reach a run that is already over. Once
 reported, the run's marker is stamped so a later recovery skips it. Reporters,
 recovery and pruning share an OS lock. Each successful callback is checkpointed;
-a failed callback leaves the remaining evidence for a later attempt. Delivery
+a failed callback is retried up to three times with 250 ms between attempts,
+without replaying checkpointed successes. Exhausting that budget leaves the
+remaining evidence for later recovery. A confirmed controller death is delivered
+even if a worker survives the 20-second worker grace period. Its evidence remains
+available until those workers finish; delivery of the controller is checkpointed
+independently. Delivery
 is **at least once**: consumers should deduplicate by run ID and fingerprint
 because a kill between callback success and its checkpoint can replay it.
 The reporter's five-minute deadline includes input delivery; an overdue child
 is killed and reaped. A successful callback means it returned without raising,
 not that an external service durably stored the incident.
+
+**Incident volume.** Live reporting emits each distinct fingerprint once per
+run, with recurrence counts in the existing summary. A completed stall probe
+cannot emit a new stall for a worker already recorded as dead. Delivered worker
+deaths are checkpointed so recovery does not announce them again.
+
+Recovery groups equivalent fingerprints. When the controller died, unresolved
+worker losses are attached to that interrupted-run incident in the optional
+`related_deaths` field, preserving each worker's full record. This describes
+unresolved losses, not proof that they share a cause. Independently diagnosed
+failures remain separate. A grouped report retains the highest severity of its
+members. A 20-worker interruption therefore need not create 21 alerts, while a
+separate diagnosed crash remains visible.
+
+The existing `run_summary` hook record stays informational; ordinary assertion
+failures do not become additional instrumentation incidents. Resource samples,
+gaps and unavailable counters are live data, not incident sources. Consumers
+should route by kind and severity rather than page on every hook invocation.
 
 **Watch-only reporting needs no privilege.** Where tracing is unavailable, the
 sidecar still starts when a reporter is configured. It reports durable state

@@ -574,29 +574,81 @@ def _report(payload: dict[str, Any], output: str) -> None:
 
 def _listen(on_message: Callable[[dict[str, Any]], None]) -> bool:
     """Read the run's messages off stdin until EOF. True if told to stop."""
-    told_to_stop = False
-    inbound = b""
-    while True:
-        try:
-            chunk = os.read(0, 65536)
-        except OSError:
-            break
-        if not chunk:
-            break  # the run that started this is gone, or asked it to stop
-        inbound += chunk
-        lines = inbound.split(b"\n")
-        inbound = lines.pop()
-        for raw in lines:
+    import queue
+    import threading
+    from ctypes import wintypes
+
+    chunks: queue.Queue[bytes] = queue.Queue(maxsize=2)
+    def read() -> None:
+        while True:
             try:
-                message = json.loads(raw)
-            except ValueError:
+                chunk = os.read(0, 65536)
+            except OSError:
+                chunk = b""
+            chunks.put(chunk)
+            if not chunk:
+                return
+    threading.Thread(target=read, daemon=True).start()
+    inbound = b""
+    handle = None
+    kernel = None
+    try:
+        while True:
+            if handle and kernel.WaitForSingleObject(handle, 0) == 0:
+                return False
+            try:
+                chunk = chunks.get(timeout=0.1)
+            except queue.Empty:
                 continue
-            if not isinstance(message, dict):
-                continue
-            if message.get("stop"):
-                told_to_stop = True
-            on_message(message)
-    return told_to_stop
+            if not chunk:
+                return False
+            inbound += chunk
+            lines = inbound.split(b"\n")
+            inbound = lines.pop()
+            for raw in lines:
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("stop"):
+                    return True
+                on_message(message)
+                payload = message.get("reporter")
+                if isinstance(payload, dict) and handle is None and sys.platform == "win32":
+                    pid = payload.get("controller_pid")
+                    if isinstance(pid, int):
+                        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                        kernel.OpenProcess.restype = wintypes.HANDLE
+                        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                        kernel.WaitForSingleObject.restype = wintypes.DWORD
+                        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                        kernel.CloseHandle.restype = wintypes.BOOL
+                        # A retained kernel handle tracks this process even if
+                        # its numeric PID is subsequently reused.
+                        handle = kernel.OpenProcess(0x00100000 | 0x1000, False, pid)
+                        if not handle:
+                            # ERROR_INVALID_PARAMETER means the PID is gone;
+                            # access denial retains the conservative EOF path.
+                            if ctypes.get_last_error() == 87:
+                                return False
+                        elif isinstance(payload.get("controller_created_at"), (int, float)):
+                            kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+                                ctypes.POINTER(wintypes.FILETIME)
+                            ] * 4
+                            kernel.GetProcessTimes.restype = wintypes.BOOL
+                            times = [wintypes.FILETIME() for _ in range(4)]
+                            if kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                                created = filetime_to_epoch(
+                                    (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                                )
+                                if abs(created - payload["controller_created_at"]) > .001:
+                                    return False
+    finally:
+        if handle:
+            kernel.CloseHandle(handle)
 
 
 def serve(session: str, output: str, mode: str = "trace") -> int:
@@ -610,6 +662,9 @@ def serve(session: str, output: str, mode: str = "trace") -> int:
     def remember(message: dict[str, Any]) -> None:
         if isinstance(message.get("reporter"), dict):
             payload.update(message["reporter"])
+            if message.get("ack"):
+                with open(output + ".armed", "w", encoding="utf-8") as ack:
+                    ack.write(str(message["ack"]))
 
     if mode != "trace":
         with open(output, "a", buffering=1, encoding="utf-8") as out:

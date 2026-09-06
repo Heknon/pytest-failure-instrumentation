@@ -1,6 +1,7 @@
 """Regressions for attribution correctness and non-interference under failure."""
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
@@ -336,7 +337,8 @@ def test_recovery_retains_evidence_while_a_worker_is_alive(tmp_path, monkeypatch
     state.update()
     state.close()
     monkeypatch.setattr(reporter, "WORKERS_GONE_SECONDS", 0)
-    assert reporter.report(payload_for(directory, remember)) == []
+    reported = reporter.report(payload_for(directory, functools.partial(remember, "survivor")))
+    assert [item.worker for item in reported] == ["controller"]
     assert not leftovers.marker(directory).get(leftovers.REPORTED_KEY)
     leftovers.prune_finished_runs(directory.parent)
     assert directory.exists()

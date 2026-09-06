@@ -105,7 +105,10 @@ def test_watcher_signal_alone_does_not_report_and_deadline_is_bounded(tmp_path, 
                 child.terminate()
                 time.sleep(.05)
             assert child.poll() is not None, "repeated signals postponed the original deadline"
-        assert child.wait(timeout=2) == 0
+        # A repeated SIGTERM can arrive after CPython restores default
+        # handlers during finalization. Grace duration and no false report
+        # are the contract; that finalization race may set the exit status.
+        assert child.wait(timeout=2) in ((0,) if normal_stop else (0, -signal.SIGTERM))
         elapsed = time.monotonic() - began
         assert elapsed < 1.5
         if not normal_stop:
@@ -117,3 +120,49 @@ def test_watcher_signal_alone_does_not_report_and_deadline_is_bounded(tmp_path, 
         if child.poll() is None:
             child.kill()
         child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("signal_watcher", [False, True])
+def test_forked_writer_cannot_hide_controller_death(tmp_path, signal_watcher):
+    result = tmp_path / "reported.json"
+    output = tmp_path / "trace.jsonl"
+    pidfile = tmp_path / "pids.json"
+    source = sidecar_source(result)
+    code = f'''
+import fcntl, json, os, subprocess, sys, time
+from pathlib import Path
+owner = open({str(output) + '.owner'!r}, "a+b")
+fcntl.lockf(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+watcher = subprocess.Popen([sys.executable, "-c", {source!r}, "test", "", {str(output)!r}, "", "watch"],
+                           stdin=subprocess.PIPE, start_new_session=True)
+watcher.stdin.write((json.dumps({{"reporter": {{"python": sys.executable, "sentinel": "forked"}}, "ack": "ready"}})+"\\n").encode())
+watcher.stdin.flush()
+child = os.fork()
+if child == 0:
+    while True: time.sleep(.1)
+Path({str(pidfile)!r}).write_text(json.dumps([watcher.pid, child]))
+while True: time.sleep(.1)
+'''
+    controller = subprocess.Popen([sys.executable, "-c", code])
+    children = []
+    try:
+        wait_for(pidfile)
+        children = json.loads(pidfile.read_text())
+        wait_for(tmp_path / "trace.jsonl.armed")
+        if signal_watcher:
+            os.kill(children[0], signal.SIGTERM)
+            time.sleep(.2)
+        controller.terminate()
+        controller.wait(timeout=5)
+        wait_for(result)
+        assert json.loads(result.read_text())["sentinel"] == "forked"
+        os.kill(children[1], 0)  # inherited writer is still alive
+    finally:
+        if controller.poll() is None:
+            controller.kill()
+        controller.wait(timeout=5)
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

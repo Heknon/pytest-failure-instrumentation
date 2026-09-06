@@ -121,6 +121,7 @@ class WorkerDeathIncident(Incident):
     #: against the far more specific verdict beside it.
     xdist_error: str = ""
     worker_pid: Optional[int] = None
+    related_deaths: list[dict[str, Any]] = Field(default_factory=list)
 
     exit_status: Optional[int] = None
     exit_status_kind: Optional[str] = None

@@ -192,6 +192,7 @@ jobs:
           tests/test_resources.py
           tests/test_resource_resilience.py
           tests/test_sidecar_termination.py
+          tests/test_reporting_resilience.py
           tests/test_profile_sampler.py
           tests/test_stall_probe.py
           tests/test_exit_status.py
