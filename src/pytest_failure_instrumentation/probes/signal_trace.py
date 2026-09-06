@@ -184,12 +184,23 @@ REPORTER_TIMEOUT = 300.0
 tracing = mode == "trace"
 
 
-class Stop(Exception):
-    pass
+# A supervisor may signal the controller and this sidecar together. A signal
+# to us is not proof of controller death: keep reading its pipe for a bounded
+# grace period. The first signal fixes the deadline; repeated signals cannot
+# postpone shutdown indefinitely. Normal stop+EOF does not pay this delay.
+SIGNAL_GRACE_SECONDS = 15.0
+signal_deadline = None
 
 
 def stop(*_):
-    raise Stop
+    global signal_deadline
+    if signal_deadline is None:
+        signal_deadline = time.monotonic() + SIGNAL_GRACE_SECONDS
+
+
+# Install before setup and the ready header, closing the startup signal race.
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
 
 
 def write(path, text):
@@ -310,8 +321,6 @@ out.write(json.dumps({
     "filter": event_filter if tracing else None,
 }) + "\n")
 
-signal.signal(signal.SIGTERM, stop)
-signal.signal(signal.SIGINT, stop)
 pipe = os.open(os.path.join(here, "trace_pipe"), os.O_RDONLY | os.O_NONBLOCK) if tracing else None
 watched = [0] + ([pipe] if tracing else [])
 pending = b""
@@ -328,7 +337,10 @@ try:
     while True:
         if closing_at is not None and time.monotonic() >= closing_at:
             break
-        ready, _, _ = select.select(watched, [], [], 0.1 if closing_at else 1.0)
+        if signal_deadline is not None and time.monotonic() >= signal_deadline:
+            break
+        ready, _, _ = select.select(watched, [], [],
+                                    0.1 if closing_at is not None or signal_deadline is not None else 1.0)
         if 0 in ready and closing_at is None:
             chunk = os.read(0, 65536)
             if not chunk:
@@ -379,8 +391,6 @@ try:
                 except OSError:
                     pass
             out.write(json.dumps(record) + "\n")
-except Stop:
-    pass
 finally:
     if tracing:
         try:

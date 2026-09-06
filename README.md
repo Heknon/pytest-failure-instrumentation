@@ -944,6 +944,17 @@ does not prove that no OOM kill occurred.
 
 ### Reporting a killed run from the sidecar
 
+On POSIX, a SIGTERM or SIGINT received by the sidecar starts a **15-second
+observation grace period** instead of ending it immediately. This covers a
+supervisor signaling both controller and sidecar: it continues reading the
+controller pipe, reports unexpected EOF, and exits promptly after the normal
+`stop`/EOF handshake. Repeated signals do not extend the deadline. A signal to
+the sidecar alone is never treated as proof that the controller was killed.
+The grace period bounds waiting for controller exit; delivery still uses the
+existing reporter timeout. SIGKILL, Windows forcible termination, or destruction
+of the whole container/host can still prevent reporting.
+
+
 Every incident above is raised by a process that survived to raise it, and a
 run whose controller is killed has none. The next run over the same evidence
 directory recovers it — but on a runner with a fresh workspace per job there
