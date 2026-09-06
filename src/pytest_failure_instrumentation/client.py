@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -760,3 +760,100 @@ async def read_fleet(
     # `return_exceptions=True` would turn into a result to be tabulated.
     gathered = await asyncio.gather(*(ask(server) for server in servers))
     return Fleet(observed_at=round(time.time(), 3), members=list(gathered))
+
+
+class ResourceFleetMember(_Wire):
+    """One server/session's resource page or explicit failure; never its token."""
+
+    url: str = ""
+    session: str = ""
+    history: Optional[ResourceHistory] = None
+    error: Optional[str] = None
+    status: Optional[int] = None
+
+    @property
+    def answered(self) -> bool:
+        return self.history is not None
+
+
+class ResourceFleet(_Wire):
+    """Resource pages retain their host/session scope; host totals are not summed."""
+
+    observed_at: float = 0.0
+    members: list[ResourceFleetMember] = Field(default_factory=list)
+
+    @property
+    def answered(self) -> list[ResourceFleetMember]:
+        return [member for member in self.members if member.answered]
+
+    @property
+    def silent(self) -> list[ResourceFleetMember]:
+        return [member for member in self.members if not member.answered]
+
+    @property
+    def cursors(self) -> dict[tuple[str, str], int]:
+        """Next cursors for answered members, keyed by normalized URL/session.
+
+        Merge these into prior cursors so temporarily unavailable members keep
+        their position. Each history also retains has_more/cursor_expired.
+        """
+        return {(member.url, member.session): member.history.next_after
+                for member in self.members if member.history is not None}
+
+
+async def read_resources_fleet(
+    servers: Sequence[LiveStackServer],
+    *,
+    after: Optional[Mapping[tuple[str, str], int]] = None,
+    limit: int = 120,
+    start: Optional[float] = None,
+    end: Optional[float] = None,
+    worker: Optional[str] = None,
+    latest: bool = False,
+    concurrency: int = 16,
+    timeout: Optional[float] = None,
+    client: Optional[httpx.AsyncClient] = None,
+) -> ResourceFleet:
+    """Read one bounded resource page per server's session_id concurrently.
+
+    Uses each ready payload's token. Missing session IDs, disabled/finished
+    collection (404), authentication, transport and schema errors stay local
+    to that member. Caller cancellation propagates. History reads never start
+    sampling or scans. Pages are not drained automatically; pass updated
+    per-member cursors on the next call. Shared host metrics remain separate
+    observations and must not be added together.
+    """
+    if not isinstance(concurrency, int) or concurrency < 1:
+        raise ValueError("concurrency must be a positive integer")
+    if client is None:
+        async with httpx.AsyncClient(timeout=timeout or DEFAULT_TIMEOUT) as owned:
+            return await read_resources_fleet(
+                servers, after=after, limit=limit, start=start, end=end, worker=worker,
+                latest=latest, concurrency=concurrency, timeout=timeout, client=owned,
+            )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def ask(server: LiveStackServer) -> ResourceFleetMember:
+        member = ResourceFleetMember(url=server.url.rstrip("/"), session=server.session_id)
+        try:
+            if not member.session:
+                raise ValueError("resource reads require the server's session_id")
+            reader = FailureServerClient(server, timeout=timeout or DEFAULT_TIMEOUT, client=client)
+            async with semaphore:
+                member.history = await reader.resources(
+                    member.session, after=(after or {}).get((member.url, member.session), 0),
+                    limit=limit, start=start, end=end, worker=worker, latest=latest, timeout=timeout,
+                )
+            if member.history.session != member.session:
+                member.history = None
+                raise ValueError("resource response belongs to a different session")
+        except ServerRefused as refused:
+            member.error, member.status = refused.message, refused.status
+        except FailureServerError as failed:
+            member.error = str(failed)
+        except Exception as unexpected:  # noqa: BLE001 - isolate each member, not cancellation
+            member.error = f"{type(unexpected).__name__}: {unexpected}"
+        return member
+
+    gathered = await asyncio.gather(*(ask(server) for server in servers))
+    return ResourceFleet(observed_at=round(time.time(), 3), members=list(gathered))

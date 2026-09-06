@@ -1041,7 +1041,8 @@ not that an external service durably stored the incident.
 
 **Incident volume.** Live reporting emits each distinct fingerprint once per
 run, with recurrence counts in the existing summary. A completed stall probe
-cannot emit a new stall for a worker already recorded as dead. Delivered worker
+cannot emit a new stall for a worker already reported as failed by xdist.
+Clean completion does not erase a previously confirmed stall. Delivered worker
 deaths are checkpointed so recovery does not announce them again.
 
 Recovery groups equivalent fingerprints. When the controller died, unresolved
@@ -1866,6 +1867,30 @@ async with FailureServerClient(url=server_url, token=token) as client:
     for sample in page.batches:
         print(sample.host.metrics, sample.processes)
 ```
+
+For multiple servers, use the `LiveStackServer` payloads received through
+`pytest_failure_server_ready`; each supplies its own token and `session_id`:
+
+```python
+from pytest_failure_instrumentation.client import read_resources_fleet
+
+cursors = {}  # retain between polls, keyed by (server URL, session)
+fleet = await read_resources_fleet(servers, after=cursors, limit=120, concurrency=16)
+cursors.update(fleet.cursors)  # failed members keep their previous cursor
+for member in fleet.answered:
+    print(member.url, member.session, member.history.batches)
+for member in fleet.silent:
+    print(member.url, member.session, member.status, member.error)
+```
+
+This reads one page per advertised session, with bounded concurrency (16 by
+default). It preserves pagination, gaps and availability rather than draining
+history automatically. `start`, `end`, `worker`, `latest`, and `timeout` have
+the same meanings as the single-server call. A shared `httpx.AsyncClient` can
+be passed as `client`; ownership stays with the caller. Cancellation propagates.
+Different pytest sessions can observe the same host, so the fleet retains
+host/session identity and does not sum their machine measurements. Existing
+`read_fleet()` continues to gather worker snapshots with its original contract.
 
 ### File tracking and bounded cost
 

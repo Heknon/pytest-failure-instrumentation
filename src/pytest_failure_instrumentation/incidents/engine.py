@@ -225,6 +225,7 @@ class IncidentEngine:
         #: because a dead worker's *last* report arrives after its death -
         #: see _touch.
         self.workers_down: set[str] = set()
+        self.workers_failed: set[str] = set()
         #: How long each live worker has been silent, on the *monotonic* clock,
         #: and which are wedged already - shared with the watcher thread below.
         #: Monotonic because this is one process measuring an interval against
@@ -557,8 +558,8 @@ class IncidentEngine:
         with self.lock:
             if self.closed:
                 return False
-            if incident.kind == "worker_stall" and incident.worker in self.workers_down:
-                return False  # A probe completed after node-down; death is authoritative.
+            if incident.kind == "worker_stall" and incident.worker in self.workers_failed:
+                return False  # A failed node already has a death report.
             count = self.seen.get(incident.fingerprint, 0) + 1
             self.seen[incident.fingerprint] = count
             if count == 1:
@@ -1336,6 +1337,8 @@ class IncidentEngine:
             # Final, and it has to be: the report xdist writes for the test
             # this worker abandoned is still to come, and it names this node.
             self.workers_down.add(worker)
+            if error:
+                self.workers_failed.add(worker)
             if worker not in self.collections.digest_by_worker:
                 self.workers_lost.add(worker)
         # One fewer collection to wait for, which may be the one that was

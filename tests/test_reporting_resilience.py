@@ -213,6 +213,7 @@ def test_repeated_live_failure_is_one_hook_and_late_stall_is_suppressed(pytester
     assert engine.raised == 1
     assert engine.suppressed == 19
     engine.workers_down.add("gw0")
+    engine.workers_failed.add("gw0")
     assert not engine.raise_incident(WorkerStallIncident(worker="gw0", verdict="STALLED_FROZEN"))
     assert len(received) == 1
     assert engine.raise_incident(WorkerDeathIncident(worker="gw21", worker_pid=999990,
@@ -231,3 +232,21 @@ def test_failure(i):
     assert [item.kind for item in incidents] == ["run_summary"]
     assert incidents[0].raised == 0
     assert incidents[0].exitstatus == 1
+
+
+def test_clean_worker_completion_does_not_hide_a_confirmed_stall(pytester):
+    from types import SimpleNamespace
+
+    from pytest_failure_instrumentation import Settings
+    from pytest_failure_instrumentation.incidents.engine import IncidentEngine
+    from pytest_failure_instrumentation.incidents.stall import WorkerStallIncident
+
+    engine = IncidentEngine(pytester.parseconfig(), Settings(directory=pytester.path / "evidence"))
+    received = []
+    engine.config = SimpleNamespace(hook=SimpleNamespace(
+        pytest_failure_incident=lambda incident: received.append(incident)))
+    engine.workers_down.add("gw0")  # Clean completion, no death incident.
+    # A stack request can interrupt native sleep after confirming a frozen
+    # worker. Finishing cleanly does not invalidate that prior observation.
+    assert engine.raise_incident(WorkerStallIncident(worker="gw0", verdict="STALLED_FROZEN"))
+    assert len(received) == 1
