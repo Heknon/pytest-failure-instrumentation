@@ -24,11 +24,15 @@ class Scanner:
                  excluded: Path, checkpoint: Callable[..., None]) -> None:
         self.root = root
         self.max_entries = max_entries
-        self.excluded = excluded
+        self.excluded = excluded.resolve()
         self.checkpoint = checkpoint
         self.db = sqlite3.connect(str(database))
         self.db.execute("PRAGMA cache_size=-1024")
-        self.db.execute("PRAGMA max_page_count=8192")  # 32 MiB with default 4 KiB pages
+        # Two inventories plus their indexes. The entry bound is independent
+        # of bytes: very long names or a full volume can exhaust either budget.
+        self.max_bytes = max(32 * 1024 * 1024, max_entries * 2048)
+        page_size = self.db.execute("PRAGMA page_size").fetchone()[0]
+        self.db.execute(f"PRAGMA max_page_count={self.max_bytes // page_size}")
         self.db.execute("PRAGMA journal_mode=DELETE")  # rollback a failed/full inventory safely
         self.db.execute("CREATE TABLE baseline(path TEXT PRIMARY KEY, size INTEGER)")
         self.db.execute("CREATE TABLE current(path TEXT PRIMARY KEY, size INTEGER)")
@@ -45,7 +49,7 @@ class Scanner:
         started = time.time()
         root_info = self.root.lstat()
         if (stat.S_ISLNK(root_info.st_mode) or getattr(root_info, "st_file_attributes", 0) & 0x400
-                or self.root == self.excluded or self.excluded in self.root.parents):
+                or self.root.resolve() == self.excluded or self.excluded in self.root.resolve().parents):
             excluded_result = {"root": str(self.root), "status": "excluded", "observed_at": started}
             self.checkpoint(excluded_result)
             return excluded_result
@@ -57,7 +61,7 @@ class Scanner:
         checkpoint_at = time.monotonic()
         result: dict[str, Any] = {"root": str(self.root), "scan_started_at": started,
                                   "status": "scanning", "attribution": "shared_directory",
-                                  "baseline": self.baseline}
+                                  "baseline": self.baseline, "inventory_max_bytes": self.max_bytes}
         self.checkpoint(result)
         while stack and not capped:
             directory = stack.pop()
@@ -72,7 +76,7 @@ class Scanner:
                             info = entry.stat(follow_symlinks=False)
                             path = Path(entry.path)
                             reparse = getattr(info, "st_file_attributes", 0) & 0x400
-                            if path == self.excluded or stat.S_ISLNK(info.st_mode) or reparse:
+                            if path.resolve() == self.excluded or stat.S_ISLNK(info.st_mode) or reparse:
                                 continue
                             if stat.S_ISDIR(info.st_mode):
                                 if len(stack) < self.max_entries:
@@ -153,7 +157,12 @@ def serve(config: dict[str, Any]) -> None:
         if not alive():
             raise SystemExit(0)
         snapshots[key] = result
-        atomic_json(directory / "files.json", {"roots": list(snapshots.values()), "volumes": volumes})
+        try:
+            atomic_json(directory / "files.json", {"roots": list(snapshots.values()), "volumes": volumes})
+        except OSError:
+            # A bounded sharing retry has already run. Preserve the in-memory
+            # snapshot for the next publication instead of killing the helper.
+            pass
 
     scanners = []
     for index, root in enumerate(config["roots"]):
@@ -181,15 +190,21 @@ def serve(config: dict[str, Any]) -> None:
                     except OSError as error:
                         volumes.append({"path": raw, "observed_at": time.time(), "metrics": {},
                                         "unavailable": {"space": type(error).__name__}})
-                atomic_json(directory / "files.json", {"roots": list(snapshots.values()), "volumes": volumes})
+                try:
+                    atomic_json(directory / "files.json", {"roots": list(snapshots.values()), "volumes": volumes})
+                except OSError:
+                    pass
                 next_volumes = now + 30
             if now >= next_scan:
                 for scanner in scanners:
                     try:
                         scanner.scan()
                     except (OSError, sqlite3.Error) as error:
-                        publish(str(scanner.root), {"root": str(scanner.root), "status": "failed",
-                                                   "error": type(error).__name__, "observed_at": time.time()})
+                        full = isinstance(error, sqlite3.Error) and "full" in str(error).lower()
+                        publish(str(scanner.root), {"root": str(scanner.root),
+                            "status": "inventory_over_budget" if full else "failed",
+                            "error": "database_or_disk_full" if full else type(error).__name__,
+                            "inventory_max_bytes": scanner.max_bytes, "observed_at": time.time()})
                 next_scan = time.monotonic() + config["scan_seconds"]
             time.sleep(0.2)
     finally:

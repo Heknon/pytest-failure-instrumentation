@@ -1840,7 +1840,11 @@ work, then pause for 50 ms. A syscall itself can exceed that duration, which
 is why the helper has a bounded shutdown. Symlinks, Windows reparse points,
 and the plugin's evidence tree are excluded. Scans have an entry budget,
 counting directories as well as files; at most eight roots are accepted.
-Each disposable SQLite inventory has a 32 MiB database cap and a 1 MiB cache.
+Each disposable SQLite inventory has a database cap of the larger of 32 MiB
+and 2,048 bytes per configured entry (about 98 MiB at 50,000 entries), plus a
+1 MiB cache. The entry and byte limits are independent: exceptionally long
+paths or a full volume report `inventory_over_budget` / `database_or_disk_full`.
+Rollback journals can temporarily require additional disk space.
 Its temporary rollback journal can use approximately another database's worth
 of disk space during a transaction. Failed/full transactions roll back, so a
 later successful scan does not compare against a damaged partial inventory.
@@ -2672,3 +2676,36 @@ then on the customer who called it — a runtime frame reported as customer code
 which is the one direction this must never fail in. Only the 3.9 cell caught
 it. And it found that ctypes cannot raise an uncaught fault on Windows at all,
 which is a fact about what users will see rather than about the plugin.
+
+
+Resource review clarifications:
+- `/resources` is opt-in host context, including surrounding process names/PIDs
+  and configured directory metadata. Loopback clients can read it without a
+  token under the existing server defaults. Configure `PYTEST_CALLSTACK_TOKEN`
+  when other local users must not read these measurements. No unrelated stack,
+  environment, command line or file content is collected by this endpoint.
+- `LiveStackServer.session_id`, delivered to `pytest_failure_server_ready`, is
+  also a source of the session identifier; polling `/workers` is not necessary.
+- Events are acknowledged after history publication. Failed publication may
+  replay an event; the bounded event queue reports overflow instead of growing
+  indefinitely. File snapshot errors distinguish oversized, unavailable and
+  not-yet-published results.
+- The on-demand `Profile readiness` workflow now also runs resource qualification:
+  two alternating pairs, 80 lightweight workers, and a separate eight-worker
+  256 MiB allocation workload with file scans. Gates are 20% elapsed/test-p99
+  overhead, 25% controller/worker RSS overhead, sample time at most the smaller
+  of one second and 20% of the configured interval, and 30-second shutdown.
+  RSS comparisons exclude the filesystem helper and double-count shared pages;
+  they are synthetic budgets, not fleet-wide guarantees.
+
+- `probes.capabilities(resources=True)` performs an explicit resource preflight;
+  ordinary capability checks do not initialize these adapters.
+- Repeated filesystem snapshots are stored once per segment. Every retained
+  segment is self-contained, and HTTP responses expand the snapshots unchanged.
+- Five consecutive collection/write errors stop sampling. The manifest records
+  the reason when writable, with a stderr diagnostic if the volume cannot accept
+  it. Run access still ends at session shutdown.
+- Existing live-history directories are not overwritten: a collision fails
+  collection setup visibly rather than deleting potentially active data. Volume
+  queries remain isolated even without directory roots, since filesystem calls
+  can block. Neither requires a permanent collector.

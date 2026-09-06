@@ -97,6 +97,8 @@ class ResourceHistory:
         self.segment_bytes = max(MAX_LINE, self.max_bytes // 16)
         self.segments: list[dict[str, Any]] = []
         self.sequence = 0
+        self.files_snapshot: Any = None
+        self.files_sequence: Optional[int] = None
         self.closed = False
         self.cleanup_error: Optional[str] = None
         self.lease = (self.directory / LEASE).open("w+b")
@@ -130,6 +132,18 @@ class ResourceHistory:
             self.segments.append({"file": f"{sequence:016d}.jsonl", "first": sequence,
                                   "last": sequence, "bytes": 0,
                                   "from": batch["observed_at"], "to": batch["observed_at"]})
+        # References never cross segments: every retained segment is independently
+        # readable after rotation, including latest/time-filtered queries. The wire
+        # response always expands snapshots, so existing clients need no cursors
+        # or back-reference resolver for filesystem data.
+        files = batch.get("files")
+        full_files = True
+        if (self.segments[-1]["bytes"] and self.files_sequence is not None
+                and files is not None and files == self.files_snapshot):
+            compact = {**batch, "sequence": sequence, "_files_sequence": self.files_sequence}
+            del compact["files"]
+            encoded = (json.dumps(compact, separators=(",", ":"), allow_nan=False) + "\n").encode()
+            full_files = False
         while len(self.segments) > 1 and sum(s["bytes"] for s in self.segments) + len(encoded) > self.max_bytes:
             old = self.segments[0]
             (self.directory / old["file"]).unlink(missing_ok=True)
@@ -146,6 +160,10 @@ class ResourceHistory:
                        bytes=segment["bytes"] + len(encoded))
         segment["from"] = min(segment["from"], batch["observed_at"])
         self.sequence = sequence
+        if full_files:
+            # Detach from caller-owned dictionaries that may be mutated later.
+            self.files_snapshot = json.loads(json.dumps(files))
+            self.files_sequence = sequence if files is not None else None
         self._publish()
 
     def deactivate(self) -> None:
@@ -217,6 +235,8 @@ def read_history(directory: Path, *, after: int = 0, limit: int = 120,
         try:
             with (root / segment["file"]).open("rb") as stream:
                 remaining = segment["bytes"]
+                files_snapshot: Any = None
+                files_sequence = None
                 while remaining > 0:
                     line = stream.readline(min(MAX_LINE + 1, remaining))
                     remaining -= len(line)
@@ -231,6 +251,14 @@ def read_history(directory: Path, *, after: int = 0, limit: int = 120,
                     seq = batch["sequence"]
                     if not segment["first"] <= seq <= segment["last"]:
                         raise OSError("resource record outside published sequence range")
+                    reference = batch.pop("_files_sequence", None)
+                    if reference is not None:
+                        if reference != files_sequence:
+                            raise OSError("resource file snapshot reference is unavailable")
+                        batch["files"] = files_snapshot
+                    elif "files" in batch:
+                        files_snapshot = batch["files"]
+                        files_sequence = seq
                     if seq <= after:
                         continue
                     if ((start is not None and batch["observed_at"] < start)

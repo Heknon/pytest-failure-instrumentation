@@ -493,15 +493,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(503, {"error": "no evidence directory"})
             return
         session = (query.get("session") or [""])[0]
+        if not session:
+            self._reply(400, {"error": "session is required (from /workers)"})
+            return
         # Same shared-server semantics as /workers, with an explicit session
         # so gw0 from two concurrent runs cannot collide. No user-built path.
         try:
             directory = next((p for p in root.iterdir() if p.is_dir() and p.name == session), None)
         except OSError:
             directory = None
-        if not session:
-            self._reply(400, {"error": "session is required (from /workers)"})
-            return
         if directory is None:
             self._reply(404, {"error": "no active resource history for this session"})
             return
@@ -581,6 +581,11 @@ class _Handler(BaseHTTPRequestHandler):
         of it. "Authorised" is only about who may *ask*, and on the default it
         is nobody in particular - which is why what may be asked *about* is
         bounded separately, by :func:`serves_pid`, rather than resting on this.
+        That bound governs stack inspection. Opt-in /resources additionally
+        serves sampled host pressure, consumer names/PIDs and configured file
+        metadata as context for a live run; it does not inspect their stacks,
+        arguments, environment or file contents. Loopback readers can see that
+        context unless the operator configures a token.
 
         Compared in constant time. The comparison is short and local and an
         attacker's timing signal across it is buried in HTTP jitter, but a

@@ -15,6 +15,7 @@ in ``resolve``, so a hand-built one cannot skip them.
 
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from dataclasses import dataclass, fields, replace
@@ -343,25 +344,30 @@ class Settings:
             "sample_seconds",
             0.0 if self.sample_seconds <= 0 else max(MIN_SAMPLE_SECONDS, float(self.sample_seconds)),
         )
-        import math
-
         for name, minimum, maximum, fallback in (
             ("resources_seconds", 0.0, 3600.0, 0.0),
             ("resources_max_mb", 8, 1024, 256),
             ("resources_scan_seconds", 10.0, 86400.0, 60.0),
             ("resources_max_files", 100, 100000, 50000),
         ):
-            value = float(getattr(self, name))
+            original = getattr(self, name)
+            value = float(original)
             value = min(maximum, max(minimum, value)) if math.isfinite(value) else fallback
             if name == "resources_seconds" and value > 0:
                 value = max(1.0, value)
-            object.__setattr__(self, name, int(value) if name in ("resources_max_mb", "resources_max_files") else value)
+            value = int(value) if name in ("resources_max_mb", "resources_max_files") else value
+            if value != float(original):
+                advise(f"failure_{name}={original!r} is outside the supported range; using {value}.")
+            object.__setattr__(self, name, value)
         roots = self.resources_roots
         if isinstance(roots, str):
             roots = (roots,)
-        object.__setattr__(self, "resources_roots", tuple(dict.fromkeys(
+        normalized = tuple(dict.fromkeys(
             str(Path(root).expanduser().absolute()) for root in roots if str(root).strip()
-        ))[:8])
+        ))
+        if len(normalized) > 8:
+            advise(f"failure_resources_roots accepts eight roots; dropping {len(normalized) - 8} additional roots.")
+        object.__setattr__(self, "resources_roots", normalized[:8])
         object.__setattr__(self, "tracer", self._usable_tracer())
         object.__setattr__(
             self,
@@ -1144,7 +1150,7 @@ def resolve(config: pytest.Config) -> Settings:
     if from_the_command_line:
         _warn_if_the_token_was_typed_where_others_can_read_it()
 
-    return Settings(
+    settings = Settings(
         directory=Path(_ini(config, "failure_directory", "") or DEFAULT_DIRECTORY),
         packages=tuple(_ini(config, "failure_packages", ()) or ()),
         product_version=_ini(config, "failure_product_version", "") or None,
@@ -1201,3 +1207,17 @@ def resolve(config: pytest.Config) -> Settings:
         profile_burst_cores=_number(config, "failure_profile_burst_cores", 0.7),
         profile_burst_seconds=_number(config, "failure_profile_burst_seconds", 2.0),
     )
+
+    if settings.resources_seconds > 0:
+        if not settings.stack_server:
+            advise("Live resource collection is enabled without a callstack server. "
+                   "Enable failure_stack_server or provide another live reader; history is deleted at session end.")
+        for root in settings.resources_roots:
+            try:
+                exists = Path(root).is_dir()
+            except OSError:
+                exists = False
+            if not exists:
+                advise(f"Resource root {root!r} is not currently an accessible directory; "
+                       "scans report unavailable until it exists.")
+    return settings

@@ -242,6 +242,9 @@ class ResourceMeasurements(_Wire):
 
 
 class ResourceProcess(ResourceMeasurements):
+    """A stable process identity and the times it was discovered and sampled."""
+
+    first_observed_at: Optional[float] = None
     pid: int
     created_at: float
     name: str = ""
@@ -272,6 +275,8 @@ class ResourceBatch(_Wire):
 
 
 class ResourceHistory(_Wire):
+    collection_status: str = "running"
+    collection_error: Optional[str] = None
     schema_version: int = 1
     session: str
     controller_pid: int
@@ -282,7 +287,7 @@ class ResourceHistory(_Wire):
     scope: str = ""
     pid_scope: str = "local"
     pytest_pid: Optional[int] = None
-    product_version: str = ""
+    product_version: Optional[str] = None
     worker_count: Optional[int] = None
     cgroups: dict[str, str] = Field(default_factory=dict)
     limits: dict[str, int] = Field(default_factory=dict)

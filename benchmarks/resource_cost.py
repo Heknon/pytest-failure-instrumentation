@@ -62,23 +62,28 @@ def pytest_sessionfinish(session):
     if hasattr(session.config, "workerinput"):
         yield
         return
-    before = time.monotonic()
     samples = []
     # Only the controller reads history, once, outside the measured test calls.
-    for path in sorted(Path("evidence").glob("*/resources-live/*.jsonl")):
-        with path.open() as handle:
-            for line in handle:
-                batch = json.loads(line)
+    from pytest_failure_instrumentation.capture.resource_history import read_history
+    for directory in Path("evidence").glob("*/resources-live"):
+        after = 0
+        while True:
+            page = read_history(directory.parent, after=after, limit=500)
+            for batch in page["batches"]:
                 samples.append({"collector": batch["collector"], "processes": len(batch["processes"]),
                     "workers": len([p for p in batch["processes"] if p["role"] == "worker"]),
                     "rss_sum_bytes": sum(p["metrics"].get("rss_bytes", 0) for p in batch["processes"]),
                     "host": batch["host"], "cgroup": batch["cgroup"], "files": batch["files"]})
+            if not page["has_more"]:
+                break
+            after = page["next_after"]
     collector_errors = 0
     for plugin in session.config.pluginmanager.get_plugins():
         collector = getattr(plugin, "resources", None)
         if collector is not None:
             collector_errors += collector.errors
     controller_memory = memory()
+    before = time.monotonic()
     yield
     Path("result.json").write_text(json.dumps({"test_seconds": values,
         "sessionfinish_seconds": time.monotonic()-before, "resources": samples,
@@ -179,8 +184,31 @@ def main():
                         return 1
     disabled = [r["test_p99_s"] for r in results if not r["enabled"]]
     enabled = [r["test_p99_s"] for r in results if r["enabled"]]
-    return int(statistics.median(enabled) - statistics.median(disabled) >= 120
-               or not all(r["history_removed"] for r in results))
+    off = [r for r in results if not r["enabled"]]
+    on = [r for r in results if r["enabled"]]
+    elapsed_ratio = statistics.median(r["elapsed_s"] for r in on) / statistics.median(r["elapsed_s"] for r in off)
+    p99_ratio = statistics.median(enabled) / statistics.median(disabled)
+    def rss(run):
+        return (run["controller_memory"]["rss_bytes"] +
+                sum(max(w["start"]["rss_bytes"], w["finish"]["rss_bytes"]) for w in run["worker_memory"]))
+    rss_ratio = statistics.median(map(rss, on)) / statistics.median(map(rss, off))
+    checks = {
+        "elapsed_ratio": {"value": elapsed_ratio, "maximum": 1.20},
+        "test_p99_ratio": {"value": p99_ratio, "maximum": 1.20},
+        "controller_worker_rss_ratio": {"value": rss_ratio, "maximum": 1.25},
+        "sample_max_seconds": {"value": max(r["sample_max_s"] for r in on),
+                               "maximum": min(1.0, args.sample_seconds * .20)},
+        "sessionfinish_seconds": {"value": max(r["sessionfinish_seconds"] for r in results), "maximum": 30},
+    }
+    for check in checks.values():
+        check["passed"] = check["value"] <= check["maximum"]
+    passed = all(c["passed"] for c in checks.values()) and all(r["history_removed"] for r in results)
+    document = json.loads(args.output.read_text())
+    document.update(checks=checks, passed=passed,
+                    memory_scope="Controller and worker RSS; excludes filesystem helper. Shared pages may be counted twice.")
+    args.output.write_text(json.dumps(document, indent=2))
+    print(json.dumps({"checks": checks, "passed": passed}), flush=True)
+    return int(not passed)
 
 
 if __name__ == "__main__":

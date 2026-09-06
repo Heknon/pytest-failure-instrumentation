@@ -65,6 +65,7 @@ class ResourceSampler:
             raise
         self.tracked: dict[tuple[int, float], dict[str, Any]] = {}
         self.inventory_at = 0.0
+        self.unmapped_workers: set[int] = set()
         self.inventory: list[dict[str, Any]] = []
         self.inventory_status: dict[str, str] = {}
         self.errors = 0
@@ -113,8 +114,11 @@ class ResourceSampler:
             if isinstance(pid, int) and len(workers) < MAX_PROCESSES:
                 visible = self.pid_map.get(pid) if self.foreign_procfs else pid
                 if visible is None:
-                    self.inventory_at = 0.0
+                    if pid not in self.unmapped_workers:
+                        self.unmapped_workers.add(pid)
+                        self.inventory_at = 0.0
                     continue
+                self.unmapped_workers.discard(pid)
                 workers[visible] = {"worker": path.stem, "nodeid": (state.get("nodeid") or "")[:1024],
                                 "phase": state.get("phase"), "state_time": state.get("time", 0)}
         return workers
@@ -124,11 +128,13 @@ class ResourceSampler:
         errors = 0
         truncated = False
         self.pid_map = {}
-        for index, proc in enumerate(psutil.process_iter()):
-            if index >= MAX_INVENTORY:
-                truncated = True
-                break
+        priority = list(dict.fromkeys([self.owner.pid, *workers, *(key[0] for key in self.tracked)]))
+        pids = psutil.pids()
+        selected = list(dict.fromkeys([*priority, *sorted(pids, reverse=True)]))
+        truncated = len(selected) > MAX_INVENTORY
+        for pid in selected[:MAX_INVENTORY]:
             try:
+                proc = psutil.Process(pid)
                 if self.foreign_procfs:
                     try:
                         root = Path("/proc") / str(proc.pid)
@@ -203,7 +209,13 @@ class ResourceSampler:
             return False
         if len(self.tracked) >= MAX_PROCESSES:
             self.inventory_status["tracked_processes"] = "truncated"
-            return False
+            # Registered workers outrank descendants even when they start later.
+            victim = next((k for k, v in self.tracked.items() if v["role"] == "descendant"), None)
+            if role not in ("worker", "controller") or victim is None:
+                return False
+            removed = self.tracked.pop(victim)
+            self.probe.previous.pop("process:" + str(victim), None)
+            self.event({"kind": "process_tracking_evicted", **removed})
         self.tracked[key] = {"pid": key[0], "created_at": key[1], "name": row["name"],
                              "parent_pid": row["ppid"], "worker": worker, "role": role,
                              "first_observed_at": time.time()}
@@ -264,15 +276,18 @@ class ResourceSampler:
         try:
             with (self.history.directory / "files.json").open("rb") as handle:
                 raw = handle.read(256 * 1024 + 1)
-                if len(raw) <= 256 * 1024:
+                if len(raw) > 256 * 1024:
+                    files["status"] = "inventory_too_large"
+                else:
                     files = json.loads(raw)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             pass
+        except (OSError, ValueError) as error:
+            files.update(status="unavailable", error=reason(error))
         if self.helper is not None and self.helper.poll() is not None:
             files["status"] = "helper_stopped"
         with self.lock:
             events = list(self.events)
-            self.events.clear()
         return {"observed_at": time.time(), "elapsed_s": began - self.started,
                 "host": {"metrics": host, "unavailable": missing},
                 "cgroup": {"metrics": cgroup, "unavailable": cgroup_missing},
@@ -286,6 +301,7 @@ class ResourceSampler:
                               "filesystem_helper_pid": self.helper.pid if self.helper is not None else None}}
 
     def _run(self) -> None:
+        consecutive_errors = 0
         try:
             while not self.stop_event.is_set():
                 began = time.monotonic()
@@ -293,9 +309,28 @@ class ResourceSampler:
                     batch = self.sample()
                     if not self.stop_event.is_set():
                         self.history.append(batch)
+                        # Acknowledge only committed events. New events and bounded
+                        # deque eviction may race with I/O; identity avoids removing
+                        # a newer event that happens to carry identical data.
+                        consecutive_errors = 0
+                        acknowledged = {id(event) for event in batch["events"]}
+                        with self.lock:
+                            self.events = deque((event for event in self.events
+                                                 if id(event) not in acknowledged), maxlen=256)
                 except Exception as error:
                     self.errors += 1
                     self.last_error = reason(error)
+                    consecutive_errors += 1
+                    if consecutive_errors >= 5:
+                        self.history.metadata["collection_status"] = "stopped_after_errors"
+                        self.history.metadata["collection_error"] = self.last_error
+                        try:
+                            self.history._publish()
+                        except OSError:
+                            pass  # A full volume may also prevent status publication.
+                        print(f"[failure-instrumentation] resource collection stopped after "
+                              f"{consecutive_errors} errors: {self.last_error}", file=sys.stderr, flush=True)
+                        break
                 elapsed = time.monotonic() - began
                 self.missed_intervals += int(elapsed // self.settings.resources_seconds)
                 if self.stop_event.wait(max(0.1, self.settings.resources_seconds - elapsed)):
