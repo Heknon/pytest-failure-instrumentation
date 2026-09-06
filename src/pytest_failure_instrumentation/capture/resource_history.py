@@ -10,15 +10,63 @@ import json
 import math
 import os
 import shutil
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional, TypeVar
+from typing import Any, BinaryIO, Optional, TypeVar
 
 NAME = "resources-live"
 MAX_LINE = 2 * 1024 * 1024
 MAX_REPLY = 2 * 1024 * 1024
 T = TypeVar("T")
+LEASE = "active.lock"
+
+
+def _lock(stream: BinaryIO, *, shared: bool = False) -> None:
+    if sys.platform == "win32":
+        import ctypes as c
+        import msvcrt
+        from ctypes import wintypes as w
+
+        class Overlapped(c.Structure):
+            _fields_ = [("Internal", c.c_size_t), ("InternalHigh", c.c_size_t),
+                        ("Offset", w.DWORD), ("OffsetHigh", w.DWORD), ("hEvent", w.HANDLE)]
+
+        kernel = c.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        lock = kernel.LockFileEx
+        lock.argtypes = [w.HANDLE, w.DWORD, w.DWORD, w.DWORD, w.DWORD, c.POINTER(Overlapped)]
+        lock.restype = w.BOOL
+        offset = Overlapped()
+        # Readers take shared locks so they never mistake another reader's
+        # momentary probe for a live writer. Closing releases either lock.
+        if not lock(msvcrt.get_osfhandle(stream.fileno()), 1 if shared else 3, 0, 1, 0, c.byref(offset)):
+            error = c.get_last_error()
+            if error == 33:  # ERROR_LOCK_VIOLATION
+                raise BlockingIOError("resource lease held")
+            raise OSError(error, "resource lease query failed")
+    else:
+        import fcntl
+        fcntl.flock(stream.fileno(), (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+
+
+def is_active(directory: Path) -> bool:
+    """An OS-held lease ends with the run, even if deleting files fails.
+
+    Read-only users cannot test a Windows lock: propagate that error as
+    unavailable, never assume it means a completed run is still active.
+    """
+    try:
+        stream = (directory / LEASE).open("r+b")
+    except FileNotFoundError:
+        return False
+    with stream:
+        try:
+            _lock(stream, shared=True)
+        except BlockingIOError:
+            return True
+        # Closing releases a successfully acquired lock: nobody owns this run.
+        return False
 
 
 def _sharing_retry(operation: Callable[[], T]) -> T:
@@ -49,8 +97,18 @@ class ResourceHistory:
         self.segment_bytes = max(MAX_LINE, self.max_bytes // 16)
         self.segments: list[dict[str, Any]] = []
         self.sequence = 0
+        self.closed = False
+        self.cleanup_error: Optional[str] = None
+        self.lease = (self.directory / LEASE).open("w+b")
+        self.lease.write(b"1")
+        self.lease.flush()
+        _lock(self.lease)
         self.metadata = {"schema_version": 1, **metadata, "max_bytes": self.max_bytes}
-        self._publish()
+        try:
+            self._publish()
+        except BaseException:
+            self.close()
+            raise
 
     def _publish(self) -> None:
         atomic_json(self.directory / "manifest.json", {
@@ -61,6 +119,8 @@ class ResourceHistory:
         })
 
     def append(self, batch: dict[str, Any]) -> None:
+        if self.closed:
+            raise FileNotFoundError("resource run finished")
         sequence = self.sequence + 1
         encoded = (json.dumps({**batch, "sequence": sequence}, separators=(",", ":"),
                               allow_nan=False) + "\n").encode()
@@ -75,7 +135,11 @@ class ResourceHistory:
             (self.directory / old["file"]).unlink(missing_ok=True)
             self.segments.pop(0)
         segment = self.segments[-1]
-        with (self.directory / segment["file"]).open("ab") as stream:
+        path = self.directory / segment["file"]
+        with path.open("r+b" if path.exists() else "w+b") as stream:
+            # Recover any short write left by a prior disk-full/I/O failure.
+            stream.truncate(segment["bytes"])
+            stream.seek(segment["bytes"])
             stream.write(encoded)
             stream.flush()
         segment.update(last=sequence, to=max(segment["to"], batch["observed_at"]),
@@ -84,8 +148,30 @@ class ResourceHistory:
         self.sequence = sequence
         self._publish()
 
-    def close(self) -> None:
-        shutil.rmtree(self.directory, ignore_errors=True)
+    def deactivate(self) -> None:
+        self.closed = True
+        self.lease.close()
+
+    def close(self) -> bool:
+        self.deactivate()
+        try:
+            _sharing_retry(lambda: shutil.rmtree(self.directory))
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            self.cleanup_error = f"{type(error).__name__}: {error}"
+            return False
+        # Older Python rmtree can report a vanished child during concurrent
+        # cleanup before removing the root. Success means the root is gone.
+        try:
+            if self.directory.exists():
+                self.cleanup_error = "resource directory still exists after cleanup"
+                return False
+        except OSError as error:
+            self.cleanup_error = f"{type(error).__name__}: {error}"
+            return False
+        self.cleanup_error = None
+        return True
 
 
 def read_history(directory: Path, *, after: int = 0, limit: int = 120,
@@ -98,6 +184,8 @@ def read_history(directory: Path, *, after: int = 0, limit: int = 120,
     if start is not None and end is not None and start > end:
         raise ValueError("from must not exceed to")
     root = directory / NAME
+    if not is_active(root):
+        raise FileNotFoundError("resource run finished")
     try:
         manifest = json.loads(_sharing_retry(lambda: (root / "manifest.json").read_text()))
     except ValueError as error:
@@ -128,17 +216,21 @@ def read_history(directory: Path, *, after: int = 0, limit: int = 120,
             continue
         try:
             with (root / segment["file"]).open("rb") as stream:
-                while True:
-                    line = stream.readline(MAX_LINE + 1)
+                remaining = segment["bytes"]
+                while remaining > 0:
+                    line = stream.readline(min(MAX_LINE + 1, remaining))
+                    remaining -= len(line)
                     if not line:
-                        break
+                        raise OSError("published resource segment is truncated")
                     if len(line) > MAX_LINE or not line.endswith(b"\n"):
-                        break
+                        raise OSError("published resource record is truncated or oversized")
                     try:
                         batch = json.loads(line)
-                    except ValueError:
-                        break
+                    except ValueError as error:
+                        raise OSError("invalid published resource record") from error
                     seq = batch["sequence"]
+                    if not segment["first"] <= seq <= segment["last"]:
+                        raise OSError("resource record outside published sequence range")
                     if seq <= after:
                         continue
                     if ((start is not None and batch["observed_at"] < start)
@@ -162,6 +254,8 @@ def read_history(directory: Path, *, after: int = 0, limit: int = 120,
             # their next request. Never turn it into another run's data.
             continue
     earliest = manifest.get("earliest_sequence")
+    if not is_active(root):
+        raise FileNotFoundError("resource run finished during read")
     return {**manifest, "batches": batches, "next_after": cursor, "has_more": more,
             "history_truncated": bool(earliest and earliest > 1),
             "cursor_expired": bool(after and earliest and after < earliest - 1)}

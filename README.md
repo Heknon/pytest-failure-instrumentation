@@ -1764,6 +1764,9 @@ RSS totals can double-count shared pages. Linux detailed USS/PSS heap-map
 walks are not performed. Process I/O accounting follows the OS API: it is
 not necessarily physical-disk traffic. Disk latency is the counter interval's
 average, not a percentile. Paging does not imply every fault required swap.
+Disk `*_time_ms` fields remain cumulative counters; separate
+`*_time_per_second_ms` fields describe their rate of increase. RAM and swap
+capacity are gauges and are never treated as traffic counters.
 Unsupported counters appear in `unavailable`; an unlimited cgroup limit is
 null without an unavailable reason. A first rate sample or reset is null.
 
@@ -1838,6 +1841,9 @@ is why the helper has a bounded shutdown. Symlinks, Windows reparse points,
 and the plugin's evidence tree are excluded. Scans have an entry budget,
 counting directories as well as files; at most eight roots are accepted.
 Each disposable SQLite inventory has a 32 MiB database cap and a 1 MiB cache.
+Its temporary rollback journal can use approximately another database's worth
+of disk space during a transaction. Failed/full transactions roll back, so a
+later successful scan does not compare against a damaged partial inventory.
 Inventories compare **logical bytes by path**, not allocated disk blocks or
 hard-link-deduplicated storage. There is no per-test recursive scan.
 
@@ -1861,7 +1867,14 @@ session, rather than a sampler in each xdist worker. Multiple controllers keep
 separate histories; their host counters must not be summed.
 
 Normal shutdown deletes **only resource history/inventories**, preserving
-existing incident evidence. Pytest cleanup is an idempotent fallback. After
+existing incident evidence. A run-held OS file lock is released before cleanup:
+readers reject a completed run even if locked files prevent their deletion and
+the Python process remains alive. Readers check the lease before and after
+reading and stay within the byte ranges in their published manifest snapshot.
+Short disk writes are truncated to the last complete batch before retrying.
+Cleanup retries transient sharing violations; persistent failures are reported
+on stderr and retried by pytest cleanup and subsequent-run pruning. Pytest
+cleanup is an idempotent fallback. After
 an abrupt process/host death, a subsequent run removes abandoned live-resource
 files when the existing owner checks establish that the owner is dead, even
 if unreported incident evidence must remain. There is no archive, upload,

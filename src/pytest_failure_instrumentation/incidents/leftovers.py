@@ -220,6 +220,10 @@ def prune_finished_runs(root: Path) -> None:
                 continue
             record = marker(path)
             owner = owner_of(path)
+            if owner is not None and record and record.get(FINISHED_KEY):
+                # An embedded pytest.main() may finish while its Python owner
+                # stays alive. Retry only resource cleanup in that case.
+                shutil.rmtree(path / "resources-live", ignore_errors=True)
             if owner is None or probes.is_running(owner):
                 continue
             # Live resource history has no post-run retention contract.

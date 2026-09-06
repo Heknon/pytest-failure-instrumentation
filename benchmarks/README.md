@@ -36,5 +36,21 @@ elapsed time, test-duration median/p99, shutdown cost, sample duration/errors,
 and observed process coverage. Missing worker samples or failed resource cleanup
 fail the command. The 120-second added test-p99 bound is a synthetic backstop,
 not proof of customer-suite p99 behaviour. File-inventory costs should be tested
-separately with representative configured roots; the benchmark does not enable
+separately with representative configured roots; the default command does not enable
 recursive directory inventories. Do not add this 80-worker job to every commit.
+
+For production-sized worker allocations and directory scans on a sufficiently
+large local runner:
+
+```sh
+python benchmarks/resource_cost.py --workers 32 --cases 2400 --pairs 2 --worker-mb 256 --scan-files 10000 --sample-seconds 1 --output resource-stress.json
+```
+
+This touches 256 MiB per worker (8 GiB total before interpreter overhead),
+prepopulates a local tree, and requires a completed baseline comparison while
+tests create more files. Choose the worker count to fit the runner; this is
+an allocation setting, not a process memory limit. The JSON retains platform,
+Python/dependency versions, visible memory and Linux cgroup limits, per-worker
+RSS/USS at fixture setup and teardown, controller memory, sampled aggregate
+RSS, final counters and inventory state. These are observations, not continuous
+per-worker peak-memory measurements. Raw run logs are retained beside the JSON.

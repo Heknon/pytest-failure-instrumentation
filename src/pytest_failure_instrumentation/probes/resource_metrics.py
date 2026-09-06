@@ -165,7 +165,7 @@ class PlatformMetrics:
 
     def rates(self, key: str, values: dict[str, Any], now: float) -> None:
         counters = {k: float(v) for k, v in values.items()
-                    if isinstance(v, (int, float)) and (
+                    if isinstance(v, (int, float)) and k not in ("ram_total_bytes", "swap_total_bytes") and (
                         k.endswith("_total_bytes") or k.endswith("_total_count")
                         or k == "cpu_total_seconds" or k.endswith("_time_ms"))}
         previous = self.previous.get(key)
@@ -181,7 +181,12 @@ class PlatformMetrics:
                         values[target] = elapsed / operations
         self.previous[key] = now, counters
         for name, value in counters.items():
-            target = "cpu_cores" if name == "cpu_total_seconds" else name.replace("_total_", "_per_second_")
+            if name == "cpu_total_seconds":
+                target = "cpu_cores"
+            elif name.endswith("_time_ms"):
+                target = name.removesuffix("_ms") + "_per_second_ms"
+            else:
+                target = name.replace("_total_", "_per_second_")
             values[target] = None
             if previous and now > previous[0] and name in previous[1] and value >= previous[1][name]:
                 values[target] = (value - previous[1][name]) / (now - previous[0])

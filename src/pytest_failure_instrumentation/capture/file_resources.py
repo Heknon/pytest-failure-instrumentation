@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .resource_history import atomic_json
+from .resource_history import atomic_json, is_active
 
 
 class Scanner:
@@ -29,12 +29,19 @@ class Scanner:
         self.db = sqlite3.connect(str(database))
         self.db.execute("PRAGMA cache_size=-1024")
         self.db.execute("PRAGMA max_page_count=8192")  # 32 MiB with default 4 KiB pages
-        self.db.execute("PRAGMA journal_mode=OFF")  # disposable inventory, no recovery contract
+        self.db.execute("PRAGMA journal_mode=DELETE")  # rollback a failed/full inventory safely
         self.db.execute("CREATE TABLE baseline(path TEXT PRIMARY KEY, size INTEGER)")
         self.db.execute("CREATE TABLE current(path TEXT PRIMARY KEY, size INTEGER)")
         self.baseline: dict[str, Any] | None = None
 
     def scan(self) -> dict[str, Any]:
+        try:
+            return self._scan()
+        except (OSError, sqlite3.Error):
+            self.db.rollback()
+            raise
+
+    def _scan(self) -> dict[str, Any]:
         started = time.time()
         root_info = self.root.lstat()
         if (stat.S_ISLNK(root_info.st_mode) or getattr(root_info, "st_file_attributes", 0) & 0x400
@@ -137,8 +144,9 @@ def serve(config: dict[str, Any]) -> None:
 
     def alive() -> bool:
         try:
-            return owner.is_running() and owner.create_time() == created
-        except psutil.Error:
+            return (owner.is_running() and owner.create_time() == created
+                    and owner.status() != psutil.STATUS_ZOMBIE and is_active(directory))
+        except (psutil.Error, OSError):
             return False
 
     def publish(key: str, result: dict[str, Any]) -> None:

@@ -48,23 +48,28 @@ class ResourceSampler:
         self.owner = psutil.Process(visible_pid)
         self.created = self.owner.create_time()
         self.started = time.monotonic()
-        self.history = ResourceHistory(directory, {
-            "session": session, "controller_pid": self.owner.pid, "controller_created_at": self.created,
-            "pytest_pid": os.getpid(), "pid_scope": "procfs" if self.foreign_procfs else "local",
-            "started_at": time.time(), "system": platform.system(), "python": platform.python_version(),
-            "product_version": settings.product_version, "worker_count": settings.worker_count,
-            "sample_seconds": settings.resources_seconds,
-            "scope": "visible_os_and_process_namespace",
-            "cgroups": {key: str(path) for key, path in self.probe.cgroups.items()},
-            "limits": {"tracked_processes": MAX_PROCESSES, "inventory_processes": MAX_INVENTORY,
-                       "surrounding_consumers": 20},
-        }, int(settings.resources_max_mb) * 1024 * 1024)
+        try:
+            self.history = ResourceHistory(directory, {
+                "session": session, "controller_pid": self.owner.pid, "controller_created_at": self.created,
+                "pytest_pid": os.getpid(), "pid_scope": "procfs" if self.foreign_procfs else "local",
+                "started_at": time.time(), "system": platform.system(), "python": platform.python_version(),
+                "product_version": settings.product_version, "worker_count": settings.worker_count,
+                "sample_seconds": settings.resources_seconds,
+                "scope": "visible_os_and_process_namespace",
+                "cgroups": {key: str(path) for key, path in self.probe.cgroups.items()},
+                "limits": {"tracked_processes": MAX_PROCESSES, "inventory_processes": MAX_INVENTORY,
+                           "surrounding_consumers": 20},
+            }, int(settings.resources_max_mb) * 1024 * 1024)
+        except BaseException:
+            self.probe.close()
+            raise
         self.tracked: dict[tuple[int, float], dict[str, Any]] = {}
         self.inventory_at = 0.0
         self.inventory: list[dict[str, Any]] = []
         self.inventory_status: dict[str, str] = {}
         self.errors = 0
         self.last_error: str | None = None
+        self.cleanup_reported = False
         self.missed_intervals = 0
         self._track((self.owner.pid, self.created),
                     {"name": self.owner.name(), "ppid": self.owner.ppid()}, None, "controller")
@@ -248,6 +253,10 @@ class ResourceSampler:
         if host.get("cpu_cores") is not None and host.get("cpu_logical_count"):
             host["cpu_percent"] = host["cpu_cores"] / host["cpu_logical_count"] * 100
         disks, disk_missing = self.probe.disks()
+        disk_keys = {"disk:" + disk["entity"] for disk in disks}
+        for disk_key in list(self.probe.previous):
+            if disk_key.startswith("disk:") and disk_key not in disk_keys:
+                del self.probe.previous[disk_key]
         for disk in disks:
             self.probe.rates("disk:" + disk["entity"], disk["metrics"], time.monotonic())
         cgroup, cgroup_missing = cgroup_metrics(self.probe.cgroups) if self.probe.cgroups else ({}, {"cgroup": "unavailable"})
@@ -298,18 +307,25 @@ class ResourceSampler:
 
     def close(self) -> None:
         self.stop_event.set()
+        # Invalidate API access before waiting on any helper, thread or disk.
+        self.history.deactivate()
         if self.helper is not None and self.helper.poll() is None:
-            self.helper.terminate()
             try:
+                self.helper.terminate()
                 self.helper.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                self.helper.kill()
                 try:
+                    self.helper.kill()
                     self.helper.wait(timeout=1)
-                except subprocess.TimeoutExpired:
+                except (subprocess.TimeoutExpired, OSError):
                     pass
+            except OSError:
+                pass  # A concurrent exit must not interrupt pytest shutdown.
         if self.thread is not None:
             self.thread.join(timeout=2)
         else:
             self.probe.close()
-        self.history.close()
+        if not self.history.close() and not self.cleanup_reported:
+            self.cleanup_reported = True
+            print(f"[failure-instrumentation] resource cleanup deferred: {self.history.cleanup_error}",
+                  file=sys.stderr, flush=True)
