@@ -1,0 +1,36 @@
+name: Reporter deadline validation
+on:
+  push:
+    branches: ["validation/reporter-deadline"]
+permissions:
+  contents: read
+jobs:
+  regression:
+    name: Windows Python 3.9 / reporter deadlines only
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 56b47e34a6da388699088a87e424fa1cf6a68732
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Build and install the candidate wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m pip install "$(ls dist/*.whl)[test]"
+      - name: Confirm exact candidate and installed package
+        run: |
+          test "$(git rev-parse HEAD)" = "56b47e34a6da388699088a87e424fa1cf6a68732"
+          python -c "import pytest_failure_instrumentation as p; print(p.__file__); assert 'site-packages' in p.__file__"
+      - name: Repeat only the two reporter deadline regressions
+        run: |
+          for trial in 1 2 3 4 5; do
+            python -m pytest -q --durations=2 tests/test_kill_readiness.py::test_reporter_deadline_covers_blocked_input_and_reaps_child || exit 1
+          done
