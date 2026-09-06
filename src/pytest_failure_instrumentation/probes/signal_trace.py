@@ -246,7 +246,30 @@ def report(payload):
             stdin=subprocess.PIPE, stdout=log, stderr=log,
             cwd=payload.get("rootdir") or None, env=payload.get("env") or None, **extra
         )
-        child.communicate(input=json.dumps(payload).encode("utf-8"), timeout=REPORTER_TIMEOUT)
+        # Older Windows Python writes stdin synchronously in communicate(),
+        # even when passed a timeout. A separate deadline must kill the child
+        # to release a blocked write. Keep the payload in the pipe, off disk.
+        import threading
+
+        timed_out = threading.Event()
+
+        def expire():
+            timed_out.set()
+            try:
+                child.kill()
+            except OSError:
+                pass  # the child may have exited at the deadline
+
+        deadline = threading.Timer(REPORTER_TIMEOUT, expire)
+        deadline.daemon = True
+        deadline.start()
+        try:
+            child.communicate(input=json.dumps(payload).encode("utf-8"))
+        finally:
+            deadline.cancel()
+            deadline.join()
+        if timed_out.is_set():
+            raise subprocess.TimeoutExpired(child.args, REPORTER_TIMEOUT)
     except Exception as failure:
         log.write(("the reporter could not be run: %r\n" % (failure,)).encode("utf-8"))
     finally:
