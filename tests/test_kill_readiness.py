@@ -368,9 +368,11 @@ def test_stderr_restoration_failure_keeps_a_retryable_handle(tmp_path, monkeypat
 def test_reporter_deadline_covers_blocked_input_and_reaps_child(tmp_path, monkeypatch, backend):
     import ast
     import subprocess
+    import threading
 
     from pytest_failure_instrumentation.probes import etw_trace
 
+    prior_threads = set(threading.enumerate())
     children = []
     real_popen = subprocess.Popen
     def start(*_, **kwargs):
@@ -380,6 +382,7 @@ def test_reporter_deadline_covers_blocked_input_and_reaps_child(tmp_path, monkey
         return child
     monkeypatch.setattr(subprocess, "Popen", start)
     payload = {"large": "x" * 1000000}
+    started = time.monotonic()
     if backend == "etw":
         monkeypatch.setattr(etw_trace, "REPORTER_TIMEOUT", 0.1)
         etw_trace._report(payload, str(tmp_path / "trace"))
@@ -392,8 +395,12 @@ def test_reporter_deadline_covers_blocked_input_and_reaps_child(tmp_path, monkey
                          REPORTER="", REPORTER_TIMEOUT=0.1)
         exec(compile(ast.Module(body=[fn], type_ignores=[]), "sidecar", "exec"), namespace)
         namespace["report"](payload)
+    elapsed = time.monotonic() - started
+    assert elapsed < 5, f"reporter exceeded its 0.1s deadline: {elapsed:.2f}s"
     assert len(children) == 1
     assert children[0].poll() is not None
+    assert children[0].stdin.closed
+    assert not (set(threading.enumerate()) - prior_threads)
     assert "TimeoutExpired" in (tmp_path / "reporter.log").read_text()
 
 

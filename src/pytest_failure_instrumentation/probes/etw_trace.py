@@ -563,7 +563,28 @@ def _report(payload: dict[str, Any], output: str) -> None:
                 creationflags=CREATE_NO_WINDOW,
             )
             assert child.stdin is not None
-            child.communicate(input=json.dumps(payload).encode("utf-8"), timeout=REPORTER_TIMEOUT)
+            # Older Windows Python writes stdin synchronously in communicate(),
+            # even when passed a timeout. A separate deadline must kill the child
+            # to release a blocked write. Keep the payload in the pipe, off disk.
+            timed_out = threading.Event()
+
+            def expire() -> None:
+                timed_out.set()
+                try:
+                    child.kill()
+                except OSError:
+                    pass  # the child may have exited at the deadline
+
+            deadline = threading.Timer(REPORTER_TIMEOUT, expire)
+            deadline.daemon = True
+            deadline.start()
+            try:
+                child.communicate(input=json.dumps(payload).encode("utf-8"))
+            finally:
+                deadline.cancel()
+                deadline.join()
+            if timed_out.is_set():
+                raise subprocess.TimeoutExpired(child.args, REPORTER_TIMEOUT)
         except Exception as failure:  # noqa: BLE001 - the log is the only reader
             log.write(f"the reporter could not be run: {failure!r}\n".encode())
         finally:
