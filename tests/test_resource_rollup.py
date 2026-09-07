@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import psutil
 import pytest
 
 from pytest_failure_instrumentation.probes.resource_metrics import PlatformMetrics, smaps_rollup
@@ -40,6 +41,7 @@ def test_bad_field_preserves_other_measurements_without_inventing_uss(tmp_path, 
 def test_rollup_failure_is_additive_and_keeps_rss(monkeypatch, error, why):
     probe = PlatformMetrics()
     probe.system = 'Linux'
+    monkeypatch.setattr(psutil, 'PROCFS_PATH', '/proc', raising=False)
     process = MagicMock()
     process.pid = 123
     process.cpu_times.return_value = (1, 2)
