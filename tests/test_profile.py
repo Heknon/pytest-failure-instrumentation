@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import textwrap
 import time
 from typing import Any
 
@@ -847,6 +848,31 @@ class TestAllocationTracing:
 
     def test_tracing_names_the_holders_and_writes_a_memory_flame_graph(self, runner: Runner) -> None:
         runner.pytester.makeini(PROFILE_INI)
+        conftest = runner.pytester.path / "conftest.py"
+        conftest.write_text(conftest.read_text() + textwrap.dedent('''
+            import threading
+            import pytest
+            from pytest_failure_instrumentation.profile import sampler
+
+            @pytest.fixture
+            def allocation_sampled(monkeypatch):
+                sampled = threading.Event()
+                original = sampler._snapshot
+
+                def observe_snapshot():
+                    snapshot = original()
+                    # Inspect the real snapshot: an early sample may see
+                    # only part of hold(), so retain the data until the
+                    # sampler has captured enough to exercise the artifact.
+                    held = sum(stat.size for stat in snapshot.statistics("filename")
+                               if stat.traceback[0].filename.endswith("test_alloc.py"))
+                    if held >= 60 * 1_000_000:
+                        sampled.set()
+                    return snapshot
+
+                monkeypatch.setattr(sampler, "_snapshot", observe_snapshot)
+                return sampled
+        '''))
         runner.pytester.makepyfile(
             test_alloc="""
             import time
@@ -856,9 +882,9 @@ class TestAllocationTracing:
             def hold(count):
                 return [bytearray(1_000_000) for _ in range(count)]
 
-            def test_peak():
+            def test_peak(allocation_sampled):
                 blob = hold(200)
-                time.sleep(1.0)
+                assert allocation_sampled.wait(10), "sampler never captured the held allocations"
                 assert len(blob) == 200
 
             def test_keeps():
@@ -885,9 +911,9 @@ class TestAllocationTracing:
         )
         (profile,) = document["profiles"]
         assert profile["unit"] == "bytes"
-        # This is the live allocation snapshot from when the sampler noticed
-        # the climb, not an exact account of the later 200 MB peak. Thread
-        # scheduling determines how far allocation advances before that tick;
-        # require a substantial useful profile without promising completeness.
+        # The workload retains its allocation until a real snapshot captures
+        # enough of it to exercise this artifact. A fixed one-second sleep raced the
+        # sampler's one-second snapshot throttle and sometimes kept only an
+        # early ~40 MB snapshot. Preserve the useful-profile assertion.
         assert sum(profile["weights"]) >= 60 * 1_000_000
         assert any(frame["file"].endswith("test_alloc.py") for frame in document["shared"]["frames"])
