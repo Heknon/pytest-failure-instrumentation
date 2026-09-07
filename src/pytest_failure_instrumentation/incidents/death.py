@@ -253,7 +253,7 @@ class WorkerDeathIncident(Incident):
         if self.recovered_from_run:
             who += f" of run {self.recovered_from_run}"
         where = f", in {self.blamed_frame.named()}" if self.blamed_frame is not None else ""
-        if self.verdict == "UNKNOWN":
+        if self.verdict == "UNKNOWN" and self.exit_status is None:
             # The status clause reads wrong between "died" and what it was
             # doing, so it comes after both.
             return f"{who} died {self._what_it_was_doing()}{where}; its exit status could not be read"
@@ -288,6 +288,8 @@ class WorkerDeathIncident(Incident):
         if self.verdict == "SELF_EXIT":
             return f"exited on its own with code {status}"
         if self.verdict == "UNKNOWN":
+            if status is not None:
+                return f"exited with code {status}, but what requested the exit is unknown"
             return "died, and its exit status could not be read"
         return f"died ({self.verdict})"
 

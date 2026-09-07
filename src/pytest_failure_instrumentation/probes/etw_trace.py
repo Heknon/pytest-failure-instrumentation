@@ -54,6 +54,7 @@ EXIT_OK, EXIT_NO_TRACE, EXIT_ACCESS_DENIED, EXIT_NO_CONSUMER = 0, 3, 5, 4
 WNODE_FLAG_TRACED_GUID = 0x00020000
 EVENT_TRACE_REAL_TIME_MODE = 0x00000100
 EVENT_TRACE_CONTROL_STOP = 1
+EVENT_TRACE_CONTROL_FLUSH = 3
 EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1
 PROCESS_TRACE_MODE_REAL_TIME = 0x00000100
 PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000
@@ -408,6 +409,16 @@ def stop_session(name: str) -> bool:
     return status == 0
 
 
+def flush_session(name: str) -> bool:
+    """Deliver buffered events without ending the session (ControlTraceW)."""
+    advapi32 = _advapi32()
+    advapi32.ControlTraceW.restype = ctypes.c_uint32
+    _buffer, properties = _properties(name, query=True)
+    return advapi32.ControlTraceW(
+        TRACEHANDLE(0), name, ctypes.byref(properties), EVENT_TRACE_CONTROL_FLUSH
+    ) == 0
+
+
 def _process_is_running(pid: int) -> bool:
     kernel32 = _kernel32()
     kernel32.OpenProcess.restype = ctypes.c_void_p
@@ -660,6 +671,11 @@ def serve(session: str, output: str, mode: str = "trace") -> int:
     payload: dict[str, Any] = {}
 
     def remember(message: dict[str, Any]) -> None:
+        if message.get("flush") and mode == "trace":
+            try:
+                flush_session(session)
+            except OSError:
+                pass  # the bounded reader wait still applies
         if isinstance(message.get("reporter"), dict):
             payload.update(message["reporter"])
             if message.get("ack"):

@@ -370,6 +370,126 @@ def evidence_with_worker(root: Path, session: str, name: str) -> Path:
     return directory
 
 
+def test_repeated_concurrent_resources_workers_and_stacks(serving, tmp_path, monkeypatch):
+    """Real HTTP and history writes while a stack reader is deliberately held.
+
+    The hold proves overlap without relying on a fast machine or py-spy attach
+    permissions. The independent real-reader test below exercises that boundary.
+    """
+    from pytest_failure_instrumentation.probes.pyspy import Reading
+
+    from .test_resources import batch, history
+
+    directory = evidence_with_worker(tmp_path, "load-run", "gw0")
+    store = history(directory)
+    service = serving(directory=directory, token="load-secret")
+    entered, release = threading.Event(), threading.Event()
+
+    def held_read(pid, options):
+        entered.set()
+        assert release.wait(15), "the other endpoints stalled behind a stack read"
+        return Reading([], None, options)
+
+    monkeypatch.setattr(stack_server.stacks, "live_reading", held_read)
+
+    async def exercise():
+        async with connected(service, "load-secret") as client:
+            for sequence in range(1, 31):
+                entered.clear()
+                release.clear()
+                store.append(batch(sequence))
+                stack = asyncio.create_task(client.callstack(pid=os.getpid()))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 10)
+                    resources, workers = await asyncio.wait_for(asyncio.gather(
+                        client.resources("load-run", latest=True), client.workers(),
+                    ), timeout=10)
+                    assert not stack.done(), "stack request was not held during other reads"
+                    assert resources.batches[0].sequence == sequence
+                    assert any(w.worker == "gw0" for w in workers.workers)
+                finally:
+                    release.set()
+                    result = await asyncio.wait_for(stack, timeout=10)
+                assert result.pid == os.getpid()
+            assert (await client.identity()).pid == os.getpid()
+            assert (await client.resources("load-run", latest=True)).latest_sequence == 30
+
+    try:
+        run(exercise())
+        assert service.serving
+    finally:
+        release.set()
+        store.close()
+
+
+def test_three_concurrent_real_stack_requests_leave_server_responsive(serving, tmp_path):
+    service = serving(directory=run_directory(tmp_path))
+
+    async def exercise():
+        async with connected(service) as client:
+            results = await asyncio.gather(
+                *(client.callstack(pid=os.getpid()) for _ in range(3)),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, ReaderFailed):
+                    # Missing reader / attach denial is a supported, structured
+                    # reply. Transport failures and server crashes are not.
+                    assert result.status == 502 and result.message
+                else:
+                    assert not isinstance(result, BaseException), repr(result)
+                    assert result.pid == os.getpid()
+            assert (await client.identity()).pid == os.getpid()
+            assert (await client.workers()).served_by.pid == os.getpid()
+
+    run(exercise())
+    assert service.serving
+
+
+def test_resource_overload_refuses_excess_work_and_recovers(serving, tmp_path, monkeypatch):
+    from pytest_failure_instrumentation.capture import resource_history
+
+    from .test_resources import batch, history
+
+    directory = evidence_with_worker(tmp_path, "load-run", "gw0")
+    store = history(directory)
+    store.append(batch())
+    service = serving(directory=directory, token="load-secret")
+    barrier = threading.Barrier(3)
+    release = threading.Event()
+    original = resource_history.read_history
+
+    def held_history(*args, **kwargs):
+        barrier.wait(timeout=15)
+        assert release.wait(15)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(resource_history, "read_history", held_history)
+
+    async def exercise():
+        async with connected(service, "load-secret") as client:
+            held = [asyncio.create_task(client.resources("load-run")) for _ in range(2)]
+            try:
+                await asyncio.to_thread(barrier.wait, 10)
+                with pytest.raises(ServerRefused) as refused:
+                    await asyncio.wait_for(client.resources("load-run"), 5)
+                assert refused.value.status == 503
+                assert (await client.workers()).served_by.pid == os.getpid()
+                assert (await client.identity()).pid == os.getpid()
+            finally:
+                release.set()
+                await asyncio.gather(*held)
+            monkeypatch.setattr(resource_history, "read_history", original)
+            assert (await client.resources("load-run")).latest_sequence == 1
+
+    try:
+        run(exercise())
+        assert service.serving
+    finally:
+        release.set()
+        store.close()
+
+
 def test_the_fleet_reads_every_server(serving, tmp_path: Path):
     first = serving(directory=run_directory(tmp_path))
     second = serving(directory=run_directory(tmp_path))

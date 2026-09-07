@@ -740,6 +740,10 @@ def test_a_worker_terminated_from_outside_names_its_killer_on_windows(distribute
     death = distributed.only(distributed.incidents(), "worker_death")
     assert death.verdict == "KILLED_BY_PROCESS", (
         output.decode("utf-8", "replace") + "\n" + death.model_dump_json(indent=2)
+        + "\nFinal ETW trace:\n" + "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")[-65536:]
+            for path in distributed.pytester.path.glob(".pytest-failures/*/signals.log")
+        )
     )
     assert death.killer is not None and death.killer.name == "TerminateProcess"
     assert death.killer.sender_pid == os.getpid()
@@ -1087,6 +1091,52 @@ def test_the_trace_is_reparsed_only_when_it_has_grown(tmp_path, monkeypatch):
     monkeypatch.setattr(killer, "TRACE_SETTLE_SECONDS", 0.25)
     killer._settled(killer.Sources(directory=tmp_path, live=True), 4242)
     assert len(parses) == 1, "the file never grew, so once is all it is worth"
+
+
+def test_pending_etw_events_are_flushed_before_attributing_a_live_death(tmp_path):
+    _trace_file(tmp_path)
+    flushed = []
+
+    def flush():
+        flushed.append(True)
+        _trace_file(tmp_path, {
+            "via": "TerminateProcess", "sender_pid": 5120, "target_pid": 4242,
+            "api_status": 0, "wall": 1000.0,
+        })
+
+    sources = killer.Sources(directory=tmp_path, trace_flush=flush)
+    found = killer.attribute(sources, pid=4242, exit_status=15, started_at=999, died_at=1001)
+    assert flushed == [True]
+    assert found.killer is not None and found.killer.sender_pid == 5120
+    assert found.killer.exit_code == 15
+    # Already published evidence must not issue another flush.
+    killer.attribute(sources, pid=4242, exit_status=15, started_at=999, died_at=1001)
+    assert flushed == [True]
+
+
+def test_failed_trace_flush_preserves_bounded_best_effort_reporting(tmp_path, monkeypatch):
+    _trace_file(tmp_path)
+    monkeypatch.setattr(killer, "TRACE_SETTLE_SECONDS", 0)
+
+    def unavailable():
+        raise OSError("sidecar already stopped")
+
+    sources = killer.Sources(directory=tmp_path, trace_flush=unavailable)
+    assert killer._settled(sources, 4242) == []
+
+
+def test_etw_flush_uses_control_flush_without_stopping_the_session(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def control(handle, name, properties, command):
+        calls.append((name, command))
+        return 0
+
+    monkeypatch.setattr(etw_trace, "_advapi32", lambda: SimpleNamespace(ControlTraceW=control))
+    assert etw_trace.flush_session("pytest-failure-test")
+    assert calls == [("pytest-failure-test", 3)]
 
 
 # -- a witness that has to outlast the signal it survived --------------------

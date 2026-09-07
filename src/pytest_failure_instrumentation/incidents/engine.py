@@ -1031,6 +1031,7 @@ class IncidentEngine:
                 elevate=self.settings.elevate,
                 trace_status=self.tracer.how if self.tracer is not None else "off: not started",
                 witness_status=self.witness_status,
+                trace_flush=self.tracer.flush if self.tracer is not None else None,
                 run_pids=lambda: {
                     os.getpid(): killer.CONTROLLER,
                     **killer.roles_in(self.directory),

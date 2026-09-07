@@ -589,6 +589,11 @@ class SignalTracer:
         except (OSError, ValueError, TypeError):
             pass
 
+    def flush(self) -> None:
+        """Ask ETW to deliver pending events without waiting for delivery."""
+        if sys.platform == "win32" and self.active:
+            self._send({"flush": True})
+
     def _came_up(self, timeout: float = 5.0) -> bool:
         """The header line is the sidecar saying the event is enabled."""
         deadline = time.monotonic() + timeout

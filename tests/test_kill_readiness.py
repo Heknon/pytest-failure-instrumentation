@@ -117,7 +117,7 @@ def test_real_deadline_overrides_do_not_falsely_explain_a_manual_exit(distribute
         assert (death.verdict, death.confidence) == ("POSSIBLE_TIMEOUT", "medium")
         assert death.matched_timeout == 1
     else:
-        assert death.verdict == "SELF_EXIT"
+        assert death.verdict == ("UNKNOWN" if sys.platform == "win32" else "SELF_EXIT")
         assert death.matched_timeout is None
 
 

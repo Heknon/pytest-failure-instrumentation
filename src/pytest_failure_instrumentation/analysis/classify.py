@@ -399,7 +399,8 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
         # slow test left behind an hour earlier.
         return "NATIVE_CRASH", "medium", close(output)
 
-    if status is not None and 128 < status < 192:
+    if (status is not None and 128 < status < 192
+            and incident.exit_status_source != "GetExitCodeProcess"):
         return "PROBABLY_SIGNALLED", "low", close([
             "Exit codes 129 to 191 are the 128+signal convention shells and "
             "container runtimes use; the signal itself was not passed through."
@@ -420,6 +421,14 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             # names a test and blames its owner, and must not rest on one
             # slot being cleared somewhere else.
             return "POSSIBLE_TIMEOUT", "medium", close([_timeout_line(incident)])
+        if incident.exit_status_source == "GetExitCodeProcess":
+            # TerminateProcess lets an external caller choose any exit code.
+            # A missing ETW row cannot prove the worker exited itself.
+            return "UNKNOWN", "low", close([
+                "Windows reported an exit code, but no termination witness identified "
+                "its origin. An external TerminateProcess and an exit requested inside "
+                "the worker can use the same code."
+            ] + sources_consulted(incident))
         # Zero included. A worker that left the run without being asked to has
         # gone wrong whatever number it exited with, and os._exit(0) inside a
         # test is a real way to do it - reported as UNKNOWN it reads as a

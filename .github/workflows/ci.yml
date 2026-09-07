@@ -195,6 +195,9 @@ jobs:
           tests/test_reporting_resilience.py
           tests/test_resource_fleet.py
           tests/test_resource_rollup.py
+          tests/test_client.py::test_repeated_concurrent_resources_workers_and_stacks
+          tests/test_client.py::test_three_concurrent_real_stack_requests_leave_server_responsive
+          tests/test_client.py::test_resource_overload_refuses_excess_work_and_recovers
           tests/test_profile_sampler.py
           tests/test_stall_probe.py
           tests/test_exit_status.py

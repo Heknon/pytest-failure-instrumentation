@@ -411,7 +411,7 @@ reports what the incident found rather than what a `-9` looks like.
 | `SIGKILLED` | `-9` and no witness answered; the incident says which witnesses this machine withheld, and why |
 | `NATIVE_CRASH` | SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, or a Windows NTSTATUS |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP — a request to stop, not a defect |
-| `SELF_EXIT` | any exit code with no signal, `0` included — a worker that left the run was not asked to |
+| `SELF_EXIT` | a non-signal POSIX exit code, `0` included; an unwitnessed Windows exit remains `UNKNOWN` because an external caller can choose the same code |
 | `PROBABLY_SIGNALLED` | exit code 128–191, a wrapper ate the signal |
 | `RUN_STOPPED` | a run found dead afterwards whose controller had been sent SIGTERM before this process's last heartbeat |
 | `UNKNOWN` | no status obtainable (remote gateway) |
@@ -1076,7 +1076,11 @@ carries the target's PID and API return status, and the event header carries the
 the process it was written in, which is the caller. Only successful calls
 are attributed. `killer.api_status` preserves the API result; `killer.exit_code`
 comes from the parent's observed process status and is unavailable during
-recovery. It is never inferred from ETW's `ReturnCode`. A rejected call or stale
+recovery. It is never inferred from ETW's `ReturnCode`. Live attribution requests
+an ETW buffer flush before its bounded wait. If no witness arrives, an ordinary
+Windows exit code remains `UNKNOWN`: `TerminateProcess` can use the same code as
+an intentional exit. Known fault codes and fatal dumps retain their diagnoses.
+A rejected call or stale
 PID match does not end the wait for a valid termination record. A sidecar of the same shape
 as the Linux one consumes a real-time session on that provider, sweeps the
 sessions a killed sidecar would have left (a machine holds at most 64), and

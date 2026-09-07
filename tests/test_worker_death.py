@@ -68,7 +68,7 @@ def test_a_deliberate_exit_is_not_reported_as_a_crash(distributed):
     incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
 
     death = distributed.only(incidents, "worker_death")
-    assert death.verdict == "SELF_EXIT"
+    assert death.verdict == ("UNKNOWN" if sys.platform == "win32" else "SELF_EXIT")
     assert death.exit_status == 3
 
 
@@ -446,7 +446,7 @@ def test_a_slow_test_that_passed_is_not_the_crash_that_killed_the_worker(distrib
     )
 
     death = distributed.only(incidents, "worker_death")
-    assert death.verdict == "SELF_EXIT"
+    assert death.verdict == ("UNKNOWN" if sys.platform == "win32" else "SELF_EXIT")
     assert death.test_in_flight == "test_slow_then_exit.py::test_leaves_on_purpose"
     # Nothing to blame, so nobody is blamed - and above all not the package
     # whose only involvement was being slow once.

@@ -128,6 +128,19 @@ def test_a_clean_code_with_no_dump_is_the_worker_leaving_on_its_own():
     assert any("os._exit()" in line for line in evidence)
 
 
+@pytest.mark.parametrize("code", [0, 1, 3, 15, 143])
+def test_windows_exit_codes_do_not_identify_who_requested_the_exit(code):
+    verdict, confidence, evidence = verdict_of(
+        exit_status=code, exit_status_source="GetExitCodeProcess",
+    )
+    assert (verdict, confidence) == ("UNKNOWN", "low")
+    assert any("same code" in line for line in evidence)
+    assert not any("exit was requested from inside" in line for line in evidence)
+    text = rendered(exit_status=code, exit_status_source="GetExitCodeProcess")
+    assert f"exited with code {code}" in text
+    assert "exit status could not be read" not in text
+
+
 def test_a_fatal_dump_outranks_a_clean_exit_code():
     """On Windows abort() exits with 3, exactly as a deliberate os._exit(3)
     does. The dump is the only thing that tells them apart."""
