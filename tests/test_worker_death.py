@@ -187,13 +187,14 @@ def test_a_windows_ntstatus_is_decoded_as_what_it_stands_for(
 def test_a_wrapped_signal_is_not_mistaken_for_a_chosen_exit_code(distributed):
     """Shells and container runtimes report a signal death as 128 + signal
     rather than passing the signal through, so the code alone is a convention
-    and the confidence has to say so."""
+    and the confidence has to say so. Windows exposes a caller-chosen DWORD,
+    not this POSIX convention, so 143 cannot identify a signal there."""
     distributed.pytester.makepyfile(test_crash=crashing_test("victim.hard_exit(143)"))
     incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
 
     death = distributed.only(incidents, "worker_death")
     assert death.exit_status == 143
-    assert death.verdict == "PROBABLY_SIGNALLED"
+    assert death.verdict == ("UNKNOWN" if sys.platform == "win32" else "PROBABLY_SIGNALLED")
     assert death.confidence == "low"
 
 
