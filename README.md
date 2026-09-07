@@ -411,7 +411,7 @@ reports what the incident found rather than what a `-9` looks like.
 | `SIGKILLED` | `-9` and no witness answered; the incident says which witnesses this machine withheld, and why |
 | `NATIVE_CRASH` | SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE, or a Windows NTSTATUS |
 | `SIGNAL_<n>` | SIGTERM/SIGINT/SIGHUP — a request to stop, not a defect |
-| `SELF_EXIT` | any exit code with no signal, `0` included — a worker that left the run was not asked to |
+| `SELF_EXIT` | a non-signal POSIX exit code, `0` included; an unwitnessed Windows exit remains `UNKNOWN` because an external caller can choose the same code |
 | `PROBABLY_SIGNALLED` | exit code 128–191, a wrapper ate the signal |
 | `RUN_STOPPED` | a run found dead afterwards whose controller had been sent SIGTERM before this process's last heartbeat |
 | `UNKNOWN` | no status obtainable (remote gateway) |
@@ -944,6 +944,17 @@ does not prove that no OOM kill occurred.
 
 ### Reporting a killed run from the sidecar
 
+On POSIX, a SIGTERM or SIGINT received by the sidecar starts a **15-second
+observation grace period** instead of ending it immediately. This covers a
+supervisor signaling both controller and sidecar: it continues reading the
+controller pipe, reports unexpected EOF, and exits promptly after the normal
+`stop`/EOF handshake. Repeated signals do not extend the deadline. A signal to
+the sidecar alone is never treated as proof that the controller was killed.
+The grace period bounds waiting for controller exit; delivery still uses the
+existing reporter timeout. SIGKILL, Windows forcible termination, or destruction
+of the whole container/host can still prevent reporting.
+
+
 Every incident above is raised by a process that survived to raise it, and a
 run whose controller is killed has none. The next run over the same evidence
 directory recovers it — but on a runner with a fresh workspace per job there
@@ -951,9 +962,17 @@ is no next run, and a cancelled or OOM-killed job was a job about which
 nothing was ever said.
 
 A sidecar can survive the controller. On POSIX it starts in a separate session,
-but it can still be killed with the container, cgroup or host. It holds the read end of a pipe only the
-controller can write, so the controller dying — whatever killed it — is EOF
-on that pipe; a controller that reaches session finish writes `stop` first.
+but it can still be killed with the container, cgroup or host. It reads the
+controller's pipe; a controller that reaches session finish writes `stop` first.
+An independent process-owned POSIX record lock, or a retained Windows process
+handle, detects controller death even if a child retains the pipe's write end.
+The controller reports the reporter as `armed` only after the sidecar acknowledges
+its payload. The acknowledgement contains a random token, never the payload.
+Owner and worker records include process creation time where available, so a
+reused PID does not hide a dead run. Missing or unreadable worker state falls
+back to the event-log PID rather than treating missing state as death.
+Legacy records and inaccessible identity
+information retain conservative PID-based checks.
 EOF without it is a death, and the sidecar then starts a *reporter*: a child
 that builds the same incidents the next run would have recovered, the
 controller's own death above all, and calls the callable you configured with
@@ -1010,12 +1029,36 @@ user's groups and environment. Its output goes to `reporter.log` in the run's
 directory, and nothing it does can reach a run that is already over. Once
 reported, the run's marker is stamped so a later recovery skips it. Reporters,
 recovery and pruning share an OS lock. Each successful callback is checkpointed;
-a failed callback leaves the remaining evidence for a later attempt. Delivery
+a failed callback is retried up to three times with 250 ms between attempts,
+without replaying checkpointed successes. Exhausting that budget leaves the
+remaining evidence for later recovery. A confirmed controller death is delivered
+even if a worker survives the 20-second worker grace period. Its evidence remains
+available until those workers finish; delivery of the controller is checkpointed
+independently. Delivery
 is **at least once**: consumers should deduplicate by run ID and fingerprint
 because a kill between callback success and its checkpoint can replay it.
 The reporter's five-minute deadline includes input delivery; an overdue child
 is killed and reaped. A successful callback means it returned without raising,
 not that an external service durably stored the incident.
+
+**Incident volume.** Live reporting emits each distinct fingerprint once per
+run, with recurrence counts in the existing summary. A completed stall probe
+cannot emit a new stall for a worker already reported as failed by xdist.
+Clean completion does not erase a previously confirmed stall. Delivered worker
+deaths are checkpointed so recovery does not announce them again.
+
+Recovery groups equivalent fingerprints. When the controller died, unresolved
+worker losses are attached to that interrupted-run incident in the optional
+`related_deaths` field, preserving each worker's full record. This describes
+unresolved losses, not proof that they share a cause. Independently diagnosed
+failures remain separate. A grouped report retains the highest severity of its
+members. A 20-worker interruption therefore need not create 21 alerts, while a
+separate diagnosed crash remains visible.
+
+The existing `run_summary` hook record stays informational; ordinary assertion
+failures do not become additional instrumentation incidents. Resource samples,
+gaps and unavailable counters are live data, not incident sources. Consumers
+should route by kind and severity rather than page on every hook invocation.
 
 **Watch-only reporting needs no privilege.** Where tracing is unavailable, the
 sidecar still starts when a reporter is configured. It reports durable state
@@ -1033,7 +1076,11 @@ carries the target's PID and API return status, and the event header carries the
 the process it was written in, which is the caller. Only successful calls
 are attributed. `killer.api_status` preserves the API result; `killer.exit_code`
 comes from the parent's observed process status and is unavailable during
-recovery. It is never inferred from ETW's `ReturnCode`. A rejected call or stale
+recovery. It is never inferred from ETW's `ReturnCode`. Live attribution requests
+an ETW buffer flush before its bounded wait. If no witness arrives, an ordinary
+Windows exit code remains `UNKNOWN`: `TerminateProcess` can use the same code as
+an intentional exit. Known fault codes and fatal dumps retain their diagnoses.
+A rejected call or stale
 PID match does not end the wait for a valid termination record. A sidecar of the same shape
 as the Linux one consumes a real-time session on that provider, sweeps the
 sessions a killed sidecar would have left (a machine holds at most 64), and
@@ -1709,6 +1756,232 @@ read another running as the same user at the same integrity level, so the
 descendant rule above simply does not apply. Reading an *elevated* process from
 an unelevated one needs `SeDebugPrivilege`.
 
+## Live resource history
+
+Resource history is an **opt-in, active-run feature**. It extends the existing
+live server without changing `/workers`, `/stack`, incidents, or worker-sample
+hooks. It collects even when no browser is connected. It requires neither
+profiling nor an installed host service.
+
+```ini
+[pytest]
+addopts = --failure-instrumentation
+failure_stack_server = true
+failure_resources_seconds = 5
+failure_resources_max_mb = 256
+# Optional: only these trees are inventoried. Never scan an entire drive.
+failure_resources_roots =
+    test-output
+    downloads
+failure_resources_scan_seconds = 60
+failure_resources_max_files = 50000
+```
+
+The equivalent programmatic settings are `resources_seconds`,
+`resources_max_mb`, `resources_roots`, `resources_scan_seconds`, and
+`resources_max_files`. They belong to the controller and are not handed to
+xdist workers. The default interval is **0 (disabled)**, including when the
+callstack server is enabled. Positive intervals have a one-second minimum.
+Installing the plugin still requires the normal enable switch or `install()`.
+
+### What is collected
+
+| Scope | Measurements | Timing |
+|---|---|---|
+| Visible OS | CPU, available/total RAM, swap, paging; supported native counters below | Resource interval, normally 5 seconds |
+| Controller, workers, observed descendants | CPU time/rate, RSS, Linux PSS/USS, supported private commit/footprint, I/O, threads, handles/FDs | Resource interval |
+| Surrounding processes | Up to ten largest RSS consumers and ten CPU consumers; names, identities and parent PIDs | 15 seconds |
+| Linux cgroup | Resolved membership, memory limits/usage, OOM events, CPU quota/throttling, supported pressure | Resource interval |
+| Disks | Supported throughput, operation and timing counters; derived read/write latency when available | Resource interval |
+| Relevant volumes | Free/used/total space, deduplicated by device | 30 seconds, in the helper |
+| Configured directories | Logical file sizes/counts, new remaining files, growth, removed baseline paths and largest growth | Initial incremental baseline; repeat 60 seconds after a scan completes |
+| Events | Observed process arrival/disappearance and links to existing deduplicated incidents | Included in the next resource batch |
+
+Windows adds **system commit/headroom, kernel pools, handle/thread/process
+counts**, and PDH counters for paging, disk queues/latency and processor queue.
+Counter names are added through the English PDH API, independent of the OS
+UI language. Linux reads procfs PSI and VM counters, and discovers cgroup v2
+or v1 through membership and mount information. macOS adds Mach VM
+paging/compression and libproc process footprint/I/O. No shell command is
+launched per measurement and no process is suspended.
+
+These are different quantities: `private_commit_bytes` (Windows),
+`physical_footprint_bytes` (macOS), and `rss_bytes` are not interchangeable.
+RSS totals can double-count shared pages. On Linux, each enabled resource sample
+also attempts one `smaps_rollup` read for each tracked process: `pss_bytes`,
+`pss_anonymous_bytes`, `pss_file_bytes`, `pss_shared_bytes`, `swap_pss_bytes`,
+`private_clean_bytes`, `private_dirty_bytes`, and `uss_bytes` (private clean
+plus private dirty). USS excludes shared resident pages; PSS apportions them
+among all processes mapping them, including processes outside this run.
+These resident figures exclude explicit hugetlb allocations, which Linux
+accounts separately. Swap PSS is separate from resident PSS.
+
+For a run's proportional resident share, sum PSS over unique process identities
+(controller, workers and observed descendants), not RSS. Report coverage: if
+any process lacks PSS, the sum is partial. Never replace missing PSS with RSS
+or zero. Samples are sequential, not an atomic machine snapshot, and summed
+PSS is not cgroup usage (which includes other charged memory).
+
+Absent, denied or malformed rollup fields appear in `unavailable`; other
+process counters remain available. There is no full `smaps` fallback.
+This is default-on only when resource sampling is enabled. Although the file
+is compact, the kernel still walks page tables and collection cost grows with
+the mappings; inspect sampling duration and lag on representative workloads.
+
+Process I/O accounting follows the OS API: it is
+not necessarily physical-disk traffic. Disk latency is the counter interval's
+average, not a percentile. Paging does not imply every fault required swap.
+Disk `*_time_ms` fields remain cumulative counters; separate
+`*_time_per_second_ms` fields describe their rate of increase. RAM and swap
+capacity are gauges and are never treated as traffic counters.
+Unsupported counters appear in `unavailable`; an unlimited cgroup limit is
+null without an unavailable reason. A first rate sample or reset is null.
+
+The scope is the **visible OS/process namespace**, not an inaccessible outer
+Windows/macOS host when pytest runs inside a VM/container. On Linux with an
+ancestor's procfs mount, `pid_scope=procfs` identifies the counter PID namespace
+and `pytest_pid` separately names the collector in pytest's namespace.
+Ownership is associated while a parent relationship is observable and retained
+through reparenting. Five-second sampling can miss short spikes; the slower
+process inventory can miss short-lived descendants. Process disappearance is
+an observation, not an invented exit code. Existing kill-attribution incidents
+remain the source of termination verdicts. This feature does not add Docker
+API access, OS log subscriptions, stack reads, allocation tracing, automatic
+file deletion, or networking diagnosis.
+
+### Reading from the current live server
+
+Use the `session` returned by `/workers`; it is mandatory because multiple
+runs on a shared server can each have a worker named `gw0`.
+
+```text
+GET /resources?session=run-abc&latest=true
+GET /resources?session=run-abc&after=0&limit=120
+GET /resources?session=run-abc&worker=gw0&from=1788600000&to=1788600300
+```
+
+Authentication and host checks are identical to `/workers`. Responses have
+`schema_version=1`, run/platform metadata, retained sequence bounds and
+`batches`. Each batch contains `sequence`, `observed_at`, `elapsed_s`, `host`,
+`cgroup`, `disks`, `processes`, `consumers`, `files`, `events`, and `collector`.
+Measurements carry `metrics` and `unavailable` maps; units are in metric names.
+CPU rates use cores (`1.0` is one fully occupied core); host `cpu_percent`
+normalizes against logical CPUs. Cgroup CPU quota remains a separate limit.
+Descendants include `worker_exited` when their observed worker is no longer
+present. This does not automatically diagnose a leaked process.
+
+`after` is an exclusive sequence cursor. Continue with `next_after` while
+`has_more` is true, or pass it on the next poll. `limit` is 1–500 batches;
+responses also have a roughly 2 MiB payload budget. Time bounds are Unix
+seconds, inclusive. `worker` filters process/event rows while preserving shared
+host conditions; it never changes collection. `latest=true` returns the newest
+published batch. There is no lossy downsampling: the client can fetch bounded
+pages without losing sampled peaks. Distinguish sampling resolution from a
+promise to catch every instantaneous peak.
+
+`history_truncated` says the start of the run was rotated out. `cursor_expired`
+says a nonzero cursor predates retained history. Missing intervals remain
+missing. Disabled, finished or unknown sessions return 404; invalid ranges
+return 400; unavailable/busy readers return 503. At most two resource queries
+are processed concurrently. Reads never start probes or file scans.
+
+```python
+from pytest_failure_instrumentation.client import FailureServerClient
+
+async with FailureServerClient(url=server_url, token=token) as client:
+    page = await client.resources(session, worker="gw0", latest=True)
+    for sample in page.batches:
+        print(sample.host.metrics, sample.processes)
+```
+
+For multiple servers, use the `LiveStackServer` payloads received through
+`pytest_failure_server_ready`; each supplies its own token and `session_id`:
+
+```python
+from pytest_failure_instrumentation.client import read_resources_fleet
+
+cursors = {}  # retain between polls, keyed by (server URL, session)
+fleet = await read_resources_fleet(servers, after=cursors, limit=120, concurrency=16)
+cursors.update(fleet.cursors)  # failed members keep their previous cursor
+for member in fleet.answered:
+    print(member.url, member.session, member.history.batches)
+for member in fleet.silent:
+    print(member.url, member.session, member.status, member.error)
+```
+
+This reads one page per advertised session, with bounded concurrency (16 by
+default). It preserves pagination, gaps and availability rather than draining
+history automatically. `start`, `end`, `worker`, `latest`, and `timeout` have
+the same meanings as the single-server call. A shared `httpx.AsyncClient` can
+be passed as `client`; ownership stays with the caller. Cancellation propagates.
+Different pytest sessions can observe the same host, so the fleet retains
+host/session identity and does not sum their machine measurements. Existing
+`read_fleet()` continues to gather worker snapshots with its original contract.
+
+### File tracking and bounded cost
+
+A single session-owned helper handles filesystem work so a slow directory or
+volume cannot block cheap resource samples or test hooks. It starts with the
+collector and is terminated at run end; it is not a service. With no configured
+roots it only queries relevant-volume space. Never enable remote/unreliable
+roots unless their measurement is needed.
+
+Directory walks yield after at most 500 entries or approximately 50 ms of
+work, then pause for 50 ms. A syscall itself can exceed that duration, which
+is why the helper has a bounded shutdown. Symlinks, Windows reparse points,
+and the plugin's evidence tree are excluded. Scans have an entry budget,
+counting directories as well as files; at most eight roots are accepted.
+Each disposable SQLite inventory has a database cap of the larger of 32 MiB
+and 2,048 bytes per configured entry (about 98 MiB at 50,000 entries), plus a
+1 MiB cache. The entry and byte limits are independent: exceptionally long
+paths or a full volume report `inventory_over_budget` / `database_or_disk_full`.
+Rollback journals can temporarily require additional disk space.
+Its temporary rollback journal can use approximately another database's worth
+of disk space during a transaction. Failed/full transactions roll back, so a
+later successful scan does not compare against a damaged partial inventory.
+Inventories compare **logical bytes by path**, not allocated disk blocks or
+hard-link-deduplicated storage. There is no per-test recursive scan.
+
+The initial baseline records its start/end timestamps. Tests keep running;
+this is not an atomic snapshot before the first test. Partial/error scans
+report observed counts, coverage and age, and do not infer deletions or exact
+baseline deltas. A scan does not overlap its next scan. Live updates include
+`scanning`, `complete`, `partial`, `failed` or `excluded` status; each completed
+scan includes the top 20 growing paths (path display capped at 1,024 characters).
+Paths remain associated with a **shared directory**, not confidently blamed
+on whichever parallel test happened to be running. Expected fixture/session
+retention must be considered before calling remaining files a leak.
+
+Numeric history uses rotating JSONL segments on local disk, not an in-memory
+list growing with run length. The history budget is separate from optional
+file inventories and small manifests. At most 512 processes are tracked and
+8,192 are considered during an inventory; truncation is explicit. Collection
+duration, errors, missed intervals and dropped event counts are recorded.
+There is one controller sampling thread and one filesystem helper per enabled
+session, rather than a sampler in each xdist worker. Multiple controllers keep
+separate histories; their host counters must not be summed.
+
+Normal shutdown deletes **only resource history/inventories**, preserving
+existing incident evidence. A run-held OS file lock is released before cleanup:
+readers reject a completed run even if locked files prevent their deletion and
+the Python process remains alive. Readers check the lease before and after
+reading and stay within the byte ranges in their published manifest snapshot.
+Short disk writes are truncated to the last complete batch before retrying.
+Cleanup retries transient sharing violations; persistent failures are reported
+on stderr and retried by pytest cleanup and subsequent-run pruning. Pytest
+cleanup is an idempotent fallback. After
+an abrupt process/host death, a subsequent run removes abandoned live-resource
+files when the existing owner checks establish that the owner is dead, even
+if unreported incident evidence must remain. There is no archive, upload,
+post-run endpoint or promise that a stopped process can delete its own files.
+Python buffers are flushed per batch; this is not an fsync durability guarantee.
+
+All collection adds some work when enabled. Benchmark on representative
+workloads before selecting intervals or making test-duration/RAM guarantees.
+The default off path does not import or start the resource collector. A
+single-process pytest run can still stop its sampling thread by holding the
+GIL; this feature does not change the existing native-GIL limitation.
+
 ## Profiling
 
 Everything above waits for something to go wrong. `--failure-profile` waits for
@@ -2222,6 +2495,11 @@ accepted and inert.
 | `failure_capture_output` | `false` | Keep the last few KB of each worker's captured stderr, so a native crash message survives the kill that swallows it. See [What the worker last said](#what-the-worker-last-said) |
 | `failure_on_run_death` | — | A dotted path `package.module:attribute` to a callable the sidecar calls with each incident of a run whose controller was killed, so a killed run is reported at once. From Python, `install(config, on_run_death=functools.partial(...))`. See [Reporting a killed run from the sidecar](#reporting-a-killed-run-from-the-sidecar) |
 | `failure_tracer` | `parent` | Who may read a worker on Linux under Yama: `parent`, `any`, `off`. Declared only when the stack server is on — a run with no reader declares nothing whatever this says |
+| `failure_resources_seconds` | `0` | Live resource sample interval; off by default, minimum 1 second when enabled |
+| `failure_resources_max_mb` | `256` | Numeric live-history disk budget in MiB, clamped to 8–1024 |
+| `failure_resources_roots` | empty | Explicit directory inventory roots, at most eight |
+| `failure_resources_scan_seconds` | `60` | Delay after each directory scan, minimum 10 seconds |
+| `failure_resources_max_files` | `50000` | Entry budget per directory scan, clamped to 100–100000 |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
@@ -2489,3 +2767,36 @@ then on the customer who called it — a runtime frame reported as customer code
 which is the one direction this must never fail in. Only the 3.9 cell caught
 it. And it found that ctypes cannot raise an uncaught fault on Windows at all,
 which is a fact about what users will see rather than about the plugin.
+
+
+Resource review clarifications:
+- `/resources` is opt-in host context, including surrounding process names/PIDs
+  and configured directory metadata. Loopback clients can read it without a
+  token under the existing server defaults. Configure `PYTEST_CALLSTACK_TOKEN`
+  when other local users must not read these measurements. No unrelated stack,
+  environment, command line or file content is collected by this endpoint.
+- `LiveStackServer.session_id`, delivered to `pytest_failure_server_ready`, is
+  also a source of the session identifier; polling `/workers` is not necessary.
+- Events are acknowledged after history publication. Failed publication may
+  replay an event; the bounded event queue reports overflow instead of growing
+  indefinitely. File snapshot errors distinguish oversized, unavailable and
+  not-yet-published results.
+- The on-demand `Profile readiness` workflow now also runs resource qualification:
+  two alternating pairs, 80 lightweight workers, and a separate eight-worker
+  256 MiB allocation workload with file scans. Gates are 20% elapsed/test-p99
+  overhead, 25% controller/worker RSS overhead, sample time at most the smaller
+  of one second and 20% of the configured interval, and 30-second shutdown.
+  RSS comparisons exclude the filesystem helper and double-count shared pages;
+  they are synthetic budgets, not fleet-wide guarantees.
+
+- `probes.capabilities(resources=True)` performs an explicit resource preflight;
+  ordinary capability checks do not initialize these adapters.
+- Repeated filesystem snapshots are stored once per segment. Every retained
+  segment is self-contained, and HTTP responses expand the snapshots unchanged.
+- Five consecutive collection/write errors stop sampling. The manifest records
+  the reason when writable, with a stderr diagnostic if the volume cannot accept
+  it. Run access still ends at session shutdown.
+- Existing live-history directories are not overwritten: a collision fails
+  collection setup visibly rather than deleting potentially active data. Volume
+  queries remain isolated even without directory roots, since filesystem calls
+  can block. Neither requires a permanent collector.

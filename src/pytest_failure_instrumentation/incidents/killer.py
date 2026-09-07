@@ -199,6 +199,7 @@ class Sources:
     #: Whether the sidecar is still writing: a death noticed live may have
     #: to wait a moment for its line, one found afterwards never does.
     live: bool = True
+    trace_flush: Optional[Callable[[], None]] = None
     #: The last kernel-log reading this run made: when it was taken, the
     #: window it opened at, and what it found. One object serves every death
     #: of a run - see :meth:`kernel_log_reading`.
@@ -424,7 +425,14 @@ def _settled(
             or time.monotonic() - sources._trace_waited_at < 2.0):
         return found
     deadline = time.monotonic() + TRACE_SETTLE_SECONDS
+    if sources.trace_flush is not None:
+        try:
+            sources.trace_flush()
+        except Exception:  # noqa: BLE001 - a failed witness cannot break reporting
+            pass
     size = _size_of(sources.trace_path)
+    # Flushing may publish synchronously before the first size check.
+    found = sources.trace_reading()
     while not any(ready(witness) for witness in found) and time.monotonic() < deadline:
         time.sleep(TRACE_POLL_SECONDS)
         grown = _size_of(sources.trace_path)

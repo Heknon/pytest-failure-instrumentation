@@ -31,7 +31,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install -e ".[test,client]"
 
       - name: Gate profiler detection and overhead
         run: python benchmarks/profile_gate.py
@@ -59,7 +59,7 @@ jobs:
           # person making the change has locally. Both happened: CI's mypy was
           # two majors ahead and rejected a python_version the local one
           # accepted. Bump these deliberately.
-          pip install -e ".[test]" ruff==0.15.8 mypy==2.3.1
+          pip install -e ".[test,client]" ruff==0.15.8 mypy==2.3.1
 
       - name: Ruff
         run: ruff check src tests
@@ -96,7 +96,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install -e ".[test,client]"
 
       # py-spy is how this package reads any live process, the one doing the
       # reading included, and it is a required dependency, so the install
@@ -120,7 +120,7 @@ jobs:
 
       - name: Show what this machine can measure
         run: |
-          python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
+          python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(resources=True), indent=2))"
 
       # -n 4 on Linux, and only there. Measured on a 4-vCPU Linux box, which is
       # the shape of this runner: 596s serially against 268s under -n 4, with
@@ -178,17 +178,26 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install -e ".[test,client]"
 
       - name: Show what this machine can measure
         run: |
-          python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(), indent=2))"
+          python -c "import json; from pytest_failure_instrumentation import probes; print(json.dumps(probes.capabilities(resources=True), indent=2))"
 
       - name: Test platform-facing code
         id: tests
         run: >-
           pytest -q
           tests/test_probes.py
+          tests/test_resources.py
+          tests/test_resource_resilience.py
+          tests/test_sidecar_termination.py
+          tests/test_reporting_resilience.py
+          tests/test_resource_fleet.py
+          tests/test_resource_rollup.py
+          tests/test_client.py::test_repeated_concurrent_resources_workers_and_stacks
+          tests/test_client.py::test_three_concurrent_real_stack_requests_leave_server_responsive
+          tests/test_client.py::test_resource_overload_refuses_excess_work_and_recovers
           tests/test_profile_sampler.py
           tests/test_stall_probe.py
           tests/test_exit_status.py

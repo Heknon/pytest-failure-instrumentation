@@ -42,7 +42,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from .. import probes
+from .. import probes as probes
+from ..probes.process import same_process
 
 if TYPE_CHECKING:
     from .death import WorkerDeathIncident
@@ -124,7 +125,52 @@ def claim(directory: Path) -> Iterator[bool]:
         handle.close()
 
 
-def deliver(directory: Path, found: list[Any], target: Callable[[Any], Any]) -> list[Any]:
+def worker_records(directory: Path) -> list[dict[str, Any]]:
+    """Recorded worker identities, with event-log fallback for torn/missing slots."""
+    from ..capture import events as event_log
+    from ..capture.state import read_state
+
+    names = {path.stem for path in directory.glob("*.state")}
+    names.update(path.stem for path in directory.glob("*.events"))
+    records = []
+    for name in sorted(names):
+        state = read_state(directory / f"{name}.state")
+        if not isinstance(state.get("pid"), int):
+            events = event_log.read_events(directory / f"{name}.events")
+            pid = event_log.worker_pid(events)
+            if pid is None:
+                continue
+            state = {"pid": pid}  # Identity unavailable: retain conservative liveness.
+        records.append({**state, "worker": name})
+    return records
+
+
+def workers_alive(directory: Path) -> bool:
+    return any(same_process(state["pid"], state.get("created_at"))
+               for state in worker_records(directory))
+
+
+def delivery_key(incident: Any) -> str:
+    return f"{incident.kind}:{incident.worker}:{incident.worker_pid}"
+
+
+def checkpoint_live(directory: Path, incident: Any) -> None:
+    """A later recovery must not replay deaths already delivered by this run."""
+    if incident.kind != "worker_death":
+        return
+    with claim(directory) as acquired:
+        record = marker(directory) if acquired else None
+        if record is None:
+            return
+        completed = set(record.get("delivered_incidents") or [])
+        completed.add(delivery_key(incident))
+        record["delivered_incidents"] = sorted(completed)
+        if not _write_marker(directory, record):
+            raise OSError("could not checkpoint live incident")
+
+
+def deliver(directory: Path, found: list[Any], target: Callable[[Any], Any],
+            prepare: Optional[Callable[[Any], Any]] = None) -> list[Any]:
     """Caller holds claim(). Checkpoint each successful delivery for retries.
 
     At least once: a kill between callback success and its checkpoint may
@@ -135,23 +181,49 @@ def deliver(directory: Path, found: list[Any], target: Callable[[Any], Any]) -> 
         return []
     completed = set(record.get("delivered_incidents") or [])
     delivered = []
+    groups: dict[str, list[Any]] = {}
+    controller = next((item for item in found if item.worker == "controller"
+                       and delivery_key(item) not in completed), None)
     for incident in found:
-        key = f"{incident.kind}:{incident.worker}:{incident.worker_pid}"
+        if delivery_key(incident) in completed:
+            continue
+        if prepare is not None:
+            prepare(incident)
+        # Unknown worker losses in an interrupted run are context for the
+        # controller incident. Retain their full facts without inventing a
+        # separate diagnosis (or claiming the controller caused them).
+        group = ("interrupted-run" if controller is not None
+                 and (incident is controller or incident.verdict == "UNKNOWN")
+                 else incident.fingerprint or delivery_key(incident))
+        groups.setdefault(group, []).append(incident)
+    for members in groups.values():
+        incident = next((item for item in members if item.worker == "controller"), members[0])
+        if len(members) > 1:
+            incident.related_deaths = [item.model_dump(exclude={"related_deaths"})
+                                      for item in members if item is not incident]
+            rank = {"informational": 0, "needs-triage": 1, "high": 2, "critical": 3}
+            incident.severity = max(members, key=lambda item: rank.get(item.severity, 1)).severity
+            incident.evidence.append(
+                f"Grouped {len(members)} process deaths: equivalent findings or unresolved "
+                "worker losses in this interrupted run; this does not prove a common cause."
+            )
+        key = delivery_key(incident)
         if key in completed:
             continue
         target(incident)
-        completed.add(key)
+        completed.update(delivery_key(item) for item in members)
         record["delivered_incidents"] = sorted(completed)
         if not _write_marker(directory, record):
             raise OSError("could not checkpoint incident delivery")
         delivered.append(incident)
-    if not stamp(directory, REPORTED_KEY):
+    if not workers_alive(directory) and not stamp(directory, REPORTED_KEY):
         raise OSError("could not mark run as reported")
     return delivered
 
 
 def deliver_left_behind(root: Path, mine: Path, target: Callable[[Any], Any],
-                        elevate: bool = False) -> None:
+                        elevate: bool = False,
+                        prepare: Optional[Callable[[Any], Any]] = None) -> None:
     for directory in run_directories(root):
         if directory == mine:
             continue
@@ -159,7 +231,7 @@ def deliver_left_behind(root: Path, mine: Path, target: Callable[[Any], Any],
             if acquired:
                 found = _deaths_in(directory, elevate)
                 if found:
-                    deliver(directory, found, target)
+                    deliver(directory, found, target, prepare=prepare)
 
 
 def stamp(directory: Path, key: str) -> bool:
@@ -220,8 +292,16 @@ def prune_finished_runs(root: Path) -> None:
                 continue
             record = marker(path)
             owner = owner_of(path)
-            if owner is None or probes.is_running(owner):
+            if owner is not None and record and record.get(FINISHED_KEY):
+                # An embedded pytest.main() may finish while its Python owner
+                # stays alive. Retry only resource cleanup in that case.
+                shutil.rmtree(path / "resources-live", ignore_errors=True)
+            if owner is None or same_process(owner, record.get("created_at") if record else None):
                 continue
+            # Live resource history has no post-run retention contract.
+            # Remove only its own subtree, even when unreported incidents
+            # must remain for recovery. Never touch an active owner's data.
+            shutil.rmtree(path / "resources-live", ignore_errors=True)
             if not record or not (record.get(FINISHED_KEY) or record.get(REPORTED_KEY)):
                 continue  # retain unreported evidence, including failed callbacks
             shutil.rmtree(path, ignore_errors=True)
@@ -273,28 +353,22 @@ def _deaths_in(directory: Path, elevate: bool = False) -> list[WorkerDeathIncide
     if record is None:
         return []  # not ours
     owner = record.get("pid")
-    if not isinstance(owner, int) or probes.is_running(owner):
+    if not isinstance(owner, int) or same_process(owner, record.get("created_at") if record else None):
         return []  # still going, so not yet anybody's to report
     if record.get(FINISHED_KEY):
         return []  # it reached its own session finish and reported for itself
     if record.get(REPORTED_KEY):
         return []  # the sidecar's reporter raised its incidents already
 
-    # A controller may die while its workers still run. Preserve the whole
-    # run until every recorded worker is gone. PID reuse can defer recovery,
-    # which is safer than reporting a live process as dead.
-    for state_path in directory.glob("*.state"):
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            pid = state.get("pid")
-            if isinstance(pid, int) and probes.is_running(pid):
-                return []
-        except (OSError, ValueError, AttributeError):
-            continue
     from . import death
 
     incidents = []
+    states = {state["worker"]: state for state in worker_records(directory)}
     for events in sorted(directory.glob("*.events")):
+        state = states.get(events.stem, {})
+        pid = state.get("pid")
+        if isinstance(pid, int) and same_process(pid, state.get("created_at")):
+            continue  # Preserve this worker for later; controller death is independent.
         incident = death.recover(events, session=directory.name, elevate=elevate)
         if incident is not None:
             incidents.append(incident)

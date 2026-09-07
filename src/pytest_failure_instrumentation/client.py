@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .live_view import LiveStackServer
 from .stack_server import AUTH_HEADER, AUTH_SCHEME
@@ -236,6 +236,73 @@ class WorkersSnapshot(_Wire):
 # --- what goes wrong ---------------------------------------------------
 
 
+class ResourceMeasurements(_Wire):
+    metrics: dict[str, Optional[float]] = Field(default_factory=dict)
+    unavailable: dict[str, str] = Field(default_factory=dict)
+
+
+class ResourceProcess(ResourceMeasurements):
+    """A stable process identity and the times it was discovered and sampled."""
+
+    first_observed_at: Optional[float] = None
+    pid: int
+    created_at: float
+    name: str = ""
+    parent_pid: int = 0
+    worker: Optional[str] = None
+    role: str = ""
+    worker_exited: bool = False
+    nodeid: Optional[str] = None
+    phase: Optional[str] = None
+    observed_at: Optional[float] = None
+
+
+class ResourceBatch(_Wire):
+    sequence: int
+    observed_at: float
+    elapsed_s: float
+    host: ResourceMeasurements
+    cgroup: ResourceMeasurements
+    processes: list[ResourceProcess] = Field(default_factory=list)
+    disks: list[dict[str, Any]] = Field(default_factory=list)
+    consumers: list[dict[str, Any]] = Field(default_factory=list)
+    files: dict[str, Any] = Field(default_factory=dict)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    collector: dict[str, Any] = Field(default_factory=dict)
+    disk_unavailable: dict[str, str] = Field(default_factory=dict)
+    inventory_unavailable: dict[str, str] = Field(default_factory=dict)
+    inventory_age_s: float = 0
+
+
+class ResourceHistory(_Wire):
+    collection_status: str = "running"
+    collection_error: Optional[str] = None
+    schema_version: int = 1
+    session: str
+    controller_pid: int
+    controller_created_at: float
+    started_at: float
+    system: str = ""
+    python: str = ""
+    scope: str = ""
+    pid_scope: str = "local"
+    pytest_pid: Optional[int] = None
+    product_version: Optional[str] = None
+    worker_count: Optional[int] = None
+    cgroups: dict[str, str] = Field(default_factory=dict)
+    limits: dict[str, int] = Field(default_factory=dict)
+    sample_seconds: float
+    max_bytes: int
+    history_bytes: int = 0
+    earliest_sequence: Optional[int] = None
+    latest_sequence: int = 0
+    next_after: int = 0
+    has_more: bool = False
+    cursor_expired: bool = False
+    history_truncated: bool = False
+    batches: list[ResourceBatch] = Field(default_factory=list)
+
+
 class FailureServerError(Exception):
     """Anything that stopped a call from producing an answer."""
 
@@ -417,6 +484,25 @@ class FailureServerClient:
         return WorkersSnapshot.model_validate(
             await self._get("/workers", params=params, timeout=timeout)
         )
+
+    async def resources(
+        self, session: str, *, after: int = 0, limit: int = 120,
+        start: Optional[float] = None, end: Optional[float] = None,
+        worker: Optional[str] = None, latest: bool = False,
+        timeout: Optional[float] = None,
+    ) -> ResourceHistory:
+        """Read active-run history. Pass next_after to fetch the next page.
+
+        History exists independently of browser polling. This never starts a
+        probe, stack read or directory scan. A finished/disabled run is 404.
+        """
+        params: dict[str, Any] = {"session": session, "after": after, "limit": limit}
+        for name, value in (("from", start), ("to", end), ("worker", worker)):
+            if value is not None:
+                params[name] = value
+        if latest:
+            params["latest"] = "true"
+        return ResourceHistory.model_validate(await self._get("/resources", params=params, timeout=timeout))
 
     async def callstack(
         self,
@@ -674,3 +760,100 @@ async def read_fleet(
     # `return_exceptions=True` would turn into a result to be tabulated.
     gathered = await asyncio.gather(*(ask(server) for server in servers))
     return Fleet(observed_at=round(time.time(), 3), members=list(gathered))
+
+
+class ResourceFleetMember(_Wire):
+    """One server/session's resource page or explicit failure; never its token."""
+
+    url: str = ""
+    session: str = ""
+    history: Optional[ResourceHistory] = None
+    error: Optional[str] = None
+    status: Optional[int] = None
+
+    @property
+    def answered(self) -> bool:
+        return self.history is not None
+
+
+class ResourceFleet(_Wire):
+    """Resource pages retain their host/session scope; host totals are not summed."""
+
+    observed_at: float = 0.0
+    members: list[ResourceFleetMember] = Field(default_factory=list)
+
+    @property
+    def answered(self) -> list[ResourceFleetMember]:
+        return [member for member in self.members if member.answered]
+
+    @property
+    def silent(self) -> list[ResourceFleetMember]:
+        return [member for member in self.members if not member.answered]
+
+    @property
+    def cursors(self) -> dict[tuple[str, str], int]:
+        """Next cursors for answered members, keyed by normalized URL/session.
+
+        Merge these into prior cursors so temporarily unavailable members keep
+        their position. Each history also retains has_more/cursor_expired.
+        """
+        return {(member.url, member.session): member.history.next_after
+                for member in self.members if member.history is not None}
+
+
+async def read_resources_fleet(
+    servers: Sequence[LiveStackServer],
+    *,
+    after: Optional[Mapping[tuple[str, str], int]] = None,
+    limit: int = 120,
+    start: Optional[float] = None,
+    end: Optional[float] = None,
+    worker: Optional[str] = None,
+    latest: bool = False,
+    concurrency: int = 16,
+    timeout: Optional[float] = None,
+    client: Optional[httpx.AsyncClient] = None,
+) -> ResourceFleet:
+    """Read one bounded resource page per server's session_id concurrently.
+
+    Uses each ready payload's token. Missing session IDs, disabled/finished
+    collection (404), authentication, transport and schema errors stay local
+    to that member. Caller cancellation propagates. History reads never start
+    sampling or scans. Pages are not drained automatically; pass updated
+    per-member cursors on the next call. Shared host metrics remain separate
+    observations and must not be added together.
+    """
+    if not isinstance(concurrency, int) or concurrency < 1:
+        raise ValueError("concurrency must be a positive integer")
+    if client is None:
+        async with httpx.AsyncClient(timeout=timeout or DEFAULT_TIMEOUT) as owned:
+            return await read_resources_fleet(
+                servers, after=after, limit=limit, start=start, end=end, worker=worker,
+                latest=latest, concurrency=concurrency, timeout=timeout, client=owned,
+            )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def ask(server: LiveStackServer) -> ResourceFleetMember:
+        member = ResourceFleetMember(url=server.url.rstrip("/"), session=server.session_id)
+        try:
+            if not member.session:
+                raise ValueError("resource reads require the server's session_id")
+            reader = FailureServerClient(server, timeout=timeout or DEFAULT_TIMEOUT, client=client)
+            async with semaphore:
+                member.history = await reader.resources(
+                    member.session, after=(after or {}).get((member.url, member.session), 0),
+                    limit=limit, start=start, end=end, worker=worker, latest=latest, timeout=timeout,
+                )
+            if member.history.session != member.session:
+                member.history = None
+                raise ValueError("resource response belongs to a different session")
+        except ServerRefused as refused:
+            member.error, member.status = refused.message, refused.status
+        except FailureServerError as failed:
+            member.error = str(failed)
+        except Exception as unexpected:  # noqa: BLE001 - isolate each member, not cancellation
+            member.error = f"{type(unexpected).__name__}: {unexpected}"
+        return member
+
+    gathered = await asyncio.gather(*(ask(server) for server in servers))
+    return ResourceFleet(observed_at=round(time.time(), 3), members=list(gathered))

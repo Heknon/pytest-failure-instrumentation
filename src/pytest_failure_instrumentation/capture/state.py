@@ -90,7 +90,10 @@ class WorkerState:
 
     def __init__(self, path: Path, pid: int, run_id: str | None = None) -> None:
         self.path = path
+        from ..probes.process import creation_time
+
         self.pid = pid
+        self.created_at = creation_time(pid)
         self.run_id = run_id
         self.sequence = 0
         self.tests_started = 0
@@ -192,6 +195,7 @@ class WorkerState:
                 "time": stamp,
                 "run_id": self.run_id,
                 "pid": self.pid,
+                "created_at": self.created_at,
                 "nodeid": nodeid,
                 "last_nodeid": last_nodeid,
                 "phase": self.phase,

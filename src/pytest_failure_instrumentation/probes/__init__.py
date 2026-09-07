@@ -1,5 +1,6 @@
 """Platform truth. Nothing here raises, and nothing here reports a value
-without saying which mechanism produced it."""
+without saying which mechanism produced it. Low-level resource_metrics parsers
+may raise; their public collection boundaries report these as unavailable."""
 
 from __future__ import annotations
 

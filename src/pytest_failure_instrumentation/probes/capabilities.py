@@ -15,10 +15,10 @@ from . import memory, pyspy, stacks, tracing
 from .platform_flags import IS_WINDOWS, platform_description
 
 
-def capabilities() -> dict[str, Any]:
+def capabilities(*, resources: bool = False) -> dict[str, Any]:
     resident, resident_source = memory.resident_megabytes()
     available, available_source = memory.system_available_megabytes()
-    return {
+    result = {
         "platform": platform_description(),
         "system": "Windows" if IS_WINDOWS else platform.system(),
         "python": platform.python_version(),
@@ -41,3 +41,27 @@ def capabilities() -> dict[str, Any]:
         # the live view can answer for a worker at all - see probes.tracing.
         "ptrace_scope": tracing.ptrace_scope(),
     }
+
+    if resources:
+        # Explicit preflight only: the ordinary incident/default path does not
+        # import or initialize the resource collector's native adapters.
+        from .resource_metrics import PlatformMetrics, reason
+        probe = PlatformMetrics()
+        try:
+            _, missing = probe.host()
+            result["resource_cgroup"] = {key: str(path) for key, path in probe.cgroups.items()}
+            result["resource_native"] = {"system": probe.system, "unavailable": missing}
+            from pathlib import Path
+
+            import psutil
+            pid = os.getpid()
+            if probe.system == "Linux":
+                pid = int(Path("/proc/self/stat").read_text().split(" ", 1)[0])
+            values, unavailable = probe.process(psutil.Process(pid))
+            result["resource_process_io"] = {"supported": "read_total_bytes" in values,
+                                             "unavailable": unavailable}
+        except Exception as error:
+            result["resource_preflight_error"] = reason(error)
+        finally:
+            probe.close()
+    return result

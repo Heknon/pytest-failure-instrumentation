@@ -117,3 +117,15 @@ request to avoid another sweep takes precedence over the default policy.
 
 After the recorded macOS regression passes, further Windows iterations skip it.
 Add `profiling-macos` to explicitly rerun that recorded regression.
+
+## Live resource qualification
+
+The same on-demand `Profile readiness` run includes `Linux / live resource
+qualification`: an 80-worker resource run and an eight-worker run with 256 MiB
+resident allocations and file scanning. Inspect both preserved JSON reports.
+Budgets: <=20% elapsed and test-call p99 overhead, <=25% controller/worker RSS
+increase, sampling <=min(1 second, 20% of interval), and <=30-second shutdown.
+RSS excludes the isolated filesystem helper; do not present it as total plugin
+memory. These are synthetic gates, not production latency guarantees.
+The platform smoke/full suites install the client extra so the real sampler to
+HTTP typed-client regression cannot silently skip for missing httpx.
