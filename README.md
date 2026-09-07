@@ -1785,7 +1785,7 @@ Installing the plugin still requires the normal enable switch or `install()`.
 | Scope | Measurements | Timing |
 |---|---|---|
 | Visible OS | CPU, available/total RAM, swap, paging; supported native counters below | Resource interval, normally 5 seconds |
-| Controller, workers, observed descendants | CPU time/rate, RSS, supported private commit/footprint, I/O, threads, handles/FDs | Resource interval |
+| Controller, workers, observed descendants | CPU time/rate, RSS, Linux PSS/USS, supported private commit/footprint, I/O, threads, handles/FDs | Resource interval |
 | Surrounding processes | Up to ten largest RSS consumers and ten CPU consumers; names, identities and parent PIDs | 15 seconds |
 | Linux cgroup | Resolved membership, memory limits/usage, OOM events, CPU quota/throttling, supported pressure | Resource interval |
 | Disks | Supported throughput, operation and timing counters; derived read/write latency when available | Resource interval |
@@ -1803,8 +1803,28 @@ launched per measurement and no process is suspended.
 
 These are different quantities: `private_commit_bytes` (Windows),
 `physical_footprint_bytes` (macOS), and `rss_bytes` are not interchangeable.
-RSS totals can double-count shared pages. Linux detailed USS/PSS heap-map
-walks are not performed. Process I/O accounting follows the OS API: it is
+RSS totals can double-count shared pages. On Linux, each enabled resource sample
+also attempts one `smaps_rollup` read for each tracked process: `pss_bytes`,
+`pss_anonymous_bytes`, `pss_file_bytes`, `pss_shared_bytes`, `swap_pss_bytes`,
+`private_clean_bytes`, `private_dirty_bytes`, and `uss_bytes` (private clean
+plus private dirty). USS excludes shared resident pages; PSS apportions them
+among all processes mapping them, including processes outside this run.
+These resident figures exclude explicit hugetlb allocations, which Linux
+accounts separately. Swap PSS is separate from resident PSS.
+
+For a run's proportional resident share, sum PSS over unique process identities
+(controller, workers and observed descendants), not RSS. Report coverage: if
+any process lacks PSS, the sum is partial. Never replace missing PSS with RSS
+or zero. Samples are sequential, not an atomic machine snapshot, and summed
+PSS is not cgroup usage (which includes other charged memory).
+
+Absent, denied or malformed rollup fields appear in `unavailable`; other
+process counters remain available. There is no full `smaps` fallback.
+This is default-on only when resource sampling is enabled. Although the file
+is compact, the kernel still walks page tables and collection cost grows with
+the mappings; inspect sampling duration and lag on representative workloads.
+
+Process I/O accounting follows the OS API: it is
 not necessarily physical-disk traffic. Disk latency is the counter interval's
 average, not a percentile. Paging does not imply every fault required swap.
 Disk `*_time_ms` fields remain cumulative counters; separate

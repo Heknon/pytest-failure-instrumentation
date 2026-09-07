@@ -239,7 +239,10 @@ def test_resource_endpoint_uses_existing_auth_and_typed_client(tmp_path):
     directory = tmp_path / "run"
     directory.mkdir()
     store = history(directory)
-    store.append(batch(time.time()))
+    sample = batch(time.time())
+    sample["processes"][0]["metrics"].update(pss_bytes=8192, uss_bytes=4096)
+    sample["processes"][0]["unavailable"] = {"swap_pss_bytes": "unsupported"}
+    store.append(sample)
     server = stack_server.StackService(0, directory=directory, token="secret")
     server.start()
     try:
@@ -251,6 +254,10 @@ def test_resource_endpoint_uses_existing_auth_and_typed_client(tmp_path):
             async with FailureServerClient(url=server.url, token="secret") as client:
                 page = await client.resources("run", worker="gw0")
                 assert len(page.batches) == 1
+                process = page.batches[0].processes[0]
+                assert process.metrics["pss_bytes"] == 8192
+                assert process.metrics["uss_bytes"] == 4096
+                assert process.unavailable["swap_pss_bytes"] == "unsupported"
                 assert [p.worker for p in page.batches[0].processes] == ["gw0"]
                 with pytest.raises(BadRequest):
                     await client.resources("run", limit=0)

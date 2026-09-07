@@ -1,4 +1,4 @@
-"""Cheap, read-only resource probes. No shells, process pauses or heap walks.
+"""Read-only resource probes. No shells, process pauses or Python heap walks.
 
 Metric names include their units. Missing values are accompanied by a reason;
 Windows private commit, RSS and macOS footprint deliberately stay distinct.
@@ -42,6 +42,49 @@ def pairs(path: Path, kilobytes: bool = False) -> dict[str, int]:
         if len(words) >= 2:
             result[words[0]] = int(words[1]) * (1024 if kilobytes else 1)
     return result
+
+
+ROLLUP_FIELDS = {
+    "Pss": "pss_bytes", "Pss_Anon": "pss_anonymous_bytes",
+    "Pss_File": "pss_file_bytes", "Pss_Shmem": "pss_shared_bytes",
+    "SwapPss": "swap_pss_bytes", "Private_Clean": "private_clean_bytes",
+    "Private_Dirty": "private_dirty_bytes",
+}
+
+
+def smaps_rollup(path: Path) -> tuple[dict[str, int], dict[str, str]]:
+    """Read Linux proportional/private resident memory without a smaps fallback.
+
+    The kernel still walks page tables; the compact response is not a constant
+    cost probe. Missing fields must never become zero or an RSS substitute.
+    """
+    values: dict[str, int] = {}
+    missing: dict[str, str] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as error:
+        why = "not_found" if isinstance(error, FileNotFoundError) else reason(error)
+        return {}, {name: why for name in (*ROLLUP_FIELDS.values(), "uss_bytes")}
+    for line in lines:
+        key, separator, raw = line.partition(":")
+        if not separator or key not in ROLLUP_FIELDS:
+            continue
+        name = ROLLUP_FIELDS[key]
+        words = raw.split()
+        try:
+            if len(words) != 2 or words[1] != "kB" or int(words[0]) < 0:
+                raise ValueError("invalid memory field")
+            values[name] = int(words[0]) * 1024
+        except ValueError:
+            missing[name] = "invalid_value"
+    for name in ROLLUP_FIELDS.values():
+        if name not in values:
+            missing.setdefault(name, "unsupported")
+    if "private_clean_bytes" in values and "private_dirty_bytes" in values:
+        values["uss_bytes"] = values["private_clean_bytes"] + values["private_dirty_bytes"]
+    else:
+        missing["uss_bytes"] = "incomplete_private_fields"
+    return values, missing
 
 
 def pressure(path: Path) -> dict[str, float]:
@@ -280,6 +323,10 @@ class PlatformMetrics:
                 found["major_faults_total_count"] = int(raw[9])
                 return found
             attempt(values, missing, "resident_breakdown", resident_breakdown)
+            proportional, unavailable = smaps_rollup(
+                Path(psutil.PROCFS_PATH) / str(process.pid) / "smaps_rollup")
+            values.update(proportional)
+            missing.update(unavailable)
         if self.system == "Darwin" and self.native is not None:
             attempt(values, missing, "process_native", lambda: self.native.process(process.pid))
             if "read_total_bytes" in values:
