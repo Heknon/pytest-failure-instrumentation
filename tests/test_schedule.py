@@ -464,15 +464,23 @@ def test_a_reader_that_catches_a_write_half_done_waits_rather_than_gives_up(tmp_
 CRASHING_SUITE = """
 import os
 import time
+from pathlib import Path
 
 import pytest
 
 
 @pytest.mark.parametrize("i", range(24))
 def test_thing(i):
-    if i == 3:
-        time.sleep(0.4)
+    if i == 0:
         os._exit(1)
+    # Keep real work pending until the replacement has joined the scheduler.
+    # Otherwise a slow worker startup can legitimately lose the race with
+    # this tiny suite, and xdist shuts it down without scheduling it at all.
+    ready = Path(__file__).with_name("replacement-collected")
+    deadline = time.monotonic() + 30
+    while not ready.exists():
+        assert time.monotonic() < deadline, "replacement never finished collection"
+        time.sleep(0.01)
     time.sleep(0.05)
 """
 
@@ -495,6 +503,15 @@ def test_a_crashed_worker_keeps_what_it_was_owed_and_the_rest_is_reassigned(pyte
     """
     evidence = pytester.path / "evidence"
     pytester.makepyfile(test_suite=CRASHING_SUITE)
+    pytester.makeconftest("""
+from pathlib import Path
+import pytest
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_node_collection_finished(node, ids):
+    if node.gateway.id not in {"gw0", "gw1"}:
+        Path(__file__).with_name("replacement-collected").write_text(node.gateway.id)
+""")
     pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
 
     result = pytester.runpytest_subprocess(ENABLE_FLAG, "-n2", "--dist=load")
@@ -507,6 +524,8 @@ def test_a_crashed_worker_keeps_what_it_was_owed_and_the_rest_is_reassigned(pyte
     # The replacement is a worker of its own, under an id of its own - the
     # dead one's row is not overwritten by the process that took its place.
     assert len(rows_by_worker) == 3, rows_by_worker
+    replacement = (pytester.path / "replacement-collected").read_text()
+    assert replacement in rows_by_worker
 
     owing = {name: row for name, row in rows_by_worker.items() if row["pending"]}
     assert len(owing) == 1, rows_by_worker
