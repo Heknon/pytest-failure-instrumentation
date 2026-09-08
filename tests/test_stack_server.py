@@ -27,7 +27,7 @@ import pytest
 
 from pytest_failure_instrumentation import stack_server
 from pytest_failure_instrumentation.incidents import stack_server as stack_server_incident
-from pytest_failure_instrumentation.probes import pyspy
+from pytest_failure_instrumentation.probes import process, pyspy
 from pytest_failure_instrumentation.probes.platform_flags import (
     IS_LINUX,
     IS_MACOS,
@@ -807,7 +807,7 @@ def test_a_reused_pid_does_not_vouch_for_the_processes_under_it(tmp_path):
         marker = run / "owner.json"
 
         marker.write_text(json.dumps({"pid": stranger.pid, "created_at": 1.0}))
-        assert not stack_server.serves_pid(stranger.child, tmp_path)
+        assert not stack_server.serves_pid(stranger.child, tmp_path), _why(stranger)
         assert stack_server.serves_pid(stranger.pid, tmp_path)
 
         # The same record, agreeing. A run whose evidence predates the field,
@@ -830,6 +830,25 @@ def test_a_reused_pid_does_not_vouch_for_the_processes_under_it(tmp_path):
         assert stack_server.serves_pid(stranger.child, tmp_path)
     finally:
         stranger.kill()
+
+
+def _why(stranger: Detached) -> str:
+    """Every link the refusal above rests on, for a failure that can only say
+    that it did not happen.
+
+    Three things have to hold and the assertion reports none of them: that the
+    machine can read when the orphan began, that the reading disagrees with
+    what the record claims, and that the chain above the child meets the
+    orphan rather than anything of this process's. Which one gave way is the
+    whole diagnosis, and none of it is in the pid the assertion prints.
+    """
+    return (
+        f"the orphan is {stranger.pid} and its child {stranger.child}; this "
+        f"process is {os.getpid()}. Its creation time reads as "
+        f"{creation_time(stranger.pid)!r}, which agrees with a recorded 1.0: "
+        f"{process.creation_time_agrees(stranger.pid, 1.0)!r}. Above the child "
+        f"are {list(process.ancestry(stranger.child))!r}"
+    )
 
 
 def test_a_process_orphaned_out_of_the_run_is_nobody_s(tmp_path):
