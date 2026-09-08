@@ -1143,7 +1143,7 @@ So the bound is descent. `/stack` answers for the serving process, for the
 controllers and workers recorded under the evidence directory, and for anything
 still running underneath those; everything else on the machine is refused with
 a 403. A recorded pid has to still be the process its record describes before
-its subtree is admitted — both records carry a creation time, pids get handed
+either it or its subtree is admitted — both records carry a creation time, pids get handed
 out again, and a finished run's marker naming a number the kernel has since
 given to somebody's shell would otherwise hand out every process under that
 shell.
@@ -1316,7 +1316,8 @@ $ curl 'localhost:8080/workers?children' | jq '.runs[0].controller'
 
 It is off unless asked for, and that is the only thing here that is not free:
 everything else on this endpoint is read out of files the run was writing
-anyway, and this is one walk of the machine's process table. One walk answers
+anyway. Child discovery also checks the recorded roots' creation times and
+makes one walk of the machine's process table. One walk answers
 for every run in the snapshot rather than one per run, the walk stops at 256
 rows and says `children_truncated` when it did, and it still signals nothing —
 a parent's number is something the kernel already knows. Each row is the pid,
@@ -1345,7 +1346,10 @@ anywhere come back under `filter.unmatched` — otherwise a caller cannot tell
 because that is what a UI sends when its filter box is empty. Narrowing and
 `?children` combine the way you would want: a worker left out of the listing
 is left out of its children too, rather than reappearing under `controller`
-because every worker is a child of the controller. The names are
+because every worker is a child of the controller. Excluded workers are
+traversal boundaries: their subtrees do not consume the 256-row limit. Stale
+records whose creation times disagree cannot claim or hide descendants.
+The names are
 compared against a directory listing and never joined onto one, so a value that
 looks like a path is just a name that matches nothing.
 

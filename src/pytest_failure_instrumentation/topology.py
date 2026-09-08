@@ -262,10 +262,12 @@ def with_children(runs: list[dict[str, Any]]) -> bool:
     report it, and everything under it, as something the *session* started -
     on a sixty-four-way run, the whole fleet under one row that asked for one
     worker. So the workers left out of the listing are seeded too, from the
-    same slots, and their rows are then attached to nothing. It costs one
-    fixed-size read each, against the machine-wide walk this is already
-    paying for; what ``only`` saves is the event tail per worker, which is the
-    expensive half and is still saved.
+    same slots, as boundaries whose subtrees are not traversed and cannot
+    consume the result limit. Every root is rechecked against its record's
+    creation time before admission, so a stale run cannot claim a reused
+    pid's children or hide them from a current run. This costs one fixed-size
+    read per slot and one owner read on this opt-in path; it does not reread
+    any worker's event tail.
 
     Returns whether the walk stopped at its bound, and stamps the same answer
     on each run as ``children_truncated``. The bound is over the whole walk
@@ -277,25 +279,34 @@ def with_children(runs: list[dict[str, Any]]) -> bool:
     ordinary case rather than a failure of the walk.
     """
     roots: dict[int, tuple[str, Optional[str]]] = {}
+    worker_pids = {
+        described["session"]: _worker_pids(described.get("directory"))
+        for described in runs
+    }
     for described in runs:
         # Controllers first, so that a single-process run - whose controller
         # and whose one "main" worker are the same process - labels that pid
         # as the worker. Both rows describe it, and the worker is the row a
         # reader is looking at the test through.
         controller = _as_pid(described.get("controller", {}).get("pid"))
-        if controller is not None:
+        directory = described.get("directory")
+        owner = _owner(Path(directory)) if directory else None
+        if controller is not None and owner and _recorded_pid(owner) == controller:
             roots[controller] = (described["session"], None)
     for described in runs:
         for row in described["workers"]:
             pid = _as_pid(row.get("pid"))
-            if pid is not None:
+            if pid is not None and worker_pids[described["session"]].get(row["worker"]) == pid:
                 roots[pid] = (described["session"], row["worker"])
+    excluded: set[int] = set()
     for described in runs:
         listed = {row["worker"] for row in described["workers"]}
-        for name, pid in _worker_pids(described.get("directory"), listed).items():
-            roots.setdefault(pid, (described["session"], name))
+        excluded.update(
+            pid for name, pid in worker_pids[described["session"]].items()
+            if name not in listed
+        )
 
-    found, truncated = process_probe.descendants(roots)
+    found, truncated = process_probe.descendants(roots, excluded=excluded)
     under: dict[tuple[str, Optional[str]], list[dict[str, Any]]] = {}
     for row in found:
         under.setdefault(row.pop("under"), []).append(row)
@@ -309,14 +320,11 @@ def with_children(runs: list[dict[str, Any]]) -> bool:
     return truncated
 
 
-def _worker_pids(directory: Optional[str], listed: set[str]) -> dict[str, int]:
-    """The pids of this run's workers that are not in ``listed``, by worker.
+def _worker_pids(directory: Optional[str]) -> dict[str, int]:
+    """Worker identities that have not been disproved by PID reuse.
 
-    Read for the workers a request did *not* ask about - see
-    :func:`with_children`. Slots already on a row are skipped by name, out of
-    the listing, so an unnarrowed request pays a directory listing and no
-    reads at all. What a skipped slot would have cost is a fixed-size read,
-    never the event tail that describing a worker costs.
+    Used only by the opt-in child listing, including for excluded workers
+    which are traversal boundaries rather than roots to enumerate.
     """
     if not directory:
         return {}
@@ -326,12 +334,17 @@ def _worker_pids(directory: Optional[str], listed: set[str]) -> dict[str, int]:
         return {}
     found: dict[str, int] = {}
     for slot in slots:
-        if slot.stem in listed:
-            continue
-        pid = _as_pid(read_state(slot).get("pid"))
+        pid = _recorded_pid(read_state(slot))
         if pid is not None:
             found[slot.stem] = pid
     return found
+
+
+def _recorded_pid(record: dict[str, Any]) -> Optional[int]:
+    pid = _as_pid(record.get("pid"))
+    if pid is not None and process_probe.creation_time_agrees(pid, record.get("created_at")):
+        return pid
+    return None
 
 
 def _as_pid(value: Any) -> Optional[int]:

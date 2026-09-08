@@ -944,8 +944,8 @@ def worker_pid(name: str, evidence_root: Optional[Path]) -> Optional[int]:
     reused, and a state file outlives the process it describes: handing back a
     pid whose process has exited means reading whatever the operating system
     has since given that number to - a stranger's process, served as though it
-    were this run's worker. Liveness is therefore part of resolving the name,
-    not a check the reader is left to make afterwards.
+    were this run's worker. Liveness and the recorded creation time are
+    therefore checked while resolving the name, before calling the reader.
 
     Two runs under one evidence root both have a ``gw0``, so the live one wins
     over a finished one's leftovers. Where both are live the first by path
@@ -965,10 +965,11 @@ def worker_pid(name: str, evidence_root: Optional[Path]) -> Optional[int]:
         if state.stem != name:
             continue
         try:
-            pid = int(read_state(state)["pid"])
+            record = read_state(state)
+            pid = int(record["pid"])
         except (KeyError, TypeError, ValueError):
             continue  # a torn or hand-written record says nothing either way
-        if process.is_running(pid):
+        if process.is_running(pid) and process.creation_time_agrees(pid, record.get("created_at")):
             return pid
     return None
 
@@ -1032,9 +1033,10 @@ def serves_pid(pid: int, evidence_root: Optional[Path]) -> bool:
     the first hop there is, and it reads no process table to answer a question
     one chain of parents settles.
 
-    **A recorded pid is checked against the run that recorded it** before its
-    whole subtree is admitted. Pids are reused, and evidence outlives the
-    process it describes - so a finished run's marker naming a number the
+    **A recorded pid is checked against the run that recorded it** before
+    either the process itself or its subtree is admitted. Pids are reused,
+    and evidence outlives the process it describes - so a finished run's
+    marker naming a number the
     kernel has since handed to somebody's shell would otherwise hand out every
     process under that shell. Both records carry the process's creation time
     for exactly this, and a definite disagreement is a refusal. A record from
@@ -1087,7 +1089,7 @@ def serves_pid(pid: int, evidence_root: Optional[Path]) -> bool:
     # position. What it still knows is its own process and what that process
     # started, which needs no file to establish.
     recorded = run_processes(evidence_root) if evidence_root is not None else {}
-    if pid in recorded:
+    if any(process.creation_time_agrees(pid, when) for when in recorded.get(pid, ())):
         return True
 
     # Upwards from the target, and stopping at the first hop that is the
@@ -1122,10 +1124,9 @@ def run_processes(evidence_root: Path) -> dict[int, list[Any]]:
     A list per pid rather than one time, because a number the machine has
     handed out twice is named by two records that disagree, and which of them
     is the live process is not this function's to decide. The creation times
-    come back unchecked for the same reason: the callers want different
-    strictness out of them - naming a process directly is as sound as the
-    record that named it, and admitting everything *underneath* one is not.
-    See :func:`serves_pid`. An unstamped record contributes ``None``, which is
+    come back unchecked: :func:`serves_pid` checks only the target and the
+    recorded ancestors its walk actually meets, rather than inspecting every
+    process on every request. An unstamped record contributes ``None``, which is
     a claim nothing can be checked against rather than an absent one.
 
     A record that cannot be read, or that names no pid, contributes nothing. A

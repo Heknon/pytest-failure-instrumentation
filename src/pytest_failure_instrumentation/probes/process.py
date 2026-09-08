@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from typing import Any, Optional
 
 import psutil
@@ -224,7 +224,7 @@ def ancestry(pid: int, limit: int = MAX_ANCESTRY) -> Iterator[int]:
 
 
 def descendants(
-    roots: dict[int, Any], limit: int = MAX_DESCENDANTS
+    roots: dict[int, Any], limit: int = MAX_DESCENDANTS, *, excluded: Collection[int] = ()
 ) -> tuple[list[dict[str, Any]], bool]:
     """Every process under ``roots``, and whether the walk hit its bound.
 
@@ -233,6 +233,10 @@ def descendants(
     it. That is what puts a worker's own children under the worker rather than
     under the controller they also descend from: the roots are all seeded
     before the walk starts, so reaching one from above never relabels it.
+
+    ``excluded`` contains boundaries whose subtrees must not be visited.
+    They use no result budget. An explicit root inside an excluded subtree
+    still starts its own walk, so filtering cannot hide another selected root.
 
     One pass over the process table, not one per root. The table is what costs
     here - a read per process - and a sixty-four-worker run would otherwise pay
@@ -267,7 +271,7 @@ def descendants(
             continue
 
     found: list[dict[str, Any]] = []
-    visited = set(roots)
+    visited = set(roots).union(excluded)
     pending = deque(roots.items())
     truncated = False
     while pending:

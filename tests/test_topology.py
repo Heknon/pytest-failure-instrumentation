@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -875,7 +876,7 @@ def test_a_walk_that_hit_its_bound_is_reported_as_one(evidence, monkeypatch):
     (see the probes' own tests); what is here is that its answer survives."""
     evidence.state("gw0")
     evidence.beats("gw0")
-    monkeypatch.setattr(topology.process_probe, "descendants", lambda roots: ([], True))
+    monkeypatch.setattr(topology.process_probe, "descendants", lambda roots, **kwargs: ([], True))
 
     described = topology.run(evidence.run, children=True)
     assert described["children_truncated"] is True
@@ -902,3 +903,83 @@ def test_a_worker_whose_process_is_gone_has_no_children(evidence):
 
     described = topology.run(evidence.run, children=True)
     assert described["workers"][0]["children"] == []
+
+
+@pytest.fixture
+def process_table(monkeypatch):
+    """Deterministic process identities and ancestry, without waiting for PID reuse."""
+    rows = []
+
+    def add(pid, ppid, created=2.0):
+        rows.append(SimpleNamespace(info={
+            "pid": pid, "ppid": ppid, "name": "python", "create_time": created,
+        }))
+
+    monkeypatch.setattr(topology.process_probe.psutil, "process_iter", lambda *a, **k: iter(rows))
+    monkeypatch.setattr(topology.process_probe, "creation_time", lambda pid: next(
+        (row.info["create_time"] for row in rows if row.info["pid"] == pid), None,
+    ))
+    monkeypatch.setattr(topology, "is_running", lambda pid: any(row.info["pid"] == pid for row in rows))
+    return add
+
+
+@pytest.mark.parametrize("root", ["controller", "worker"])
+def test_children_ignore_reused_root_identities(evidence, process_table, root):
+    process_table(100, 1)
+    process_table(101, 100, 3.0)
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": DEAD}))
+    path = evidence.run / ("owner.json" if root == "controller" else "gw0.state")
+    path.write_text(json.dumps({"pid": 100, "created_at": 1.0}) + "\n")
+
+    def children():
+        described = topology.run(evidence.run, children=True)
+        row = described["controller"] if root == "controller" else described["workers"][0]
+        return [child["pid"] for child in row["children"]]
+
+    assert children() == []
+    path.write_text(json.dumps({"pid": 100, "created_at": 2.0}) + "\n")
+    assert children() == [101]
+
+
+def test_stale_run_cannot_steal_current_runs_children(evidence, process_table):
+    process_table(100, 1)
+    process_table(101, 100, 3.0)
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": 100, "created_at": 2.0}))
+    stale = evidence.base / "run-z-stale"
+    stale.mkdir()
+    (stale / "owner.json").write_text(json.dumps({"pid": 100, "created_at": 1.0}))
+    runs = {run["session"]: run for run in topology.snapshot(evidence.base, children=True)["runs"]}
+    assert [row["pid"] for row in runs[evidence.run.name]["controller"]["children"]] == [101]
+    assert runs[stale.name]["controller"]["children"] == []
+
+
+@pytest.mark.parametrize("selected_parent", [300, 200])
+def test_excluded_worker_children_do_not_consume_the_result_limit(evidence, process_table, selected_parent):
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": 300, "created_at": 2.0}))
+    evidence.state("gw0", pid=100, created_at=2.0)
+    evidence.state("gw1", pid=200, created_at=2.0)
+    for pid, parent in [(300, 1), (100, selected_parent), (200, 300), (101, 100), (102, 101)]:
+        process_table(pid, parent)
+    for pid in range(1000, 1256):
+        process_table(pid, 200)
+
+    described = topology.run(evidence.run, only=["gw0"], children=True)
+    assert [row["pid"] for row in described["workers"][0]["children"]] == [101, 102]
+    assert described["controller"]["children"] == []
+    assert described["children_truncated"] is False
+
+    # The same fleet still respects the bound when both workers are selected.
+    described = topology.run(evidence.run, children=True)
+    assert sum(len(row["children"]) for row in described["workers"]) == 256
+    assert described["children_truncated"] is True
+
+
+def test_stale_excluded_worker_does_not_hide_current_controller_children(evidence, process_table):
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": 300, "created_at": 2.0}))
+    evidence.state("gw0", pid=100, created_at=2.0)
+    evidence.state("gw1", pid=200, created_at=1.0)
+    for pid, parent in [(300, 1), (100, 300), (200, 300), (201, 200)]:
+        process_table(pid, parent)
+
+    described = topology.run(evidence.run, only=["gw0"], children=True)
+    assert [row["pid"] for row in described["controller"]["children"]] == [200, 201]

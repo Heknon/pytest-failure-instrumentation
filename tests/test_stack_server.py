@@ -814,8 +814,7 @@ def test_a_reused_pid_does_not_vouch_for_the_processes_under_it(tmp_path):
     A marker naming a number the kernel has since given to somebody's shell
     would otherwise hand out every process under that shell. Both records carry
     the process's creation time for exactly this; a definite disagreement is a
-    refusal, and the pid itself stays answerable because naming it directly is
-    only ever as sound as the record that named it.
+    refusal for both the pid itself and anything underneath it.
     """
     if creation_time(os.getpid()) is None:
         # A container showing an ancestor's procfs cannot answer when a process
@@ -831,7 +830,7 @@ def test_a_reused_pid_does_not_vouch_for_the_processes_under_it(tmp_path):
 
         marker.write_text(json.dumps({"pid": stranger.pid, "created_at": 1.0}))
         assert not stack_server.serves_pid(stranger.child, tmp_path), _why(stranger)
-        assert stack_server.serves_pid(stranger.pid, tmp_path)
+        assert not stack_server.serves_pid(stranger.pid, tmp_path)
 
         # The same record, agreeing. A run whose evidence predates the field,
         # or a machine whose procfs cannot answer, leaves it unchecked - which
@@ -872,6 +871,77 @@ def _why(stranger: Detached) -> str:
         f"{process.creation_time_agrees(stranger.pid, 1.0)!r}. Above the child "
         f"are {list(process.ancestry(stranger.child))!r}"
     )
+
+
+@pytest.mark.parametrize("record_name", ["owner.json", "gw0.state"])
+def test_reused_recorded_pid_refuses_direct_and_descendant_reads(tmp_path, monkeypatch, record_name):
+    """A stale record cannot authorize its replacement or that replacement's children."""
+    pid = os.getpid() + 100_000
+    run = tmp_path / "run-stale"
+    run.mkdir()
+    record = run / record_name
+    record.write_text(json.dumps({"pid": pid, "created_at": 1.0}) + "\n")
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "ancestry", lambda target: iter([pid] if target == pid + 1 else []))
+
+    assert not stack_server.serves_pid(pid, tmp_path)
+    assert not stack_server.serves_pid(pid + 1, tmp_path)
+
+    # The actual current identity restores both forms of access.
+    record.write_text(json.dumps({"pid": pid, "created_at": 2.0}) + "\n")
+    assert stack_server.serves_pid(pid, tmp_path)
+    assert stack_server.serves_pid(pid + 1, tmp_path)
+
+    # Preserve the existing best-effort contract for old records and hosts
+    # that cannot report a creation time.
+    record.write_text(json.dumps({"pid": pid}) + "\n")
+    assert stack_server.serves_pid(pid, tmp_path)
+    record.write_text(json.dumps({"pid": pid, "created_at": 1.0}) + "\n")
+    monkeypatch.setattr(process, "creation_time", lambda target: None)
+    assert stack_server.serves_pid(pid, tmp_path)
+
+
+def test_a_current_record_wins_over_a_stale_record_for_the_same_pid(tmp_path, monkeypatch):
+    pid = os.getpid() + 100_000
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "ancestry", lambda target: iter([pid] if target == pid + 1 else []))
+    for name, created in [("run-old", 1.0), ("run-current", 2.0)]:
+        run = tmp_path / name
+        run.mkdir()
+        (run / "owner.json").write_text(json.dumps({"pid": pid, "created_at": created}))
+    assert stack_server.serves_pid(pid, tmp_path)
+    assert stack_server.serves_pid(pid + 1, tmp_path)
+
+
+def test_reused_pid_is_refused_over_http_without_calling_the_reader(serving, tmp_path, monkeypatch):
+    pid = os.getpid() + 100_000
+    run = a_run_of(tmp_path)
+    stale = json.dumps({"pid": pid, "created_at": 1.0}) + "\n"
+    (run / "owner.json").write_text(stale)
+    (run / "gw0.state").write_text(stale)
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "ancestry", lambda target: iter(()))
+    monkeypatch.setattr(process, "is_running", lambda target: True)
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("the reader must not receive a reused PID")
+
+    monkeypatch.setattr(stack_server, "read_stack", unexpected_read)
+    service = serving(0, directory=run)
+    assert wait_for(lambda: service.serving)
+    assert get(service.bound_port, f"/stack?pid={pid}&locals")[0] == 403
+    assert get(service.bound_port, "/stack?worker=gw0&locals")[0] == 404
+
+
+def test_worker_name_skips_reused_pid_and_resolves_the_current_run(tmp_path, monkeypatch):
+    pid = os.getpid() + 100_000
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "is_running", lambda target: True)
+    for name, target, created in [("run-a-old", pid, 1.0), ("run-b-current", pid + 1, 2.0)]:
+        run = tmp_path / name
+        run.mkdir()
+        (run / "gw0.state").write_text(json.dumps({"pid": target, "created_at": created}) + "\n")
+    assert stack_server.worker_pid("gw0", tmp_path) == pid + 1
 
 
 def test_a_process_no_longer_linked_to_the_run_is_nobody_s(tmp_path):
