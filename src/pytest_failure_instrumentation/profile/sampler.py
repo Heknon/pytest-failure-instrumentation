@@ -128,8 +128,8 @@ class ThreadClock:
     reader stands down rather than weight samples by somebody else's counter.
 
     On 64-bit Windows GetThreadTimes reads the known Win32 thread IDs
-    without releasing the GIL. psutil discovers native-only threads once a
-    second and remains the fallback. The counters move in roughly sixteen
+    without releasing the GIL. A process-specific thread snapshot discovers
+    native-only threads periodically; psutil remains the fallback. The counters move in roughly sixteen
     millisecond ticks, which is coarse against a twenty millisecond sampling
     interval but sums correctly over a test.
 
@@ -141,6 +141,7 @@ class ThreadClock:
         self.source = "unavailable"
         self._mach: Any = None
         self._windows: Any = None
+        self._windows_ids: Any = None
         if IS_LINUX and hasattr(time, "clock_gettime_ns"):
             try:
                 time.clock_gettime_ns(_thread_clock_id(os.getpid()))
@@ -167,6 +168,12 @@ class ThreadClock:
                     self._windows = windows
                     self._process = psutil.Process()
                     self.source = "windows-thread-times"
+                    try:
+                        from ..probes.windows_thread_ids import WindowsThreadIds
+
+                        self._windows_ids = WindowsThreadIds()
+                    except Exception:
+                        pass  # older Windows or a refused API keeps psutil
                     return
             except Exception:
                 pass
@@ -224,7 +231,8 @@ class ThreadClock:
         is called once a second rather than once a tick. A native thread that
         starts and dies within that second goes unseen, which is the trade.
 
-        The other two readers list every thread on every read anyway, so
+        Windows snapshots only this process's thread IDs. The other two
+        readers list every thread on every read anyway, so
         ``known`` - the clocks read a moment ago on this same tick - is
         already the answer and is used rather than asking again. It matters
         most where it costs most: psutil's ``Process.threads()`` on Windows
@@ -238,6 +246,11 @@ class ThreadClock:
             except (OSError, ValueError):
                 return []
         if self.source == "windows-thread-times":
+            if self._windows_ids is not None:
+                try:
+                    return self._windows_ids.read()
+                except Exception:
+                    self._windows_ids = None
             try:
                 return [int(entry.id) for entry in self._process.threads()]
             except Exception:
@@ -606,7 +619,7 @@ class Sampler:
             self._all_tids = self.clock.discover()
             self._discovered = True
         # Windows already has clocks for every known Python thread. Its
-        # system-wide native-thread scan can run on the first sampler tick,
+        # native-thread discovery can run on the first sampler tick,
         # rather than holding up the test thread before sampling even starts.
         self._last_clock = self.clock.read(self._tids_to_read())
         self._last_tick = time.monotonic()
