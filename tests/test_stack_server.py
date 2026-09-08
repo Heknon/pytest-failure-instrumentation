@@ -8,6 +8,7 @@ takes 8080 would fight whatever the developer running it already has there.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import socket
@@ -250,8 +251,16 @@ class Detached:
     the server is running in, so it is one of the run's processes and reading
     it is exactly what these changes made possible - which makes it useless as
     the stranger a bound is tested against. So it is started at one remove and
-    the process that started it exits, leaving it reparented onto init with no
-    line back here at all.
+    the process that started it exits.
+
+    **What that leaves is not the same on both platforms**, and assuming it was
+    is what made this flake. POSIX reparents an orphan onto init, so the chain
+    above it stops there and no longer names this process. Windows does not
+    reparent: the pid of the launcher stays in the child's record after the
+    launcher has gone, and while that dead process is still resolvable - which
+    it is until every handle to it closes - the chain reads straight through it
+    to the test. So :func:`detached` checks the whole chain rather than one hop
+    of it, and says so when the platform has not severed the link.
     """
 
     def __init__(self, pid: int, child: int) -> None:
@@ -275,7 +284,16 @@ class Detached:
 
 
 def detached(spawns_a_child: bool = False) -> Detached:
-    """A process orphaned onto init, and optionally one under it."""
+    """A process with no line back to this one, and optionally one under it.
+
+    Skips the test where the platform will not give one. On Windows a dead
+    parent's pid stays in its child's record, so what severs the chain there is
+    the launcher's process object going away rather than an orphan being
+    reparented - and that happens when the last handle to it closes. The one
+    this process holds is inside the object ``subprocess.run`` discards, so it
+    closes on collection: hence the collect below, and the check afterwards for
+    the case where something still holds it.
+    """
     inner = SPAWNS_A_CHILD if spawns_a_child else "import time; time.sleep(300)"
     launched = subprocess.run(
         [sys.executable, "-c", DETACHES, inner, "with-child" if spawns_a_child else "alone"],
@@ -286,20 +304,25 @@ def detached(spawns_a_child: bool = False) -> Detached:
     assert launched.returncode == 0, launched.stderr
     pid, child = (int(value) for value in launched.stdout.split())
     detached_process = Detached(pid, child)
-    # The launcher is gone, so this is no longer a descendant of the test. If
-    # some ancestor of this process reaps orphans instead of init, it still is
-    # not: the roots a server serves are the run's own pids, never their
-    # ancestors.
-    assert _parent_of(pid) != os.getpid()
+    gc.collect()  # drop the launcher's handle, so its pid stops resolving
+
+    # The whole chain, not one hop of it. Checking only the immediate parent
+    # passed on Windows while the chain above it still reached this process,
+    # which served the very pid the bound was being tested with - so the test
+    # failed when a handle happened to outlive the launcher and passed when it
+    # did not.
+    for above in (pid, child):
+        if not above:
+            continue
+        chain = list(process.ancestry(above))
+        if os.getpid() in chain:
+            detached_process.kill()
+            pytest.skip(
+                f"this platform still links {above} back to this process "
+                f"through {chain}, so it cannot supply a process that is not "
+                "this run's - see Detached"
+            )
     return detached_process
-
-
-def _parent_of(pid: int) -> Optional[int]:
-    try:
-        parent = psutil.Process(pid).parent()
-    except psutil.Error:
-        return None
-    return parent.pid if parent is not None else None
 
 
 def wait_for(condition, timeout: float = 20.0):
@@ -851,11 +874,14 @@ def _why(stranger: Detached) -> str:
     )
 
 
-def test_a_process_orphaned_out_of_the_run_is_nobody_s(tmp_path):
-    """A test's leftover daemon outlives the worker that started it and is
-    reparented onto init, where it is indistinguishable from any other process
-    on the machine. Claiming it on the strength of what it used to be under is
-    the thing this bound exists to refuse."""
+def test_a_process_no_longer_linked_to_the_run_is_nobody_s(tmp_path):
+    """A test's leftover daemon outlives the worker that started it, and where
+    the platform severs the link - POSIX reparents it onto init - it is
+    indistinguishable from any other process on the machine. Claiming it on the
+    strength of what it used to be under is what this bound refuses.
+
+    Where the link survives the parent, as it does on Windows until the dead
+    parent stops resolving, there is nothing to test and ``detached`` says so."""
     orphan = detached()
     try:
         a_run_of(tmp_path, gw0=os.getpid())

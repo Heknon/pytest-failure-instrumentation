@@ -1146,9 +1146,17 @@ a 403. A recorded pid has to still be the process its record describes before
 its subtree is admitted — both records carry a creation time, pids get handed
 out again, and a finished run's marker naming a number the kernel has since
 given to somebody's shell would otherwise hand out every process under that
-shell. A child that outlived the worker that started it is reparented onto
-init, where nothing distinguishes it from any other process on the machine, and
-is refused with everything else there.
+shell.
+
+A child that outlived the worker that started it is refused once the platform
+has severed its line back to the run — on POSIX that is the moment it is
+reparented onto init, where nothing distinguishes it from any other process on
+the machine. Windows does not reparent, so the dead worker's pid stays in the
+child's record and the chain reads through it while that process is still
+resolvable: the same daemon goes on being the run's there. Both answers are
+right. A chain that still names a process the run started is naming something
+the run really did start, and a chain through a pid the machine has since
+handed to somebody else is severed a hop earlier by the creation-time check.
 
 ```console
 $ curl 'localhost:8080/workers?children' | jq '.runs[0].workers[0]'

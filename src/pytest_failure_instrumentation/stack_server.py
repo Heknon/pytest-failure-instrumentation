@@ -703,9 +703,9 @@ class _Handler(BaseHTTPRequestHandler):
                 "recorded under the evidence directory it was given, and the "
                 "processes still running underneath those - a database a "
                 "fixture started, a server under test, anything a subprocess "
-                "test spawned. A child that outlived the worker that started "
-                "it was orphaned onto init and is no longer telling anyone it "
-                "was this run's"
+                "test spawned. A child whose parent has gone is refused where "
+                "the platform has since severed its line back to the run, "
+                "which on POSIX is the moment it was reparented onto init"
                 if evidence_root is not None
                 else "the process it is running in and whatever that process "
                 "started: it was given no evidence directory, so it knows of "
@@ -1043,10 +1043,19 @@ def serves_pid(pid: int, evidence_root: Optional[Path]) -> bool:
     it always was: the check tightens what can be proved wrong and invents
     nothing where nothing can be.
 
-    **A process that outlived its parent is nobody's.** Orphaned onto init, a
-    test's leftover daemon is indistinguishable from any other process on the
-    machine, and claiming it on the strength of what it used to be under is
-    the thing this function exists to refuse.
+    **A process whose link to the run is gone is nobody's**, and what breaks
+    that link is the platform's, not this function's. POSIX reparents an
+    orphan onto init: a test's leftover daemon whose worker died is then
+    indistinguishable from any other process on the machine, and claiming it
+    on the strength of what it used to be under is what this refuses. Windows
+    does not reparent - the dead parent's pid stays in the child's record, and
+    the chain reads through it for as long as that process is still
+    resolvable, so the same daemon goes on being the run's there. Both are
+    right: a chain that still names a process the run started is naming
+    something the run really did start, and a chain through a pid the machine
+    has since handed to somebody else is severed by the creation-time check
+    inside :func:`..probes.process.ancestry`, one hop earlier than it could
+    mislead.
 
     Read on every request rather than once at startup, because the set is not
     fixed: xdist replaces a crashed worker mid-run, a second session starts
