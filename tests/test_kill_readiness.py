@@ -232,6 +232,40 @@ def test_windows_cascade_shares_the_completed_trace_wait(tmp_path, monkeypatch):
     assert clock[0] - 100. <= 2.1
 
 
+@pytest.mark.parametrize("arrival", [2.15, None])
+def test_etw_delivery_grace_is_bounded_and_shared_across_a_cascade(tmp_path, monkeypatch, arrival):
+    """A real Windows witness arrived 2.14s after the termination event.
+
+    Its one-second buffer timer is not a two-second delivery guarantee.
+    Replay that delay without sleeping, including a source that never answers.
+    """
+    clock = [100.]
+    trace = tmp_path / signal_trace.TRACE_FILE
+    trace.write_text("")
+    monkeypatch.setattr(killer.time, "monotonic", lambda: clock[0])
+    sent = []
+
+    def advance(seconds):
+        clock[0] += seconds
+        if arrival is not None and not sent and clock[0] >= 100. + arrival:
+            sent.append(True)
+            trace.write_text(json.dumps({
+                "via": "TerminateProcess", "target_pid": 456, "sender_pid": 123,
+                "api_status": 0, "wall": 99.,
+            }) + "\n")
+
+    monkeypatch.setattr(killer.time, "sleep", advance)
+    sources = killer.Sources(tmp_path, live=True, trace_status="etw")
+    found, _ = killer._from_trace(sources, {}, 456, 15, 90., 105., 100.)
+    if arrival is not None:
+        assert found is not None and found.sender_pid == 123
+    else:
+        assert found is None
+    for pid in range(80):
+        killer._settled(sources, pid)
+    assert 2.1 <= clock[0] - 100. <= 3.05
+
+
 def test_blocked_kernel_reader_does_not_block_a_death_cascade(tmp_path, monkeypatch):
     release = threading.Event()
     def read(**_):
