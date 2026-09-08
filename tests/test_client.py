@@ -15,6 +15,8 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -164,6 +166,60 @@ def test_a_name_that_matched_nothing_is_reported_rather_than_dropped(serving, tm
     assert snapshot.filter is not None
     assert snapshot.filter.workers == ["gw0", "gw9"]
     assert snapshot.filter.unmatched == ["gw0", "gw9"]
+
+
+def test_the_processes_under_a_run_arrive_where_they_can_be_asked_about(
+    serving, tmp_path: Path
+):
+    """The other half of the same call: a worker parked waiting for a
+    subprocess is not the stall, it is the wait for one, and the stack that
+    says why is in the child. Nothing wrote the child down, so a caller with
+    only the workers has no pid to ask about - and its pid is one this server
+    answers for.
+    """
+    directory = run_directory(tmp_path)
+    service = serving(directory=directory)
+    spawned = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        (directory / "gw0.state").write_bytes(
+            json.dumps({"pid": os.getpid(), "nodeid": "test_pool.py::test_writes",
+                        "phase": "call", "time": time.time()}).encode() + b"\n"
+        )
+        (directory / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+
+        async def ask():
+            async with connected(service) as client:
+                plain = await client.workers()
+                return plain, await client.workers(children=True)
+
+        plain, described = run(ask())
+        # Off unless asked for: it is the one part of this answer the server
+        # cannot assemble from the run's own files.
+        assert plain.workers[0].children == []
+
+        under = {child.pid: child for child in described.workers[0].children}
+        assert spawned.pid in under
+        assert under[spawned.pid].ppid == os.getpid()
+        assert under[spawned.pid].name
+        assert described.runs[0].children_truncated is False
+
+        async def read():
+            async with connected(service) as client:
+                return await client.callstack(pid=spawned.pid)
+
+        try:
+            assert run(read()).pid == spawned.pid
+        except ReaderFailed as failed:
+            # Whether py-spy can read this machine's processes is a different
+            # question from whether the server will let it be asked - and it
+            # is 403 that this test is about not seeing.
+            assert failed.status == 502, failed.status
+    finally:
+        spawned.kill()
+        spawned.wait(timeout=10)
 
 
 def test_a_stack_read_answers_or_says_why_it_could_not(serving):

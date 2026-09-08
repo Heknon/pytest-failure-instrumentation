@@ -37,6 +37,16 @@ question can change its answer: a raw syscall in native code that does not
 handle EINTR returns early when a signal lands, and the stall being observed
 resumes. A view that perturbs what it is viewing is worse than no view.
 
+**And a run is more processes than its workers.** The controller runs no tests
+of its own; beside the workers it starts this package's own helpers, and under
+each worker is whatever the *tests* started - a database a fixture brought up,
+a server under test, a pool, a shell. None of the files above knows any of them
+exists, because nothing in the run wrote them down. :func:`with_children` finds
+them by walking the machine's process table once and hanging each on the row
+that started it, and it is opt-in for exactly that reason: it is the only thing
+here that costs a read of the machine rather than of the run. It still
+signals nothing - a parent's number is something the kernel already knows.
+
 The classification is :mod:`.analysis.stall`'s, in its own words, with one
 difference: a stall is confirmed over two passes an interval apart, and a
 snapshot has only this instant. So ``frozen`` here says it is unconfirmed, and
@@ -70,6 +80,7 @@ from .capture.events import head_events, tail_events, this_run
 from .capture.heartbeat import DEFAULT_INTERVAL
 from .capture.state import ELIDED, read_state
 from .probes import is_running
+from .probes import process as process_probe
 from .schedule import read as read_schedule
 from .schedule import worker_rows
 
@@ -89,6 +100,7 @@ def snapshot(
     served_by: Optional[dict[str, Any]] = None,
     now: Optional[float] = None,
     only: Optional[Collection[str]] = None,
+    children: bool = False,
 ) -> dict[str, Any]:
     """Every run under ``directory``, and every worker in each.
 
@@ -108,6 +120,12 @@ def snapshot(
     ``gw0`` is not helped by three runs that do not have one. Names that
     matched nothing anywhere are reported rather than silently dropped - a
     caller cannot otherwise tell "not running" from "misspelt".
+
+    ``children`` adds the processes running underneath the run - see
+    :func:`with_children`. Off unless asked for, because it is the one thing
+    here that costs a walk of the machine rather than a read of the run's own
+    files, and one walk answers for every run in the snapshot rather than one
+    per run.
     """
     moment = time.time() if now is None else now
     wanted = _wanted(only)
@@ -125,6 +143,9 @@ def snapshot(
         if wanted is not None and not described["workers"]:
             continue
         runs.append(described)
+
+    if children:
+        with_children(runs)
 
     found: dict[str, Any] = {
         "served_by": served_by or {},
@@ -156,12 +177,18 @@ def run(
     directory: Path,
     now: Optional[float] = None,
     only: Optional[Collection[str]] = None,
+    children: bool = False,
 ) -> Optional[dict[str, Any]]:
     """One run, or None if this directory is not one of ours.
 
     The owner file is the test, not the name: ``failure_directory`` is a
     natural thing to point at an artifacts directory, and describing a
     stranger's build output as a pytest run would be a confident lie.
+
+    ``children`` adds the processes running underneath this run - see
+    :func:`with_children`. A caller describing several runs should ask
+    :func:`snapshot` for them instead, which walks the machine once for all of
+    them rather than once each.
     """
     moment = time.time() if now is None else now
     owner = _owner(directory)
@@ -185,7 +212,7 @@ def run(
         if wanted is None or state.stem in wanted
     ]
     controller_pid = owner.get("pid")
-    return {
+    described = {
         "session": directory.name,
         "run_id": _run_id(directory),
         "directory": str(directory),
@@ -199,6 +226,125 @@ def run(
         "schedule": _schedule_summary(schedule),
         "workers": workers,
     }
+    if children:
+        with_children([described])
+    return described
+
+
+def with_children(runs: list[dict[str, Any]]) -> bool:
+    """Hang each run's other processes off the row that started them.
+
+    A session is more processes than the ones running tests, and none of the
+    files above knows about any of them. The controller runs no tests itself
+    and starts helpers beside the workers; each worker starts whatever the
+    *tests* start - a database a fixture brought up, a server under test, a
+    ``multiprocessing`` pool, a shell. They are the processes a run hangs on
+    as often as the workers are, and until something says they exist a caller
+    holding this snapshot cannot ask ``/stack`` about one, because it does not
+    know its pid.
+
+    So the rows arrive where the thing that started them is: under the worker
+    that spawned it, and under ``controller`` for what the session started
+    beside its workers. Attribution is to the *nearest* of those - a shell's
+    own child is the worker's, not the controller's, though it descends from
+    both.
+
+    **This is the one thing in this module that reads the machine rather than
+    the run's files**, which is why every caller has to ask for it. It is one
+    pass over the process table however many runs are passed in, and it still
+    asks no process anything: a parent's number is something the kernel
+    already knows, so nothing is signalled and nothing is perturbed - the rule
+    the module docstring sets out is intact.
+
+    **A worker nobody asked about is still a root**, and that is not an
+    optimisation. Every worker is a child of the controller, so a run narrowed
+    to ``gw0`` would otherwise walk out of the controller into ``gw1`` and
+    report it, and everything under it, as something the *session* started -
+    on a sixty-four-way run, the whole fleet under one row that asked for one
+    worker. So the workers left out of the listing are seeded too, from the
+    same slots, and their rows are then attached to nothing. It costs one
+    fixed-size read each, against the machine-wide walk this is already
+    paying for; what ``only`` saves is the event tail per worker, which is the
+    expensive half and is still saved.
+
+    Returns whether the walk stopped at its bound, and stamps the same answer
+    on each run as ``children_truncated``. The bound is over the whole walk
+    rather than per run, so a truncated snapshot means rows are missing
+    somewhere in it and not necessarily from the run reporting it.
+
+    A pid that no longer exists contributes nothing and is not an error: these
+    are the processes of a run in trouble, and one that has just exited is the
+    ordinary case rather than a failure of the walk.
+    """
+    roots: dict[int, tuple[str, Optional[str]]] = {}
+    for described in runs:
+        # Controllers first, so that a single-process run - whose controller
+        # and whose one "main" worker are the same process - labels that pid
+        # as the worker. Both rows describe it, and the worker is the row a
+        # reader is looking at the test through.
+        controller = _as_pid(described.get("controller", {}).get("pid"))
+        if controller is not None:
+            roots[controller] = (described["session"], None)
+    for described in runs:
+        for row in described["workers"]:
+            pid = _as_pid(row.get("pid"))
+            if pid is not None:
+                roots[pid] = (described["session"], row["worker"])
+    for described in runs:
+        listed = {row["worker"] for row in described["workers"]}
+        for name, pid in _worker_pids(described.get("directory"), listed).items():
+            roots.setdefault(pid, (described["session"], name))
+
+    found, truncated = process_probe.descendants(roots)
+    under: dict[tuple[str, Optional[str]], list[dict[str, Any]]] = {}
+    for row in found:
+        under.setdefault(row.pop("under"), []).append(row)
+
+    for described in runs:
+        session = described["session"]
+        described.setdefault("controller", {})["children"] = under.get((session, None), [])
+        for row in described["workers"]:
+            row["children"] = under.get((session, row["worker"]), [])
+        described["children_truncated"] = truncated
+    return truncated
+
+
+def _worker_pids(directory: Optional[str], listed: set[str]) -> dict[str, int]:
+    """The pids of this run's workers that are not in ``listed``, by worker.
+
+    Read for the workers a request did *not* ask about - see
+    :func:`with_children`. Slots already on a row are skipped by name, out of
+    the listing, so an unnarrowed request pays a directory listing and no
+    reads at all. What a skipped slot would have cost is a fixed-size read,
+    never the event tail that describing a worker costs.
+    """
+    if not directory:
+        return {}
+    try:
+        slots = sorted(Path(directory).glob("*.state"))
+    except OSError:
+        return {}
+    found: dict[str, int] = {}
+    for slot in slots:
+        if slot.stem in listed:
+            continue
+        pid = _as_pid(read_state(slot).get("pid"))
+        if pid is not None:
+            found[slot.stem] = pid
+    return found
+
+
+def _as_pid(value: Any) -> Optional[int]:
+    """This field out of a JSON record as a process id, or None if it is not one.
+
+    ``True`` is an ``int`` in Python, and these numbers are read out of files
+    something else could have written - so an ``isinstance`` check alone lets
+    ``{"pid": true}`` through as process 1, which on POSIX is init and would
+    make the whole machine's process tree this run's.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 def _schedule_summary(schedule: dict[str, Any]) -> dict[str, Any]:

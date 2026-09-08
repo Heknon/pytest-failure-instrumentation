@@ -27,6 +27,15 @@ only where something is actually going to read a worker's stack rather than on
 every run - see ``Settings.tracer_in_force``, which resolves that on the
 controller and hands each worker the answer.
 
+It runs one way only, and that is the limit on reading the rest of the run's
+tree. The declaration is about the process that makes it and is not inherited:
+a worker makes it for itself, and the child a *test* spawns makes none, because
+it is arbitrary code that never linked this package. ``/stack`` will ask about
+that child - see :func:`..stack_server.serves_pid`, where it is one of the
+run's processes - and at ``ptrace_scope=1`` the kernel refuses the read anyway.
+Nothing here can fix that from this side: the exception has to be declared by
+the process being read.
+
 ``PR_SET_PTRACER_ANY`` is wider again: it drops the ancestry requirement
 altogether, so anything the uid could already ptrace may read the process. It
 is what the "any" policy below declares, and it is not the default - a *shared*

@@ -160,11 +160,37 @@ class ScheduleSummary(_Wire):
     updated_at: Optional[float] = None
 
 
+class ChildProcess(_Wire):
+    """One process running under a run, that the run never wrote down.
+
+    What the tests spawned - a database a fixture brought up, a server under
+    test, a pool, a shell - and what the session started beside its workers.
+    Present only when ``children`` was asked for, since finding them costs a
+    walk of the machine's process table.
+
+    The pid is the point of the row: it is what ``callstack`` takes, and these
+    are processes ``/stack`` answers about.
+    """
+
+    pid: int = 0
+    #: Which process started it, which is a row above it in this same tree.
+    ppid: Optional[int] = None
+    #: The name the kernel holds. Never the command line: that is where a
+    #: program's arguments are, and a token passed as a flag with them.
+    name: Optional[str] = None
+    #: Epoch seconds, from the process table rather than from any record.
+    started_at: Optional[float] = None
+
+
 class Controller(_Wire):
     pid: Optional[int] = None
     #: A controller gone while its workers are not is a run nobody is
     #: collecting.
     alive: Optional[bool] = None
+    #: What the session started beside its workers, nearest-parent attributed:
+    #: this package's own helpers, and anything else the controller spawned.
+    #: Empty unless ``children`` was asked for.
+    children: list[ChildProcess] = []
 
 
 class Worker(_Wire):
@@ -196,6 +222,11 @@ class Worker(_Wire):
     heartbeat_age_s: Optional[float] = None
     #: None is not zero: "burned nothing" and "could not measure" differ.
     cpu_rate: Optional[float] = None
+    #: What this worker's tests started, and what those started in turn. Empty
+    #: unless ``children`` was asked for. A worker parked in ``communicate()``
+    #: is not the stall, it is the wait for one - the stack that says why is in
+    #: one of these.
+    children: list[ChildProcess] = []
 
 
 class Run(_Wire):
@@ -206,6 +237,10 @@ class Run(_Wire):
     started_at: Optional[float] = None
     schedule: Optional[ScheduleSummary] = None
     workers: list[Worker] = []
+    #: Whether the walk that found the children stopped at its bound, so some
+    #: are missing. The bound is over the whole snapshot, so this can be true
+    #: on a run none of whose own rows were dropped.
+    children_truncated: bool = False
 
 
 class WorkerFilter(_Wire):
@@ -463,6 +498,7 @@ class FailureServerClient:
         self,
         *,
         only: Optional[Sequence[str]] = None,
+        children: bool = False,
         timeout: Optional[float] = None,
     ) -> WorkersSnapshot:
         """Every run on this machine, and what each worker is doing.
@@ -475,12 +511,22 @@ class FailureServerClient:
         listing rather than after the read - a worker nobody asked about costs
         a name comparison instead of a state read. Names that matched nothing
         come back under ``filter.unmatched`` rather than being dropped.
+
+        ``children`` adds the processes running underneath the run - what the
+        tests spawned, and what the session started beside its workers - each
+        under the row that started it. That is the one part of this answer the
+        server cannot assemble from the run's files, so it walks the machine's
+        process table for it: ask for it when somebody is looking at a worker,
+        not on the poll. Their pids are pids :meth:`callstack` will answer
+        about, which is the reason to have them.
         """
         params: dict[str, Any] = {}
         if only:
             # Comma-joined: the server takes either shape, and one parameter
             # keeps a long fleet's URL readable in a log.
             params["worker"] = ",".join(only)
+        if children:
+            params["children"] = "true"
         return WorkersSnapshot.model_validate(
             await self._get("/workers", params=params, timeout=timeout)
         )

@@ -29,6 +29,11 @@ has_waitid = pytest.mark.skipif(
 )
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 
+#: A number no process in this run's tree has. Not pid 1, which is init on
+#: POSIX and nothing at all on Windows - the ids there start at 0 for Idle -
+#: so a test written around it would pass for the wrong reason on one of them.
+DEFINITELY_NOT_A_PARENT = 999999
+
 
 def child(*code: str) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-c", "; ".join(code)])
@@ -422,3 +427,131 @@ def test_windows_rss_falls_back_if_native_read_fails(monkeypatch):
         Process=lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=10485760))
     ))
     assert memory.resident_megabytes() == (10, "psutil")
+
+
+# -- the run's process tree -----------------------------------------------
+#
+# What a session is made of is wider than what it wrote down: the controller
+# runs no tests, this package starts helpers beside the workers, and under
+# each worker is whatever the tests started. The live view decides what it may
+# read from these two walks, so a wrong answer here is either a stalled
+# process nobody can look at or a stranger's process served as the run's.
+
+
+SPAWNS_A_CHILD = """
+import subprocess, sys, time
+
+inner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+print(inner.pid, flush=True)
+time.sleep(300)
+"""
+
+
+@pytest.fixture
+def a_child_with_a_child():
+    """``(pid, child_pid)`` for a process this one started, cleaned up after."""
+    started = subprocess.Popen(
+        [sys.executable, "-c", SPAWNS_A_CHILD], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        yield started.pid, int(started.stdout.readline().strip())
+    finally:
+        started.kill()
+        started.wait(timeout=10)
+
+
+def test_the_ancestry_of_a_process_starts_at_its_parent(a_child_with_a_child):
+    spawned, deeper = a_child_with_a_child
+
+    assert list(process.ancestry(deeper))[:2] == [spawned, os.getpid()]
+    assert list(process.ancestry(spawned))[0] == os.getpid()
+
+
+def test_an_ancestry_that_cannot_be_read_is_empty_rather_than_an_error():
+    """These are the processes of a run in trouble: one that exits mid-walk is
+    the ordinary case, and a shorter chain is an answer where a raised
+    exception is a live view that stops working."""
+    assert list(process.ancestry(0)) == []
+    assert list(process.ancestry(-1)) == []
+
+
+def test_an_ancestry_is_followed_no_further_than_it_is_asked_to_be(a_child_with_a_child):
+    """The chain is read hop by hop out of a live table, so it has a ceiling."""
+    _spawned, deeper = a_child_with_a_child
+
+    assert len(list(process.ancestry(deeper, limit=1))) == 1
+    assert list(process.ancestry(deeper, limit=0)) == []
+
+
+def test_an_ancestry_holds_what_a_process_came_from_and_nothing_else(a_child_with_a_child):
+    """What a caller asking "is this one of mine" matches against: one chain of
+    parents rather than a walk of the machine."""
+    spawned, deeper = a_child_with_a_child
+
+    assert os.getpid() in list(process.ancestry(deeper))
+    assert os.getpid() in list(process.ancestry(spawned))
+    # A process is not above itself, and neither is anything it never came
+    # from - which is what makes a stranger's pid a refusal rather than a
+    # match somewhere up the chain.
+    assert os.getpid() not in list(process.ancestry(os.getpid()))
+    assert DEFINITELY_NOT_A_PARENT not in list(process.ancestry(deeper))
+
+
+def test_every_process_under_a_root_is_found_and_labelled(a_child_with_a_child):
+    spawned, deeper = a_child_with_a_child
+
+    found, truncated = process.descendants({os.getpid(): "controller"})
+    assert not truncated
+    rows = {row["pid"]: row for row in found}
+    assert spawned in rows and deeper in rows
+    assert rows[deeper]["ppid"] == spawned
+    assert rows[spawned]["under"] == rows[deeper]["under"] == "controller"
+    assert rows[spawned]["name"] and rows[spawned]["started_at"] > 0
+    # The name the kernel holds, never the command line: that is where a
+    # program's arguments are, and a token passed as a flag with them.
+    assert set(rows[spawned]) == {"pid", "ppid", "name", "started_at", "under"}
+
+
+def test_a_process_is_labelled_by_the_nearest_root_above_it(a_child_with_a_child):
+    """Roots are seeded before the walk starts, so reaching one from above
+    never relabels it - which is what puts a worker's own children under the
+    worker rather than under the controller they also descend from."""
+    spawned, deeper = a_child_with_a_child
+
+    found, _truncated = process.descendants({os.getpid(): "controller", spawned: "gw0"})
+    rows = {row["pid"]: row for row in found}
+    assert rows[deeper]["under"] == "gw0"
+    # And a root is not a row of its own walk: it is already described by
+    # whatever named it a root.
+    assert spawned not in rows
+
+
+def test_a_walk_stops_at_its_bound_and_says_that_it_did(a_child_with_a_child):
+    """A reply about a live machine must have a size that does not depend on
+    what the machine is doing, and a short list has to be distinguishable from
+    a complete one."""
+    found, truncated = process.descendants({os.getpid(): "controller"}, limit=1)
+    assert len(found) == 1 and truncated is True
+
+    found, truncated = process.descendants({os.getpid(): "controller"}, limit=0)
+    assert found == [] and truncated is True
+
+
+def test_a_root_with_nothing_under_it_is_no_rows_rather_than_a_failure():
+    found, truncated = process.descendants({DEFINITELY_NOT_A_PARENT: "gone"})
+    assert found == [] and truncated is False
+    assert process.descendants({}) == ([], False)
+
+
+def test_a_recorded_creation_time_is_checked_only_when_both_ends_know_one():
+    """The weaker half of same_process, and weaker on purpose: this is asked
+    about a live process a caller is about to read, so False has to mean
+    "reused" and nothing else."""
+    assert process.creation_time_agrees(os.getpid(), process.creation_time(os.getpid()))
+    # A record from before the field existed, or a machine whose procfs
+    # belongs to another namespace, leaves the claim unchecked rather than
+    # refused - the check catches reuse where reuse can be proven.
+    assert process.creation_time_agrees(os.getpid(), None)
+    assert process.creation_time_agrees(os.getpid(), "not a time")
+    if process.creation_time(os.getpid()) is not None:
+        assert not process.creation_time_agrees(os.getpid(), 1.0)
