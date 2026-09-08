@@ -879,3 +879,100 @@ def test_windows_system_clock_failure_resets_portable_baseline():
     assert clock.busy_permille() is None
     assert clock._windows is None
     assert clock.busy_permille() == 750
+
+
+@pytest.mark.parametrize("failure", [None, "capture", "marker", "walk", "identity"])
+def test_windows_thread_snapshot_releases_resources_on_every_exit(failure):
+    from types import SimpleNamespace
+
+    from pytest_failure_instrumentation.probes.windows_thread_ids import WindowsThreadIds
+
+    released = []
+    pending = [threading.get_native_id(), 123456]
+
+    def capture(process, flags, context, snapshot):
+        assert flags == 0x80 and context == 0, "capture IDs without cloning memory or contexts"
+        snapshot._obj.value = 123
+        return 5 if failure == "capture" else 0
+
+    def marker(allocator, result):
+        result._obj.value = 456
+        return 5 if failure == "marker" else 0
+
+    def walk(snapshot, kind, marker, result, size):
+        assert kind == 3
+        if failure == "walk":
+            return 5
+        if not pending:
+            return 259
+        result._obj.ProcessId = os.getpid() if failure != "identity" else 0
+        result._obj.ThreadId = pending.pop(0)
+        return 0
+
+    reader = WindowsThreadIds.__new__(WindowsThreadIds)
+    reader.capture_api = SimpleNamespace(PssCaptureSnapshot=capture)
+    reader.api = SimpleNamespace(
+        PssWalkMarkerCreate=marker, PssWalkSnapshot=walk,
+        PssWalkMarkerFree=lambda marker: released.append("marker"),
+        PssFreeSnapshot=lambda process, snapshot: released.append("snapshot"),
+    )
+    if failure:
+        with pytest.raises(OSError):
+            reader.read()
+    else:
+        assert reader.read() == [threading.get_native_id(), 123456]
+    expected = [] if failure == "capture" else ["snapshot"] if failure == "marker" else ["marker", "snapshot"]
+    assert released == expected
+
+
+def test_windows_discovery_falls_back_after_a_snapshot_failure():
+    from types import SimpleNamespace
+
+    attempts = []
+
+    def unavailable():
+        attempts.append(True)
+        raise OSError("snapshot unavailable")
+
+    clock = ThreadClock.__new__(ThreadClock)
+    clock.source = "windows-thread-times"
+    clock._windows_ids = SimpleNamespace(read=unavailable)
+    clock._process = SimpleNamespace(threads=lambda: [SimpleNamespace(id=123)])
+    assert clock.discover() == [123]
+    assert clock.discover() == [123]
+    assert attempts == [True]
+
+
+@pytest.mark.skipif(sys.platform != "win32" or sys.maxsize <= 2**32, reason="64-bit Windows process snapshot API")
+def test_windows_snapshot_finds_raw_threads_and_releases_native_handles():
+    import _thread
+
+    import psutil
+
+    from pytest_failure_instrumentation.probes.windows_thread_ids import WindowsThreadIds
+
+    ready, release, done = (threading.Event() for _ in range(3))
+    native = []
+
+    def raw_thread():
+        native.append(threading.get_native_id())
+        ready.set()
+        release.wait(10)
+        done.set()
+
+    _thread.start_new_thread(raw_thread, ())
+    try:
+        assert ready.wait(5)
+        reader = WindowsThreadIds()
+        process = psutil.Process()
+        before = process.num_handles()
+        for _ in range(20):
+            tids = reader.read()
+            assert threading.get_native_id() in tids and native[0] in tids
+        assert process.num_handles() <= before + 2
+        clock = ThreadClock()
+        assert native[0] in clock.discover()
+        assert clock._windows_ids is not None, "the process-scoped reader must work on supported Windows"
+    finally:
+        release.set()
+        assert done.wait(5)

@@ -141,8 +141,9 @@ PERMISSION_HINTS = {
         "/proc/sys/kernel/yama/ptrace_scope "
         "(0 allows this; at 1 the tracer must be an ancestor of the target, "
         "and py-spy is a sibling of the worker rather than its ancestor - "
-        "workers grant the exception themselves at startup, so a refusal here "
-        "usually means the target is not one of ours), and add "
+        "workers grant the exception themselves at startup, but a process a "
+        "test spawned grants nothing and cannot be made to, so at 1 its stack "
+        "is refused even though it is this run's), and add "
         "--cap-add=SYS_PTRACE if this is a container"
     ),
     "darwin": (

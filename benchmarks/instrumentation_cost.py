@@ -139,6 +139,20 @@ def pytest_sessionfinish(session):
 def main() -> int:
     output = Path("readiness").resolve()
     output.mkdir(exist_ok=True)
+    if sys.platform == "win32":
+        import psutil
+        from pytest_failure_instrumentation.probes.windows_thread_ids import WindowsThreadIds
+
+        discovery = {}
+        for name, read in (("system_snapshot", psutil.Process().threads),
+                           ("process_snapshot", WindowsThreadIds().read)):
+            samples = []
+            for _ in range(20):
+                began = time.perf_counter()
+                assert read()
+                samples.append(time.perf_counter() - began)
+            discovery[name] = {"median_seconds": statistics.median(samples), "seconds": samples}
+        print(json.dumps({"thread_discovery": discovery}), flush=True)
     with tempfile.TemporaryDirectory(prefix="failure-instrumentation-cost-") as temporary:
         root = Path(temporary)
         (root / "test_work.py").write_text(WORKLOAD, encoding="utf-8")

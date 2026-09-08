@@ -1130,6 +1130,62 @@ one afterwards means reading whatever the machine has since given that number
 to. Name it one way or the other; both at once is refused, because they can
 disagree and there is no right one to prefer.
 
+**Which processes it will answer about is the run's whole tree, not its list of
+workers.** A session is more processes than the ones running tests: the
+controller runs none of its own, this package starts a kill witness and a
+filesystem helper beside the workers, and under each worker is whatever the
+*tests* started — a database a fixture brought up, a server under test, a
+`multiprocessing` pool, a shell. Those are the processes a run hangs on as
+often as the workers are. A worker parked in `communicate()` is not the stall,
+it is the wait for one, and the stack that says why is in the child.
+
+So the bound is descent. `/stack` answers for the serving process, for the
+controllers and workers recorded under the evidence directory, and for anything
+still running underneath those; everything else on the machine is refused with
+a 403. A recorded pid has to still be the process its record describes before
+either it or its subtree is admitted — both records carry a creation time, pids get handed
+out again, and a finished run's marker naming a number the kernel has since
+given to somebody's shell would otherwise hand out every process under that
+shell.
+
+A child that outlived the worker that started it is refused once the platform
+has severed its line back to the run — on POSIX that is the moment it is
+reparented onto init, where nothing distinguishes it from any other process on
+the machine. Windows does not reparent, so the dead worker's pid stays in the
+child's record and the chain reads through it while that process is still
+resolvable: the same daemon goes on being the run's there. Both answers are
+right. A chain that still names a process the run started is naming something
+the run really did start, and a chain through a pid the machine has since
+handed to somebody else is severed a hop earlier by the creation-time check.
+
+```console
+$ curl 'localhost:8080/workers?children' | jq '.runs[0].workers[0]'
+{"worker": "gw0", "pid": 21615, "nodeid": "test_pool.py::test_writes", "phase": "call",
+ "status": "blocked", "why": "heartbeat 0.4s old but no CPU progress: the test thread is waiting on something",
+ "children": [{"pid": 21630, "ppid": 21615, "name": "python", "started_at": 1787688103.2},
+              {"pid": 21634, "ppid": 21630, "name": "postgres", "started_at": 1787688103.4}]}
+
+$ curl 'localhost:8080/stack?pid=21630'      # the process the test is waiting on
+{"pid": 21630, "source": "py-spy", ...}
+```
+
+What the reader can then do with that pid is a separate question from whether it
+will be asked. py-spy reads Python processes, so the `postgres` row above comes
+back as a 502 carrying the reader's own reason — the reply says the read failed
+and why, which is a different answer from "this is not yours to look at".
+
+**On Linux at `ptrace_scope=1` a spawned child's stack is refused by the
+kernel**, and that is worth knowing before you go looking for a bug here. The
+tracer must be an ancestor of its target, and py-spy is a child of the
+controller rather than an ancestor of anything — which is what `PR_SET_PTRACER`
+exists for, and what each worker declares about itself at startup (see
+[Containers](#containers), which is where that is set out). A process a *test*
+spawned declares nothing and
+cannot be made to: it is arbitrary code that never linked this package. So the
+403 becomes a 502 naming ptrace_scope, on the machines where that setting is
+1 — Ubuntu and Debian, most desktop distributions. `ptrace_scope=0`, a container
+run with `--cap-add=SYS_PTRACE`, macOS with root, and Windows all read it.
+
 **Asking for more than the frames.** Three options, each one py-spy flag, all
 off unless switched on. A bare `?locals` is on: only an explicit `?locals=0` is
 a no.
@@ -1246,6 +1302,34 @@ the run was writing anyway — no ptrace, no per-test cost, nothing written:
       "tests_finished": 48, "tests_running": 1, "tests_queued": 11, "tests_assigned": 60}]}]}
 ```
 
+`?children` adds the processes running underneath the run, each under the row
+that started it: what the tests spawned goes on the worker whose tests spawned
+it, and what the session started beside its workers goes on `controller`.
+Attribution is to the *nearest* of those, so a shell's own child is the
+worker's rather than the controller's, though it descends from both.
+
+```console
+$ curl 'localhost:8080/workers?children' | jq '.runs[0].controller'
+{"pid": 17155, "alive": true,
+ "children": [{"pid": 17161, "ppid": 17155, "name": "python", "started_at": 1787688100.9}]}
+```
+
+It is off unless asked for, and that is the only thing here that is not free:
+everything else on this endpoint is read out of files the run was writing
+anyway. Child discovery also checks the recorded roots' creation times and
+makes one walk of the machine's process table. One walk answers
+for every run in the snapshot rather than one per run, the walk stops at 256
+rows and says `children_truncated` when it did, and it still signals nothing —
+a parent's number is something the kernel already knows. Each row is the pid,
+its parent's, the name the kernel holds and when it started; never the command
+line, which is where a program's arguments are and a token passed as a flag
+with them. The pid is the point of the row: it is one `/stack` will answer
+about.
+
+Where resource sampling is on, `/resources` already reports the same processes
+under `role: "descendant"`, with their measurements attached — those pids are
+readable too, and always were reported without being readable.
+
 `?worker=` narrows it to particular workers, which on a sixty-four-way run is
 the difference between reading one state file and reading all of them. Both
 spellings and both shapes work, and they mix:
@@ -1259,7 +1343,13 @@ $ curl 'localhost:8080/workers?worker=gw0&worker=gw2'
 Runs left with no matching worker drop out, and names that matched nothing
 anywhere come back under `filter.unmatched` — otherwise a caller cannot tell
 "not running" from "misspelt". An empty `?worker=` is treated as no filter,
-because that is what a UI sends when its filter box is empty. The names are
+because that is what a UI sends when its filter box is empty. Narrowing and
+`?children` combine the way you would want: a worker left out of the listing
+is left out of its children too, rather than reappearing under `controller`
+because every worker is a child of the controller. Excluded workers are
+traversal boundaries: their subtrees do not consume the 256-row limit. Stale
+records whose creation times disagree cannot claim or hide descendants.
+The names are
 compared against a directory listing and never joined onto one, so a value that
 looks like a path is just a name that matches nothing.
 
@@ -1706,6 +1796,15 @@ than "the controller's py-spy may read this worker". The controller's
 descendants are the whole process tree of the run: every other worker, and any
 subprocess a test spawns while the declaration stands. The reader it exists for
 is one of them and is not the only one.
+
+It runs one way only, and that is the limit on reading what a test spawned. The
+declaration is per process and is not inherited: a worker makes it about
+itself, and the child it starts makes none, because it is arbitrary code that
+never linked this package. `/stack` will ask about that child — it is one of the
+run's processes — but at `ptrace_scope=1` the kernel refuses the read, and the
+reply is the 502 above rather than a stack. Where the setting is 0, or the
+container has `--cap-add=SYS_PTRACE`, or the platform is macOS with root or
+Windows, it reads like anything else.
 
 **So the declaration is only made where something is going to read a worker's
 stack** — the live stack server, or the sampler (`failure_sample_seconds`) —

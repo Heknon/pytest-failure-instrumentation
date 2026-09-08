@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -714,3 +715,271 @@ def test_a_long_run_does_not_report_every_healthy_worker_as_frozen(tmp_path):
     assert worker["status"] != "frozen", (
         f"a healthy worker on a {interval:g}s beat was reported frozen: {worker['why']}"
     )
+
+
+# -- the processes underneath ---------------------------------------------
+
+
+SPAWNS_A_CHILD = """
+import subprocess, sys, time
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+print(child.pid, flush=True)
+time.sleep(300)
+"""
+
+
+@pytest.fixture
+def spawner():
+    """A process that starts one of its own, cleaned up however a test ends.
+
+    Two levels, because attribution is to the *nearest* root above a process
+    and one level cannot tell that from attribution to any root at all.
+    """
+    started = []
+
+    def start():
+        process = subprocess.Popen(
+            [sys.executable, "-c", SPAWNS_A_CHILD], stdout=subprocess.PIPE, text=True
+        )
+        started.append(process)
+        return process.pid, int(process.stdout.readline().strip())
+
+    yield start
+    for process in started:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def test_the_processes_under_a_run_are_not_described_unless_asked_for(evidence):
+    """Everything else here is a read of files the run wrote anyway. This is
+    the one thing that costs a walk of the machine, so a UI polling every
+    second gets the cheap answer and asks for the rest when somebody looks."""
+    evidence.state("gw0")
+    evidence.beats("gw0")
+
+    described = topology.run(evidence.run)
+    assert "children" not in described["workers"][0]
+    assert "children" not in described["controller"]
+    assert "children_truncated" not in described
+
+    # Asked for, the rows are there. What is under this process at this instant
+    # is not this test's business - another test's subprocess is as much a
+    # descendant of the process running both as anything else is.
+    described = topology.run(evidence.run, children=True)
+    assert isinstance(described["workers"][0]["children"], list)
+    assert isinstance(described["controller"]["children"], list)
+    assert described["children_truncated"] is False
+
+
+def test_what_a_worker_s_tests_started_arrives_under_that_worker(evidence, spawner):
+    """A worker parked waiting for a subprocess is not the stall, it is the
+    wait for one. Nothing writes the child down, because nothing in this
+    package started it - so it is found by descent and reported where it can
+    be asked about."""
+    spawned, deeper = spawner()
+    evidence.state("gw0", pid=spawned)
+    evidence.beats("gw0")
+
+    described = topology.run(evidence.run, children=True)
+    children = described["workers"][0]["children"]
+    assert [row["pid"] for row in children] == [deeper]
+    assert children[0]["ppid"] == spawned
+    assert children[0]["name"]
+    assert children[0]["started_at"] > 0
+    # The name is the kernel's; the command line is not here at all, because
+    # that is where a program's arguments are.
+    assert "cmdline" not in children[0]
+
+
+def test_a_process_is_attributed_to_the_nearest_row_above_it(evidence, spawner):
+    """A worker's child descends from the controller too - the controller is
+    what started the worker. Reported under the controller it would be a row
+    pointing at the wrong process to look at.
+
+    Both directions are here, because attributing everything to the controller
+    and attributing everything to the nearest worker are each right about half
+    of this and the two halves look identical with only one process in play.
+    """
+    spawned, deeper = spawner()
+    helper, under_helper = spawner()  # started by the controller, not a worker
+    evidence.state("gw0", pid=spawned)
+    evidence.beats("gw0")
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+
+    described = topology.run(evidence.run, children=True)
+    assert [row["pid"] for row in described["workers"][0]["children"]] == [deeper]
+
+    controller = [row["pid"] for row in described["controller"]["children"]]
+    # What the session started beside its workers, however deep.
+    assert helper in controller and under_helper in controller
+    # And not the worker, which has a row of its own, nor anything the worker
+    # started, which belongs to that row.
+    assert spawned not in controller
+    assert deeper not in controller
+
+
+def test_a_worker_left_out_of_the_listing_is_still_not_the_controller_s(evidence, spawner):
+    """Every worker is a child of the controller, so a run narrowed to one of
+    them would otherwise walk out of the controller into the rest and report
+    the whole fleet as something the session started - under the one row of
+    the one worker that was asked about."""
+    asked_about, its_child = spawner()
+    left_out, under_the_other = spawner()
+    evidence.state("gw0", pid=asked_about)
+    evidence.beats("gw0")
+    evidence.state("gw1", pid=left_out)
+    evidence.beats("gw1")
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+
+    described = topology.run(evidence.run, only=["gw0"], children=True)
+    assert [row["worker"] for row in described["workers"]] == ["gw0"]
+    assert [row["pid"] for row in described["workers"][0]["children"]] == [its_child]
+
+    controller = [row["pid"] for row in described["controller"]["children"]]
+    assert left_out not in controller
+    assert under_the_other not in controller
+
+
+def test_one_walk_answers_for_every_run_in_a_snapshot(evidence, spawner):
+    """The process table is what costs here, and reading it once per run would
+    make a machine hosting four sessions pay four times for one request."""
+    spawned, deeper = spawner()
+    evidence.state("gw0", pid=spawned)
+    evidence.beats("gw0")
+    second = evidence.base / "run-def456"
+    second.mkdir()
+    (second / "owner.json").write_text(json.dumps({"pid": LIVE}))
+
+    calls = []
+    real = topology.process_probe.descendants
+
+    def counted(roots, *args, **kwargs):
+        calls.append(dict(roots))
+        return real(roots, *args, **kwargs)
+
+    topology.process_probe.descendants = counted
+    try:
+        snapshot = topology.snapshot(evidence.base, children=True)
+    finally:
+        topology.process_probe.descendants = real
+
+    assert len(calls) == 1
+    described = next(run for run in snapshot["runs"] if run["session"] == "run-abc123")
+    assert [row["pid"] for row in described["workers"][0]["children"]] == [deeper]
+
+
+def test_a_walk_that_hit_its_bound_is_reported_as_one(evidence, monkeypatch):
+    """A reply about a live machine must have a size that does not depend on
+    what the machine is doing - and a caller reading a short list has to be
+    able to tell it apart from a complete one. The bound itself is the walk's
+    (see the probes' own tests); what is here is that its answer survives."""
+    evidence.state("gw0")
+    evidence.beats("gw0")
+    monkeypatch.setattr(topology.process_probe, "descendants", lambda roots, **kwargs: ([], True))
+
+    described = topology.run(evidence.run, children=True)
+    assert described["children_truncated"] is True
+
+
+def test_a_hand_written_pid_cannot_make_the_machine_this_run_s(evidence):
+    """``True`` is an ``int`` in Python, so a record saying ``"pid": true``
+    reads as process 1 - which on POSIX is init, and would put every process
+    on the machine under this run."""
+    evidence.state("gw0", pid=True)
+    evidence.beats("gw0")
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": True}))
+
+    described = topology.run(evidence.run, children=True)
+    assert described["workers"][0]["children"] == []
+    assert described["controller"]["children"] == []
+
+
+def test_a_worker_whose_process_is_gone_has_no_children(evidence):
+    """Its own leftovers were orphaned onto init when it died, and a process
+    on init is indistinguishable from any other on the machine."""
+    evidence.state("gw0", pid=DEAD)
+    evidence.beats("gw0")
+
+    described = topology.run(evidence.run, children=True)
+    assert described["workers"][0]["children"] == []
+
+
+@pytest.fixture
+def process_table(monkeypatch):
+    """Deterministic process identities and ancestry, without waiting for PID reuse."""
+    rows = []
+
+    def add(pid, ppid, created=2.0):
+        rows.append(SimpleNamespace(info={
+            "pid": pid, "ppid": ppid, "name": "python", "create_time": created,
+        }))
+
+    monkeypatch.setattr(topology.process_probe.psutil, "process_iter", lambda *a, **k: iter(rows))
+    monkeypatch.setattr(topology.process_probe, "creation_time", lambda pid: next(
+        (row.info["create_time"] for row in rows if row.info["pid"] == pid), None,
+    ))
+    monkeypatch.setattr(topology, "is_running", lambda pid: any(row.info["pid"] == pid for row in rows))
+    return add
+
+
+@pytest.mark.parametrize("root", ["controller", "worker"])
+def test_children_ignore_reused_root_identities(evidence, process_table, root):
+    process_table(100, 1)
+    process_table(101, 100, 3.0)
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": DEAD}))
+    path = evidence.run / ("owner.json" if root == "controller" else "gw0.state")
+    path.write_text(json.dumps({"pid": 100, "created_at": 1.0}) + "\n")
+
+    def children():
+        described = topology.run(evidence.run, children=True)
+        row = described["controller"] if root == "controller" else described["workers"][0]
+        return [child["pid"] for child in row["children"]]
+
+    assert children() == []
+    path.write_text(json.dumps({"pid": 100, "created_at": 2.0}) + "\n")
+    assert children() == [101]
+
+
+def test_stale_run_cannot_steal_current_runs_children(evidence, process_table):
+    process_table(100, 1)
+    process_table(101, 100, 3.0)
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": 100, "created_at": 2.0}))
+    stale = evidence.base / "run-z-stale"
+    stale.mkdir()
+    (stale / "owner.json").write_text(json.dumps({"pid": 100, "created_at": 1.0}))
+    runs = {run["session"]: run for run in topology.snapshot(evidence.base, children=True)["runs"]}
+    assert [row["pid"] for row in runs[evidence.run.name]["controller"]["children"]] == [101]
+    assert runs[stale.name]["controller"]["children"] == []
+
+
+@pytest.mark.parametrize("selected_parent", [300, 200])
+def test_excluded_worker_children_do_not_consume_the_result_limit(evidence, process_table, selected_parent):
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": 300, "created_at": 2.0}))
+    evidence.state("gw0", pid=100, created_at=2.0)
+    evidence.state("gw1", pid=200, created_at=2.0)
+    for pid, parent in [(300, 1), (100, selected_parent), (200, 300), (101, 100), (102, 101)]:
+        process_table(pid, parent)
+    for pid in range(1000, 1256):
+        process_table(pid, 200)
+
+    described = topology.run(evidence.run, only=["gw0"], children=True)
+    assert [row["pid"] for row in described["workers"][0]["children"]] == [101, 102]
+    assert described["controller"]["children"] == []
+    assert described["children_truncated"] is False
+
+    # The same fleet still respects the bound when both workers are selected.
+    described = topology.run(evidence.run, children=True)
+    assert sum(len(row["children"]) for row in described["workers"]) == 256
+    assert described["children_truncated"] is True
+
+
+def test_stale_excluded_worker_does_not_hide_current_controller_children(evidence, process_table):
+    (evidence.run / "owner.json").write_text(json.dumps({"pid": 300, "created_at": 2.0}))
+    evidence.state("gw0", pid=100, created_at=2.0)
+    evidence.state("gw1", pid=200, created_at=1.0)
+    for pid, parent in [(300, 1), (100, 300), (200, 300), (201, 200)]:
+        process_table(pid, parent)
+
+    described = topology.run(evidence.run, only=["gw0"], children=True)
+    assert [row["pid"] for row in described["controller"]["children"]] == [200, 201]

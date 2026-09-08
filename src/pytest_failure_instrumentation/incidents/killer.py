@@ -64,6 +64,13 @@ AFTER_DEATH_SECONDS = 5.0
 #: and never for a death found afterwards - its file is as complete as it
 #: will ever be.
 TRACE_SETTLE_SECONDS = 2.0 if sys.platform == "win32" else 0.5
+#: The ETW buffer timer is not a delivery deadline: ProcessTrace still has
+#: to dispatch the buffered events and the sidecar has to publish them.
+#: A Windows runner delivered a valid termination after 2.14 seconds, just
+#: after the old two-second wait had reported UNKNOWN. Allow one more second
+#: for an active ETW source, still shared across a cascade and never paid by
+#: a clean run, recovery, or evidence already present in the trace file.
+ETW_TRACE_SETTLE_SECONDS = 3.0
 TRACE_POLL_SECONDS = 0.05
 
 
@@ -424,7 +431,8 @@ def _settled(
     if (any(ready(witness) for witness in found) or not sources.live
             or time.monotonic() - sources._trace_waited_at < 2.0):
         return found
-    deadline = time.monotonic() + TRACE_SETTLE_SECONDS
+    allowance = ETW_TRACE_SETTLE_SECONDS if sources.trace_status == "etw" else TRACE_SETTLE_SECONDS
+    deadline = time.monotonic() + allowance
     if sources.trace_flush is not None:
         try:
             sources.trace_flush()
@@ -441,7 +449,7 @@ def _settled(
         size = grown
         found = sources.trace_reading()
     # Share the completed wait. Dating the cooldown from its start makes
-    # Windows' two-second wait expire its own two-second cooldown, so every
+    # Windows' wait expire its own two-second cooldown, so every
     # death in a cascade pays again.
     sources._trace_waited_at = time.monotonic()
     return found

@@ -88,11 +88,22 @@ minted nothing have no way to share a credential. It answers with a service
 name, a version and a pid.
 
 **What may be asked about is bounded too**, and separately, because on the
-default nothing bounds who is asking. ``/stack`` answers for the serving
-process and for the workers this run wrote ``.state`` files for, and refuses
-every other pid with a 403 - see :func:`serves_pid`. The reader behind it does
-not care whose process it is pointed at, so without that the endpoint was a way
-to walk the pids of the machine and read the frames of anything on it.
+default nothing bounds who is asking. ``/stack`` answers for the run's process
+tree - the serving process, the controllers and workers recorded under the
+evidence directory, and whatever is still running underneath those - and
+refuses every other pid with a 403 - see :func:`serves_pid`. The reader behind
+it does not care whose process it is pointed at, so without that the endpoint
+was a way to walk the pids of the machine and read the frames of anything on
+it.
+
+That the tree is the bound rather than the worker list is the point of it. A
+session is more processes than the ones running tests: the controller runs
+none, this package starts a kill witness and a filesystem helper beside it, and
+under each worker is whatever the *tests* started - a database a fixture
+brought up, a server under test, a ``multiprocessing`` pool, a shell. A worker
+parked in ``communicate()`` is not the stall, it is the wait for one, and the
+stack that says why is in the child. ``/workers?children`` is where a caller
+finds their pids.
 
 **Which addresses it answers to is the other half of that**, because "bound to
 loopback" is not the same as "only reachable by things on this machine that
@@ -201,12 +212,14 @@ MAX_CONCURRENT_READS = 8
 
 _readers = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
 
-#: What a worker's state file is called, which is the only thing under the
-#: evidence root that says which processes belong to a run - see
-#: :func:`serves_pid`. Spelled here as well as in :mod:`.topology` because the
-#: two read it for different reasons: that module describes workers, and this
-#: one only wants to know whether a pid is one.
+#: The two files under the evidence root that name a process of a run - see
+#: :func:`run_processes`. A ``.state`` slot names a worker, and the marker at
+#: the top of a run directory names its controller, which under xdist has no
+#: state file of its own. Spelled here as well as in :mod:`.topology` because
+#: the two read them for different reasons: that module describes workers, and
+#: this one only wants to know whether a pid is the run's.
 STATE_SUFFIX = ".state"
+OWNER_FILE = "owner.json"
 
 #: How long :meth:`StackService.stop` waits for a session that has just
 #: claimed the port to reach its accept loop, before giving up on shutting it
@@ -686,11 +699,17 @@ class _Handler(BaseHTTPRequestHandler):
             # and saying "no such process" about one that exists would send a
             # caller looking for the wrong fault.
             serves = (
-                "the process it is running in, and the workers whose state "
-                "files are under the evidence directory it was given"
+                "the process it is running in, the controllers and workers "
+                "recorded under the evidence directory it was given, and the "
+                "processes still running underneath those - a database a "
+                "fixture started, a server under test, anything a subprocess "
+                "test spawned. A child whose parent has gone is refused where "
+                "the platform has since severed its line back to the run, "
+                "which on POSIX is the moment it was reparented onto init"
                 if evidence_root is not None
-                else "the process it is running in, and nothing else: it was "
-                "given no evidence directory, so it knows of no workers"
+                else "the process it is running in and whatever that process "
+                "started: it was given no evidence directory, so it knows of "
+                "no workers and of no other run"
             )
             self._reply(
                 403,
@@ -808,6 +827,15 @@ class _Handler(BaseHTTPRequestHandler):
         repeated parameters and one comma-separated list - because a caller
         will write whichever occurs to them and being strict about it would
         only ever produce a wrong answer rather than a corrected one.
+
+        ``?children`` adds the processes running underneath the run - what the
+        tests spawned, and what the session started beside its workers. It is
+        the one thing here that costs a walk of the machine's process table
+        rather than a read of the run's own files, so it is asked for rather
+        than given: a UI polling this every second wants the cheap answer, and
+        the same UI wants the pids the moment somebody looks at a stuck
+        worker, because those are exactly the pids ``/stack`` will now answer
+        about.
         """
         from . import topology
 
@@ -821,7 +849,15 @@ class _Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        self._reply(200, topology.snapshot(base, served_by=identity(), only=_named(query)))
+        self._reply(
+            200,
+            topology.snapshot(
+                base,
+                served_by=identity(),
+                only=_named(query),
+                children=_switched_on(query, "children"),
+            ),
+        )
 
     def _reply(self, status: int, payload: dict[str, Any]) -> None:
         self._replied = True
@@ -852,7 +888,8 @@ ENDPOINTS = {
     "/resources?session=<session>": "bounded live resource history; after/limit/from/to/worker/latest filters",
     "/workers": "every run on this machine, and what each worker is doing",
     "/workers?worker=gw0,gw3": "only those workers; repeat the parameter or comma-separate",
-    "/stack?pid=N": "the current stack of every thread in process N",
+    "/workers?children": "also the processes running under each worker and controller",
+    "/stack?pid=N": "the current stack of every thread in process N, for any process of this run",
     "/stack?worker=gw0": "the same, for a worker of this run named by xdist id",
     "/stack?...&native": "frames from C, C++ and Cython extensions as well",
     "/stack?...&locals": "each frame's variables, rendered as text",
@@ -907,8 +944,8 @@ def worker_pid(name: str, evidence_root: Optional[Path]) -> Optional[int]:
     reused, and a state file outlives the process it describes: handing back a
     pid whose process has exited means reading whatever the operating system
     has since given that number to - a stranger's process, served as though it
-    were this run's worker. Liveness is therefore part of resolving the name,
-    not a check the reader is left to make afterwards.
+    were this run's worker. Liveness and the recorded creation time are
+    therefore checked while resolving the name, before calling the reader.
 
     Two runs under one evidence root both have a ``gw0``, so the live one wins
     over a finished one's leftovers. Where both are live the first by path
@@ -928,10 +965,11 @@ def worker_pid(name: str, evidence_root: Optional[Path]) -> Optional[int]:
         if state.stem != name:
             continue
         try:
-            pid = int(read_state(state)["pid"])
+            record = read_state(state)
+            pid = int(record["pid"])
         except (KeyError, TypeError, ValueError):
             continue  # a torn or hand-written record says nothing either way
-        if process.is_running(pid):
+        if process.is_running(pid) and process.creation_time_agrees(pid, record.get("created_at")):
             return pid
     return None
 
@@ -965,18 +1003,79 @@ def serves_pid(pid: int, evidence_root: Optional[Path]) -> bool:
     a service, an interpreter holding a credential in a local. The port is
     opened to watch *this* run, and that is the set it answers about.
 
-    Two things are in it. This process, which answers out of its own frames
-    and needs no permission from anybody. And the workers, which are read out
-    of the ``.state`` files the run is writing anyway - the same files
-    ``/workers`` is assembled from, so a pid a UI can see here is a pid it can
-    ask about, and nothing else is.
+    **The set is the run's process tree, not its list of workers.** A session
+    is more processes than the ones running tests. The controller itself runs
+    none. Beside it are the ones this package starts - the kill witness, the
+    filesystem helper, a py-spy mid-read - and under the workers is
+    everything the *tests* start: a database a fixture brought up, a server
+    under test, a ``multiprocessing`` pool, a shell that a subprocess test
+    spawned. Those are the processes a run hangs on, and refusing to read them
+    was refusing the question most worth asking - a worker sitting in
+    ``communicate()`` is not the stall, it is the wait for one, and the stack
+    that says why is in the child.
+
+    So three things are in it, in the order they are decided:
+
+    *This process*, which answers out of its own frames and needs no
+    permission from anybody, and whatever it started - which needs no file to
+    establish, and is the whole of what a server given no evidence directory
+    knows.
+
+    *What the run wrote down*: every worker's ``.state`` pid and every run's
+    ``owner.json`` pid, out of the same files ``/workers`` is assembled from,
+    so a pid a UI can see there is a pid it can ask about here.
+
+    *Anything descended from those*, which is what covers the processes
+    nothing wrote down because nothing here started them. It is decided by
+    walking the target's own parents - see :func:`..probes.process.ancestry` -
+    rather than by enumerating what the run's own processes have under them.
+    That direction stops at the first hop that is the run's, which is normally
+    the first hop there is, and it reads no process table to answer a question
+    one chain of parents settles.
+
+    **A recorded pid is checked against the run that recorded it** before
+    either the process itself or its subtree is admitted. Pids are reused,
+    and evidence outlives the process it describes - so a finished run's
+    marker naming a number the
+    kernel has since handed to somebody's shell would otherwise hand out every
+    process under that shell. Both records carry the process's creation time
+    for exactly this, and a definite disagreement is a refusal. A record from
+    before that field existed, or one whose creation time cannot be read at
+    all - a container showing an ancestor's procfs - is taken at its word, as
+    it always was: the check tightens what can be proved wrong and invents
+    nothing where nothing can be.
+
+    **A process whose link to the run is gone is nobody's**, and what breaks
+    that link is the platform's, not this function's. POSIX reparents an
+    orphan onto init: a test's leftover daemon whose worker died is then
+    indistinguishable from any other process on the machine, and claiming it
+    on the strength of what it used to be under is what this refuses. Windows
+    does not reparent - the dead parent's pid stays in the child's record, and
+    the chain reads through it for as long as that process is still
+    resolvable, so the same daemon goes on being the run's there. Both are
+    right: a chain that still names a process the run started is naming
+    something the run really did start, and a chain through a pid the machine
+    has since handed to somebody else is severed by the creation-time check
+    inside :func:`..probes.process.ancestry`, one hop earlier than it could
+    mislead.
 
     Read on every request rather than once at startup, because the set is not
     fixed: xdist replaces a crashed worker mid-run, a second session starts
-    under the same evidence root, and a snapshot taken when the port was
-    claimed would refuse exactly the worker somebody is asking about because
-    it is new. It costs one directory listing and one fixed-size read per
-    worker, against a request that is about to spawn a subprocess.
+    under the same evidence root, a test spawns something new. A snapshot
+    taken when the port was claimed would refuse exactly the process somebody
+    is asking about, because it is the new one. It costs two directory
+    listings, one fixed-size read per worker and per run marker, and a walk up
+    a few parents - against a request that is about to spawn a subprocess.
+    Nothing is asked about a process that the walk did not meet.
+
+    **Whether the read then succeeds is a different question**, and one this
+    does not answer. At Linux's ``ptrace_scope=1`` a tracer must be an
+    ancestor of its target; a worker declares the exception for itself at
+    startup and a process a *test* spawned declares nothing, so its stack is
+    refused by the kernel even though it is this run's. That is a 502 carrying
+    the reader's reason rather than the 403 here, which is the distinction
+    worth keeping: one says the question was not allowed, the other that the
+    answer could not be had. See :mod:`..probes.tracing`.
 
     :mod:`.topology` reads the same files and is deliberately not called here:
     it answers "what is every worker doing", which is an event tail, a CPU
@@ -985,28 +1084,98 @@ def serves_pid(pid: int, evidence_root: Optional[Path]) -> bool:
     """
     if pid == os.getpid():
         return True
-    if evidence_root is None:
-        # Nothing to enumerate, so nothing is claimed. A server started
-        # without an evidence directory serves its own stack and says so -
-        # see the 503 from /workers, which is the same position.
-        return False
+    # A server given no evidence directory has no runs to enumerate and claims
+    # no workers - it says so from /workers with a 503, which is the same
+    # position. What it still knows is its own process and what that process
+    # started, which needs no file to establish.
+    recorded = run_processes(evidence_root) if evidence_root is not None else {}
+    if any(process.creation_time_agrees(pid, when) for when in recorded.get(pid, ())):
+        return True
 
+    # Upwards from the target, and stopping at the first hop that is the
+    # run's, which is normally the first hop there is. The other direction -
+    # enumerating what every process the run wrote down has under it - reads
+    # the whole process table to answer a question one chain of parents
+    # settles, and the identity check below would then run against every
+    # recorded pid rather than against the one this walk actually met.
+    for ancestor in process.ancestry(pid):
+        if ancestor == os.getpid():
+            return True  # this process is a root whatever the files say
+        times = recorded.get(ancestor)
+        # Any record that agrees is enough. A pid the machine has handed out
+        # twice is named by two records, one of them describing the process
+        # that has it now, and refusing on the strength of the stale one would
+        # lose the live worker's children to the run that had the number
+        # before it.
+        if times and any(process.creation_time_agrees(ancestor, when) for when in times):
+            return True
+    return False
+
+
+def run_processes(evidence_root: Path) -> dict[int, list[Any]]:
+    """Every pid the runs under ``evidence_root`` wrote down, against when each
+    record says it began.
+
+    Two kinds of record name a process. A worker's ``.state`` slot is the one
+    ``/workers`` is built from; a run's ``owner.json`` names the controller,
+    which has no state file of its own under xdist and is otherwise the one
+    process of a run that nothing here could name.
+
+    A list per pid rather than one time, because a number the machine has
+    handed out twice is named by two records that disagree, and which of them
+    is the live process is not this function's to decide. The creation times
+    come back unchecked: :func:`serves_pid` checks only the target and the
+    recorded ancestors its walk actually meets, rather than inspecting every
+    process on every request. An unstamped record contributes ``None``, which is
+    a claim nothing can be checked against rather than an absent one.
+
+    A record that cannot be read, or that names no pid, contributes nothing. A
+    torn slot or somebody's hand-written JSON says nothing either way, and a
+    reader that guessed would be guessing about which processes it may read.
+    """
     from .capture.state import read_state
 
+    found: dict[int, list[Any]] = {}
     try:
         # One level down: the evidence root is the parent of the run
         # directories, since /workers describes the machine rather than
         # whichever run happens to be hosting.
         states = sorted(evidence_root.glob(f"*/*{STATE_SUFFIX}"))
+        markers = sorted(evidence_root.glob(f"*/{OWNER_FILE}"))
     except OSError:
-        return False
+        return found
+
     for state in states:
+        record = read_state(state)
+        _remember(found, record.get("pid"), record.get("created_at"))
+    for path in markers:
         try:
-            if int(read_state(state)["pid"]) == pid:
-                return True
-        except (KeyError, TypeError, ValueError):
-            continue  # a torn or hand-written record says nothing either way
-    return False
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict):
+            _remember(found, record.get("pid"), record.get("created_at"))
+    return found
+
+
+def _remember(found: dict[int, list[Any]], pid: Any, created: Any) -> None:
+    """Add one record, keeping what the others said as well.
+
+    Several files name the same pid on purpose - a single-process run writes
+    it as both its controller and its ``main`` worker - and only some of them
+    may carry a creation time. Overwriting would let a bare record silently
+    turn off the reuse check for a process another record could have proved.
+
+    ``True`` is an ``int`` in Python, so the pid is checked for that before
+    anything else: a hand-written record is JSON somebody else's program may
+    have produced, and ``{"pid": true}`` would otherwise be process 1.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return
+    when = created if isinstance(created, (int, float)) and not isinstance(created, bool) else None
+    times = found.setdefault(pid, [])
+    if when not in times:
+        times.append(when)
 
 
 def identity() -> dict[str, Any]:

@@ -8,6 +8,7 @@ takes 8080 would fight whatever the developer running it already has there.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import socket
@@ -22,18 +23,48 @@ import zlib
 from pathlib import Path
 from typing import Any, Optional
 
+import psutil
 import pytest
 
 from pytest_failure_instrumentation import stack_server
 from pytest_failure_instrumentation.incidents import stack_server as stack_server_incident
-from pytest_failure_instrumentation.probes import pyspy
+from pytest_failure_instrumentation.probes import process, pyspy
 from pytest_failure_instrumentation.probes.platform_flags import (
     IS_LINUX,
     IS_MACOS,
     IS_WINDOWS,
 )
+from pytest_failure_instrumentation.probes.process import creation_time
 
 from .conftest import ENABLE_FLAG, needs_pyspy
+
+#: A process that starts one of its own and says what its number is, so that a
+#: test can ask about a process the run never wrote down anywhere. It prints
+#: the number rather than having the test look for it: a walk of the machine
+#: for "whatever appeared just now" is a race with every other test.
+SPAWNS_A_CHILD = """
+import subprocess, sys, time
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+print(child.pid, flush=True)
+time.sleep(300)
+"""
+
+#: What ``detached`` runs. The process it starts survives it, which is the
+#: whole point: what is left has no line back to the test that arranged it.
+#: Its own child is started first where one is wanted, so that the pids of
+#: both are known before this exits and orphans them.
+DETACHES = """
+import subprocess, sys
+
+inner = subprocess.Popen(
+    [sys.executable, "-c", sys.argv[1]],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+)
+child = inner.stdout.readline().strip() if sys.argv[2] == "with-child" else "0"
+print(inner.pid, child, flush=True)
+"""
+
 
 #: A process parked in a known frame, readable by its parent's descendants.
 VICTIM_THAT_PERMITS_TRACING = """
@@ -211,6 +242,87 @@ def a_run_of(tmp_path: Path, **workers: int) -> Path:
             + b"\n"
         )
     return run
+
+
+class Detached:
+    """A live process on this machine that is not this run's.
+
+    Not a plain ``Popen``. A process a test starts is a child of the process
+    the server is running in, so it is one of the run's processes and reading
+    it is exactly what these changes made possible - which makes it useless as
+    the stranger a bound is tested against. So it is started at one remove and
+    the process that started it exits.
+
+    **What that leaves is not the same on both platforms**, and assuming it was
+    is what made this flake. POSIX reparents an orphan onto init, so the chain
+    above it stops there and no longer names this process. Windows does not
+    reparent: the pid of the launcher stays in the child's record after the
+    launcher has gone, and while that dead process is still resolvable - which
+    it is until every handle to it closes - the chain reads straight through it
+    to the test. So :func:`detached` checks the whole chain rather than one hop
+    of it, and says so when the platform has not severed the link.
+    """
+
+    def __init__(self, pid: int, child: int) -> None:
+        self.pid = pid
+        #: Its own child, where one was asked for; 0 otherwise.
+        self.child = child
+
+    def kill(self) -> None:
+        """Both of them, and never mind which are still there.
+
+        Nothing waits on these: their parent is init now, so it is init that
+        reaps them and this process could not wait even if it wanted to.
+        """
+        for pid in (self.child, self.pid):
+            if not pid:
+                continue
+            try:
+                psutil.Process(pid).kill()
+            except psutil.Error:
+                pass
+
+
+def detached(spawns_a_child: bool = False) -> Detached:
+    """A process with no line back to this one, and optionally one under it.
+
+    Skips the test where the platform will not give one. On Windows a dead
+    parent's pid stays in its child's record, so what severs the chain there is
+    the launcher's process object going away rather than an orphan being
+    reparented - and that happens when the last handle to it closes. The one
+    this process holds is inside the object ``subprocess.run`` discards, so it
+    closes on collection: hence the collect below, and the check afterwards for
+    the case where something still holds it.
+    """
+    inner = SPAWNS_A_CHILD if spawns_a_child else "import time; time.sleep(300)"
+    launched = subprocess.run(
+        [sys.executable, "-c", DETACHES, inner, "with-child" if spawns_a_child else "alone"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert launched.returncode == 0, launched.stderr
+    pid, child = (int(value) for value in launched.stdout.split())
+    detached_process = Detached(pid, child)
+    gc.collect()  # drop the launcher's handle, so its pid stops resolving
+
+    # The whole chain, not one hop of it. Checking only the immediate parent
+    # passed on Windows while the chain above it still reached this process,
+    # which served the very pid the bound was being tested with - so the test
+    # failed when a handle happened to outlive the launcher and passed when it
+    # did not.
+    for above in (pid, child):
+        if not above:
+            continue
+        chain = list(process.ancestry(above))
+        if os.getpid() in chain:
+            detached_process.kill()
+            pytest.skip(
+                f"this platform still links {above} back to this process "
+                f"through {chain}, so it cannot supply a process that is not "
+                "this run's - see Detached"
+            )
+    return detached_process
 
 
 def wait_for(condition, timeout: float = 20.0):
@@ -572,7 +684,11 @@ def test_only_the_processes_of_this_run_can_be_asked_about(serving, tmp_path):
     # is the only answer this test is about.
     assert get(port, f"/stack?pid={os.getpid()}")[0] != 403
 
-    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    # Orphaned rather than merely spawned. A process this test starts is a
+    # child of the process the server is running in, so it *is* one of the
+    # run's - see the tests below. A stranger is a process with no line back
+    # to the run at all, which is what being reparented onto init leaves.
+    stranger = detached()
     try:
         status, body = get(port, f"/stack?pid={stranger.pid}")
         assert status == 403
@@ -587,12 +703,12 @@ def test_only_the_processes_of_this_run_can_be_asked_about(serving, tmp_path):
         assert get(port, f"/stack?pid={stranger.pid}")[0] != 403
     finally:
         stranger.kill()
-        stranger.wait(timeout=10)
 
 
-def test_a_server_with_no_evidence_directory_answers_only_for_itself(serving):
-    """It has nowhere to learn a run's workers from, so it claims none. The
-    same position /workers is in, and it says so the same way."""
+def test_a_server_with_no_evidence_directory_answers_only_for_its_own_tree(serving):
+    """It has nowhere to learn a run's workers from, so it claims none - the
+    same position /workers is in, and it says so the same way. What it still
+    knows without a file is its own process and what that process started."""
     service = serving(free_port(), directory=None)
     assert wait_for(lambda: service.serving), "never served"
     port = service.bound_port
@@ -602,6 +718,13 @@ def test_a_server_with_no_evidence_directory_answers_only_for_itself(serving):
     status, body = get(port, "/stack?pid=999999")
     assert status == 403
     assert "no evidence directory" in body["error"]
+
+    spawned = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        assert get(port, f"/stack?pid={spawned.pid}")[0] != 403
+    finally:
+        spawned.kill()
+        spawned.wait(timeout=10)
 
 
 def test_the_pids_a_server_will_answer_for_come_from_the_run(tmp_path):
@@ -617,6 +740,224 @@ def test_the_pids_a_server_will_answer_for_come_from_the_run(tmp_path):
     assert stack_server.serves_pid(os.getpid(), None)
     assert not stack_server.serves_pid(4242, None)
     assert not stack_server.serves_pid(4242, run)
+
+
+def test_a_process_a_test_spawned_is_one_of_the_run_s(serving, tmp_path):
+    """The processes a run hangs on are not always the ones running tests.
+
+    A worker parked in ``communicate()`` is not the stall, it is the wait for
+    one, and the stack that says why is in the child - a database a fixture
+    brought up, a server under test, a shell. Nothing writes those down,
+    because nothing in this package started them, so they are recognised by
+    descent from a process the run did write down.
+    """
+    run = a_run_of(tmp_path)
+    service = serving(0, directory=run)
+    assert wait_for(lambda: service.serving), service.status
+    port = service.bound_port
+
+    # A child of this process, which owner.json names as the run's controller,
+    # and a grandchild of it - what a test that spawns a shell that spawns a
+    # server leaves behind. Depth is not the bound; descent is.
+    child = subprocess.Popen(
+        [sys.executable, "-c", SPAWNS_A_CHILD], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert child.stdout is not None
+        grandchild = int(child.stdout.readline().strip())
+
+        for pid in (child.pid, grandchild):
+            status, body = get(port, f"/stack?pid={pid}")
+            assert status != 403, body
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_a_child_of_a_worker_is_answered_for_though_nothing_wrote_it_down(tmp_path):
+    """The same rule as the run's own, one level further out.
+
+    The controller is in the marker and the workers are in their state files;
+    what a *test* starts is in neither, and is exactly what somebody looking at
+    a stuck worker wants next.
+    """
+    worker = subprocess.Popen(
+        [sys.executable, "-c", SPAWNS_A_CHILD], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert worker.stdout is not None
+        spawned = int(worker.stdout.readline().strip())
+        a_run_of(tmp_path, gw0=worker.pid)
+
+        assert stack_server.serves_pid(worker.pid, tmp_path)
+        assert stack_server.serves_pid(spawned, tmp_path)
+    finally:
+        worker.kill()
+        worker.wait(timeout=10)
+
+
+def test_the_controller_of_a_run_is_answered_for_though_it_runs_no_tests(tmp_path):
+    """It has no state file under xdist - it runs no tests - and it is still
+    one of the run's processes. /workers reports its pid and whether it is
+    alive; refusing its stack was refusing the process that assigns the work."""
+    run = tmp_path / "run-controller"
+    run.mkdir()
+    (run / "owner.json").write_text(json.dumps({"pid": 4242}))
+
+    assert stack_server.serves_pid(4242, tmp_path)
+    assert not stack_server.serves_pid(4243, tmp_path)
+
+
+def test_a_reused_pid_does_not_vouch_for_the_processes_under_it(tmp_path):
+    """Evidence outlives the process it describes, and pids are handed out again.
+
+    A marker naming a number the kernel has since given to somebody's shell
+    would otherwise hand out every process under that shell. Both records carry
+    the process's creation time for exactly this; a definite disagreement is a
+    refusal for both the pid itself and anything underneath it.
+    """
+    if creation_time(os.getpid()) is None:
+        # A container showing an ancestor's procfs cannot answer when a process
+        # began, and an unanswerable check is one that never refuses - which is
+        # the documented behaviour and leaves nothing here to assert.
+        pytest.skip("this machine cannot read a process's creation time")
+
+    stranger = detached(spawns_a_child=True)
+    try:
+        run = tmp_path / "run-reused"
+        run.mkdir()
+        marker = run / "owner.json"
+
+        marker.write_text(json.dumps({"pid": stranger.pid, "created_at": 1.0}))
+        assert not stack_server.serves_pid(stranger.child, tmp_path), _why(stranger)
+        assert not stack_server.serves_pid(stranger.pid, tmp_path)
+
+        # The same record, agreeing. A run whose evidence predates the field,
+        # or a machine whose procfs cannot answer, leaves it unchecked - which
+        # is what an absent created_at asks for.
+        marker.write_text(
+            json.dumps({"pid": stranger.pid, "created_at": creation_time(stranger.pid)})
+        )
+        assert stack_server.serves_pid(stranger.child, tmp_path)
+
+        marker.write_text(json.dumps({"pid": stranger.pid}))
+        assert stack_server.serves_pid(stranger.child, tmp_path)
+
+        # And where the machine has handed the number out twice, the record
+        # that agrees is the one that decides. Refusing on the strength of the
+        # stale one would lose a live worker's children to the run that had
+        # its pid before it.
+        marker.write_text(json.dumps({"pid": stranger.pid, "created_at": 1.0}))
+        a_run_of(tmp_path, gw0=stranger.pid)
+        assert stack_server.serves_pid(stranger.child, tmp_path)
+    finally:
+        stranger.kill()
+
+
+def _why(stranger: Detached) -> str:
+    """Every link the refusal above rests on, for a failure that can only say
+    that it did not happen.
+
+    Three things have to hold and the assertion reports none of them: that the
+    machine can read when the orphan began, that the reading disagrees with
+    what the record claims, and that the chain above the child meets the
+    orphan rather than anything of this process's. Which one gave way is the
+    whole diagnosis, and none of it is in the pid the assertion prints.
+    """
+    return (
+        f"the orphan is {stranger.pid} and its child {stranger.child}; this "
+        f"process is {os.getpid()}. Its creation time reads as "
+        f"{creation_time(stranger.pid)!r}, which agrees with a recorded 1.0: "
+        f"{process.creation_time_agrees(stranger.pid, 1.0)!r}. Above the child "
+        f"are {list(process.ancestry(stranger.child))!r}"
+    )
+
+
+@pytest.mark.parametrize("record_name", ["owner.json", "gw0.state"])
+def test_reused_recorded_pid_refuses_direct_and_descendant_reads(tmp_path, monkeypatch, record_name):
+    """A stale record cannot authorize its replacement or that replacement's children."""
+    pid = os.getpid() + 100_000
+    run = tmp_path / "run-stale"
+    run.mkdir()
+    record = run / record_name
+    record.write_text(json.dumps({"pid": pid, "created_at": 1.0}) + "\n")
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "ancestry", lambda target: iter([pid] if target == pid + 1 else []))
+
+    assert not stack_server.serves_pid(pid, tmp_path)
+    assert not stack_server.serves_pid(pid + 1, tmp_path)
+
+    # The actual current identity restores both forms of access.
+    record.write_text(json.dumps({"pid": pid, "created_at": 2.0}) + "\n")
+    assert stack_server.serves_pid(pid, tmp_path)
+    assert stack_server.serves_pid(pid + 1, tmp_path)
+
+    # Preserve the existing best-effort contract for old records and hosts
+    # that cannot report a creation time.
+    record.write_text(json.dumps({"pid": pid}) + "\n")
+    assert stack_server.serves_pid(pid, tmp_path)
+    record.write_text(json.dumps({"pid": pid, "created_at": 1.0}) + "\n")
+    monkeypatch.setattr(process, "creation_time", lambda target: None)
+    assert stack_server.serves_pid(pid, tmp_path)
+
+
+def test_a_current_record_wins_over_a_stale_record_for_the_same_pid(tmp_path, monkeypatch):
+    pid = os.getpid() + 100_000
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "ancestry", lambda target: iter([pid] if target == pid + 1 else []))
+    for name, created in [("run-old", 1.0), ("run-current", 2.0)]:
+        run = tmp_path / name
+        run.mkdir()
+        (run / "owner.json").write_text(json.dumps({"pid": pid, "created_at": created}))
+    assert stack_server.serves_pid(pid, tmp_path)
+    assert stack_server.serves_pid(pid + 1, tmp_path)
+
+
+def test_reused_pid_is_refused_over_http_without_calling_the_reader(serving, tmp_path, monkeypatch):
+    pid = os.getpid() + 100_000
+    run = a_run_of(tmp_path)
+    stale = json.dumps({"pid": pid, "created_at": 1.0}) + "\n"
+    (run / "owner.json").write_text(stale)
+    (run / "gw0.state").write_text(stale)
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "ancestry", lambda target: iter(()))
+    monkeypatch.setattr(process, "is_running", lambda target: True)
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("the reader must not receive a reused PID")
+
+    monkeypatch.setattr(stack_server, "read_stack", unexpected_read)
+    service = serving(0, directory=run)
+    assert wait_for(lambda: service.serving)
+    assert get(service.bound_port, f"/stack?pid={pid}&locals")[0] == 403
+    assert get(service.bound_port, "/stack?worker=gw0&locals")[0] == 404
+
+
+def test_worker_name_skips_reused_pid_and_resolves_the_current_run(tmp_path, monkeypatch):
+    pid = os.getpid() + 100_000
+    monkeypatch.setattr(process, "creation_time", lambda target: 2.0)
+    monkeypatch.setattr(process, "is_running", lambda target: True)
+    for name, target, created in [("run-a-old", pid, 1.0), ("run-b-current", pid + 1, 2.0)]:
+        run = tmp_path / name
+        run.mkdir()
+        (run / "gw0.state").write_text(json.dumps({"pid": target, "created_at": created}) + "\n")
+    assert stack_server.worker_pid("gw0", tmp_path) == pid + 1
+
+
+def test_a_process_no_longer_linked_to_the_run_is_nobody_s(tmp_path):
+    """A test's leftover daemon outlives the worker that started it, and where
+    the platform severs the link - POSIX reparents it onto init - it is
+    indistinguishable from any other process on the machine. Claiming it on the
+    strength of what it used to be under is what this bound refuses.
+
+    Where the link survives the parent, as it does on Windows until the dead
+    parent stops resolving, there is nothing to test and ``detached`` says so."""
+    orphan = detached()
+    try:
+        a_run_of(tmp_path, gw0=os.getpid())
+        assert not stack_server.serves_pid(orphan.pid, tmp_path)
+    finally:
+        orphan.kill()
 
 
 def test_an_unknown_endpoint_lists_the_ones_that_exist(serving):

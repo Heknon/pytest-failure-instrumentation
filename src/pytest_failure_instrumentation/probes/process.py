@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import os
 import time
+from collections import deque
+from collections.abc import Collection, Iterator
 from typing import Any, Optional
 
 import psutil
@@ -45,6 +47,29 @@ def same_process(pid: int, created: Any = None) -> bool:
     observed = creation_time(pid)
     return not (isinstance(created, (float, int)) and observed is not None
                 and abs(observed - created) > 0.001)
+
+
+def creation_time_agrees(pid: int, created: Any) -> bool:
+    """Whether ``pid`` can still be the process a record claiming ``created``
+    described.
+
+    The weaker half of :func:`same_process`, and weaker on purpose. That one
+    asks whether a process *is* the recorded one and answers no for a process
+    that has since exited; this asks only whether the number has been handed
+    to something else since, which is a question about a live process and the
+    only one a caller holding a pid it is about to read has any use for.
+
+    False is therefore a *disagreement* and nothing else: two creation times
+    that are both known and are not the same instant. A record from before the
+    field was written, or a machine whose procfs belongs to another namespace
+    and cannot answer, leaves the claim unchecked rather than refused - the
+    check is here to catch reuse where reuse can be proven, not to withdraw a
+    facility from every platform that cannot prove it.
+    """
+    if not isinstance(created, (int, float)) or isinstance(created, bool):
+        return True
+    observed = creation_time(pid)
+    return observed is None or abs(observed - created) <= 0.001
 
 
 def is_running(pid: int) -> bool:
@@ -141,6 +166,129 @@ def _procfs_state(pid: int) -> Optional[bytes]:
         return raw.rsplit(b")", 1)[1].split()[0]
     except IndexError:
         return None
+
+
+#: How far up an ancestry a membership question is followed before it is given
+#: up on. A run's tree is a handful of levels deep - a controller, a worker,
+#: whatever a test spawned and whatever that spawned in turn - and a walk that
+#: reaches thirty-two hops without meeting the run has left it. The bound is
+#: here because the chain is read hop by hop out of a live process table: a
+#: walk with no ceiling is one loop away from never ending, on a machine that
+#: is already in trouble.
+MAX_ANCESTRY = 32
+
+#: How many processes a descendant walk will describe before it stops. A reply
+#: about a live machine must have a size that does not depend on what the
+#: machine is doing, and a test that forked a thousand times is exactly the
+#: kind of run somebody is looking at this for.
+MAX_DESCENDANTS = 256
+
+
+def ancestry(pid: int, limit: int = MAX_ANCESTRY) -> Iterator[int]:
+    """Each process above ``pid``, nearest first, for as far as it can be read.
+
+    Yielded rather than returned, because every caller is asking whether the
+    chain meets something it already knows, and the answer is usually one or
+    two hops up. A list would climb all the way to init to answer a question
+    that stopped at the worker.
+
+    **Each hop is psutil's, not a raw ppid.** A parent that has exited leaves a
+    number the kernel may hand to something else, and a chain walked by number
+    alone would climb into a stranger's ancestry and report what it found there
+    as the caller's own. ``Process.parent()`` compares creation times and
+    answers None rather than handing back the impostor, which is the whole
+    reason this is not three lines of procfs reads.
+
+    Stops rather than raises at every step. A process that exits mid-walk is
+    the ordinary case here - these are the processes of a run in trouble - and
+    a chain that ends early is an answer where an exception is not.
+
+    This is the cheap direction of the question :func:`descendants` answers
+    expensively, and a caller asking only whether one process is under another
+    should come here: one chain of parents rather than a walk over every
+    process on the machine, which matters when the caller is a request handler
+    and the machine may have thousands.
+    """
+    try:
+        current = psutil.Process(pid)
+    except Exception:  # noqa: BLE001 - gone, or not ours to ask about
+        return
+    for _ in range(max(0, limit)):
+        try:
+            current = current.parent()
+        except Exception:  # noqa: BLE001 - it exited, or its ppid is unreadable
+            return
+        if current is None:
+            return  # init, or a parent gone and so no longer identifiable
+        yield current.pid
+
+
+def descendants(
+    roots: dict[int, Any], limit: int = MAX_DESCENDANTS, *, excluded: Collection[int] = ()
+) -> tuple[list[dict[str, Any]], bool]:
+    """Every process under ``roots``, and whether the walk hit its bound.
+
+    ``roots`` maps a pid to whatever the caller wants that subtree labelled
+    with, and each row comes back under the label of the *nearest* root above
+    it. That is what puts a worker's own children under the worker rather than
+    under the controller they also descend from: the roots are all seeded
+    before the walk starts, so reaching one from above never relabels it.
+
+    ``excluded`` contains boundaries whose subtrees must not be visited.
+    They use no result budget. An explicit root inside an excluded subtree
+    still starts its own walk, so filtering cannot hide another selected root.
+
+    One pass over the process table, not one per root. The table is what costs
+    here - a read per process - and a sixty-four-worker run would otherwise pay
+    for sixty-four passes to answer one request.
+
+    A row is what can be had without touching the process: its number, its
+    parent's, the name the kernel already holds and when it started.
+    Deliberately not the command line. That is where a program's arguments are -
+    a URL with a token in it, a password passed as a flag - and nothing that
+    needs to know a process exists and belongs to the run needs to read them.
+    """
+    children: dict[int, list[int]] = {}
+    rows: dict[int, dict[str, Any]] = {}
+    try:
+        listed = list(psutil.process_iter(["pid", "ppid", "name", "create_time"], ad_value=None))
+    except Exception:  # noqa: BLE001 - a table that cannot be read is no rows
+        return [], False
+    for entry in listed:
+        try:
+            info = entry.info
+            parent = info.get("ppid")
+            if parent is None:
+                continue
+            rows[info["pid"]] = {
+                "pid": info["pid"],
+                "ppid": parent,
+                "name": info.get("name"),
+                "started_at": info.get("create_time"),
+            }
+            children.setdefault(parent, []).append(info["pid"])
+        except Exception:  # noqa: BLE001 - it exited between the listing and the read
+            continue
+
+    found: list[dict[str, Any]] = []
+    visited = set(roots).union(excluded)
+    pending = deque(roots.items())
+    truncated = False
+    while pending:
+        parent, label = pending.popleft()
+        for child in sorted(children.get(parent, ())):
+            if child in visited:
+                continue  # a root in its own right, or already reached
+            visited.add(child)
+            row = rows.get(child)
+            if row is None:
+                continue
+            if len(found) >= max(0, limit):
+                truncated = True
+                continue
+            found.append({**row, "under": label})
+            pending.append((child, label))
+    return found, truncated
 
 
 def unsigned_on_windows(status: int) -> int:
