@@ -56,8 +56,16 @@ def _bounded(value) -> str:
     return piece
 
 
-def seal(limit: int = 4096) -> None:
-    """Install the budget. Idempotent."""
+def seal(limit: int = 4096, max_depth: int = 12) -> None:
+    """Install the budget. Idempotent.
+
+    `limit` bounds the characters one top-level repr may spend. `max_depth`
+    bounds how far it may descend, and is NOT optional: fuel alone bounds width
+    but not descent, so a model with a cheap per-level cost (short class name,
+    one field) keeps recursing until Python's own limit and raises
+    RecursionError inside your exception handler. Raising `limit` makes that
+    worse, not better, because more fuel buys a deeper descent.
+    """
     if _originals:
         return
     _originals["__repr__"] = BaseModel.__repr__
@@ -67,8 +75,12 @@ def seal(limit: int = 4096) -> None:
     def __repr__(self) -> str:
         top = not getattr(_fuel, "active", False)
         if top:
-            _fuel.active, _fuel.left = True, limit
+            _fuel.active, _fuel.left, _fuel.depth = True, limit, 0
         try:
+            if _fuel.depth >= max_depth:
+                placeholder = _placeholder(self)
+                _spend(len(placeholder))
+                return placeholder
             if _fuel.left <= 0:
                 placeholder = _placeholder(self)
                 _spend(len(placeholder))
@@ -85,7 +97,11 @@ def seal(limit: int = 4096) -> None:
                     _spend(2)                          # ", "
                 if key:
                     _spend(len(key) + 1)               # "key="
-                piece = _bounded(value)
+                _fuel.depth += 1
+                try:
+                    piece = _bounded(value)
+                finally:
+                    _fuel.depth -= 1
                 parts.append("%s=%s" % (key, piece) if key else piece)
             out = "%s(%s)" % (name, ", ".join(parts))
             # the fuel gauge bounds the WORK; this bounds the OUTPUT exactly,

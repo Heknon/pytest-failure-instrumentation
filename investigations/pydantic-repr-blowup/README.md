@@ -189,6 +189,7 @@ python 9_formats.py                # sharing vs cycles across every serialiser
 python 10_exception_group.py       # the exception tree as a second multiplier
 python 11_hermetic.py              # seal(), before and after
 pytest test_hermetic.py            # the budget holds for shapes nobody planned for
+python 12_where_it_breaks.py       # where the seal breaks, and why a bigger budget is worse
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -596,3 +597,34 @@ to walk your objects. It buys unbounded time. It does not make
 
 Do both: `seal()` today so nothing can wedge the process again, then remove the
 duplicate reference so the serialiser is fast too.
+
+## Where the seal breaks
+
+It does not break at a depth. It breaks at `budget / characters-per-level`,
+which means **a bigger budget breaks it sooner**. `12_where_it_breaks.py`, with
+the fuel gauge only and no depth cap:
+
+```
+budget     4,096   Turn (~20 chars/level)   depth 20,000  ->  4,096 bytes   ok
+budget     4,096   A    (~5 chars/level)    depth    500  ->  RecursionError
+budget    65,536   Turn (~20 chars/level)   depth    500  ->  RecursionError
+budget 1,000,000   Turn (~20 chars/level)   depth    500  ->  RecursionError
+```
+
+Fuel bounds *width*, not *descent*. A model with a cheap per-level cost - short
+class name, one field - keeps recursing until Python's own limit, and the
+`RecursionError` lands inside the exception handler that was already handling
+something else. With `sys.setrecursionlimit()` raised, it segfaults instead.
+
+So `seal()` takes a `max_depth` (default 12) and it is not optional. With it,
+verified to depth 20,000 at every budget above, and a real reference cycle
+reprs to 357 characters instead of raising.
+
+**Both bounds are load-bearing.** Neither alone is enough:
+
+- budget alone → `RecursionError` on deep-and-cheap graphs
+- `max_depth=12` alone → two recursive fields still means 2^12 = 4,096
+  expansions, ~147 KB per repr (measured, at `limit=10_000_000`)
+
+The budget catches exponential width; the depth cap catches runaway descent.
+
