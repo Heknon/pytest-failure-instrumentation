@@ -183,6 +183,8 @@ python 4_why_not_reprlib.py        # cycles vs sharing, and the reprlib trap
 DEPTH=22 python 5_fix_validation.py
 DEPTH=14 python 6_who_else.py     # who else walks the graph; rich takes ~2 min
 python 7_why.py                    # small-model-vs-huge-output, hand-checkable
+DEPTH=14 python 8_fixes.py         # every fix vs every consumer; rich takes ~5 min
+pytest test_repr_bomb.py           # the regression test
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -333,3 +335,92 @@ size is the number of root-to-leaf **paths**, not the number of objects.
 
 6 KB in, 243 MB out, at a compression ratio of about 40,000:1. Add one more
 conversation turn and it is 486 MB. Four more and you are at your 8 GB.
+
+---
+
+# How to fix it
+
+`fixes.py` is drop-in; `test_repr_bomb.py` is the regression test. Every row
+below is measured in `8_fixes.py` at depth 14, against all five consumers.
+
+|  | repr | model_dump_json | better_exc | sentry | rich locals |
+|---|---|---|---|---|---|
+| baseline (`echo: Turn`) | 1.0 MB | 950 KB | 0.11s | 1.0 MB | **145s / 40 MB** |
+| `Field(exclude=True, repr=False)` | 414 B | 264 B | ok | 414 B | ok |
+| `__repr__` override | 39 B | **950 KB** | ok | 39 B | **139s** |
+| store a key, not the object | 481 B | 466 B | ok | 481 B | ok |
+
+## 0. Confirm it, on the real object (30 seconds)
+
+```python
+from fixes import shared_nodes, predicted_repr_size
+print(predicted_repr_size(state))   # bytes repr() would produce
+print(shared_nodes(state)[:5])      # [(expansions, type, fields), ...]
+```
+
+Both are O(V+E) and memoised, so they are safe to run on the thing that hung.
+On a 41-object graph whose repr is 64 TB they return in 160 microseconds.
+If `shared_nodes` is empty, this whole theory is wrong - stop here.
+
+## 1. Stop the bleeding (config only, ship today)
+
+Makes the 10-minute hang impossible even while the data is still wrong:
+
+- unset `BETTER_EXCEPTIONS` (and delete `better_exceptions_hook.pth` if uninstalling)
+- `sentry_sdk.init(..., include_local_variables=False)`
+- never turn on `rich` `show_locals=True`
+
+This does **not** fix `model_dump_json()`, which is still exponential and is
+what produced your write timeout.
+
+## 2. The actual fix: delete the second path
+
+```python
+class Turn(BaseModel):
+    idx: int
+    prev: "Turn | None" = None
+    echo_idx: int | None = None     # a key, not a second pointer
+```
+
+Fixes all five consumers, including the serializer. If you genuinely need the
+object pointer in memory, the one-line version keeps it and hides it from both
+walkers:
+
+```python
+    echo: "Turn | None" = Field(default=None, exclude=True, repr=False)
+```
+
+Same result, with the caveat that the field no longer serialises, so it will not
+round-trip.
+
+## 3. Defence in depth, one edit for the whole codebase
+
+Make your base model non-recursive to print:
+
+```python
+from fixes import BoundedReprModel
+
+class LaGuruModel(BoundedReprModel):
+    ...
+```
+
+Covers `repr()`, logging, better_exceptions and sentry everywhere at once. Be
+clear about what it does not cover: **`model_dump_json()`** walks in
+pydantic-core and never calls `__repr__`, and **rich's `show_locals`**
+introspects attributes directly and ignores `__repr__` too (measured: 139s even
+with the override in place). It is a safety net, not a substitute for step 2.
+
+## 4. Make it impossible to reintroduce
+
+```python
+from fixes import assert_repr_bounded
+
+def test_agent_state_is_not_a_repr_bomb():
+    state = build_production_like_state(turns=50)
+    assert_repr_bounded(state, limit=100_000)
+```
+
+The failure message names the shared nodes and their expansion counts. The test
+is O(V+E) - the suite here detects a 64 TB repr bomb, and the whole file runs in
+0.18s - so it can run on every build. That is the part that stops this coming
+back, because the bug is invisible at depth 20 and fatal at depth 27.
