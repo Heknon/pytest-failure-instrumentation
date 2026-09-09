@@ -192,6 +192,7 @@ pytest test_hermetic.py            # the budget holds for shapes nobody planned 
 python 12_where_it_breaks.py       # where the seal breaks, and why a bigger budget is worse
 DEPTH=24 python 13_churn_vs_retention.py   # the repr churn does not leak; needs ~1GB
 python 14_what_pins_the_ram.py     # what actually holds 5GB after the handler ran
+python 15_precedent.py             # numpy and pandas truncate by default; pydantic does not
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -494,9 +495,47 @@ it guards: *"Decorator to make a repr function return fillvalue for a recursive
 call."* Recursive, i.e. the same object already open in the current call stack.
 A cycle. Not sharing.
 
-## So is there anything worth filing?
+## Truncation is a separate question, and there pydantic is the outlier
 
-Not against `repr` or `json` - a memo table there would change the output of
+The argument above is about **memoisation** - teaching repr to emit a
+back-reference. That genuinely cannot be done without changing the format.
+
+**Truncation** is a different ask, and it is completely normal.
+`15_precedent.py`, 5,000,000 elements handed to each container's `repr()`:
+
+| library | repr size | wall |
+|---|---|---|
+| numpy `ndarray` | **90 chars** | 0.368s |
+| pandas `Series` | **238 chars** | 0.232s |
+| pandas `DataFrame` | **231 chars** | 0.026s |
+| **pydantic `BaseModel`** | **43,888,899 chars** | **2.224s** |
+| plain `list` (a primitive) | 43,888,890 chars | 0.363s |
+
+```
+numpy   np.get_printoptions()['threshold'] = 1000
+pandas  pd.get_option('display.max_rows')  = 60
+pydantic                                   = no repr length/depth option
+```
+
+Every library that grew big enough to hit this solved it the same way: truncate
+by default, expose a knob. Pydantic's repr behaves like a *primitive* rather
+than like a *rich container* - and costs 6x a plain list for identical output.
+
+The counter-arguments are real but not decisive: truncating breaks
+`eval(repr(model))` round-tripping, and it would change doctest and snapshot
+output, so it needs a major version. numpy broke exactly the same things and
+shipped anyway, because a repr that can hang a process is worse than a repr you
+cannot paste back into a REPL. `model_config` is the obvious home for it:
+`ConfigDict(repr_max_length=..., repr_max_depth=...)`, mirroring
+`np.set_printoptions`.
+
+So yes - a defaults-and-a-knob feature request against pydantic is reasonable
+and well-precedented. That is a different filing from asking repr to understand
+graphs, which is the part that cannot be done.
+
+## Anything else worth filing?
+
+Not a memo table in `repr` or `json` - that would change the output of
 every program in the language, into a format nothing can read back.
 
 Against the **consumers**, yes, and this one is a real defect: better_exceptions'

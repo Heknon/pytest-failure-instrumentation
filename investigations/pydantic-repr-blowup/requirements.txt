@@ -3,3 +3,5 @@ httpx
 pydantic>=2
 rich
 sentry-sdk
+numpy
+pandas
