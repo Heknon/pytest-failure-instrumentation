@@ -1,3 +1,5 @@
 better_exceptions
 httpx
 pydantic>=2
+rich
+sentry-sdk

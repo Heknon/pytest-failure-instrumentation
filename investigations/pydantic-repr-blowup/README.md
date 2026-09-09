@@ -181,8 +181,112 @@ python 2_dag_scaling.py            # the doubling table
 DEPTH=24 python 3_end_to_end.py    # full incident; ~8 min, needs ~5 GB
 python 4_why_not_reprlib.py        # cycles vs sharing, and the reprlib trap
 DEPTH=22 python 5_fix_validation.py
+DEPTH=14 python 6_who_else.py     # who else walks the graph; rich takes ~2 min
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
 too-large `DEPTH` cannot take the machine down. Start low - the cost doubles
 with every step.
+
+---
+
+# "Can I just disable better_exceptions?"
+
+Yes, and you should - but it is a tourniquet, not the fix. `6_who_else.py`
+hands the *same* model and the *same* exception to every consumer, depth 14,
+15 objects, ~1 KB of real data:
+
+```
+-- walkers with no memo table: every shared node re-expanded per path --
+pydantic model_dump_json()                         0.031s   1,376,281 bytes
+json.dumps(model_dump())                           0.059s   1,605,650 bytes
+logger.exception (better_exceptions)               0.188s   1,006 bytes  <- work is invisible in the output
+sentry (include_local_variables=True, default)     0.257s   1,343,514 bytes
+rich Traceback(show_locals=True)                 112.610s  33,099,143 bytes
+
+-- formatters that never read locals --
+traceback.format_exc()                             0.000s   570 bytes
+logger.exception (stdlib)                          0.000s   594 bytes
+sentry (include_local_variables=False)             0.004s   -
+rich Traceback(show_locals=False, default)         0.011s   3,463 bytes
+
+-- walkers that DO carry a memo table: sharing costs nothing --
+pickle.dumps()                                     0.000s   920 bytes
+copy.deepcopy() then pickle                        0.000s   920 bytes
+```
+
+Every one of those numbers doubles per conversation turn.
+
+## How to actually turn it off
+
+`better_exceptions` installs a `better_exceptions_hook.pth` into site-packages
+that auto-hooks whenever the `BETTER_EXCEPTIONS` env var is set:
+
+```python
+if 'BETTER_EXCEPTIONS' in os.environ:
+    import better_exceptions; better_exceptions.hook()
+```
+
+So: **unset `BETTER_EXCEPTIONS`** in the service env, and if it was installed
+deliberately, uninstall it and delete any leftover `better_exceptions_hook.pth`.
+
+Note what `hook()` does beyond `sys.excepthook` (`better_exceptions/log.py`):
+
+```python
+logging.setLoggerClass(BetExcLogger)   # re-patches on every getLogger()
+patch_logging()                        # replaces formatter.formatException
+```
+
+It replaces `formatException` on stderr `StreamHandler` formatters and installs
+a Logger subclass that re-patches on **every logger created afterwards**. So a
+plain `logger.exception("upstream failed")` inside an `except` block goes
+through it. This almost certainly was the entry point - the timeout was caught
+and logged, not unhandled.
+
+## What it does *not* fix
+
+- **`model_dump_json()` blows up on its own.** 45s at depth 24 in
+  `3_end_to_end.py`, with no exception handler involved. This is likely what
+  produced the write timeout in the first place.
+- **Sentry ships `include_local_variables=True` by default**, and
+  `sentry_sdk.utils.safe_repr` is literally `repr(value)` inside a
+  `try/except` - no length bound at all, and `max_value_length` defaults to
+  `None`. It stored a 1.3 MB string for one frame local at depth 14; 86 MB and
+  12.4s at depth 20. If Sentry is on, disabling better_exceptions moves the
+  bomb, it does not defuse it.
+- **`rich` is worse, not better.** With `show_locals=True` it is ~600x slower
+  than better_exceptions on the same object. Its `locals_max_length` /
+  `locals_max_string` bound containers and strings, not the recursive expansion
+  of an arbitrary object. `show_locals=False` is the default and is safe - so
+  do not turn it on as a "nicer" replacement.
+
+# "Why the fuck does this happen?"
+
+Because `repr` is a *tree* serialisation of a *graph*, and there is no memo
+table anywhere in the chain.
+
+`pickle` and `deepcopy` walk the exact same object and cost nothing, because
+they keep a `{id(obj): ...}` memo and emit a back-reference the second time they
+meet a node. `repr` cannot do that - there is no syntax for "the object I
+printed 4 MB ago" in a human-readable repr, and no syntax for it in JSON either.
+So every tree-shaped output format re-expands shared nodes, once per path that
+reaches them. With two paths per level that is 2^depth.
+
+Python's only built-in defence is `reprlib.recursive_repr`, and it guards the
+wrong thing: it detects *the same object already being repr'd in the current
+call stack*, i.e. cycles. Sharing is not a cycle. The walk terminates, the
+result is finite, nothing is detectably wrong - it is just astronomically large.
+Pydantic's `Representation` does not use even that.
+
+So the failure is quiet by construction:
+
+- the object graph is a few kilobytes and looks fine in a debugger
+- there is no error, no warning, no recursion limit hit
+- the cost is invisible in the output, because every consumer truncates
+  afterwards - better_exceptions produced 1,006 bytes for 0.188s of work
+- and it is exponential, so it goes from "fine" to "wedged for ten minutes"
+  within about three extra conversation turns
+
+The one honest signal is that `model_dump_json()` got slow first. That was the
+warning, and it read as "the upstream is slow" because it showed up as a
+timeout.
