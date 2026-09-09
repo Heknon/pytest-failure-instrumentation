@@ -1,0 +1,3 @@
+better_exceptions
+httpx
+pydantic>=2
