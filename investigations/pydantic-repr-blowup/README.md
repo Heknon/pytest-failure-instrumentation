@@ -185,6 +185,7 @@ DEPTH=14 python 6_who_else.py     # who else walks the graph; rich takes ~2 min
 python 7_why.py                    # small-model-vs-huge-output, hand-checkable
 DEPTH=14 python 8_fixes.py         # every fix vs every consumer; rich takes ~5 min
 pytest test_repr_bomb.py           # the regression test
+python 9_formats.py                # sharing vs cycles across every serialiser
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -424,3 +425,82 @@ The failure message names the shared nodes and their expansion counts. The test
 is O(V+E) - the suite here detects a 64 TB repr bomb, and the whole file runs in
 0.18s - so it can run on every build. That is the part that stops this coming
 back, because the bug is invisible at depth 20 and fatal at depth 27.
+
+---
+
+# Why isn't this fixed upstream?
+
+Because it is not a bug. `9_formats.py` puts the same 17-node graph through
+every serialiser in reach:
+
+| | sharing (a DAG) | a cycle |
+|---|---|---|
+| `repr()` | 3,801,190 bytes | `RecursionError` |
+| `model_dump_json()` | 3,801,190 bytes | **raises "Circular reference detected"** |
+| `json.dumps()` | 4,456,545 bytes | **raises "Circular reference detected"** |
+| `pprint.pformat()` | 40,108,163 bytes | handled |
+| `pickle.dumps()` | **861 bytes** | fine |
+| `yaml.dump()` | **1,380 bytes** | fine |
+
+Every one of them implemented cycle detection. None of them preserve sharing.
+That split is deliberate, and you can read the decision in the stdlib:
+
+```python
+# json/encoder.py
+markerid = id(o)
+if markerid in markers:
+    raise ValueError("Circular reference detected")
+markers[markerid] = o
+...
+    yield from _iterencode(o, _current_indent_level)
+    if markers is not None:
+        del markers[markerid]      # <-- this line
+```
+
+The encoder **already has** the `id()` table needed to spot a repeated object.
+It deletes the entry on the way back out, so the table only ever holds the
+current *path*. That catches cycles and lets sharing expand. Remove the `del`
+and you would catch this too - and then be unable to emit anything, because
+JSON has no syntax for "the node I already wrote".
+
+YAML has that syntax, which is why it is 1,380 bytes:
+
+```yaml
+echo: &id003
+  echo: &id002
+    echo: &id001 {echo: null, idx: 0, prev: null}
+    idx: 1
+    prev: *id001
+  idx: 2
+  prev: *id002
+idx: 3
+prev: *id003
+```
+
+`&id001` declares, `*id001` refers back. Pickle does the same thing in binary.
+Both formats were designed for object *graphs*. JSON and `repr` were designed
+for *trees*, and a tree has exactly one path to every node. Feeding a graph to a
+tree serialiser and getting the paths enumerated is the correct answer to the
+question that was asked.
+
+CPython's one concession is `reprlib.recursive_repr`, whose docstring says what
+it guards: *"Decorator to make a repr function return fillvalue for a recursive
+call."* Recursive, i.e. the same object already open in the current call stack.
+A cycle. Not sharing.
+
+## So is there anything worth filing?
+
+Not against `repr` or `json` - a memo table there would change the output of
+every program in the language, into a format nothing can read back.
+
+Against the **consumers**, yes, and this one is a real defect: better_exceptions'
+`format_value` and sentry's `safe_repr` both intend to emit a bounded string
+(128 chars; `max_value_length`) and both do unbounded work to get there. The
+intent is already "small output"; the implementation just orders the truncation
+after the expansion instead of before. That is fixable without changing any
+format, and `fixes.py`'s `bounded_repr` is roughly the patch.
+
+Searching the pydantic tracker turns up the *cycle* case repeatedly
+(pydantic#9424 "__repr__ recursion", pydantic#524 "Multiple RecursionErrors with
+self-referencing models") - the case that already raises. Nothing found for the
+sharing case, though one search is not proof of absence.
