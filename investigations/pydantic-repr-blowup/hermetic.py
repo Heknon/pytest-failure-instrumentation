@@ -156,3 +156,26 @@ def guard_dumps(model, limit: int = 5_000_000, raise_on_exceed: bool = True):
             raise ReprBudgetExceeded(message)
         warnings.warn(message, RuntimeWarning, stacklevel=2)
     return model.model_dump_json()
+
+
+def release(exc, _seen=None):
+    """Strip tracebacks from an exception tree you need to KEEP.
+
+    An exception you retain - in a retry list, an ExceptionGroup, a Future, a
+    log record - owns its traceback, which owns every frame, which owns every
+    local in that frame. One 300 MB serialised payload in one frame is 300 MB
+    that no `gc.collect()` can reclaim, because it is all still reachable.
+
+    This keeps the errors and their messages and drops the frames.
+    """
+    if _seen is None:
+        _seen = set()
+    if exc is None or id(exc) in _seen:
+        return exc
+    _seen.add(id(exc))
+    exc.__traceback__ = None
+    release(getattr(exc, "__cause__", None), _seen)
+    release(getattr(exc, "__context__", None), _seen)
+    for sub in getattr(exc, "exceptions", ()) or ():
+        release(sub, _seen)
+    return exc

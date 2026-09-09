@@ -190,6 +190,8 @@ python 10_exception_group.py       # the exception tree as a second multiplier
 python 11_hermetic.py              # seal(), before and after
 pytest test_hermetic.py            # the budget holds for shapes nobody planned for
 python 12_where_it_breaks.py       # where the seal breaks, and why a bigger budget is worse
+DEPTH=24 python 13_churn_vs_retention.py   # the repr churn does not leak; needs ~1GB
+python 14_what_pins_the_ram.py     # what actually holds 5GB after the handler ran
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -628,3 +630,94 @@ reprs to 357 characters instead of raising.
 
 The budget catches exponential width; the depth cap catches runaway descent.
 
+
+---
+
+# "It never came back down from 5 GB"
+
+That is a **second, separate problem**, and it is not the repr work. The repr
+churn is entirely transient - `13_churn_vs_retention.py`, three ~1.4 GB reprs
+built and dropped:
+
+```
+   baseline                      0.02 GB
+   peak                          0.93 GB
+   after dropping the strings    0.02 GB      <- no gc needed
+   after gc.collect()            0.02 GB
+   reachable strings > 10MB      0            <- a real leak would show here
+   after malloc_trim(0)          0.02 GB
+```
+
+Nothing sticks. Big strings go straight to `mmap` and are returned on free. So a
+plateau at 5 GB is not the bomb - it is something *holding the exception*.
+
+`14_what_pins_the_ram.py` finds two mechanisms, both matching an incident like
+yours.
+
+## 1. The exception/frame reference cycle
+
+```python
+except TimeoutError as exc:
+    err = exc          # a local in THIS frame, and this frame is in exc's traceback
+```
+
+`exc` → `__traceback__` → frame → `err` → `exc`. A cycle, so refcounting cannot
+free it:
+
+```
+   after the handler returned    0.30 GB
+   refcounting + malloc_trim     0.30 GB   <- refcounting alone cannot free a cycle
+   after gc.collect()            0.01 GB   <- only the cyclic GC gets it back
+```
+
+Under low allocation rates a gen-2 collection can be a long time coming, so RSS
+sits high and then drops for no visible reason. That is the shape of "it came
+back eventually".
+
+## 2. An ExceptionGroup pins every sub-exception's frames
+
+This is the one for a mock-API fan-out. Each retained sub-exception owns its own
+traceback, which owns every frame, which owns every local - including the
+serialised payload:
+
+```
+   6 sub-exceptions held          1.77 GB   (+1.76 GB = 6 x 300MB payload)
+   gc + trim while group held     1.77 GB   <- all reachable, none can go
+   after dropping the group       0.01 GB
+```
+
+`gc.collect()` is useless here. Nothing is garbage; it is all still reachable
+through the group you are deliberately keeping.
+
+## The fix, when you need to keep the errors
+
+```python
+hermetic.release(group)     # keeps the errors, drops the frames
+```
+
+```
+   group kept, tracebacks cleared 0.01 GB   (+0.00 GB)
+   still have the errors: ['TimeoutError', 'TimeoutError', 'TimeoutError'] ...
+```
+
+`release()` walks `__cause__`, `__context__` and `.exceptions`, sets
+`__traceback__ = None` on each, and is cycle-safe. Call it on any exception you
+put in a retry list, a Future, an ExceptionGroup, or a log record - anything
+that outlives the `except` block.
+
+## How to tell which one you have
+
+```python
+import gc
+gc.collect()          # if RSS drops, it was the cycle
+```
+
+If `gc.collect()` does not move it, nothing is garbage - something is holding it.
+Find what:
+
+```python
+import gc
+frames = [o for o in gc.get_objects() if type(o).__name__ == "frame"]
+print(len(frames))                       # a frame count that only grows is the tell
+print(gc.get_referrers(some_big_object)) # walk back to the owner
+```

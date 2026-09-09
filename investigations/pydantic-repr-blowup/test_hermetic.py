@@ -129,3 +129,32 @@ def test_depth_cap_alone_would_not_be_enough():
     hermetic.unseal()
     hermetic.seal(limit=LIMIT, max_depth=12)
     assert len(repr(chain(30))) <= LIMIT         # budget closes it
+
+
+def test_release_drops_frames_but_keeps_the_errors():
+    def boom():
+        payload = "X" * 1_000_000          # noqa: F841  - a frame local we want gone
+        raise TimeoutError("read timeout")
+
+    errors = []
+    for _ in range(3):
+        try:
+            boom()
+        except TimeoutError as exc:
+            errors.append(exc)
+    group = ExceptionGroup("fan-out failed", errors)
+
+    assert all(e.__traceback__ is not None for e in group.exceptions)
+    hermetic.release(group)
+    assert all(e.__traceback__ is None for e in group.exceptions)
+    assert group.__traceback__ is None
+    assert [str(e) for e in group.exceptions] == ["read timeout"] * 3
+
+
+def test_release_survives_a_cyclic_exception_tree():
+    a = TimeoutError("a")
+    b = TimeoutError("b")
+    a.__context__ = b
+    b.__context__ = a                      # cycle
+    hermetic.release(a)                    # must terminate
+    assert a.__traceback__ is None and b.__traceback__ is None
