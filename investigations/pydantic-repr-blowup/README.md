@@ -182,6 +182,7 @@ DEPTH=24 python 3_end_to_end.py    # full incident; ~8 min, needs ~5 GB
 python 4_why_not_reprlib.py        # cycles vs sharing, and the reprlib trap
 DEPTH=22 python 5_fix_validation.py
 DEPTH=14 python 6_who_else.py     # who else walks the graph; rich takes ~2 min
+python 7_why.py                    # small-model-vs-huge-output, hand-checkable
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -290,3 +291,45 @@ So the failure is quiet by construction:
 The one honest signal is that `model_dump_json()` got slow first. That was the
 warning, and it read as "the upstream is slow" because it showed up as a
 timeout.
+
+---
+
+# Small model, big model, or infinite loop?
+
+Small model. `7_why.py`, depth 3, four objects, printable by eye:
+
+```
+Turn(idx=3, prev=Turn(idx=2, prev=Turn(idx=1, prev=Turn(idx=0, prev=None, echo=None),
+echo=Turn(idx=0, prev=None, echo=None)), echo=Turn(idx=1, prev=Turn(idx=0, ...
+```
+
+There is **one** `idx=0` object in memory. It appears in that string **8 times** -
+once per path from the root down to it. Four objects, 2^3 leaf printings.
+
+| depth | objects | RAM bytes | times the leaf is printed | repr bytes |
+|---:|---:|---:|---:|---:|
+| 3 | 4 | 1,056 | 8 | 439 |
+| 10 | 11 | 2,904 | 1,024 | 59,368 |
+| 14 | 15 | 3,960 | 16,384 | 950,278 |
+| 18 | 19 | 5,016 | 262,144 | 15,204,838 |
+| 22 | 23 | 6,072 | 4,194,304 | 243,277,798 |
+
+The left column grows by one object. The right column doubles.
+
+**Not a big model.** At depth 22 the entire graph is 23 objects and 6,072 bytes,
+holding 23 integers. There is no payload in it at all.
+
+**Not an infinite loop.** It terminates - 22.1s, returns normally, 243 MB of
+string. It makes steady forward progress the whole time. That is why nothing
+catches it: no recursion limit, no error, no hang detector. A real cycle *is*
+effectively infinite and Python catches that in 1ms with `RecursionError`
+(`4_why_not_reprlib.py`). This is worse precisely because it is finite.
+
+**What it actually is: a decompression bomb.** The object graph is a *compressed*
+tree, and pointers are the compression - `prev` and `echo` are 16 bytes that
+mean "that entire subtree, twice". `repr` has no syntax for a pointer, so it
+cannot preserve the sharing; it has to write the subtree out again. The output
+size is the number of root-to-leaf **paths**, not the number of objects.
+
+6 KB in, 243 MB out, at a compression ratio of about 40,000:1. Add one more
+conversation turn and it is 486 MB. Four more and you are at your 8 GB.
