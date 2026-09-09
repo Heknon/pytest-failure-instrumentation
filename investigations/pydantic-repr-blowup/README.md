@@ -193,6 +193,8 @@ python 12_where_it_breaks.py       # where the seal breaks, and why a bigger bud
 DEPTH=24 python 13_churn_vs_retention.py   # the repr churn does not leak; needs ~1GB
 python 14_what_pins_the_ram.py     # what actually holds 5GB after the handler ran
 python 15_precedent.py             # numpy and pandas truncate by default; pydantic does not
+python 16_why_400kb.py             # 400KB -> 3.2GB, RAM column vs text column
+python 17_which_exceptions.py      # print-fat vs hold-fat exceptions, and routes to 8GB
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -760,3 +762,59 @@ frames = [o for o in gc.get_objects() if type(o).__name__ == "frame"]
 print(len(frames))                       # a frame count that only grows is the tell
 print(gc.get_referrers(some_big_object)) # walk back to the owner
 ```
+
+---
+
+# Which exception could reach 8 GB?
+
+`17_which_exceptions.py`. Exceptions split into two kinds, and they map onto the
+two separate problems in this incident.
+
+## Print-fat: `repr(exc)` dumps the payload
+
+Handed a 50 MB payload, stdlib only, no formatter involved:
+
+| exception | `str(exc)` | `repr(exc)` |
+|---|---|---|
+| `UnicodeDecodeError` | 77 | **52,428,882** |
+| `UnicodeEncodeError` | 90 | **52,428,883** |
+| `ValueError(big_string)` | 52,428,800 | 52,428,814 |
+| `AssertionError(big_string)` | 52,428,800 | 52,428,818 |
+
+`UnicodeDecodeError` is the trap: the message is 77 characters, so it looks
+harmless in a log, but `repr()` writes out the **entire object being decoded**.
+Any formatter that reprs the exception as a frame local pays 50 MB per frame.
+
+## Hold-fat: never printed, but pins memory
+
+| exception | `repr(exc)` | bytes held on the object |
+|---|---|---|
+| `json.JSONDecodeError` | 82 | **52,428,807** (`.doc`) |
+| `subprocess.CalledProcessError` | 28 | **52,428,800** (`.output`/`.stderr`) |
+
+These print small and cost nothing to format - and keep the whole payload alive
+for as long as anything holds the exception. This is the 5 GB plateau, not the
+10 minute hang. `httpx.HTTPStatusError` behaves the same way via `.response`.
+
+## What it takes to reach 8 GB
+
+Assuming a typical httpx/anyio timeout stack of ~13 frames:
+
+| route | input required for 8 GB |
+|---|---|
+| body repr'd once per frame | **630 MB body** |
+| `UnicodeDecodeError` repr per frame | **630 MB payload** |
+| `ValidationError` (5,300 B each) | **1,620,742 errors** |
+| exponential, 400 KB payload shared per level | **11 levels of double-reference** |
+| exponential, 4 KB payload shared per level | **17 levels of double-reference** |
+
+**The 8 GB is itself the diagnostic.** Every linear route needs an input you
+would already have noticed - a 630 MB request body does not go unremarked, and
+1.6 million validation errors is not a thing that happens. Only the exponential
+route gets to 8 GB from inputs nobody would look at twice: 11 levels of "stored
+in two places" on a payload of a few hundred KB.
+
+Worth noting on the way past: pydantic **does** truncate input values inside
+`ValidationError` messages - 20 rows of 1 KB and 20 rows of 1 MB both produce
+exactly 5,300 bytes. It already knows how to bound a rendering. It just does not
+do it in `__repr__`.
