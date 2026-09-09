@@ -1,0 +1,89 @@
+"""The seal has to hold for shapes nobody anticipated. That is the whole claim."""
+import sys
+from pathlib import Path
+
+import pytest
+from pydantic import BaseModel
+
+sys.path.insert(0, str(Path(__file__).parent))
+import hermetic  # noqa: E402
+
+LIMIT = 4096
+
+
+class Turn(BaseModel):
+    idx: int
+    prev: "Turn | None" = None
+    echo: "Turn | None" = None
+
+
+class Wide(BaseModel):
+    a: str = ""
+    kids: list = []
+    payload: bytes = b""
+    nested: "Wide | None" = None
+
+
+@pytest.fixture(autouse=True)
+def sealed():
+    hermetic.seal(limit=LIMIT)
+    yield
+    hermetic.unseal()
+
+
+def chain(depth):
+    turn = Turn(idx=0)
+    for i in range(1, depth + 1):
+        turn = Turn(idx=i, prev=turn, echo=turn)
+    return turn
+
+
+def wide(depth, width=40):
+    node = Wide(a="x" * 5000, payload=b"\xff" * 100_000, kids=list(range(width)))
+    for _ in range(depth):
+        node = Wide(a="y" * 5000, kids=[node] * width, nested=node, payload=b"\x00" * 100_000)
+    return node
+
+
+@pytest.mark.parametrize("obj", [
+    chain(10), chain(30), chain(200),
+    wide(5), wide(20),
+    Wide(a="z" * 10_000_000),
+    Wide(payload=b"\xfe" * 5_000_000),
+    Wide(kids=list(range(1_000_000))),
+], ids=["dag10", "dag30", "dag200", "wide5", "wide20", "huge_str", "huge_bytes", "huge_list"])
+def test_repr_never_exceeds_budget(obj):
+    assert len(repr(obj)) <= LIMIT
+    assert len(str(obj)) <= LIMIT
+    assert len("%r" % (obj,)) <= LIMIT
+    assert len(f"{obj!r}") <= LIMIT
+
+
+def test_rich_cannot_walk_the_graph():
+    rich_repr = list(Turn(idx=1, prev=chain(30), echo=chain(30)).__rich_repr__())
+    for _, value in rich_repr:
+        assert not isinstance(value, BaseModel), "rich would recurse into this"
+
+
+def test_unseal_restores_the_original():
+    hermetic.unseal()
+    assert len(repr(chain(14))) > LIMIT      # the bomb is back
+    hermetic.seal(limit=LIMIT)
+    assert len(repr(chain(14))) <= LIMIT
+
+
+def test_guard_dumps_refuses_the_bomb_and_says_why():
+    with pytest.raises(hermetic.ReprBudgetExceeded) as excinfo:
+        hermetic.guard_dumps(chain(40))
+    assert "shared nodes" in str(excinfo.value)
+
+
+def test_guard_dumps_passes_healthy_models_through():
+    assert hermetic.guard_dumps(Turn(idx=1)) == Turn(idx=1).model_dump_json()
+
+
+def test_seal_is_idempotent_and_thread_local_state_resets():
+    hermetic.seal(limit=LIMIT)
+    hermetic.seal(limit=LIMIT)
+    assert len(repr(chain(30))) <= LIMIT
+    assert len(repr(chain(30))) <= LIMIT      # second call must not inherit spent fuel

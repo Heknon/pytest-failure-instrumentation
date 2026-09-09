@@ -186,6 +186,9 @@ python 7_why.py                    # small-model-vs-huge-output, hand-checkable
 DEPTH=14 python 8_fixes.py         # every fix vs every consumer; rich takes ~5 min
 pytest test_repr_bomb.py           # the regression test
 python 9_formats.py                # sharing vs cycles across every serialiser
+python 10_exception_group.py       # the exception tree as a second multiplier
+python 11_hermetic.py              # seal(), before and after
+pytest test_hermetic.py            # the budget holds for shapes nobody planned for
 ```
 
 `rss.py` samples `/proc/self/statm` and hard-aborts the process above 9 GB so a
@@ -504,3 +507,92 @@ Searching the pydantic tracker turns up the *cycle* case repeatedly
 (pydantic#9424 "__repr__ recursion", pydantic#524 "Multiple RecursionErrors with
 self-referencing models") - the case that already raises. Nothing found for the
 sharing case, though one search is not proof of absence.
+
+---
+
+# The exception tree is a second multiplier
+
+An exception object holding sub-exceptions (an `ExceptionGroup`, a task group, a
+mock-API fan-out) multiplies the model blow-up by however many sub-exceptions it
+carries. `10_exception_group.py`, model depth 12, group of 12:
+
+```
+traceback.format_exception (group-aware)      0.00s        10,422 bytes
+better_exceptions                             0.04s           980 bytes   <- pre-PEP654, does not descend
+sentry (walks every sub-exception)            1.19s     8,790,341 bytes
+                    one repr of that model:                237,550 bytes
+```
+
+Sentry paid 37x a single repr - 12 sub-exceptions times ~3 frames each. Nothing
+about the model changed. So chasing duplicate references field by field is
+never finished: the amplification can come from the exception side too.
+
+# The hermetic fix
+
+`hermetic.py`. One call, no model changes, no migration:
+
+```python
+import hermetic
+hermetic.seal()          # at process start, before anything imports your models
+```
+
+It replaces `BaseModel.__repr__`, `__str__` and `__rich_repr__` process-wide
+with a **fuel gauge**: one top-level repr gets a budget of N characters, nested
+calls spend from it, and when it runs out everything returns `...`. Depth,
+sharing, payload size and object count stop mattering, because the budget is on
+the work rather than on the shape of the data.
+
+Same scenario as above, model depth 10, group of 6:
+
+| | before | after |
+|---|---|---|
+| `repr()` | 59,368 B | 4,096 B |
+| `f"{model!r}"` | 59,368 B | 4,096 B |
+| logging `"%r"` | 59,368 B | 4,096 B |
+| sentry + ExceptionGroup | 712,531 B | 49,267 B |
+| rich `show_locals` | **34.4s / 9.9 MB** | **0.13s / 38 KB** |
+| `model_dump_json()` | 59,368 B | 59,368 B (deliberately untouched) |
+
+`__rich_repr__` has to be patched separately: pydantic implements rich's
+protocol, and rich drives its own recursion through it and never calls
+`__repr__` at all. That is why the `BoundedReprModel` base class did not help
+rich earlier.
+
+## The budget is a real budget
+
+`test_hermetic.py` tries to break it - deep DAGs (depth 200), wide-and-deep with
+40-way fan-out, a 10 MB string field, a 5 MB bytes field, a million-element list:
+
+```
+worst case: 4096 chars against a 4096 budget -> bounded
+```
+
+Two mechanisms, because one is not enough. The fuel gauge bounds the **work**
+(it stops the traversal). A hard slice at the top level bounds the **output**
+exactly, mopping up the handful of characters each level can overshoot by as the
+stack unwinds. The gauge alone leaked to 5,096 on the depth-200 case.
+
+## What it deliberately does not seal
+
+`model_dump_json()`. Silently truncating a serialiser corrupts real data that
+something downstream is depending on - worse than the hang. That path gets a
+loud guard instead:
+
+```python
+hermetic.guard_dumps(state)
+# ReprBudgetExceeded: serialising this Turn would expand to ~63,773,821,894,630
+# bytes; shared nodes: Turn x1,099,511,627,776, Turn x549,755,813,888, ...
+```
+
+The prediction is O(V+E), so the check costs microseconds even when the answer
+is 64 TB.
+
+## Hermetic is not a substitute for the data fix
+
+It is a seal, and seals are for things you cannot enumerate: third-party models,
+code you have not written yet, the exception side, the next library that decides
+to walk your objects. It buys unbounded time. It does not make
+`model_dump_json()` fast, and that is still what timed out.
+
+Do both: `seal()` today so nothing can wedge the process again, then remove the
+duplicate reference so the serialiser is fast too.
