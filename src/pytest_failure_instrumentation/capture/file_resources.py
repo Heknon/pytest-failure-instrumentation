@@ -34,8 +34,10 @@ class Scanner:
         page_size = self.db.execute("PRAGMA page_size").fetchone()[0]
         self.db.execute(f"PRAGMA max_page_count={self.max_bytes // page_size}")
         self.db.execute("PRAGMA journal_mode=DELETE")  # rollback a failed/full inventory safely
-        self.db.execute("CREATE TABLE baseline(path TEXT PRIMARY KEY, size INTEGER)")
-        self.db.execute("CREATE TABLE current(path TEXT PRIMARY KEY, size INTEGER)")
+        # SQLite TEXT rejects lone surrogates from undecodable filenames.
+        # Store lossless bytes internally; decoded paths remain strings on the wire.
+        self.db.execute("CREATE TABLE baseline(path BLOB PRIMARY KEY, size INTEGER)")
+        self.db.execute("CREATE TABLE current(path BLOB PRIMARY KEY, size INTEGER)")
         self.baseline: dict[str, Any] | None = None
 
     def scan(self) -> dict[str, Any]:
@@ -89,7 +91,7 @@ class Scanner:
                                     capped = True
                                     break
                                 self.db.execute("INSERT OR REPLACE INTO current VALUES (?, ?)",
-                                                (str(path.relative_to(self.root)), info.st_size))
+                                                (str(path.relative_to(self.root)).encode("utf-8", "surrogatepass"), info.st_size))
                                 count += 1
                                 total += info.st_size
                         except OSError:
@@ -127,7 +129,7 @@ class Scanner:
             result["grown_existing_bytes"] = self.db.execute(
                 "SELECT COALESCE(SUM(c.size-b.size),0) FROM current c JOIN baseline b ON c.path=b.path "
                 "WHERE c.size>b.size").fetchone()[0]
-            result["largest_growth"] = [{"path": row[0][:1024], "logical_bytes": row[1], "growth_bytes": row[2]}
+            result["largest_growth"] = [{"path": row[0].decode("utf-8", "surrogatepass")[:1024], "logical_bytes": row[1], "growth_bytes": row[2]}
                 for row in self.db.execute(
                     "SELECT c.path, c.size, c.size-COALESCE(b.size,0) AS growth FROM current c "
                     "LEFT JOIN baseline b ON c.path=b.path WHERE growth>0 ORDER BY growth DESC LIMIT 20")]

@@ -70,7 +70,7 @@ def worker_key(worker: str) -> list:
 def digest_of(identifiers: Iterable[str]) -> str:
     hasher = hashlib.sha1()
     for identifier in identifiers:
-        hasher.update(identifier.encode("utf-8"))
+        hasher.update(identifier.encode("utf-8", "surrogatepass"))
         hasher.update(b"\0")
     return hasher.hexdigest()[:12]
 

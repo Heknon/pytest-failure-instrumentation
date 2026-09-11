@@ -1438,13 +1438,19 @@ class IncidentEngine:
             return
         folder = self.directory / "profiles"
         folder.mkdir(exist_ok=True)
+        occurrences: dict[str, int] = {}
         for record in wanted:
             nodeid = record.get("nodeid") or f"background-{record.get('worker') or 'main'}"
             # Readable, and unique: sanitising alone maps test_x[a/b] and
             # test_x[a_b] to one name, and the second would overwrite the
             # first. A hash of the full name and the worker tells them apart.
-            digest = hashlib.sha1(f"{record.get('worker')}|{nodeid}".encode()).hexdigest()[:8]
+            digest = hashlib.sha1(f"{record.get('worker')}|{nodeid}".encode("utf-8", "surrogatepass")).hexdigest()[:8]
             name = f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', str(nodeid))[:110]}-{digest}"
+            # Reruns and separate background windows share an identity but
+            # carry different samples. Keep each instead of overwriting it.
+            occurrences[name] = occurrences.get(name, 0) + 1
+            if occurrences[name] > 1:
+                name = f"{name}-{occurrences[name]}"
             documents = {
                 f"{name}.speedscope.json": analysis.speedscope(record, str(nodeid)),
                 f"{name}.memory.speedscope.json": analysis.memory_speedscope(record, str(nodeid)),

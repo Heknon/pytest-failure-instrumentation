@@ -10,13 +10,15 @@ Field types are deliberately loose - ``str``, not ``Literal``. This code runs
 while something is already going wrong, and a validation error raised out of a
 crash-reporting path would end the very run it exists to explain.
 
-The *shape* is open for the same reason, one step further out: ``extra="allow"``
+Starting in 0.12, the *shape* is open for the same reason, one step further out: ``extra="allow"``
 means a field added by a later release does not break a consumer pinned to an
 earlier one. Their models simply do not know the new column, keep it as an
 extra rather than dropping it - so a row they read and write back still
 carries it - and carry on. This package adds payload fields as it learns to
 measure more, and ``extra="forbid"`` made every one of those additions a
 break: the reader raised on the field rather than on anything being wrong.
+Consumers on 0.11 or earlier still reject new fields: upgrade readers before
+producers when crossing that boundary. Unknown kinds still need new models.
 
 What that costs is a builder inventing a field being caught at construction.
 That guard moves to the suite, where every incident any test produces is

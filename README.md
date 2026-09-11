@@ -310,6 +310,14 @@ incident = registry.parse(json.loads(row))   # -> WorkerDeathIncident, ...
 registry.json_schema()
 ```
 
+**Upgrading incident consumers from 0.11 or earlier.** Upgrade readers to
+0.12 or later before upgrading the pytest producers. Older readers reject
+new payload fields, including the new hash fields even when their value is
+null. The permissive models introduced in 0.12 protect readers on 0.12 or
+later against added fields; they do not change already-installed 0.11 readers.
+If readers cannot be upgraded first, keep producers pinned until they can.
+Unknown incident kinds still require a reader upgrade.
+
 **Every node id in the payload is paired with its hash.** Wherever an incident
 names a test there are two fields: the id as text, for a person to read, and
 the `sha256` of the whole id, for you to store and join on —
@@ -2340,7 +2348,9 @@ test a finding names, and for the gaps between tests, under
 `<run directory>/profiles/` (`<test>-<hash>.speedscope.json` for CPU, and
 with allocation tracing on `<test>-<hash>.memory.speedscope.json` for the
 allocations at its peak; the hash is of the full node id, so two names that
-sanitise alike cannot overwrite each other). The raw per-test records are in `<worker>.profile.jsonl` beside
+sanitise alike cannot overwrite each other). Repeated executions and separate
+background windows receive `-2`, `-3`, and later suffixes after the hash,
+keeping each window's CPU and memory profiles. The raw per-test records are in `<worker>.profile.jsonl` beside
 the rest of the evidence, timeline included — each carrying the test's
 `nodeid` and, beside it, `nodeid_hash`: the sha256 of the whole id, the column
 these records join to the findings and the worker rows on. The findings
