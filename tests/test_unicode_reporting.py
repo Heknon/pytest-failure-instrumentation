@@ -1,6 +1,7 @@
 """Reporting must preserve IDs and filenames containing undecodable bytes."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -90,17 +91,26 @@ def test_profile_export_preserves_repeated_tests_and_background_windows(pytester
                   if p["unit"] == "bytes") == [1024, 2048]
 
 
-@pytest.mark.skipif(os.name != "posix", reason="undecodable POSIX filename bytes")
-def test_file_inventory_preserves_undecodable_names_across_scans(tmp_path):
+@pytest.mark.parametrize("names", [
+    pytest.param(("café", "naïve"), id="unicode"),
+    pytest.param(("bad_\udcff", "bad_\udcfe"), id="undecodable",
+                 marks=pytest.mark.skipif(os.name != "posix", reason="undecodable POSIX filename bytes")),
+])
+def test_file_inventory_preserves_undecodable_names_across_scans(tmp_path, names):
     root = tmp_path / "files"
     root.mkdir()
-    existing = root / "bad_\udcff"
-    existing.write_bytes(b"old")
+    existing = root / names[0]
+    try:
+        existing.write_bytes(b"old")
+    except OSError as error:
+        if error.errno == errno.EILSEQ:
+            pytest.skip("this filesystem rejects undecodable filename bytes")
+        raise
     scanner = Scanner(root, tmp_path / "inventory.sqlite", 100, tmp_path / "excluded", lambda _: None)
     try:
         assert scanner.scan()["baseline"]["file_count"] == 1
         existing.write_bytes(b"grown")
-        added = root / "bad_\udcfe"
+        added = root / names[1]
         added.write_bytes(b"new file")
         result = scanner.scan()
         assert result["status"] == "complete"
