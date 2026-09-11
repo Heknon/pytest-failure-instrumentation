@@ -46,10 +46,16 @@ def hash_of(nodeid: str | None) -> str | None:
     has no test to identify, and a constant hash in that column is an id every
     idle worker in the fleet would share - which is exactly the join a
     consumer would then make.
+
+    Encode as UTF-8 with ``surrogatepass``. Python uses surrogate escapes for
+    undecodable filesystem bytes, and collectors can also supply lone
+    surrogates. Preserve them deterministically rather than raising or
+    replacing distinct ids with the same text. Ordinary UTF-8 hashes do not
+    change.
     """
     if not nodeid:
         return None
-    return hashlib.sha256(nodeid.encode("utf-8")).hexdigest()
+    return hashlib.sha256(nodeid.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def hashes_of(nodeids: Iterable[str]) -> list[str]:

@@ -322,6 +322,9 @@ elided on its way here and the hash never is: it is taken from the whole id at
 the moment the id was known, is 64 hex characters whatever the id was, and
 hashing the text yourself will not reproduce it when the text was cut. List
 hashes are positional, index for index. A null id has a null hash.
+Hashes use UTF-8 with Python's `surrogatepass` error handler, preserving lone
+surrogates (including undecodable filename bytes) without changing hashes of
+ordinary Unicode IDs. Consumers should use the exported `hash_of` helper.
 
 ```python
 from pytest_failure_instrumentation import hash_of
