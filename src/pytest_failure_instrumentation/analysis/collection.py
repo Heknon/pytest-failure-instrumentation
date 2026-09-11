@@ -162,7 +162,7 @@ class CollectionTracker:
                     break
             if rows:
                 samples.append(
-                    {"test": test, "test_hash": hash_of(test) or "", "workers": rows}
+                    {"test": test, "test_hash": hash_of(test), "workers": rows}
                 )
         return samples
 

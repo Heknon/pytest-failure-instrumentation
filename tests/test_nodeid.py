@@ -17,6 +17,7 @@ import pkgutil
 import pytest
 from pydantic import BaseModel
 
+from pytest_failure_instrumentation.incidents import registry
 from pytest_failure_instrumentation.incidents.collection import (
     CollectionMismatchIncident,
     CollectionVariant,
@@ -192,3 +193,61 @@ def test_a_node_id_field_added_later_is_not_forgotten():
                     f"{model.__name__}.{name} holds a node id and has no hash "
                     "beside it; add the pair to NODE_ID_FIELDS once it does"
                 )
+
+
+# --- backwards compatibility -------------------------------------------
+
+#: One row per kind, shaped the way a version before the hashes existed wrote
+#: them: the node id fields are there and no hash field is. A consumer's table
+#: is full of these, and they have to keep parsing.
+ROWS_WITHOUT_HASHES = [
+    {"kind": "worker_death", "worker": "gw1", "verdict": "SIGNAL_SEGV",
+     "test_in_flight": "t.py::test_a", "last_test": "t.py::test_a", "phase": "call"},
+    {"kind": "worker_stall", "worker": "gw2", "verdict": "STALLED_BLOCKED",
+     "test_in_flight": "t.py::test_b", "state": "BLOCKED"},
+    {"kind": "internal_error", "worker": "gw0", "verdict": "INTERNAL_ERROR",
+     "test_in_flight": "t.py::test_c", "exception": "KeyError: x"},
+    {"kind": "cpu_hotspot", "worker": "gw0", "verdict": "PYTHON_CODE",
+     "tests": ["t.py::test_d"], "test_count": 1},
+    {"kind": "cpu_burst", "worker": "gw0", "verdict": "LONG_BURST",
+     "nodeid": "t.py::test_e", "tests": ["t.py::test_e"]},
+    {"kind": "memory_profile", "worker": "gw0", "verdict": "RETAINED_AFTER_TEST",
+     "nodeid": "t.py::test_f", "tests": ["t.py::test_f"], "delta_mb": 42},
+    {"kind": "collection_mismatch", "worker": "controller",
+     "verdict": "COLLECTION_MEMBERSHIP_DIFFERS", "unstable_tests": ["t.py::test_g"],
+     "variants": [{"digest": "abc", "missing": ["t.py::test_g"], "extra": []}],
+     "parameter_samples": [{"test": "t.py::test_g", "workers": []}]},
+]
+
+
+@pytest.mark.parametrize(
+    "row", ROWS_WITHOUT_HASHES, ids=lambda row: row["kind"]
+)
+def test_a_row_written_before_the_hashes_existed_still_parses(row):
+    """Every hash is optional, so adding them did not invalidate anybody's
+    stored rows. A required one would make the whole history unreadable on the
+    upgrade that introduced it."""
+    incident = registry.parse(row)
+    assert str(incident)
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "companion"),
+    NODE_ID_FIELDS,
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+def test_no_hash_is_ever_required(model, field, companion):
+    assert not model.model_fields[companion].is_required()
+
+
+def test_a_missing_hash_reads_as_missing_rather_than_as_a_value():
+    """Absent, not empty. A consumer joining on this column must not match a
+    pre-hash row against the test whose id hashes to the empty string - and
+    must not match those rows to each other either."""
+    death = registry.parse(ROWS_WITHOUT_HASHES[0])
+    assert death.test_in_flight_hash is None and death.last_test_hash is None
+
+    mismatch = registry.parse(ROWS_WITHOUT_HASHES[6])
+    assert mismatch.parameter_samples[0].test_hash is None
+    assert mismatch.unstable_test_hashes == []
+    assert mismatch.variants[0].missing_hashes == []

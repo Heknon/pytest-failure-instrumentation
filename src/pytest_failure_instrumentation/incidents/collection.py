@@ -37,8 +37,11 @@ class UnstableParameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     test: str
-    #: The sha256 of that id - see :mod:`..nodeid`.
-    test_hash: str = ""
+    #: The sha256 of that id - see :mod:`..nodeid`. Optional like every other
+    #: hash here, and null rather than empty when absent: a row written before
+    #: these existed has no hash, and "" is a value rather than the absence of
+    #: one.
+    test_hash: Optional[str] = None
     #: worker id -> the parameter values that worker collected.
     workers: list[dict[str, Any]] = Field(default_factory=list)
 
