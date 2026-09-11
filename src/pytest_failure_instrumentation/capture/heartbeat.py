@@ -46,12 +46,9 @@ class Heartbeat:
         self.observers = observers or []
         #: Called on every wake, with nothing. Must be cheap.
         self.tickers = tickers or []
-        self._nodeid: str | None = None
-        #: The sha256 of the whole id beside it - see :mod:`..nodeid`. Kept in
-        #: step by the setter below rather than by whoever assigns the id: a
-        #: beat carrying one test's text and another's hash is worse than a
-        #: beat carrying neither.
-        self.nodeid_hash: str | None = None
+        # Publish both values together. Hashing long ids releases the GIL,
+        # so separate assignments can expose a new id with the previous hash.
+        self._identity: tuple[str | None, str | None] = (None, None)
         self.phase: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -61,14 +58,18 @@ class Heartbeat:
     @property
     def nodeid(self) -> str | None:
         """The test in flight, as the recorder last set it."""
-        return self._nodeid
+        return self._identity[0]
 
     @nodeid.setter
     def nodeid(self, value: str | None) -> None:
-        if value == self._nodeid:
+        if value == self._identity[0]:
             return  # the recorder sets it once per phase, with the same id
-        self._nodeid = value
-        self.nodeid_hash = hash_of(value)
+        self._identity = (value, hash_of(value))
+
+    @property
+    def nodeid_hash(self) -> str | None:
+        """The hash of the whole id in the latest published identity."""
+        return self._identity[1]
 
     def start(self) -> None:
         # A baseline beat before any test can seize the interpreter. Without it
@@ -99,18 +100,24 @@ class Heartbeat:
         for ticker in self.tickers:
             ticker.stop()
 
-    def _beat(self) -> int | None:
+    def _beat(self, *, notify_observers: bool = False) -> int | None:
         from .. import probes
 
         resident, _source = probes.resident_megabytes()
+        # Read once: event-log I/O and observers can yield to the recorder.
+        # Every consumer of this measurement must use this same identity.
+        nodeid, nodeid_hash = self._identity
         self.record(
             "heartbeat",
             cpu_seconds=round(time.process_time(), 3),
             rss_mb=resident,
-            nodeid=self.nodeid,
-            nodeid_hash=self.nodeid_hash,
+            nodeid=nodeid,
+            nodeid_hash=nodeid_hash,
             phase=self.phase,
         )
+        if notify_observers:
+            for observer in self.observers:
+                observer.observe(resident, nodeid, nodeid_hash)
         return resident
 
     def _run(self) -> None:
@@ -122,6 +129,4 @@ class Heartbeat:
             if time.monotonic() < due:
                 continue
             due = time.monotonic() + self.interval
-            resident = self._beat()
-            for observer in self.observers:
-                observer.observe(resident, self.nodeid, self.nodeid_hash)
+            self._beat(notify_observers=True)

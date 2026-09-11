@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import pkgutil
 
 import pytest
@@ -90,6 +91,43 @@ def test_non_ascii_ids_hash_as_utf_8():
     to be the one every other reader will assume."""
     nodeid = "t.py::test_x[é中文]"
     assert hash_of(nodeid) == hashlib.sha256(nodeid.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("character", ["\udcff", "\ud800", "\udfff"])
+def test_surrogate_ids_have_distinct_lossless_hashes(character):
+    nodeid = f"t.py::test_x[{character}]"
+    expected = hashlib.sha256(nodeid.encode("utf-8", "surrogatepass")).hexdigest()
+    assert hash_of(nodeid) == expected
+    assert hash_of(nodeid) != hash_of("t.py::test_x[?]")
+    assert hash_of(nodeid) != hash_of("t.py::test_x[\ufffd]")
+
+
+def test_a_surrogate_nodeid_does_not_break_a_passing_run(pytester):
+    # A collector can produce surrogates on any platform; POSIX also uses
+    # them to represent filenames with undecodable bytes. Disable pytest's
+    # own cache writer, whose strict UTF-8 output is independent of capture.
+    pytester.makeconftest(r'''
+def pytest_collection_modifyitems(items):
+    for item in items:
+        item._nodeid += "[\udcff]"
+''')
+    pytester.makepyfile('''
+import json
+from pathlib import Path
+from pytest_failure_instrumentation.capture.state import read_state
+
+def test_ok():
+    slot, = Path(".pytest-failures").glob("*/main.state")
+    Path("seen.json").write_text(json.dumps(read_state(slot)), encoding="utf-8")
+''')
+    result = pytester.runpytest_subprocess(
+        "--failure-instrumentation", "-p", "no:cacheprovider", "-q"
+    )
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0
+    row = json.loads((pytester.path / "seen.json").read_text(encoding="utf-8"))
+    assert row["nodeid"].endswith("[\udcff]")
+    assert row["nodeid_hash"] == hash_of(row["nodeid"])
 
 
 # --- the payload contract ----------------------------------------------
