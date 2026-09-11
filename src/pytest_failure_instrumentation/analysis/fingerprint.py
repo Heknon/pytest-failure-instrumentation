@@ -28,4 +28,4 @@ def of(incident: Incident, frame: Frame | None) -> str:
             getattr(incident, "phase", None) or "no-phase",
             nodeid.split("::")[0] or "no-test",
         ]
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1("|".join(parts).encode("utf-8", "surrogatepass")).hexdigest()[:16]
