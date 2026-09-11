@@ -50,6 +50,10 @@ class SampledWorker(BaseModel):
     worker: str = ""
     pid: Optional[int] = None
     nodeid: Optional[str] = None
+    #: The sha256 of the whole node id - see :mod:`.nodeid`. The text above is
+    #: what the worker's fixed-size slot could hold; this is what identifies
+    #: the test whether or not that was all of it.
+    nodeid_hash: Optional[str] = None
     phase: Optional[str] = None
 
     #: ``working`` / ``blocked`` / ``frozen`` / ``gone`` / ``unmeasured`` -
@@ -142,6 +146,7 @@ class WorkerSampler:
                     worker=record.get("worker") or "",
                     pid=record.get("pid"),
                     nodeid=record.get("nodeid"),
+                    nodeid_hash=record.get("nodeid_hash"),
                     phase=record.get("phase"),
                     status=record.get("status") or "",
                     why=record.get("why") or "",

@@ -19,7 +19,7 @@ from .base import Incident
 
 
 class RunSummaryIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 

@@ -21,6 +21,13 @@ object does not parse, and the reader then loses the phase and the counters
 too, and reports a worker that died mid-test as one that died before running
 anything.
 
+A trimmed id is still not the id, and two cases that differ only in the part
+that was dropped trim to the same text. So each id is written twice: the text,
+elided when it had to be, and the sha256 of the *whole* id beside it - taken
+before anything is cut, 64 characters whatever the id was, and therefore of a
+fixed cost to the slot. See :mod:`..nodeid`. The hash is what a reader joins
+on; the text is what a person reads.
+
 There are two of them, and the difference is the whole reason this file is
 read at all. ``nodeid`` is the test *in flight* and is cleared when the test
 ends; ``last_nodeid`` is the most recent test whether or not it finished. A
@@ -49,10 +56,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..nodeid import hash_of
+
 #: One write of one buffer, so the size is nearly free - see the module
-#: docstring. This leaves around 4950 bytes for a node id, which is past any
-#: real one by an order of magnitude: a path, a class, a test name and a
-#: couple of content hashes together use a twentieth of it.
+#: docstring. The record holds the id twice - in flight and last - and a hash
+#: of each, so around 2350 characters of an id survive whole, which is past
+#: any real one by an order of magnitude: a path, a class, a test name and a
+#: couple of content hashes together use a fiftieth of it.
 SLOT_SIZE = 5 * 1024
 
 #: Marks the part of a node id that did not fit, so a reader can tell an
@@ -103,6 +113,12 @@ class WorkerState:
         #: module docstring: "which test was it in" and "which test was it
         #: last in" are different questions and only one of them is a finding.
         self.last_nodeid: str | None = None
+        #: The sha256 of each of the two, whole - see :mod:`..nodeid`. Written
+        #: beside the text and never elided, because the text can be: an id
+        #: that lost its middle is no longer an identity, and the pair is what
+        #: lets a reader have both.
+        self.nodeid_hash: str | None = None
+        self.last_nodeid_hash: str | None = None
         self.phase: str | None = None
         #: When the current phase began, and when the current *test* began
         #: (its setup). These clocks let the controller correlate death with
@@ -125,12 +141,21 @@ class WorkerState:
         #: was kept. update() runs six times per test with the same ids, and
         #: the search below is the only expensive thing in this file.
         self._trimmed: tuple[tuple[str | None, str | None], int] | None = None
+        #: The pair the hashes above were taken of, so that six updates with
+        #: the same ids hash them once. Hashing is cheap, but so is a write,
+        #: and nothing in this file is allowed to cost a test anything.
+        self._hashed: tuple[str | None, str | None] = (None, None)
 
     def update(self, **fields: Any) -> None:
         for name, value in fields.items():
             setattr(self, name, value)
         if self.nodeid:
             self.last_nodeid = self.nodeid
+        if self.nodeid != self._hashed[0]:
+            self.nodeid_hash = hash_of(self.nodeid)
+        if self.last_nodeid != self._hashed[1]:
+            self.last_nodeid_hash = hash_of(self.last_nodeid)
+        self._hashed = (self.nodeid, self.last_nodeid)
         self.sequence += 1
         payload_bytes = self._encode().ljust(SLOT_SIZE)
         try:
@@ -198,6 +223,11 @@ class WorkerState:
                 "created_at": self.created_at,
                 "nodeid": nodeid,
                 "last_nodeid": last_nodeid,
+                # Of the whole ids, whether or not the two above were cut to
+                # fit. Fixed width, so they are part of the budget the search
+                # in _encode works within rather than something it can trade.
+                "nodeid_hash": self.nodeid_hash,
+                "last_nodeid_hash": self.last_nodeid_hash,
                 "phase": self.phase,
                 "phase_started": self.phase_started,
                 "test_started": self.test_started,

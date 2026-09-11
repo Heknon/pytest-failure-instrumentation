@@ -17,6 +17,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from ..nodeid import hash_of
+
 DEFAULT_INTERVAL = 5.0
 
 #: How often the thread wakes, as against how often it beats. Work that only
@@ -44,12 +46,29 @@ class Heartbeat:
         self.observers = observers or []
         #: Called on every wake, with nothing. Must be cheap.
         self.tickers = tickers or []
-        self.nodeid: str | None = None
+        self._nodeid: str | None = None
+        #: The sha256 of the whole id beside it - see :mod:`..nodeid`. Kept in
+        #: step by the setter below rather than by whoever assigns the id: a
+        #: beat carrying one test's text and another's hash is worse than a
+        #: beat carrying neither.
+        self.nodeid_hash: str | None = None
         self.phase: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="failure-heartbeat", daemon=True
         )
+
+    @property
+    def nodeid(self) -> str | None:
+        """The test in flight, as the recorder last set it."""
+        return self._nodeid
+
+    @nodeid.setter
+    def nodeid(self, value: str | None) -> None:
+        if value == self._nodeid:
+            return  # the recorder sets it once per phase, with the same id
+        self._nodeid = value
+        self.nodeid_hash = hash_of(value)
 
     def start(self) -> None:
         # A baseline beat before any test can seize the interpreter. Without it
@@ -89,6 +108,7 @@ class Heartbeat:
             cpu_seconds=round(time.process_time(), 3),
             rss_mb=resident,
             nodeid=self.nodeid,
+            nodeid_hash=self.nodeid_hash,
             phase=self.phase,
         )
         return resident
@@ -104,4 +124,4 @@ class Heartbeat:
             due = time.monotonic() + self.interval
             resident = self._beat()
             for observer in self.observers:
-                observer.observe(resident, self.nodeid)
+                observer.observe(resident, self.nodeid, self.nodeid_hash)

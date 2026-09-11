@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import sys
 
+from pytest_failure_instrumentation.nodeid import hash_of
+
 from .conftest import needs_xdist
 
 pytestmark = needs_xdist
@@ -54,6 +56,10 @@ def test_a_blocked_thread_is_named_along_with_what_it_is_waiting_on(distributed)
     # little itself, which is why the busy threshold is not zero either.
     assert stall.cpu_rate is not None and stall.cpu_rate < 0.05
     assert stall.test_in_flight == "test_hang.py::test_deadlocks"
+    # The worker's own hash of the whole id, carried end to end. It is what a
+    # consumer joins on: the text above goes through a fixed-size slot and a
+    # long enough id reaches it - see pytest_failure_instrumentation.nodeid.
+    assert stall.test_in_flight_hash == hash_of("test_hang.py::test_deadlocks")
     assert stall.run_ending is True
     # The blamed frame must be the blocked test, not this plugin's own
     # heartbeat thread, which is the first one in the dump.

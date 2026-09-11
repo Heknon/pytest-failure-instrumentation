@@ -69,6 +69,7 @@ from statistics import median
 from typing import Any, Optional
 
 from ..analysis.attribution import Attributor
+from ..nodeid import hash_of, hashes_of
 from .sampler import BACKGROUND_RECORD, TEST_RECORD
 
 #: Owners a stack is charged to first. The runtime and a dependency are never
@@ -210,6 +211,17 @@ class Finding:
     machine_busy_percent: Optional[float] = None
     cpus: Optional[int] = None
     worker_count: int = 0
+    #: The sha256 of ``nodeid``, and of each id in ``tests`` in the same
+    #: order - see :mod:`..nodeid`. Derived rather than passed, and safe to
+    #: derive here because the ids a finding is built from come out of the
+    #: profiler's own log, which writes them whole: nothing on this path
+    #: elides, so hashing the text is hashing the id.
+    nodeid_hash: Optional[str] = None
+    test_hashes: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.nodeid_hash = hash_of(self.nodeid)
+        self.test_hashes = hashes_of(self.tests)
 
 
 @dataclass

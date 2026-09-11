@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import sys
@@ -14,6 +15,7 @@ import pytest
 from pytest_failure_instrumentation.capture.file_resources import Scanner
 from pytest_failure_instrumentation.capture.resource_history import ResourceHistory, read_history
 from pytest_failure_instrumentation.config import Settings
+from pytest_failure_instrumentation.nodeid import hash_of
 from pytest_failure_instrumentation.probes.resource_metrics import (
     PlatformMetrics,
     cgroup_metrics,
@@ -242,6 +244,10 @@ def test_resource_endpoint_uses_existing_auth_and_typed_client(tmp_path):
     sample = batch(time.time())
     sample["processes"][0]["metrics"].update(pss_bytes=8192, uss_bytes=4096)
     sample["processes"][0]["unavailable"] = {"swap_pss_bytes": "unsupported"}
+    # The inventory caps the id at a kilobyte and the hash is of the whole one,
+    # so the pair has to survive the wire and the typed model both.
+    sample["processes"][0]["nodeid"] = "t.py::test_a"
+    sample["processes"][0]["nodeid_hash"] = hash_of("t.py::test_a")
     store.append(sample)
     server = stack_server.StackService(0, directory=directory, token="secret")
     server.start()
@@ -258,6 +264,8 @@ def test_resource_endpoint_uses_existing_auth_and_typed_client(tmp_path):
                 assert process.metrics["pss_bytes"] == 8192
                 assert process.metrics["uss_bytes"] == 4096
                 assert process.unavailable["swap_pss_bytes"] == "unsupported"
+                assert process.nodeid == "t.py::test_a"
+                assert process.nodeid_hash == hash_of("t.py::test_a")
                 assert [p.worker for p in page.batches[0].processes] == ["gw0"]
                 with pytest.raises(BadRequest):
                     await client.resources("run", limit=0)
@@ -465,6 +473,33 @@ def test_real_sampler_round_trips_through_typed_http_client(tmp_path):
     finally:
         server.stop()
         sampler.close()
+
+
+def test_a_worker_row_carries_the_hash_of_the_whole_node_id(tmp_path):
+    """The inventory caps the id at a kilobyte, so the text in the row is not
+    always the id. The hash beside it is the worker's, taken of the whole one
+    before anything was cut - which is what makes the row joinable at all."""
+    from pytest_failure_instrumentation.capture.state import WorkerState
+
+    nodeid = "tests/e2e/test_replay.py::test_settles[" + "x" * 4000 + "]"
+    directory = tmp_path / "run"
+    directory.mkdir()
+    (directory / "owner.json").write_text(json.dumps({"pid": os.getpid()}))
+    state = WorkerState(directory / "gw0.state", os.getpid(), run_id="run")
+    state.update(nodeid=nodeid, phase="call")
+
+    sampler = ResourceSampler(directory, "run", Settings(resources_seconds=1))
+    try:
+        rows = [p for p in sampler.sample()["processes"] if p.get("role") == "worker"]
+        assert rows, "the sampler found no worker to report on"
+        row = rows[0]
+        assert row["nodeid"] != nodeid, "the cap is what this test is about"
+        assert row["nodeid_hash"] == hash_of(nodeid)
+        # And not of the text beside it, which is the whole distinction.
+        assert row["nodeid_hash"] != hash_of(row["nodeid"])
+    finally:
+        sampler.close()
+        state.close()
 
 
 def test_events_survive_failed_append_and_concurrent_arrival(tmp_path, monkeypatch):

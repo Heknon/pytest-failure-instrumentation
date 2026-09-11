@@ -119,8 +119,12 @@ class ResourceSampler:
                         self.inventory_at = 0.0
                     continue
                 self.unmapped_workers.discard(pid)
+                # The id is capped at a kilobyte here; the hash the worker
+                # took of the whole one is not capped at all - see
+                # :mod:`.nodeid`.
                 workers[visible] = {"worker": path.stem, "nodeid": (state.get("nodeid") or "")[:1024],
-                                "phase": state.get("phase"), "state_time": state.get("time", 0)}
+                                    "nodeid_hash": state.get("nodeid_hash"),
+                                    "phase": state.get("phase"), "state_time": state.get("time", 0)}
         return workers
 
     def _discover(self, workers: dict[int, dict[str, Any]], now: float) -> None:
@@ -249,6 +253,7 @@ class ResourceSampler:
                 worker = workers.get(key[0], {}) if row["role"] == "worker" else {}
                 processes.append({**row, "metrics": values, "unavailable": missing,
                                   "observed_at": time.time(), "nodeid": worker.get("nodeid"),
+                                  "nodeid_hash": worker.get("nodeid_hash"),
                                   "phase": worker.get("phase")})
             except psutil.NoSuchProcess:
                 self.event({"kind": "process_no_longer_observed", **row})

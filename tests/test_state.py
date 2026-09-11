@@ -15,6 +15,7 @@ from pytest_failure_instrumentation.capture.state import (
     WorkerState,
     read_state,
 )
+from pytest_failure_instrumentation.nodeid import hash_of
 
 # The long-but-ordinary shape: a real path, a class, and a parameter set
 # carrying content hashes. This is what the slot is sized to hold whole.
@@ -96,6 +97,50 @@ def test_a_record_stays_readable_as_the_counters_grow_digits(tmp_path):
         record = read_state(tmp_path / "gw0.state")
         assert record["tests_started"] == count
         assert record["nodeid"].startswith("tests/matrix/test_grid.py::")
+
+
+def test_the_hash_is_of_the_whole_id_even_when_the_text_is_not(tmp_path):
+    """What elision costs is identity, and this is what buys it back. The hash
+    is taken before anything is cut, so a reader that can no longer match the
+    text can still match on this - and two cases differing only in the part
+    that was dropped stay two."""
+    record = state_for(tmp_path, nodeid=OVERSIZED_NODEID, phase="call")
+    assert ELIDED in record["nodeid"]
+    assert record["nodeid_hash"] == hash_of(OVERSIZED_NODEID)
+    assert record["nodeid_hash"] != hash_of(record["nodeid"])
+
+
+def test_an_id_that_fits_is_hashed_the_same_way(tmp_path):
+    """One column, whether or not the id beside it had to give anything up:
+    a consumer joining on it never has to ask which case this row is."""
+    record = state_for(tmp_path, nodeid=HASHED_NODEID, phase="call")
+    assert record["nodeid"] == HASHED_NODEID
+    assert record["nodeid_hash"] == hash_of(HASHED_NODEID)
+
+
+def test_the_last_test_keeps_its_own_hash(tmp_path):
+    """The two ids are different questions and so are their hashes. A worker
+    between tests has nothing in flight to identify, and the test it last ran
+    is still identified."""
+    state = WorkerState(tmp_path / "gw0.state", 4242)
+    state.update(nodeid=OVERSIZED_NODEID, phase="call")
+    state.update(phase=None, nodeid=None)
+
+    record = read_state(tmp_path / "gw0.state")
+    assert record["nodeid"] is None and record["nodeid_hash"] is None
+    assert record["last_nodeid_hash"] == hash_of(OVERSIZED_NODEID)
+
+
+def test_the_hashes_cost_the_slot_the_same_whatever_the_id(tmp_path):
+    """They are what the id is not: a fixed width. So they are part of the
+    budget the elision search works within rather than something it trades
+    away, and the record still parses at any id length."""
+    state = WorkerState(tmp_path / "gw0.state", 4242)
+    for nodeid in ("t.py::test_a", HASHED_NODEID, "t.py::test_b[" + "x" * 20000 + "]"):
+        state.update(nodeid=nodeid, phase="call")
+        record = read_state(tmp_path / "gw0.state")
+        assert (tmp_path / "gw0.state").stat().st_size == SLOT_SIZE
+        assert record["nodeid_hash"] == hash_of(nodeid)
 
 
 def test_a_missing_file_reads_as_nothing_known(tmp_path):

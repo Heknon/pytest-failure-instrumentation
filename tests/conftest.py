@@ -14,8 +14,9 @@ import sys
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
-from pytest_failure_instrumentation.incidents.base import Incident
+from pytest_failure_instrumentation.incidents.base import Capabilities, Incident
 from pytest_failure_instrumentation.incidents.registry import parse
 from pytest_failure_instrumentation.probes import pyspy
 
@@ -126,6 +127,33 @@ def break_pytest():
 '''
 
 
+def _invented_fields(model: BaseModel, path: str = "") -> dict[str, Any]:
+    """Every field set on ``model``, or on anything under it, that the model
+    does not declare.
+
+    ``extra="allow"`` is there so a consumer on an older release keeps parsing
+    a payload that grew - see incidents/base.py. It is not there to let a
+    builder here write a misspelled key into a row nobody reads, and the models
+    no longer raise on one, so the suite looks instead.
+
+    :class:`Capabilities` is the exception and was open long before that: what
+    a machine could measure differs per platform, and it carries whatever this
+    one answered - ``ptrace_scope`` on Linux and not elsewhere. Its extras are
+    the payload rather than a mistake in it.
+    """
+    if isinstance(model, Capabilities):
+        return {}
+    found = {f"{path}{name}": value for name, value in (model.model_extra or {}).items()}
+    for name in type(model).model_fields:
+        value = getattr(model, name, None)
+        entries = value if isinstance(value, list) else [value]
+        for index, item in enumerate(entries):
+            if isinstance(item, BaseModel):
+                under = f"{path}{name}[{index}]." if isinstance(value, list) else f"{path}{name}."
+                found.update(_invented_fields(item, under))
+    return found
+
+
 class Runner:
     def __init__(self, pytester: pytest.Pytester) -> None:
         self.pytester = pytester
@@ -205,6 +233,14 @@ class Runner:
             # Every scenario doubles as a round-trip test: what a database
             # would store has to come back as the model it was written from.
             assert incident.model_dump() == raw, incident.kind
+            # And as the guard that `extra="allow"` gave up at construction:
+            # the models take a field they do not know so that a consumer on
+            # an older release keeps parsing, which means *our* builders have
+            # to be checked for inventing one somewhere other than the type.
+            # Nested too - a variant, a frame and a killer are each built
+            # from a dict of their own.
+            invented = _invented_fields(incident)
+            assert not invented, (incident.kind, invented)
             found.append(incident)
         return found
 

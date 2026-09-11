@@ -12,6 +12,8 @@ import sys
 
 import pytest
 
+from pytest_failure_instrumentation.nodeid import hash_of
+
 from .conftest import INNER_CONFTEST, needs_xdist
 
 pytestmark = needs_xdist
@@ -355,6 +357,9 @@ def test_the_opt_in_probes_name_the_line_holding_the_memory(distributed):
     mark = death.high_water[-1]
     assert mark["rss_mb"] >= 1
     assert mark["nodeid"] == "test_greedy.py::test_grows_then_dies"
+    # The heartbeat that took the mark carried the id's hash with it, so a
+    # high-water row joins to the incident and to the worker view.
+    assert mark["nodeid_hash"] == hash_of("test_greedy.py::test_grows_then_dies")
     # The allocating line, which is the whole reason the depth setting exists.
     assert any(
         "test_greedy.py" in entry["file"] for entry in mark["top_allocations"]

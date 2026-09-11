@@ -13,8 +13,14 @@ import sysconfig
 from typing import Any
 
 from pytest_failure_instrumentation.analysis.attribution import Attributor
+from pytest_failure_instrumentation.nodeid import hash_of, hashes_of
 from pytest_failure_instrumentation.profile import analysis
-from pytest_failure_instrumentation.profile.analysis import Thresholds, analyse, speedscope
+from pytest_failure_instrumentation.profile.analysis import (
+    Finding,
+    Thresholds,
+    analyse,
+    speedscope,
+)
 
 # Taken from the interpreter rather than written down: the attributor knows
 # the stdlib by where sysconfig says it is, and a hardcoded /usr/lib path only
@@ -292,6 +298,39 @@ class TestGarbageCollection:
         report = analyse([record("t::a", [stack([0], 10.0)], frames, gc_seconds=0.2)], attributor)
 
         assert not findings_of(report, "GC_PRESSURE")
+
+
+class TestNodeIdHashes:
+    """Every finding names tests, and a node id is not a storable identity on
+    its own - see :mod:`pytest_failure_instrumentation.nodeid`. The hashes are
+    derived here rather than carried, which is only safe because the ids a
+    finding is built from come out of the profiler's own log whole."""
+
+    def test_a_finding_about_one_test_carries_its_hash(self) -> None:
+        report = analyse(
+            [record("t::a", [], [], rss=(100, 260, 260), heap=(10, 170), blocks=(1000, 1100))],
+            attributor,
+        )
+
+        (finding,) = findings_of(report, "RETAINED_AFTER_TEST")
+        assert finding.nodeid == "t::a"
+        assert finding.nodeid_hash == hash_of("t::a")
+
+    def test_a_finding_naming_several_tests_hashes_each_in_order(self) -> None:
+        frames = [frame(PRODUCT, 14, "is_images_different"), frame(TEST, 30, "test_screen")]
+        report = analyse(
+            [record(f"t::{name}", [stack([0, 1], 8.0)], frames) for name in "abc"],
+            attributor,
+        )
+
+        (finding,) = findings_of(report, "PYTHON_CODE")
+        assert finding.tests
+        assert finding.test_hashes == hashes_of(finding.tests)
+
+    def test_a_finding_about_no_test_has_no_hash(self) -> None:
+        """Null rather than a constant: a finding that belongs to the run
+        rather than to a test must not join to one."""
+        assert Finding(kind="cpu_hotspot", verdict="X", evidence=[]).nodeid_hash is None
 
 
 # -- memory ---------------------------------------------------------------------

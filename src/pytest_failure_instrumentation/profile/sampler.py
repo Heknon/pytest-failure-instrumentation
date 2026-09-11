@@ -46,6 +46,7 @@ from pathlib import Path
 from types import CodeType
 from typing import Any, Callable, Optional
 
+from ..nodeid import hash_of
 from ..probes.platform_flags import IS_LINUX
 
 #: Seconds between samples. Fifty a second is enough to see a two-second
@@ -441,6 +442,9 @@ class _Window:
 
     def __init__(self, nodeid: Optional[str], rss_mb: Optional[int]) -> None:
         self.nodeid = nodeid
+        #: Taken once here rather than per record: the window outlives a
+        #: test's six phase transitions and the id does not change within it.
+        self.nodeid_hash = hash_of(nodeid)
         self.started = time.monotonic()
         self.cpu_started = time.process_time()
         self.rss_before = rss_mb
@@ -1263,6 +1267,10 @@ class Sampler:
             "record": kind,
             "worker": self.worker,
             "nodeid": window.nodeid,
+            # The sha256 of it, whole - so a consumer joins these records to
+            # the incidents and the worker rows on one column. See
+            # :mod:`..nodeid`.
+            "nodeid_hash": window.nodeid_hash,
             "cpus": os.cpu_count(),
             "wall_s": round(now - window.started, 4),
             "cpu_s": round(time.process_time() - window.cpu_started, 4),

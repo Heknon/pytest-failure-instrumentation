@@ -26,6 +26,7 @@ import pytest
 
 from pytest_failure_instrumentation import stack_server
 from pytest_failure_instrumentation.incidents import stack_server as stack_server_incident
+from pytest_failure_instrumentation.nodeid import hash_of
 from pytest_failure_instrumentation.probes import pyspy
 from pytest_failure_instrumentation.probes.platform_flags import (
     IS_LINUX,
@@ -1165,6 +1166,7 @@ def test_the_workers_endpoint_describes_the_run_it_is_serving(serving, tmp_path)
             {
                 "pid": os.getpid(),
                 "nodeid": "test_pool.py::test_writes",
+                "nodeid_hash": hash_of("test_pool.py::test_writes"),
                 "phase": "call",
                 "time": time.time(),
                 "tests_started": 3,
@@ -1187,6 +1189,9 @@ def test_the_workers_endpoint_describes_the_run_it_is_serving(serving, tmp_path)
     worker = described[0]["workers"][0]
     assert worker["worker"] == "gw0"
     assert worker["nodeid"] == "test_pool.py::test_writes"
+    # Served beside the text, so a consumer of the live view joins on the same
+    # column the incidents carry.
+    assert worker["nodeid_hash"] == hash_of("test_pool.py::test_writes")
     assert worker["process_exists"] is True
 
 

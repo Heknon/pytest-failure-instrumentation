@@ -25,6 +25,11 @@ Nothing here imports pydantic. The incident models do, and they are loaded on
 the controller only, once something has already gone wrong - so a worker's
 per-test path is unaffected by any of it.
 
+Every node id this package records is recorded with the sha256 of the whole id
+beside it, because the text can be elided to fit where the hash never is - see
+:mod:`.nodeid`, whose ``hash_of`` is exported here for a consumer joining its
+own node ids against stored rows.
+
 A product reading a run's live view from outside it wants
 :class:`~.client.FailureServerClient`, which is async and needs httpx - so it
 lives in its own module behind the ``client`` extra, and nothing on a run's own
@@ -32,8 +37,9 @@ path imports it.
 """
 
 from .config import Settings
+from .nodeid import hash_of
 from .registration import install, installed_settings
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
-__all__ = ["Settings", "__version__", "install", "installed_settings"]
+__all__ = ["Settings", "__version__", "hash_of", "install", "installed_settings"]

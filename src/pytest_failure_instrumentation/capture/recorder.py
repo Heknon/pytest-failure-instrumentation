@@ -516,7 +516,10 @@ class WorkerRecorder:
         # there, so the INTERNALERROR block shows xdist's frame rather than
         # this failure. Record the real one, attributed to this worker.
         self.events.record(
-            "internal_error", detail=str(excrepr), nodeid=self.state.nodeid
+            "internal_error",
+            detail=str(excrepr),
+            nodeid=self.state.nodeid,
+            nodeid_hash=self.state.nodeid_hash,
         )
 
     def close(self) -> None:

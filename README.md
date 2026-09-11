@@ -310,6 +310,25 @@ incident = registry.parse(json.loads(row))   # -> WorkerDeathIncident, ...
 registry.json_schema()
 ```
 
+**Every node id in the payload is paired with its hash.** Wherever an incident
+names a test there are two fields: the id as text, for a person to read, and
+the `sha256` of the whole id, for you to store and join on —
+`test_in_flight` / `test_in_flight_hash`, `last_test` / `last_test_hash`,
+`nodeid` / `nodeid_hash`, and the lists `tests` / `test_hashes`,
+`missing` / `missing_hashes`, `extra` / `extra_hashes`,
+`unstable_tests` / `unstable_test_hashes`. Node ids have no length bound —
+a parametrize over file contents runs to kilobytes — so the text may have been
+elided on its way here and the hash never is: it is taken from the whole id at
+the moment the id was known, is 64 hex characters whatever the id was, and
+hashing the text yourself will not reproduce it when the text was cut. List
+hashes are positional, index for index. A null id has a null hash.
+
+```python
+from pytest_failure_instrumentation import hash_of
+
+incidents.find(test_in_flight_hash=hash_of("tests/e2e/test_replay.py::test_settles"))
+```
+
 **The stack** is in the payload but out of `str(incident)`, because forty
 frames turn a readable incident into a wall and whether they belong in an alert
 is your call. `incident.raw_stack()` returns them as lines whatever the kind is;
@@ -574,9 +593,10 @@ to a fixed-size slot with `os.pwrite` — one syscall, no append, no growth, and
 file that is the same size after a million tests as after one. That is what
 separates "died in teardown" from "died mid-call": pytest's own `logfinish`
 fires only after the whole protocol, so it cannot tell them apart. The slot is
-5 KiB, holding a node id of around 4950 characters whole — past any real one by
-an order of magnitude, since a path, a class, a test name and a couple of
-content hashes together use a twentieth of it. The size is close to free: one
+5 KiB. It carries the node id twice — the test in flight and the last test, see
+below — plus a hash of each, so an id of around 2350 characters is kept whole:
+past any real one by an order of magnitude, since a path, a class, a test name
+and a couple of content hashes together use a fiftieth of it. The size is close to free: one
 write of one buffer costs the same syscall from 256 bytes to 8 KiB, and 5 KiB
 per worker is 320 KiB across a 64-way run. An id longer than that gives up its
 *middle*, never the record: truncating the encoded record leaves it
@@ -595,6 +615,24 @@ between two tests came to be reported as having died *in* the one that had
 already passed — attributed to whoever owns it, with an owner and a severity on
 it. Where nothing is in flight the incident says so, and the lead it offers
 names itself as the last test rather than the running one.
+
+**And beside each id, the sha256 of the whole one.** Elision buys the record
+its fixed size and costs it an identity: two parametrized cases that differ
+only in the part that was dropped store as the same text, and nothing reading
+the slot can tell either from a short id that happens to look like it. So each
+of the two ids is written twice — `test_in_flight` and `last_test` for a person
+to read, `test_in_flight_hash` and `last_test_hash` for a consumer to join on.
+The hash is taken on the worker before anything is cut, is `sha256` of the
+whole id in hex, and is 64 characters however long the id was, which is why it
+costs the slot the same at any length. Node ids have no bound at all — a
+parametrize over file contents or a dozen-dimension matrix runs to kilobytes —
+so **match on the hash and show the text**. The same pair travels everywhere a
+node id is recorded: the worker rows `/workers` serves (`nodeid_hash`), the
+sample hook, the resource inventory, the profiler's own records and every
+profiling finding (`nodeid_hash`, `test_hashes`), and the ids a collection
+mismatch reports (`missing_hashes`, `extra_hashes`). A null id has a null hash
+rather than the hash of the empty string, so an idle worker never joins to a
+test.
 
 It carries the run id too. The evidence directory outlives a run and clearing
 it is best-effort — on Windows a file another process still has open cannot be
@@ -1233,16 +1271,19 @@ the run was writing anyway — no ptrace, no per-test cost, nothing written:
            "controller": {"pid": 17155, "alive": true},
            "schedule": {"dist": "load", "collected": 812, "unassigned": 240, "settled": false},
    "workers": [
-     {"worker": "gw0", "pid": 21615, "nodeid": "test_slow.py::test_alpha", "phase": "call",
-      "status": "blocked", "why": "heartbeat 0.5s old but no CPU progress: the test thread is waiting on something",
+     {"worker": "gw0", "pid": 21615, "nodeid": "test_slow.py::test_alpha",
+      "nodeid_hash": "c8f2a10d4b…", "phase": "call", "status": "blocked",
+      "why": "heartbeat 0.5s old but no CPU progress: the test thread is waiting on something",
       "process_exists": true, "heartbeat_age_s": 0.5, "cpu_rate": 0.001, "rss_mb": 32,
       "tests_finished": 51, "tests_running": 1, "tests_queued": 12, "tests_assigned": 64},
-     {"worker": "gw1", "pid": 21618, "nodeid": "test_slow.py::test_beta", "phase": "call",
-      "status": "gone", "why": "process 21618 no longer exists; last seen in call of test_slow.py::test_beta",
+     {"worker": "gw1", "pid": 21618, "nodeid": "test_slow.py::test_beta",
+      "nodeid_hash": "70b31ce9af…", "phase": "call", "status": "gone",
+      "why": "process 21618 no longer exists; last seen in call of test_slow.py::test_beta",
       "process_exists": false,
       "tests_finished": 12, "tests_running": 1, "tests_queued": 7, "tests_assigned": 20},
-     {"worker": "gw2", "pid": 21621, "nodeid": "test_slow.py::test_gamma", "phase": "call",
-      "status": "working", "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0,
+     {"worker": "gw2", "pid": 21621, "nodeid": "test_slow.py::test_gamma",
+      "nodeid_hash": "1d04e7b562…", "phase": "call", "status": "working",
+      "why": "heartbeat 0.3s old, burning 1.00 cores", "cpu_rate": 1.0,
       "tests_finished": 48, "tests_running": 1, "tests_queued": 11, "tests_assigned": 60}]}]}
 ```
 
@@ -1272,7 +1313,7 @@ number — and `/stack` for it is read exactly as any other pid is.
 $ curl localhost:8080/workers
 {"runs": [{"session": "run-8f21c0b4e5d7", "controller": {"pid": 4212, "alive": true},
    "workers": [{"worker": "main", "pid": 4212, "nodeid": "test_pool.py::test_writes",
-                "phase": "call", "status": "blocked",
+                "nodeid_hash": "5a9e0c31f7…", "phase": "call", "status": "blocked",
                 "why": "heartbeat 0.4s old but no CPU progress: the test thread is waiting on something"}]}]}
 
 $ curl 'localhost:8080/stack?pid=4212'
@@ -1334,7 +1375,10 @@ beats already on disk, because asking a wedged process a question can dissolve
 the stall you were measuring.
 
 `nodeid` and `phase` are `null` between tests, and a very long `nodeid` is
-trimmed from both ends with `nodeid_elided: true` saying so.
+trimmed from both ends with `nodeid_elided: true` saying so. `nodeid_hash` is
+the sha256 of the id the worker had, *whole*, taken before the slot trimmed
+anything — so it is what to match a row against a collection on, and the text
+beside it is what to show.
 
 ### How many tests each worker has
 
@@ -1629,6 +1673,9 @@ def pytest_failure_worker_sample(sample):
     for worker in sample.workers:
         rows.insert(session=sample.session_id, at=sample.observed_at,
                     worker=worker.worker, nodeid=worker.nodeid,
+                    # The id the worker had, whole, as sha256 — a node id has
+                    # no length bound and this column does not need one.
+                    nodeid_hash=worker.nodeid_hash,
                     phase=worker.phase, status=worker.status, why=worker.why,
                     rss_mb=worker.rss_mb, cpu_rate=worker.cpu_rate,
                     assigned=worker.tests_assigned, done=worker.tests_finished,
@@ -1868,7 +1915,10 @@ Measurements carry `metrics` and `unavailable` maps; units are in metric names.
 CPU rates use cores (`1.0` is one fully occupied core); host `cpu_percent`
 normalizes against logical CPUs. Cgroup CPU quota remains a separate limit.
 Descendants include `worker_exited` when their observed worker is no longer
-present. This does not automatically diagnose a leaked process.
+present. This does not automatically diagnose a leaked process. A worker's
+process row carries the test it was in as `nodeid`, capped at a kilobyte, and
+`nodeid_hash` — the sha256 of the *whole* id, which is what to join these rows
+to the worker rows and the incidents on.
 
 `after` is an exclusive sequence cursor. Continue with `next_after` while
 `has_more` is true, or pass it on the next poll. `limit` is 1–500 batches;
@@ -2288,7 +2338,11 @@ test a finding names, and for the gaps between tests, under
 with allocation tracing on `<test>-<hash>.memory.speedscope.json` for the
 allocations at its peak; the hash is of the full node id, so two names that
 sanitise alike cannot overwrite each other). The raw per-test records are in `<worker>.profile.jsonl` beside
-the rest of the evidence, timeline included.
+the rest of the evidence, timeline included — each carrying the test's
+`nodeid` and, beside it, `nodeid_hash`: the sha256 of the whole id, the column
+these records join to the findings and the worker rows on. The findings
+themselves carry the same pairing — `nodeid_hash` beside `nodeid`, and
+`test_hashes` positionally beside `tests`.
 
 ### What it cannot see
 
@@ -2415,8 +2469,11 @@ overwhelming majority of what runs.
 
 - Per test: six fixed-size writes to a file that never grows — two per phase,
   one as it opens and one as it closes, which is what separates "died in
-  teardown" from "died mid-call" — plus two clock reads. No append log, no
-  `/proc` read, no allocation tracking.
+  teardown" from "died mid-call" — plus two clock reads, and one `sha256` of
+  the node id for the hash the record carries beside it. Each of those is
+  taken once per test rather than once per write: the id does not change
+  within a test, and the writes are what the slot exists for. No append log,
+  no `/proc` read, no allocation tracking.
 - Per test that outlives `failure_slow_test_seconds` (measured setup through
   teardown): one ~5 KB stack dump every interval, written and renamed by the
   heartbeat thread, and an unlink when the test ends. Nothing accumulates

@@ -21,6 +21,7 @@ import pytest
 from pytest_failure_instrumentation import topology
 from pytest_failure_instrumentation.capture import events as events_module
 from pytest_failure_instrumentation.capture.events import TAIL_BYTES, tail_events
+from pytest_failure_instrumentation.nodeid import hash_of
 from pytest_failure_instrumentation.probes import is_running
 
 LIVE = os.getpid()
@@ -331,6 +332,25 @@ def test_an_elided_node_id_is_flagged(evidence):
 
     evidence.state("gw2", nodeid=None)
     assert evidence.worker("gw2")["nodeid_elided"] is False
+
+
+def test_the_row_carries_the_hash_the_worker_took_of_the_whole_id(evidence):
+    """An elided id is not an identity, and the row would otherwise have no
+    other. The hash is the worker's, taken before its slot cut anything, so it
+    is passed through rather than computed from the text that arrived."""
+    whole = hash_of("test_a.py::test_b[aaa-the-middle-zzz]")
+    evidence.state("gw0", nodeid="test_a.py::test_b[aaa...zzz]", nodeid_hash=whole)
+
+    row = evidence.worker("gw0")
+    assert row["nodeid_elided"] is True
+    assert row["nodeid_hash"] == whole
+    assert row["nodeid_hash"] != hash_of(row["nodeid"])
+
+
+def test_a_worker_with_no_test_has_no_hash_either(evidence):
+    """A constant in that column would be a test id every idle worker shares."""
+    evidence.state("gw0", nodeid=None, nodeid_hash=None)
+    assert evidence.worker("gw0")["nodeid_hash"] is None
 
 
 def test_a_worker_between_tests_reports_no_node_id(evidence):

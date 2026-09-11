@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pytest_failure_instrumentation.analysis import collection
+from pytest_failure_instrumentation.nodeid import hash_of, hashes_of
 
 
 def identifiers(*names):
@@ -92,6 +93,34 @@ def test_an_enormous_difference_is_capped_and_says_so():
     # The count is the truth; the list is what would fit.
     assert result["missing_count"] == 2000
     assert len(result["missing"]) == collection.IDS_KEPT
+
+
+def test_every_differing_id_has_its_hash_beside_it():
+    """The ids are what a person reads and the hashes are what a consumer
+    joins on: a node id has no length bound and the column somebody stores it
+    in does, so the pair is what survives being stored anywhere."""
+    result = collection.difference(identifiers(*"abcd"), identifiers("a", "e"))
+    assert result["missing_hashes"] == hashes_of(result["missing"])
+    assert result["extra_hashes"] == hashes_of(result["extra"])
+    # Positional, so the hash at index n is the id at index n and nothing else.
+    assert len(result["missing_hashes"]) == len(result["missing"])
+
+
+def test_the_hashes_are_capped_with_the_ids_they_describe():
+    """Read positionally, so a capped id list beside an uncapped hash list
+    would pair every row with the wrong test."""
+    baseline = [f"test_module.py::test_{n:05d}" for n in range(2000)]
+    result = collection.difference(baseline, [])
+    assert len(result["missing_hashes"]) == len(result["missing"]) == collection.IDS_KEPT
+
+
+def test_the_two_ids_that_diverged_are_hashed_too():
+    tracker = collection.CollectionTracker()
+    tracker.record("gw0", identifiers("a", "b", "c"))
+    tracker.record("gw1", identifiers("c", "b", "a"))
+
+    odd = tracker.summarise()["variants"][1]
+    assert odd["first_divergence_hashes"] == hashes_of(odd["first_divergence"])
 
 
 def test_ids_are_stable_across_runs():
@@ -193,6 +222,7 @@ def test_the_values_each_worker_produced_are_reported_side_by_side():
     samples = tracker.parameter_samples()
     assert len(samples) == 1
     assert samples[0]["test"] == "test_billing.py::test_invoice"
+    assert samples[0]["test_hash"] == hash_of("test_billing.py::test_invoice")
 
     rows = samples[0]["workers"]
     assert len(rows) == 3, "a few workers, not all of them"

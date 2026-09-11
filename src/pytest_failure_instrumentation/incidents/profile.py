@@ -45,14 +45,14 @@ def _on(worker: Optional[str]) -> str:
 
 
 class HotLine(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     line: int
     percent: float
 
 
 class CpuHotspotIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 
@@ -72,6 +72,10 @@ class CpuHotspotIncident(Incident):
     #: How many tests it was seen in, and the three it cost most in.
     test_count: int = 0
     tests: list[str] = Field(default_factory=list)
+    #: The sha256 of each of those ids, in the same order - see
+    #: :mod:`..nodeid`. A node id has no length limit and a column does, so
+    #: this is what a consumer keys on however the text beside it was stored.
+    test_hashes: list[str] = Field(default_factory=list)
     hottest_lines: list[HotLine] = Field(default_factory=list)
     #: The deepest frame the cost is under, for a LIBRARY_CALL: which library.
     below: Optional[Frame] = None
@@ -115,7 +119,7 @@ class CpuHotspotIncident(Incident):
 
 
 class CpuBurstIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 
@@ -124,6 +128,8 @@ class CpuBurstIncident(Incident):
     #: The test the burst was in, or None for one between tests or for the
     #: whole-run CONTENDED verdict.
     nodeid: Optional[str] = None
+    #: The sha256 of it, whole - see :mod:`..nodeid`.
+    nodeid_hash: Optional[str] = None
     phase: Optional[str] = None
     thread: Optional[str] = None
     #: How long the burst held the cores; for RECURRING_BURST the typical
@@ -143,6 +149,8 @@ class CpuBurstIncident(Incident):
     #: How many tests burst here, and the three that burnt most.
     test_count: int = 0
     tests: list[str] = Field(default_factory=list)
+    #: The sha256 of each of those ids, in the same order.
+    test_hashes: list[str] = Field(default_factory=list)
     #: The stack that was there for most of the burst, deepest first.
     stack: list[str] = Field(default_factory=list)
 
@@ -196,7 +204,7 @@ class CpuBurstIncident(Incident):
 
 
 class MemoryGrowth(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     tests: int
     per_test_mb: float
@@ -205,7 +213,7 @@ class MemoryGrowth(BaseModel):
 
 
 class MemoryProfileIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 
@@ -214,6 +222,8 @@ class MemoryProfileIncident(Incident):
     #: The test the finding is about: the one that kept or climbed, the first
     #: of a growing run, or the one where an imbalanced worker diverged.
     nodeid: Optional[str] = None
+    #: The sha256 of it, whole - see :mod:`..nodeid`.
+    nodeid_hash: Optional[str] = None
     #: Which phase the step landed in, when the boundary readings say.
     phase: Optional[str] = None
     before_mb: Optional[int] = None
@@ -227,6 +237,8 @@ class MemoryProfileIncident(Incident):
     worker_rss: dict[str, int] = Field(default_factory=dict)
     median_mb: Optional[int] = None
     tests: list[str] = Field(default_factory=list)
+    #: The sha256 of each of those ids, in the same order.
+    test_hashes: list[str] = Field(default_factory=list)
     #: The stack that was running while most of the memory climbed, deepest
     #: first, as faulthandler prints it. Empty for a finding that is not about
     #: one test's climb, or when nothing was seen climbing.
@@ -317,6 +329,7 @@ def build(finding: Finding, worker: str) -> Incident:
             thread=finding.thread,
             test_count=finding.test_count,
             tests=list(finding.tests),
+            test_hashes=list(finding.test_hashes),
             hottest_lines=[HotLine(line=line, percent=percent) for line, percent in finding.hottest_lines],
             below=below,
             stack=list(finding.stack),
@@ -328,6 +341,7 @@ def build(finding: Finding, worker: str) -> Incident:
             confidence="high" if finding.stack or finding.verdict == "CONTENDED" else "medium",
             evidence=list(finding.evidence),
             nodeid=finding.nodeid,
+            nodeid_hash=finding.nodeid_hash,
             phase=finding.phase,
             thread=finding.thread,
             burst_seconds=finding.burst_seconds,
@@ -339,6 +353,7 @@ def build(finding: Finding, worker: str) -> Incident:
             workers=finding.worker_count,
             test_count=finding.test_count,
             tests=list(finding.tests),
+            test_hashes=list(finding.test_hashes),
             stack=list(finding.stack),
         )
     return MemoryProfileIncident(
@@ -347,6 +362,7 @@ def build(finding: Finding, worker: str) -> Incident:
         confidence="high",
         evidence=list(finding.evidence),
         nodeid=finding.nodeid,
+        nodeid_hash=finding.nodeid_hash,
         phase=finding.phase,
         before_mb=finding.before_mb,
         after_mb=finding.after_mb,
@@ -364,6 +380,7 @@ def build(finding: Finding, worker: str) -> Incident:
         worker_rss=dict(finding.worker_rss),
         median_mb=finding.median_mb,
         tests=list(finding.tests),
+        test_hashes=list(finding.test_hashes),
         stack=list(finding.stack),
         climb_mb=finding.climb_mb,
         climb_total_mb=finding.climb_total_mb,
