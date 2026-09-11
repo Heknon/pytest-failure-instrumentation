@@ -33,7 +33,7 @@ EXCEPTION_LINE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt)\b
 
 
 class InternalErrorIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     # Nothing carries on past this: pytest tears the session down.
     ends_run: ClassVar[bool] = True

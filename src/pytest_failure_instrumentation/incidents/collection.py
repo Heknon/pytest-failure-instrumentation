@@ -34,7 +34,7 @@ WORKERS_SHOWN = 4
 class UnstableParameters(BaseModel):
     """One parametrized test, and what a few workers produced for it."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     test: str
     #: The sha256 of that id - see :mod:`..nodeid`. Optional like every other
@@ -49,7 +49,7 @@ class UnstableParameters(BaseModel):
 class CollectionVariant(BaseModel):
     """One distinct collection, and how it differs from the majority."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     digest: str
     workers: list[str] = Field(default_factory=list)
@@ -197,7 +197,7 @@ def _tests(count: int) -> str:
 
 
 class CollectionMismatchIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     #: Overridden per instance: see ends_this_run.
     ends_run: ClassVar[bool] = True

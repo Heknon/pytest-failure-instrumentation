@@ -40,7 +40,7 @@ BIND_REFUSED = "BIND_REFUSED"
 
 
 class StackServerIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 

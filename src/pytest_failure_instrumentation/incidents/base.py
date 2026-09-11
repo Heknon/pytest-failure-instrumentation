@@ -8,9 +8,20 @@ see :mod:`.registry` for parsing a stored row back into the right model.
 
 Field types are deliberately loose - ``str``, not ``Literal``. This code runs
 while something is already going wrong, and a validation error raised out of a
-crash-reporting path would end the very run it exists to explain. What is
-strict is the *shape*: ``extra="forbid"`` means a builder that invents a field
-is caught in development rather than writing a column nobody reads.
+crash-reporting path would end the very run it exists to explain.
+
+The *shape* is open for the same reason, one step further out: ``extra="allow"``
+means a field added by a later release does not break a consumer pinned to an
+earlier one. Their models simply do not know the new column, keep it as an
+extra rather than dropping it - so a row they read and write back still
+carries it - and carry on. This package adds payload fields as it learns to
+measure more, and ``extra="forbid"`` made every one of those additions a
+break: the reader raised on the field rather than on anything being wrong.
+
+What that costs is a builder inventing a field being caught at construction.
+That guard moves to the suite, where every incident any test produces is
+checked for extra fields, because catching our own typo is worth a test and is
+not worth rejecting somebody's stored row.
 
 Nothing here is imported by the worker-side capture path. The controller loads
 these models when it needs an incident or has a receiver for the run summary.
@@ -54,7 +65,7 @@ UNSET_RUN_ID = "unknown"
 class Frame(BaseModel):
     """One line of a stack, with the answer to "whose code is this"."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     file: str
     line: int
@@ -71,7 +82,7 @@ class Frame(BaseModel):
 
 
 class CgroupMemory(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     current_mb: Optional[int] = None
     peak_mb: Optional[int] = None
@@ -103,7 +114,7 @@ class Capabilities(BaseModel):
 class Incident(BaseModel):
     """The fields every kind shares. Subclass per kind; never emitted itself."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     #: True for kinds that end the session rather than costing it one worker.
     #: xdist replaces a dead worker and carries on; it cannot carry on past an

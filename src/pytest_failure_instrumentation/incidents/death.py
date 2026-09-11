@@ -109,7 +109,7 @@ def _crash_dump(path: Path, status: Optional[int]) -> list[str]:
 
 
 class WorkerDeathIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     # xdist starts a replacement worker and the run continues, so a death
     # costs the session one worker rather than ending it.

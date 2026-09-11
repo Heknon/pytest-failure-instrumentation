@@ -45,14 +45,14 @@ def _on(worker: Optional[str]) -> str:
 
 
 class HotLine(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     line: int
     percent: float
 
 
 class CpuHotspotIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 
@@ -119,7 +119,7 @@ class CpuHotspotIncident(Incident):
 
 
 class CpuBurstIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 
@@ -204,7 +204,7 @@ class CpuBurstIncident(Incident):
 
 
 class MemoryGrowth(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     tests: int
     per_test_mb: float
@@ -213,7 +213,7 @@ class MemoryGrowth(BaseModel):
 
 
 class MemoryProfileIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     ends_run: ClassVar[bool] = False
 

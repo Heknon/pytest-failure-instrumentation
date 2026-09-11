@@ -70,7 +70,7 @@ TRACE_POLL_SECONDS = 0.05
 class SignalRecord(BaseModel):
     """One signal somebody sent to a process of this run, and who."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     #: The signal number, or 0 for a Windows ``TerminateProcess``, whose
     #: ``name`` says so. ``exit_code`` is the observed victim exit status;
@@ -135,7 +135,7 @@ class OomKillRecord(BaseModel):
     """What the kernel printed when it chose this process, and the fleet
     around it at that instant."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     victim_pid: int
     victim_comm: str = ""
@@ -179,7 +179,7 @@ class OomKillRecord(BaseModel):
 class KillSources(BaseModel):
     """What each source said about itself, so an absence is never silent."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     kernel_log: str = "not consulted"
     signal_trace: str = "off"

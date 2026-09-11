@@ -52,7 +52,7 @@ SOURCE_WORDING = {
 
 
 class WorkerStallIncident(Incident):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     # The run cannot finish while a worker is wedged: xdist waits for work it
     # handed out and never gets back. That is an inference from the evidence at

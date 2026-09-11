@@ -54,9 +54,19 @@ def test_an_unknown_kind_is_rejected_rather_than_guessed():
         registry.parse({"kind": "something_new", "worker": "gw1"})
 
 
-def test_a_builder_that_invents_a_field_is_caught():
-    with pytest.raises(ValidationError):
-        WorkerDeathIncident(worker="gw1", exit_code_typo=3)
+def test_a_field_a_reader_does_not_know_is_kept_rather_than_rejected():
+    """The payload grows, and a consumer pinned to an older release must not
+    break when it does - their models do not know the new column and must
+    carry on. Kept rather than dropped, so a row they read and write back
+    still has it; see the module docstring in incidents/base.py.
+
+    What this gives up is a builder's typo raising at construction. That guard
+    is in conftest's round-trip instead, where it sees every incident any
+    scenario actually produces."""
+    incident = WorkerDeathIncident(worker="gw1", a_field_from_a_later_release=3)
+    assert incident.model_extra == {"a_field_from_a_later_release": 3}
+    assert incident.model_dump()["a_field_from_a_later_release"] == 3
+    assert str(incident)
 
 
 @pytest.mark.parametrize("model", EVERY_KIND, ids=lambda model: model.__name__)
