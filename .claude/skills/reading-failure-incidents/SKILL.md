@@ -68,8 +68,9 @@ wrong conclusion. Check this list before quoting a figure back to anyone.
 | `severity=critical` | urgency, blast radius | ownership routing. It says the blamed frame is in a package the project declared as its own — the same deadlock in a test file would be `informational` |
 | `suspect_owner` | who did it | who *might* have; set only when no stack named anybody |
 | `started=N finished=M` | throughput | where in the worker's life it died. `started=1 finished=0` is a death on the very first test, not a leak accumulating over a long worker lifetime |
-| `missing` / `extra` | the whole difference | capped at 500 per side. `missing_count` / `extra_count` are the true totals |
-| `test_in_flight` | the node id, verbatim | written to a fixed-size slot, so a very long id is elided from the middle and marked `...` — head and tail are kept, since the module is at the front and a parametrized hash at the end. Match on the parts, not the whole string, and do not report an elided id as the test's real name |
+| `missing` / `extra` | the whole difference | capped at 500 per side. `missing_count` / `extra_count` are the true totals. `missing_hashes` / `extra_hashes` are the sha256 of each id, positionally beside them |
+| `test_in_flight` | the node id, verbatim | written to a fixed-size slot, so a very long id is elided from the middle and marked `...` — head and tail are kept, since the module is at the front and a parametrized hash at the end. Do not report an elided id as the test's real name, and match on `test_in_flight_hash` rather than on the text |
+| `test_in_flight_hash` / `last_test_hash` | a checksum of the text beside it | the sha256 of the **whole** node id, taken on the worker before anything was elided — so it does not match a hash of the (possibly trimmed) text. This is the identity: two parametrized cases differing only in the dropped middle share the text and not this. Null exactly where the id is |
 | `last_test` | the test that failed | the last test the worker *ran*, set whether or not it finished. It is only ever context. When `test_in_flight` is null nothing was running — the worker was between tests, still collecting, or waiting to be handed work — and `last_test` had already finished. Never report it as the test that died or hung |
 | `test_in_flight: null` on a stall | the worker had no work | one of three ordinary things that look identical from outside: between tests, collecting, or idle awaiting work. The silence is still real (the run cannot end while a worker never comes back) but the confidence drops to `low` and nothing is blamed on a test |
 | `no stack: pid … could not be confirmed` | the probe failed | the probe was *never sent*. `SIGUSR1` terminates by default, and the pid came out of a file — an exited worker leaves its number to be reused, so an unconfirmable pid is left alone rather than signalled. Not a finding about the worker |
@@ -112,6 +113,18 @@ cheapest question anyone can ask of an incident: has this fired before? First
 occurrence and long-running quiet recurrence call for different responses.
 Duplicates are collapsed within a single run only, so grouping across runs is
 the reader's job, and this is the key to do it on.
+
+**Every node id has a hash beside it.** Wherever an incident names a test,
+the field naming it is paired with a `sha256` of the *whole* node id:
+`test_in_flight` / `test_in_flight_hash`, `last_test` / `last_test_hash`,
+`nodeid` / `nodeid_hash`, and the lists `tests` / `test_hashes`,
+`missing` / `extra` with `missing_hashes` / `extra_hashes`,
+`unstable_tests` / `unstable_test_hashes`. Node ids have no length bound and
+the places they are stored do — the worker's slot elides a long one from the
+middle — so the text is what you *show* and the hash is what you *match*.
+Hashing the text yourself does not reproduce the hash when the text was
+elided; that is the point of carrying both. List hashes are positional: index
+*n* describes index *n*. A null id has a null hash.
 
 **`capabilities`** — what the machine could measure. Check it before concluding
 anything from an absent figure: a missing memory number means unmeasurable

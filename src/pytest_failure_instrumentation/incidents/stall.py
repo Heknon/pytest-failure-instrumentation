@@ -80,6 +80,12 @@ class WorkerStallIncident(Incident):
     #: ever context: a worker wedged between two tests is not wedged *in* the
     #: one that already passed, and the two must not share a field.
     last_test: Optional[str] = None
+    #: The sha256 of each of the two ids above, whole. The worker took them
+    #: before its fixed-size slot trimmed anything, so these identify the
+    #: tests even where the text beside them lost its middle - see
+    #: :mod:`..nodeid`. Null where the id itself is.
+    test_in_flight_hash: Optional[str] = None
+    last_test_hash: Optional[str] = None
     phase: Optional[str] = None
 
     stack: list[str] = Field(default_factory=list)
@@ -259,6 +265,8 @@ def build(
         worker_pid=pid,
         test_in_flight=in_flight,
         last_test=state.get("last_nodeid"),
+        test_in_flight_hash=state.get("nodeid_hash"),
+        last_test_hash=state.get("last_nodeid_hash"),
         phase=state.get("phase"),
         stack=stack,
         stack_probed=probed,

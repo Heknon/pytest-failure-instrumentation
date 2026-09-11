@@ -20,6 +20,8 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any, Optional
 
+from ..nodeid import hash_of, hashes_of
+
 #: How many distinct collections keep their full id list. The design assumes a
 #: handful of variants; a suite whose ids are not stable produces one per
 #: worker, which is the hundreds-of-megabytes case the digest exists to avoid.
@@ -159,7 +161,9 @@ class CollectionTracker:
                 if len(rows) >= workers_shown:
                     break
             if rows:
-                samples.append({"test": test, "workers": rows})
+                samples.append(
+                    {"test": test, "test_hash": hash_of(test) or "", "workers": rows}
+                )
         return samples
 
     def unstable_tests(self, limit: int = MODULES_SHOWN) -> list[str]:
@@ -261,18 +265,20 @@ def difference(
         # tests by position, so this is just as fatal as a real difference,
         # and a unified diff renders it as a near-total rewrite.
         index = first_divergence(baseline, variant)
+        diverged = [baseline[index], variant[index]] if index is not None else []
         return {
             "kind": "order",
             "missing_count": 0,
             "extra_count": 0,
             "first_divergence_index": index,
-            "first_divergence": (
-                [baseline[index], variant[index]] if index is not None else []
-            ),
+            "first_divergence": diverged,
+            "first_divergence_hashes": hashes_of(diverged),
             "modules": [],
             "module_count": 0,
             "missing": [],
             "extra": [],
+            "missing_hashes": [],
+            "extra_hashes": [],
         }
 
     changed = missing + extra
@@ -283,10 +289,15 @@ def difference(
         "extra_count": len(extra),
         "first_divergence_index": None,
         "first_divergence": [],
+        "first_divergence_hashes": [],
         # Sorted, so the same mismatch reports the same ids in the same order
         # on every run and the fingerprint does not drift with worker timing.
         "missing": missing[:ids_kept],
         "extra": extra[:ids_kept],
+        # The sha256 of each, in the same order - what a consumer joins these
+        # against its own collection on. See :mod:`..nodeid`.
+        "missing_hashes": hashes_of(missing[:ids_kept]),
+        "extra_hashes": hashes_of(extra[:ids_kept]),
         "modules": modules[:MODULES_SHOWN],
         "module_count": len(modules),
     }

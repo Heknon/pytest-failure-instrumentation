@@ -274,6 +274,10 @@ def worker(
         # A node id that did not fit its slot is trimmed from both ends. A
         # consumer matching it against a collection has to know that happened.
         "nodeid_elided": ELIDED in nodeid if isinstance(nodeid, str) else False,
+        # And the sha256 of the id as the worker had it, whole, which is what
+        # makes an elided row joinable at all - the worker took it before
+        # anything was cut. See :mod:`.nodeid`.
+        "nodeid_hash": record.get("nodeid_hash"),
         "phase": record.get("phase"),
         "tests_started": record.get("tests_started"),
         "tests_finished": record.get("tests_finished"),

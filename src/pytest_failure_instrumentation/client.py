@@ -176,6 +176,10 @@ class Worker(_Wire):
     #: A node id too long for its slot is trimmed from both ends and says so,
     #: which a consumer matching it against a collection has to know.
     nodeid_elided: bool = False
+    #: The sha256 of the *whole* id, taken by the worker before anything was
+    #: trimmed. This is what to join on: the text above may be elided, and two
+    #: cases whose ids differ only in the middle elide to the same string.
+    nodeid_hash: Optional[str] = None
     phase: Optional[str] = None
     tests_started: Optional[int] = None
     tests_finished: Optional[int] = None
@@ -253,6 +257,10 @@ class ResourceProcess(ResourceMeasurements):
     role: str = ""
     worker_exited: bool = False
     nodeid: Optional[str] = None
+    #: The sha256 of the whole node id. The text beside it is capped at a
+    #: kilobyte in the inventory; this is not capped at all - see
+    #: :mod:`.nodeid`.
+    nodeid_hash: Optional[str] = None
     phase: Optional[str] = None
     observed_at: Optional[float] = None
 

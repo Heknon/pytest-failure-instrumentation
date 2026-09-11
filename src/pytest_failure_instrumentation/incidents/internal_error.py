@@ -45,6 +45,10 @@ class InternalErrorIncident(Incident):
     #: The traceback, tail-truncated - a recursion error produces megabytes.
     detail: str = ""
     test_in_flight: Optional[str] = None
+    #: The sha256 of that id, whole. The worker hashed it before writing the
+    #: event, so it identifies the test even where the text was elided on its
+    #: way here - see :mod:`..nodeid`.
+    test_in_flight_hash: Optional[str] = None
     #: False when this is xdist's re-raise of a worker's error rather than the
     #: error itself, which is what makes worker attribution unreliable.
     first_hand: bool = True
@@ -111,6 +115,7 @@ def build(
         exception=_exception_line(detail),
         detail=detail[-4000:],
         test_in_flight=(chosen or {}).get("test_in_flight"),
+        test_in_flight_hash=(chosen or {}).get("test_in_flight_hash"),
         first_hand=chosen is not None or "worker_internal_error" not in text,
         evidence=evidence,
     )
@@ -160,6 +165,7 @@ def _captured(directory: Path, run_id: str | None) -> list[dict[str, Any]]:
                     "worker": path.stem,
                     "detail": event.get("detail", ""),
                     "test_in_flight": event.get("nodeid"),
+                    "test_in_flight_hash": event.get("nodeid_hash"),
                 }
             )
     return results

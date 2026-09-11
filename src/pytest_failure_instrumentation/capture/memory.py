@@ -71,7 +71,12 @@ class MemoryMonitor:
             "object_census": self.object_census,
         }
 
-    def observe(self, resident_mb: int | None, nodeid: str | None) -> None:
+    def observe(
+        self,
+        resident_mb: int | None,
+        nodeid: str | None,
+        nodeid_hash: str | None = None,
+    ) -> None:
         """Called on each tick. Snapshots only when the mark is crossed."""
         if resident_mb is None or not self.threshold_mb:
             return
@@ -85,6 +90,7 @@ class MemoryMonitor:
             threshold_mb=self.threshold_mb,
             system_available_mb=probes.system_available_megabytes()[0],
             nodeid=nodeid,
+            nodeid_hash=nodeid_hash,
             top_allocations=self.top_allocations(),
             objects_by_type=self.objects_by_type(),
         )

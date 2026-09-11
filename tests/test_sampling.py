@@ -13,6 +13,7 @@ import os
 import time
 from pathlib import Path
 
+from pytest_failure_instrumentation.nodeid import hash_of
 from pytest_failure_instrumentation.sampling import WorkerSampler
 
 from .conftest import ENABLE_FLAG, needs_xdist
@@ -34,7 +35,8 @@ def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid
     (root / "owner.json").write_text(json.dumps({"pid": 1, "started_at": moment - 60}))
     alive = os.getpid() if pid is None else pid
     for name, cpus in workers.items():
-        state = {"pid": alive, "nodeid": f"test_x.py::{name}", "phase": "call",
+        state = {"pid": alive, "nodeid": f"test_x.py::{name}",
+                 "nodeid_hash": hash_of(f"test_x.py::{name}"), "phase": "call",
                  "time": moment, "tests_started": finished + 1,
                  "tests_finished": finished}
         raw = json.dumps(state).encode()
@@ -83,6 +85,9 @@ def test_a_row_carries_what_a_dashboard_draws(tmp_path):
     assert entry.worker == "gw0"
     assert entry.pid == os.getpid()
     assert entry.nodeid == "test_x.py::gw0"
+    # The worker's hash of the whole id travels with the row: the text is what
+    # its fixed-size slot could hold, and a long enough id reaches that bound.
+    assert entry.nodeid_hash == hash_of("test_x.py::gw0")
     assert entry.phase == "call"
     assert entry.rss_mb == 40
     assert entry.cpu_rate is not None

@@ -21,6 +21,7 @@ from typing import Any, ClassVar, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..analysis.collection import SAMPLE_SIZE, CollectionTracker
+from ..nodeid import hashes_of
 from .base import Incident
 
 #: Variant rows in the alert text. Beyond this the report says how many more
@@ -36,6 +37,8 @@ class UnstableParameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     test: str
+    #: The sha256 of that id - see :mod:`..nodeid`.
+    test_hash: str = ""
     #: worker id -> the parameter values that worker collected.
     workers: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -67,10 +70,17 @@ class CollectionVariant(BaseModel):
     #: was reached - those are the true totals.
     missing: list[str] = Field(default_factory=list)
     extra: list[str] = Field(default_factory=list)
+    #: The sha256 of each id above, in the same order - see :mod:`..nodeid`.
+    #: A node id has no length bound and the column somebody stores it in
+    #: does, so this is the side of the pair that survives being stored.
+    missing_hashes: list[str] = Field(default_factory=list)
+    extra_hashes: list[str] = Field(default_factory=list)
     modules: list[str] = Field(default_factory=list)
     module_count: int = 0
     first_divergence_index: Optional[int] = None
     first_divergence: list[str] = Field(default_factory=list)
+    #: The sha256 of those two ids, in the same order.
+    first_divergence_hashes: list[str] = Field(default_factory=list)
 
     def describe(self) -> list[str]:
         """One variant, as a sentence about what it did differently.
@@ -208,6 +218,11 @@ class CollectionMismatchIncident(Incident):
     parameters_unstable: bool = False
     #: The parametrized tests responsible, named without their parameters.
     unstable_tests: list[str] = Field(default_factory=list)
+    #: The sha256 of each of those names, in the same order. Of the name as
+    #: it appears above - parameters already stripped - because that is the
+    #: identity this list is about; a parametrized case's own id is not
+    #: stable across the workers here, which is the finding.
+    unstable_test_hashes: list[str] = Field(default_factory=list)
     #: What a few workers actually produced for each of them. This is the part
     #: that makes the cause visible rather than merely located.
     parameter_samples: list[UnstableParameters] = Field(default_factory=list)
@@ -319,6 +334,7 @@ def build(
     summary = tracker.summarise()
     variants = [CollectionVariant(**variant) for variant in summary["variants"]]
     unstable = tracker.parameters_unstable
+    unstable_tests = tracker.unstable_tests() if unstable else []
     order_only = all(
         variant.kind == "order" for variant in variants if variant.role != "baseline"
     )
@@ -340,7 +356,8 @@ def build(
         variants=variants,
         variant_files=write_variant_files(tracker, directory),
         parameters_unstable=unstable,
-        unstable_tests=tracker.unstable_tests() if unstable else [],
+        unstable_tests=unstable_tests,
+        unstable_test_hashes=hashes_of(unstable_tests),
         parameter_samples=(
             [UnstableParameters(**sample) for sample in tracker.parameter_samples()]
             if unstable

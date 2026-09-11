@@ -134,6 +134,12 @@ class WorkerDeathIncident(Incident):
     #: not in it - which is why it is not ``test_in_flight``, and why the
     #: attribution below says which of the two it is working from.
     last_test: Optional[str] = None
+    #: The sha256 of each of the two ids above, whole. The worker took them
+    #: before its fixed-size slot trimmed anything, so these identify the
+    #: tests even where the text beside them lost its middle - see
+    #: :mod:`..nodeid`. Null where the id itself is.
+    test_in_flight_hash: Optional[str] = None
+    last_test_hash: Optional[str] = None
     phase: Optional[str] = None
     tests_started: int = 0
     tests_finished: int = 0
@@ -347,6 +353,8 @@ def build(
         exit_status_meaning=exit_status.describe(status),
         test_in_flight=state.get("nodeid"),
         last_test=state.get("last_nodeid"),
+        test_in_flight_hash=state.get("nodeid_hash"),
+        last_test_hash=state.get("last_nodeid_hash"),
         phase=state.get("phase"),
         tests_started=state.get("tests_started") or 0,
         tests_finished=state.get("tests_finished") or 0,
@@ -518,6 +526,8 @@ def recover(
         exit_status_meaning="unknown",
         test_in_flight=state.get("nodeid"),
         last_test=state.get("last_nodeid"),
+        test_in_flight_hash=state.get("nodeid_hash"),
+        last_test_hash=state.get("last_nodeid_hash"),
         phase=state.get("phase"),
         tests_started=state.get("tests_started") or 0,
         tests_finished=state.get("tests_finished") or 0,

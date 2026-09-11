@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from pytest_failure_instrumentation.capture.state import read_state
+from pytest_failure_instrumentation.nodeid import hash_of
 
 from .conftest import RERUN_CONFTEST, needs_pyspy, needs_xdist
 
@@ -420,6 +421,9 @@ def test_a_run_that_never_came_back_is_reported_by_the_next_one(runner):
     # the key a consumer joins on, and the finder had no part in it.
     assert death.run_id == killed
     assert death.test_in_flight == "test_gone.py::test_leaves"
+    # Recovered from the dead run's own slot, hash included - so an id long
+    # enough to have been elided on the way here is still identifiable.
+    assert death.test_in_flight_hash == hash_of("test_gone.py::test_leaves")
     assert death.phase == "call"
     assert death.tests_started == 2
     assert death.tests_finished == 1
