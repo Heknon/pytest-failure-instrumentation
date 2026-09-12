@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1112,6 +1113,39 @@ def test_pending_etw_events_are_flushed_before_attributing_a_live_death(tmp_path
     # Already published evidence must not issue another flush.
     killer.attribute(sources, pid=4242, exit_status=15, started_at=999, died_at=1001)
     assert flushed == [True]
+
+
+@pytest.mark.parametrize("needs_flush", [False, True])
+def test_delayed_etw_delivery_is_attributed_within_the_windows_budget(tmp_path, monkeypatch, needs_flush):
+    _trace_file(tmp_path)
+    clock = [100.0]
+    flushes = []
+    monkeypatch.setattr(killer, "TRACE_SETTLE_SECONDS", 5.0)
+
+    def publish():
+        _trace_file(tmp_path, {
+            "via": "TerminateProcess", "sender_pid": 5120, "target_pid": 4242,
+            "api_status": 0, "wall": 1000.0,
+        })
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if not needs_flush and clock[0] >= 102.15:
+            publish()
+
+    def flush():
+        flushes.append(clock[0])
+        if needs_flush and clock[0] >= 102.15:
+            publish()
+
+    monkeypatch.setattr(killer, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=sleep, time=time.time,
+    ))
+    sources = killer.Sources(directory=tmp_path, trace_flush=flush)
+    found = killer.attribute(sources, pid=4242, exit_status=15, started_at=999, died_at=1001)
+    assert found.killer is not None and found.killer.sender_pid == 5120
+    assert 2.15 <= clock[0] - 100.0 < 3.0
+    assert 2 <= len(flushes) <= 6
 
 
 def test_failed_trace_flush_preserves_bounded_best_effort_reporting(tmp_path, monkeypatch):

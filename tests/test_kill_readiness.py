@@ -221,15 +221,17 @@ def test_cascade_shares_kernel_and_trace_reads(tmp_path, monkeypatch):
 
 def test_windows_cascade_shares_the_completed_trace_wait(tmp_path, monkeypatch):
     clock = [100.]
-    monkeypatch.setattr(killer, "TRACE_SETTLE_SECONDS", 2.)
+    monkeypatch.setattr(killer, "TRACE_SETTLE_SECONDS", 5.)
     monkeypatch.setattr(killer.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(killer.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     monkeypatch.setattr(signal_trace, "witnessed", lambda _: [])
     (tmp_path / signal_trace.TRACE_FILE).write_text("")
-    sources = killer.Sources(tmp_path, live=True)
+    flushes = []
+    sources = killer.Sources(tmp_path, live=True, trace_flush=lambda: flushes.append(clock[0]))
     for pid in range(80):
         killer._settled(sources, pid)
-    assert clock[0] - 100. <= 2.1
+    assert 5.0 <= clock[0] - 100. <= 5.1
+    assert 2 <= len(flushes) <= 10
 
 
 def test_blocked_kernel_reader_does_not_block_a_death_cascade(tmp_path, monkeypatch):

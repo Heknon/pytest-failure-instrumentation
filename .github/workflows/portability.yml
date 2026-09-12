@@ -31,6 +31,7 @@ on:
         type: choice
         default: "3.13"
         options:
+          - "3.9"
           - "3.11"
           - "3.13"
       tests:
@@ -142,3 +143,34 @@ jobs:
           path: .test-results/failed-tests.txt
           if-no-files-found: ignore
           retention-days: 7
+
+  # Validate the oldest Windows release cell before tagging, without adding
+  # another full suite to every PR commit. The regression label runs only
+  # kill attribution; the final portability label verifies the complete wheel.
+  windows39-wheel:
+    if: github.event.label.name == 'windows39-regression' || github.event.label.name == 'full-portability'
+    name: windows wheel / py3.9 / ${{ github.event.label.name == 'full-portability' && 'full' || 'targeted' }}
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+      - name: Build and install the wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m pip install "$(ls dist/*.whl)[test,client]"
+          python -c "import pytest_failure_instrumentation as p; assert 'site-packages' in p.__file__, p.__file__"
+      - name: Run Windows kill attribution regression
+        if: github.event.label.name == 'windows39-regression'
+        run: pytest -q tests/test_kill_attribution.py tests/test_kill_readiness.py
+      - name: Run full wheel suite
+        if: github.event.label.name == 'full-portability'
+        run: pytest -q
