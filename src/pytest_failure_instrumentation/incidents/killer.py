@@ -60,10 +60,12 @@ AFTER_DEATH_SECONDS = 5.0
 #: How long a *live* death waits for its line to reach the trace file. The
 #: controller learns of a death within milliseconds of it; the Linux sidecar
 #: writes within a few more, and ETW flushes its real-time buffers on a
-#: one-second timer. Waited only while nothing for this pid is there yet,
+#: one-second timer, but delivery to the consumer can take longer than two
+#: seconds on a loaded runner. Waited only while nothing for this pid is there yet,
 #: and never for a death found afterwards - its file is as complete as it
 #: will ever be.
-TRACE_SETTLE_SECONDS = 2.0 if sys.platform == "win32" else 0.5
+TRACE_SETTLE_SECONDS = 5.0 if sys.platform == "win32" else 0.5
+TRACE_FLUSH_SECONDS = 0.5
 TRACE_POLL_SECONDS = 0.05
 
 
@@ -425,23 +427,33 @@ def _settled(
             or time.monotonic() - sources._trace_waited_at < 2.0):
         return found
     deadline = time.monotonic() + TRACE_SETTLE_SECONDS
-    if sources.trace_flush is not None:
-        try:
-            sources.trace_flush()
-        except Exception:  # noqa: BLE001 - a failed witness cannot break reporting
-            pass
+
+    def flush() -> None:
+        if sources.trace_flush is not None:
+            try:
+                sources.trace_flush()
+            except Exception:  # noqa: BLE001 - a failed witness cannot break reporting
+                pass
+
+    flush()
+    next_flush = time.monotonic() + TRACE_FLUSH_SECONDS
     size = _size_of(sources.trace_path)
     # Flushing may publish synchronously before the first size check.
     found = sources.trace_reading()
     while not any(ready(witness) for witness in found) and time.monotonic() < deadline:
         time.sleep(TRACE_POLL_SECONDS)
+        # The first asynchronous flush can precede the termination event.
+        # Retry within the same deadline; never extend a death cascade wait.
+        if time.monotonic() >= next_flush and time.monotonic() < deadline:
+            flush()
+            next_flush = time.monotonic() + TRACE_FLUSH_SECONDS
         grown = _size_of(sources.trace_path)
         if grown == size:
             continue
         size = grown
         found = sources.trace_reading()
     # Share the completed wait. Dating the cooldown from its start makes
-    # Windows' two-second wait expire its own two-second cooldown, so every
+    # Windows' wait expire its own two-second cooldown, so every
     # death in a cascade pays again.
     sources._trace_waited_at = time.monotonic()
     return found

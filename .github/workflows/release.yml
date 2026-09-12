@@ -135,7 +135,7 @@ jobs:
           # [test] later would be missing from the one run that decides
           # whether to publish - the gate quietly weakening without a line of
           # this file changing.
-          python -m pip install "$(ls dist/*.whl)[test]"
+          python -m pip install "$(ls dist/*.whl)[test,client]"
 
       - name: Confirm the plugin registers from the installed package
         shell: bash
