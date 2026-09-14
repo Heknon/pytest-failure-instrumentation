@@ -163,6 +163,88 @@ def test_a_rerun_of_the_same_test_is_not_a_second_finish():
     assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 2, "pending": 1}
 
 
+def test_a_rerun_in_flight_is_not_counted_as_finished_and_still_owed_both():
+    """The moment the test above skips over, and the one that was wrong: the
+    attempt has reported its teardown and the scheduler has not been told
+    anything, because the protocol has not ended. Counting the attempt there
+    put the test in both halves of the total at once, for as long as the rerun
+    ran - three tests handed out on a run of three read as four."""
+    scheduler = Pending(collection=range(3), pending=[], gw0=[0, 1, 2])
+    tracker = ScheduleTracker("load")
+
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")
+    # The next attempt starting is what says the last one was not the last,
+    # and it is the id alone that says so: xdist relays logstart without the
+    # node it came from.
+    assert tracker.saw_a_test_start("test_a.py::test_flaky") is True
+
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 0, "pending": 3}
+
+    # Taken back once, whichever of the two callers gets there first.
+    assert tracker.saw_a_test_start("test_a.py::test_flaky", "gw0") is False
+
+    # And the attempt that turns out to be the last is counted, at the same
+    # moment the scheduler drops the index.
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")
+    scheduler.complete("gw0")
+
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2}
+
+
+def test_the_next_test_starting_is_not_a_rerun_of_the_last_one():
+    """Only the test just finished on that same worker takes a finish back.
+    Every other start is a start."""
+    scheduler = Pending(collection=range(4), pending=[], gw0=[0, 1], gw1=[2, 3])
+    tracker = ScheduleTracker("load")
+
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_one")
+    scheduler.complete("gw0")
+
+    assert tracker.saw_a_test_start("test_a.py::test_two") is False
+    assert tracker.saw_a_test_start("test_a.py::test_one", "gw1") is False
+    assert tracker.saw_a_test_start(None) is False
+    assert tracker.saw_a_test_start(None, "gw0") is False
+
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 1, "pending": 1}
+    assert rows(tracker, scheduler)["gw1"] == {"assigned": 2, "completed": 0, "pending": 2}
+
+
+def test_a_start_with_nothing_finished_behind_it_takes_nothing_back():
+    """A worker's count is published, so it may not go below zero on its way
+    through a state this has not thought of."""
+    scheduler = Pending(collection=range(2), pending=[], gw0=[0, 1])
+    tracker = ScheduleTracker("load")
+
+    assert tracker.saw_a_test_start("test_a.py::test_one", "gw0") is False
+
+    assert rows(tracker, scheduler)["gw0"]["completed"] == 0
+
+
+def test_an_id_alone_names_a_worker_only_where_a_test_has_one():
+    """``each`` gives every worker the whole collection, so a worker finishing
+    a test and another starting that same test for the first time are the same
+    event seen from the id - and taking a finish back there would leave that
+    worker's total reading low for the rest of the run. The report backstop,
+    which carries the node, is what covers those runs."""
+    scheduler = Pending(collection=range(2), pending=[], gw0=[0, 1], gw1=[0, 1])
+    tracker = ScheduleTracker("each")
+
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_one")
+
+    assert tracker.saw_a_test_start("test_a.py::test_one") is False
+    assert tracker.saw_a_test_start("test_a.py::test_one", "gw0") is True
+
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 0, "pending": 2}
+
+    # And where the mode does hand a test to one worker, two workers holding
+    # the same last-finished id is still not a question an id can answer.
+    tracker = ScheduleTracker("load")
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_one")
+    tracker.saw_a_test_finish("gw1", "test_a.py::test_one")
+
+    assert tracker.saw_a_test_start("test_a.py::test_one") is False
+
+
 def test_a_finish_with_no_id_to_compare_is_counted():
     """Nothing to tell a rerun by means nothing is told apart."""
     scheduler = Pending(collection=range(2), pending=[], gw0=[0, 1])
@@ -803,6 +885,74 @@ def test_thing(i):
             seen.write_text("x")
             assert False, "the first attempt fails"
 """
+
+
+#: The same reruns, slow enough that a poller is inside the second attempt
+#: rather than between two of them: the window this is about is exactly as
+#: long as the attempt, which is why a suite of instant tests never showed it.
+IN_FLIGHT_SUITE = """
+import time
+from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.parametrize("i", range(6))
+def test_thing(i):
+    time.sleep(0.15)
+    if i in (1, 4):
+        seen = Path(f"seen-{i}")
+        if not seen.exists():
+            seen.write_text("x")
+            assert False, "the first attempt fails"
+"""
+
+
+@needs_xdist
+def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
+    """The end of the run was never the problem. A rerun's failed attempt
+    reports its teardown and the scheduler is told nothing until the protocol
+    ends, so between the two the test was counted as run *and* still owed, and
+    every record written in that window - one per test start anywhere in the
+    run - said six tests were a run of seven. The test above reads the record
+    once everything has settled, which is the one moment it was always right.
+
+    So this polls it while the run is going and checks the totals against the
+    run's own size. ``load`` gives each worker a slice of the collection, so
+    the slices cannot add up to more than there is; ``each`` is the mode where
+    they deliberately do, and is not this test.
+    """
+    evidence = pytester.path / "evidence"
+    pytester.makeconftest(RERUN_CONFTEST)
+    pytester.makepyfile(test_suite=IN_FLIGHT_SUITE)
+    pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
+
+    polled: list[int] = []
+
+    def poll() -> None:
+        for directory in evidence.glob("*/"):
+            record = schedule.read(directory)
+            collected = record.get("collected")
+            rows_here = schedule.worker_rows(record)
+            if not collected or not rows_here:
+                continue
+            polled.append(collected)
+            handed_out = sum(row["assigned"] for row in rows_here.values())
+            assert handed_out <= collected, (
+                f"{handed_out} tests handed out on a run of {collected}: {record}"
+            )
+            for worker, row in rows_here.items():
+                assert row["completed"] <= row["assigned"], (worker, row)
+
+    with _polling(poll):
+        result = pytester.runpytest_subprocess(ENABLE_FLAG, "-n2", "--dist=load")
+
+    result.assert_outcomes(passed=6)
+    # Worth nothing unless the reruns happened and the record was read while
+    # they were running.
+    assert all((pytester.path / f"seen-{i}").exists() for i in (1, 4))
+    assert "rerun" in result.stdout.str()
+    assert len(polled) > 20, len(polled)
 
 
 @needs_xdist

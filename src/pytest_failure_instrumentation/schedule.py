@@ -51,6 +51,12 @@ high. The record is written from the start of a test rather than the end of
 one, which is a moment that worker is never inside that window, so what is left
 is the rare case of a *different* worker's two events straddling this one's.
 
+A rerun holds that same window open for a whole attempt - the failed attempt
+reports a teardown and the scheduler is not told anything, because the protocol
+has not ended - so it is not an instant and cannot be left to pass. The finish
+is taken back when the worker starts the test again, in
+:meth:`ScheduleTracker.saw_a_test_start`.
+
 **Written on every test, and that is what makes it usable.** It was throttled
 to twice a second at first, on the reasoning that a reader polls at seconds
 anyway. That reasoning is wrong, and measurably: a worker's ``.state`` slot is
@@ -81,6 +87,15 @@ from typing import Any, Optional
 #: than an ImportError at collection. It decides only whether a total that has
 #: stopped *growing* can still shrink; see :meth:`ScheduleTracker._settled`.
 STEAL_MIN_PENDING = 2
+
+#: The ``--dist`` modes that give a test to exactly one worker, which is what
+#: makes "who just finished this id" an answerable question - see
+#: :meth:`ScheduleTracker._worker_that_last_finished`. ``each`` is the one
+#: xdist mode deliberately outside it, and a scheduler supplied by some other
+#: plugin is outside it because nothing here knows what it does.
+ONE_WORKER_PER_TEST = frozenset(
+    {"load", "loadscope", "loadfile", "loadgroup", "worksteal"}
+)
 
 #: Written beside ``owner.json`` at the top of a run's directory, and
 #: overwritten in place for the life of the run. One file per run rather than
@@ -158,7 +173,8 @@ class ScheduleTracker:
         #: total for every scheduler that keeps only what is outstanding.
         self._finished: dict[str, int] = {}
         #: The test each worker last finished, which is what tells a rerun of
-        #: it from the next test. See :meth:`saw_a_test_finish`.
+        #: it from the next test. Cleared when that finish is taken back. See
+        #: :meth:`saw_a_test_finish` and :meth:`saw_a_test_start`.
         self._last_finished: dict[str, str] = {}
         #: The last row computed for each worker, kept so that one xdist has
         #: let go of still has its final numbers. A worker that died owing
@@ -215,6 +231,93 @@ class ScheduleTracker:
                 return
             self._last_finished[worker] = nodeid
         self._finished[worker] = self._finished.get(worker, 0) + 1
+
+    def saw_a_test_start(self, nodeid: Optional[str], worker: Optional[str] = None) -> bool:
+        """A test is starting. Take its finish back if this is a rerun of it.
+
+        True when one was taken back, which is the caller's cue to write the
+        record - see :class:`..incidents.engine.IncidentEngine`.
+
+        A total is what has finished plus what is still outstanding, and while
+        a rerun runs the test is in both halves: the attempt that failed sent
+        a teardown report, counted in :meth:`saw_a_test_finish`, while the
+        scheduler is told when the *protocol* ends and so still holds the
+        index. Suppressing the second teardown report made the total right
+        again once the rerun was over and left it one high for as long as the
+        rerun ran - a whole test execution rather than an instant, spanning
+        every record written in it, and a run of six tests with one rerun read
+        as seven of six with ``unassigned: 0`` and ``settled: true`` beside it.
+
+        So the finish is taken back when a worker starts the test it just
+        finished, which is what the worker does with its own counter and for
+        the same reason (:meth:`..capture.recorder.WorkerRecorder._phase`): at
+        the end of an attempt nobody knows yet whether it was the last, and
+        the next attempt is what says it was not. The last attempt's teardown
+        counts it again, and the scheduler drops the index within the same
+        breath, so the two halves of the total move together.
+
+        **Two callers, because what this needs does not arrive in one event.**
+        ``pytest_runtest_logstart`` fires before the attempt runs, which is
+        what puts the correction in front of the record rather than behind it
+        - but xdist relays it without the node, so the worker is resolved from
+        the ids here. The setup *report* names its node and cannot be mistaken,
+        and under a rerun plugin it arrives at the *end* of the attempt rather
+        than the start - ``runtestprotocol(..., log=False)`` holds every
+        report until the attempt is over - so it is the backstop and not the
+        signal. Either way the first one to land clears the id, and the second
+        finds nothing to take back.
+
+        Resolving a worker from an id at all takes a mode where a test belongs
+        to one worker, which is every mode xdist has except ``each`` - there
+        every worker is given the whole collection, so a worker finishing a
+        test and another starting *that same test for the first time* look
+        alike from the id, and taking a finish back on that would be a total
+        that reads low for the rest of the run. Under ``each``, and under a
+        scheduler this package does not know, the report backstop is all there
+        is and a rerun reads one high until the attempt's reports arrive.
+
+        What no caller here can tell from a rerun is the same id collected
+        twice - ``--keep-duplicates`` - and run back to back on one worker.
+        That reads one *low* while the second copy runs, which is a number
+        that is late rather than one that cannot be true, and the worker's own
+        count floors it back up where the two are joined - see
+        :func:`.topology._progress`.
+        """
+        if nodeid is None:
+            return False
+        if worker is None:
+            worker = self._worker_that_last_finished(nodeid)
+        if not worker or self._last_finished.get(worker) != nodeid:
+            return False
+        counted = self._finished.get(worker, 0)
+        if counted <= 0:
+            # Nothing to take back. Unreachable while the two dictionaries
+            # below are written together, and a guard rather than an assertion
+            # because a negative count here would be published.
+            return False
+        self._finished[worker] = counted - 1
+        self._last_finished.pop(worker, None)
+        return True
+
+    def _worker_that_last_finished(self, nodeid: str) -> Optional[str]:
+        """Whose rerun a bare node id is, or None if it cannot be said.
+
+        One pass over the workers, which is the number of processes and not
+        the number of tests - nothing in this module scales with the suite.
+        Two workers holding the same id as their last finished test is the
+        ``each``-shaped case this cannot judge, and it says so rather than
+        guessing; the modes below are the ones where a test is given out once.
+        """
+        if self.dist not in ONE_WORKER_PER_TEST:
+            return None
+        found = None
+        for name, last in self._last_finished.items():
+            if last != nodeid:
+                continue
+            if found is not None:
+                return None
+            found = name
+        return found
 
     # -- what it produces ------------------------------------------------
 

@@ -1463,10 +1463,25 @@ test, its node id and its slot in the scheduler's queue are one. Both counters
 count the test: the worker counts a start at the first setup of a protocol and
 not at a second, and takes back the finish it counted at the end of the attempt
 that turned out not to be the last, so a rerun in flight reads as one running;
-the controller counts a teardown report that names the test the worker has just
-finished as that test again. Before that, a run of 368 tests with six rerun once
-was reported as 374 — every attempt a test, and the total floored at the
+the controller does the same, and takes its own count back when a worker starts
+the test it has just finished. Before that, a run of 368 tests with six rerun
+once was reported as 374 — every attempt a test, and the total floored at the
 worker's count so that an attempt became a test nobody was given.
+
+**The take-back is what a rerun costs the controller, and it is why the count
+moves at a start.** A worker's total is what it has finished plus what it still
+owes, and while a rerun runs the test is in both: the attempt that failed sent
+its teardown, and the scheduler is told only when the protocol ends. Counting
+the attempt and then ignoring the *second* teardown made the total right again
+once the rerun was over and left it one high for the length of the attempt —
+long enough to be written into every record taken in it, so a run of six tests
+with one rerun read as seven of six with `unassigned: 0` and `settled: true`
+beside it. The finish is taken back instead, at the next attempt's start, which
+is before the record is written rather than after. xdist relays that start
+without the worker it came from, so the id names the worker — which it can do
+under every mode but `--dist each`, where the same test runs on all of them and
+a first run and a rerun read alike. There a rerun still reads one high, until
+the attempt's own reports arrive and name their worker.
 
 **A crashed worker keeps its row, so the rows can add up to more than the run.**
 xdist drops a dead worker's queue back into the global one and starts a
