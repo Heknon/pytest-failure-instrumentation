@@ -62,6 +62,13 @@ class WorkerRecorder:
         #: started, or None between tests. What makes a rerun not count twice
         #: - see pytest_runtest_protocol.
         self._counted: str | None = None
+        #: Which attempt of `_counted` is running, kept here rather than read
+        #: back from the state slot: the slot clears the attempt at the end of
+        #: every teardown, exactly as it clears the node id, so a counter
+        #: living there would start again from the cleared value and every
+        #: attempt after the second would report itself as the second. Reset
+        #: at the protocol boundary below, where the test changes.
+        self._attempt = 0
         # Filled as each resource is opened, so close() works on a recorder
         # that never finished being built.
         self._open_resources: list[Any] = []
@@ -358,8 +365,10 @@ class WorkerRecorder:
         after the last attempt, whichever attempt that turns out to be.
         """
         self._counted = None
+        self._attempt = 0
         yield
         self._counted = None
+        self._attempt = 0
         self._profile("end_test", item.nodeid)
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
@@ -440,21 +449,29 @@ class WorkerRecorder:
                 # The first setup of the protocol is the test starting.
                 self._counted = nodeid
                 self.state.tests_started += 1
-            elif self.state.tests_finished > 0:
+                self._attempt = 1
+            else:
                 # A second one is a rerun of the same test, which is not a
-                # test starting - see pytest_runtest_protocol - and the
-                # finish counted at the end of its last attempt was not a
-                # finish either. It is taken back rather than never counted,
-                # because at the end of a teardown nobody yet knows whether
-                # an attempt was the last; and it is taken back rather than
-                # left, because the row is read as ``started - finished``
-                # running, and that read zero beside a call phase in the slot.
-                self.state.tests_finished -= 1
+                # test starting - see pytest_runtest_protocol. The attempt is
+                # counted whatever the counters are doing, because it is the
+                # only field that says a rerun is happening at all; everything
+                # else here is about tests, of which this is still the one.
+                self._attempt += 1
+                if self.state.tests_finished > 0:
+                    # And the finish counted at the end of the last attempt
+                    # was not a finish either. It is taken back rather than
+                    # never counted, because at the end of a teardown nobody
+                    # yet knows whether an attempt was the last; and taken
+                    # back rather than left, because the row is read as
+                    # ``started - finished`` running, and that read zero
+                    # beside a call phase in the slot.
+                    self.state.tests_finished -= 1
             # The whole test's clock, not the phase's: pytest-timeout and
             # faulthandler_timeout both time the item from its setup, so a
             # death is matched against a timeout by how long the *test* ran.
             # Set on every attempt, rerun or not: an enforcer gives each
             # attempt its own deadline, measured from that attempt's setup.
+            self.state.attempt = self._attempt
             self.state.test_started = now
             from .timeouts import effective
 
@@ -493,6 +510,11 @@ class WorkerRecorder:
             return
         self.slow_test.end_test()
         self.state.tests_finished += 1
+        # Cleared with the test rather than with the phase, exactly as the
+        # node id below is and for the same reason: between two tests there is
+        # no attempt in flight, and a row saying there is names one that is
+        # over. A rerun sets it again at its next setup, above.
+        self.state.attempt = None
         # The node id is cleared with the *test*, not with each phase. A worker
         # that dies or wedges in the gap between two tests has no test in
         # flight, and saying it had one names a test that already passed - to
@@ -539,6 +561,11 @@ class WorkerRecorder:
         # in flight: what the controller reads a moment later.
         self._profile("stop")
         self.events.record("worker_finish", exitstatus=int(exitstatus))
-        self.state.update(phase=None, nodeid=None)
+        # The attempt goes with the node id, and for the same reason: a
+        # session torn down inside a test - pytest.exit() in a call phase -
+        # reaches here without the teardown that would have cleared either,
+        # and an attempt beside a null node id names a test the same record
+        # says is not running.
+        self.state.update(phase=None, nodeid=None, attempt=None)
         if self._allocation_tracer is not None:
             self._allocation_tracer.close()

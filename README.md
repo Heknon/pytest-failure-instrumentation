@@ -1280,12 +1280,14 @@ the run was writing anyway — no ptrace, no per-test cost, nothing written:
 {"served_by": {"service": "…", "pid": 17155}, "observed_at": 1787688175.421,
  "runs": [{"session": "run-19d52c2ff8e2", "run_id": "757f3cc51790…",
            "controller": {"pid": 17155, "alive": true},
-           "schedule": {"dist": "load", "collected": 812, "unassigned": 240, "settled": false},
+           "schedule": {"dist": "load", "collected": 812, "unassigned": 240, "settled": false,
+                        "rerunning": 1},
    "workers": [
      {"worker": "gw0", "pid": 21615, "nodeid": "test_slow.py::test_alpha",
-      "nodeid_hash": "c8f2a10d4b…", "phase": "call", "status": "blocked",
+      "nodeid_hash": "c8f2a10d4b…", "phase": "call", "status": "blocked", "attempt": 2,
       "why": "heartbeat 0.5s old but no CPU progress: the test thread is waiting on something",
       "process_exists": true, "heartbeat_age_s": 0.5, "cpu_rate": 0.001, "rss_mb": 32,
+      "rerunning": true,
       "tests_finished": 51, "tests_running": 1, "tests_queued": 12, "tests_assigned": 64},
      {"worker": "gw1", "pid": 21618, "nodeid": "test_slow.py::test_beta",
       "nodeid_hash": "70b31ce9af…", "phase": "call", "status": "gone",
@@ -1411,9 +1413,12 @@ the evidence pick it up like every other fact here.
 | `tests_finished` | worker | of those, how many it has run |
 | `tests_running` | worker | the test in flight — 1, or 0 between tests |
 | `tests_queued` | worker | the ones it has not begun |
+| `attempt` | worker | which attempt of `nodeid` is running: 1, or 2 upwards under a rerun plugin. `null` between tests |
+| `rerunning` | worker | whether the controller believes this worker is inside a rerun. `attempt` is the one to believe |
 | `collected` | run | tests in the run's whole collection |
 | `unassigned` | run | tests that are nobody's yet — what every total can still grow by |
 | `settled` | run | whether any worker's total can still change |
+| `rerunning` | run | how many workers are inside a rerun right now |
 
 **The three worker counts partition the total**: `finished + running + queued
 == assigned`, always, with every test in exactly one of them. That shape is
@@ -1463,10 +1468,39 @@ test, its node id and its slot in the scheduler's queue are one. Both counters
 count the test: the worker counts a start at the first setup of a protocol and
 not at a second, and takes back the finish it counted at the end of the attempt
 that turned out not to be the last, so a rerun in flight reads as one running;
-the controller counts a teardown report that names the test the worker has just
-finished as that test again. Before that, a run of 368 tests with six rerun once
-was reported as 374 — every attempt a test, and the total floored at the
+the controller does the same, and takes its own count back when a worker starts
+the test it has just finished. Before that, a run of 368 tests with six rerun
+once was reported as 374 — every attempt a test, and the total floored at the
 worker's count so that an attempt became a test nobody was given.
+
+**The take-back is what a rerun costs the controller, and it is why the count
+moves at a start.** A worker's total is what it has finished plus what it still
+owes, and while a rerun runs the test is in both: the attempt that failed sent
+its teardown, and the scheduler is told only when the protocol ends. Counting
+the attempt and then ignoring the *second* teardown made the total right again
+once the rerun was over and left it one high for the length of the attempt —
+long enough to be written into every record taken in it, so a run of six tests
+with one rerun read as seven of six with `unassigned: 0` and `settled: true`
+beside it. The finish is taken back instead, at the next attempt's start, which
+is before the record is written rather than after. xdist relays that start
+without the worker it came from, so the id names the worker — which it can do
+under every mode but `--dist each`, where the same test runs on all of them and
+a first run and a rerun read alike. There a rerun still reads one high, until
+the attempt's own reports arrive and name their worker.
+
+**And a rerun is the one thing the counts cannot show, so it is reported
+separately.** Every number above is a number of *tests*, which is what makes
+them add up — so a worker three test-lengths into the same node id moves none
+of them, and a run full of reruns looks like a run that has stopped. `attempt`
+on a worker's row says which attempt of the test in flight is running: 1
+ordinarily, 2 upwards while a rerun plugin repeats it, `null` between tests. It
+comes from the worker, which sees the protocol boundary and so is the one to
+believe. `rerunning` beside it is the controller's own reading, from the
+take-back above, and the run's `rerunning` is how many workers are inside one.
+
+All three are `null` from a run older than they are, which is not zero: no
+rerun anywhere and nobody counting them are different findings, and a product
+polling across an upgrade reads both.
 
 **A crashed worker keeps its row, so the rows can add up to more than the run.**
 xdist drops a dead worker's queue back into the global one and starts a

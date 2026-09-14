@@ -20,7 +20,7 @@ from .conftest import ENABLE_FLAG, needs_xdist
 
 
 def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid=None,
-             finished=0):
+             finished=0, attempt=None):
     """A run directory shaped like one a real run leaves behind.
 
     ``workers`` is {name: cpu_seconds_series}, and the series is the knob these
@@ -39,6 +39,10 @@ def evidence(root: Path, workers, run_id="run-1", beats_apart=5.0, now=None, pid
                  "nodeid_hash": hash_of(f"test_x.py::{name}"), "phase": "call",
                  "time": moment, "tests_started": finished + 1,
                  "tests_finished": finished}
+        if attempt is not None:
+            # Left out otherwise, which is what a record written before the
+            # field existed looks like to every reader of one.
+            state["attempt"] = attempt
         raw = json.dumps(state).encode()
         (root / f"{name}.state").write_bytes(raw + b"\x00" * (5120 - len(raw)))
         lines = [json.dumps({"event": "watchdog_started", "interval": beats_apart,
@@ -111,18 +115,22 @@ def test_each_pass_reports_the_evidence_as_it_stands(tmp_path):
     assert sampler.sample().workers[0].status == "blocked"
 
 
-def _schedule(root, **workers):
-    (root / "schedule.json").write_text(
-        json.dumps(
-            {
-                "dist": "load", "collected": 40, "unassigned": 12, "settled": False,
-                "workers": {
-                    name: {"assigned": a, "completed": c, "pending": a - c}
-                    for name, (a, c) in workers.items()
-                },
-            }
-        )
-    )
+def _schedule(root, rerunning=None, **workers):
+    """``workers`` is {name: (assigned, completed)}, or with a third item to
+    say the controller has this worker inside a rerun. Both that and the
+    run-level count are left out entirely unless asked for, which is how a
+    record written before they existed reads."""
+    record = {
+        "dist": "load", "collected": 40, "unassigned": 12, "settled": False,
+        "workers": {
+            name: {"assigned": row[0], "completed": row[1], "pending": row[0] - row[1],
+                   **({"rerunning": row[2]} if len(row) > 2 else {})}
+            for name, row in workers.items()
+        },
+    }
+    if rerunning is not None:
+        record["rerunning"] = rerunning
+    (root / "schedule.json").write_text(json.dumps(record))
 
 
 def test_a_row_carries_the_denominator_the_worker_cannot_supply(tmp_path):
@@ -160,6 +168,34 @@ def test_a_total_the_worker_has_already_passed_is_the_stale_one(tmp_path):
 
     assert entry.tests_assigned == 20  # the slot says one is in flight past it
     assert (entry.tests_finished, entry.tests_running, entry.tests_queued) == (19, 1, 0)
+
+
+def test_a_sample_carries_the_attempt_and_the_reruns_in_flight(tmp_path):
+    """What the counts cannot say. A rerun is the same test, so a run full of
+    them stands still while everything in it is working - the attempt on the
+    row and the count on the sample are what a product shows instead of an
+    apparently stalled bar."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=9, attempt=2)
+    _schedule(root, rerunning=1, gw0=(14, 9, True))
+    sample = WorkerSampler(root).sample()
+
+    assert sample.rerunning == 1
+    assert sample.workers[0].attempt == 2
+    assert sample.workers[0].rerunning is True
+
+
+def test_a_sample_of_an_older_run_says_nothing_of_either(tmp_path):
+    """The fields arrived after the records did, and a product polling across
+    the upgrade reads both. None is not zero and not one: no attempt recorded
+    is a different finding from a first attempt."""
+    root = evidence(tmp_path / "run", {"gw0": [1.0, 3.0]}, finished=9)
+    _schedule(root, gw0=(14, 9))
+    sample = WorkerSampler(root).sample()
+
+    assert sample.rerunning is None
+    assert sample.workers[0].attempt is None
+    assert sample.workers[0].rerunning is None
+    assert sample.workers[0].tests_assigned == 14
 
 
 def test_a_sample_says_how_big_the_run_is_and_whether_that_is_settled(tmp_path):

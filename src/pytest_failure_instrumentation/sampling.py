@@ -71,6 +71,16 @@ class SampledWorker(BaseModel):
     cpu_rate: Optional[float] = None
     heartbeat_age_s: Optional[float] = None
 
+    #: Which attempt of ``nodeid`` is running: 1 ordinarily, 2 upwards while a
+    #: rerun plugin repeats it, None between tests and from a worker whose
+    #: record predates the field. The counts below are counts of *tests*, and
+    #: a rerun is one test however many times it runs, so this is what
+    #: explains a worker that has held the same id for three test-lengths.
+    attempt: Optional[int] = None
+    #: The controller's reading of the same thing. The row's own ``attempt``
+    #: is the one to believe; this is None wherever there is no schedule
+    #: record to ask.
+    rerunning: Optional[bool] = None
     #: How many tests this worker has been given - the denominator a row of
     #: statuses otherwise has no way to carry, because a worker's own files
     #: count what it has run and nothing can tell them how much is left.
@@ -108,6 +118,10 @@ class WorkerSample(BaseModel):
     #: anything in it, and under ``worksteal`` while a steal is still possible
     #: - see :mod:`.schedule`.
     settled: Optional[bool] = None
+    #: How many workers are inside a rerun. None where the run's record
+    #: predates the field, which is not zero: no reruns and nobody counting
+    #: them are different findings.
+    rerunning: Optional[int] = None
     #: What ``--dist`` this run was started with, reported as-is.
     dist: Optional[str] = None
 
@@ -140,6 +154,7 @@ class WorkerSampler:
             collected=schedule.get("collected"),
             unassigned=schedule.get("unassigned"),
             settled=schedule.get("settled"),
+            rerunning=schedule.get("rerunning"),
             dist=schedule.get("dist"),
             workers=[
                 SampledWorker(
@@ -148,6 +163,8 @@ class WorkerSampler:
                     nodeid=record.get("nodeid"),
                     nodeid_hash=record.get("nodeid_hash"),
                     phase=record.get("phase"),
+                    attempt=record.get("attempt"),
+                    rerunning=record.get("rerunning"),
                     status=record.get("status") or "",
                     why=record.get("why") or "",
                     rss_mb=record.get("rss_mb"),

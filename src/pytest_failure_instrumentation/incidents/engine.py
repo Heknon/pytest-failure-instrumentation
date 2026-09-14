@@ -1179,7 +1179,18 @@ class IncidentEngine:
         ``pytest_xdist_node_collection_finished`` and *after* that hook, so
         the write from there is taken before anything has been assigned, and
         without this the totals would read zero until the first test finished.
+
+        And the one moment a rerun can be caught before it is written down. A
+        rerun plugin fires this again for the attempt it is about to run,
+        while the reports of the attempt that failed are already counted and
+        the scheduler has not been told anything - so the total here would
+        count the test as run and still owed both, for as long as the attempt
+        took. Taking the finish back first is what keeps that out of the
+        record rather than correcting it afterwards; xdist relays this without
+        the node, so the tracker resolves the worker from the id - see
+        :meth:`..schedule.ScheduleTracker.saw_a_test_start`.
         """
+        self.schedule.saw_a_test_start(nodeid)
         self._record_schedule()
 
     def pytest_runtest_logreport(self, report: Any) -> None:
@@ -1206,8 +1217,20 @@ class IncidentEngine:
         # Once per *attempt*, strictly: a rerun plugin tears the same test
         # down again, and the node id is what lets the tracker tell that from
         # the next test - see ScheduleTracker.saw_a_test_finish.
-        if getattr(report, "when", None) == "teardown":
+        when = getattr(report, "when", None)
+        if when == "teardown":
             self.schedule.saw_a_test_finish(worker, getattr(report, "nodeid", None))
+        elif when == "setup" and self.schedule.saw_a_test_start(
+            getattr(report, "nodeid", None), worker
+        ):
+            # A worker starting the test it just finished is that test being
+            # rerun, and it was never finished: the teardown counted above was
+            # an attempt's, not the test's. Ordinarily logstart has already
+            # said so and this finds nothing to take back - what it is here
+            # for is the runs where the id alone could not name the worker,
+            # ``--dist each`` among them. Rare enough to write the record
+            # again for, and a write is one small buffer at a fixed offset.
+            self._record_schedule()
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_xdist_node_collection_finished(self, node: Any, ids: Any) -> None:
@@ -1345,6 +1368,12 @@ class IncidentEngine:
         # One fewer collection to wait for, which may be the one that was
         # holding a mismatch back.
         self._report_mismatch(partial=False)
+        # Whatever it was in the middle of, it is not any more. A worker
+        # killed inside a rerun sends no further report, and the flag that
+        # says it is rerunning comes off at a report - so without this the
+        # final record of a finished run says a dead worker is repeating a
+        # test.
+        self.schedule.saw_a_worker_go(worker)
         # The last reading anybody gets of this worker, and it is an accurate
         # one: xdist fires this hook *before* it takes the node out of the
         # scheduler, so the queue is still there to be read. Forced, and
