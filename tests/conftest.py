@@ -79,6 +79,21 @@ def pytest_report_teststatus(report):
         return "rerun", "R", "RERUN"
 '''
 
+
+def rerun_conftest(attempts: int = 2) -> str:
+    """The same plugin, allowed ``attempts`` tries at a failing test.
+
+    More than two is not a variation for its own sake: a counter of attempts
+    that reads the slot it wrote - which is cleared at the end of every
+    teardown, like the node id - starts again from the cleared value, and
+    every attempt after the second reports itself as the second. Two attempts
+    cannot tell that apart from a counter that works.
+    """
+    return RERUN_CONFTEST.replace("range(2)", f"range({attempts})").replace(
+        "attempt == 0", f"attempt < {attempts - 1}"
+    )
+
+
 VICTIM_MODULE = '''
 import ctypes
 import os

@@ -71,11 +71,6 @@ class SampledWorker(BaseModel):
     cpu_rate: Optional[float] = None
     heartbeat_age_s: Optional[float] = None
 
-    #: How many tests this worker has been given - the denominator a row of
-    #: statuses otherwise has no way to carry, because a worker's own files
-    #: count what it has run and nothing can tell them how much is left.
-    #: ``None`` before the workers have collected, and on any run whose
-    #: scheduler this package does not recognise - see :mod:`.schedule`.
     #: Which attempt of ``nodeid`` is running: 1 ordinarily, 2 upwards while a
     #: rerun plugin repeats it, None between tests and from a worker whose
     #: record predates the field. The counts below are counts of *tests*, and
@@ -86,6 +81,11 @@ class SampledWorker(BaseModel):
     #: is the one to believe; this is None wherever there is no schedule
     #: record to ask.
     rerunning: Optional[bool] = None
+    #: How many tests this worker has been given - the denominator a row of
+    #: statuses otherwise has no way to carry, because a worker's own files
+    #: count what it has run and nothing can tell them how much is left.
+    #: ``None`` before the workers have collected, and on any run whose
+    #: scheduler this package does not recognise - see :mod:`.schedule`.
     tests_assigned: Optional[int] = None
     #: That total split three ways, so that it adds up: what this worker has
     #: run, the one test in flight if there is one, and the ones it has not

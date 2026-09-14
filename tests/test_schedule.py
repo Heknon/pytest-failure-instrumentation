@@ -24,7 +24,7 @@ from pytest_failure_instrumentation import schedule, topology
 from pytest_failure_instrumentation.capture.state import read_state
 from pytest_failure_instrumentation.schedule import ScheduleTracker
 
-from .conftest import ENABLE_FLAG, RERUN_CONFTEST, needs_xdist
+from .conftest import ENABLE_FLAG, RERUN_CONFTEST, needs_xdist, rerun_conftest
 
 
 class Gateway:
@@ -273,6 +273,28 @@ def test_a_row_says_when_the_controller_believes_a_rerun_is_running():
 
     assert rows(tracker, scheduler)["gw0"]["rerunning"] is False
     assert tracker.record(scheduler)["rerunning"] == 0
+
+
+def test_a_worker_that_died_inside_a_rerun_stops_being_one():
+    """The flag comes off at that worker's next report, and a worker killed
+    inside an attempt sends no more of them. Without xdist letting go of it
+    here, the final record of a finished run says a dead process is repeating
+    a test."""
+    scheduler = Pending(collection=range(3), pending=[], gw0=[0, 1, 2])
+    tracker = ScheduleTracker("load")
+
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")
+    tracker.saw_a_test_start("test_a.py::test_flaky")
+    assert tracker.record(scheduler)["rerunning"] == 1
+
+    tracker.saw_a_worker_go("gw0")
+
+    assert tracker.record(scheduler)["rerunning"] == 0
+    assert rows(tracker, scheduler)["gw0"]["rerunning"] is False
+    # And what it was owed is untouched: the row is kept precisely because a
+    # worker that died owing tests is what a reader wants one for.
+    assert rows(tracker, scheduler)["gw0"]["assigned"] == 3
+    tracker.saw_a_worker_go(None)  # nothing to let go of is not an error
 
 
 def test_a_finish_with_no_id_to_compare_is_counted():
@@ -951,6 +973,17 @@ def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
     run's own size. ``load`` gives each worker a slice of the collection, so
     the slices cannot add up to more than there is; ``each`` is the mode where
     they deliberately do, and is not this test.
+
+    What it asserts is that the crossing does not *last*, rather than that it
+    never happens for an instant, because one instant of it is left and is
+    the accepted one this module's docstring describes: the finish is counted
+    when the failed attempt's teardown report arrives and taken back when the
+    next attempt's start does, and another worker's start can be dequeued
+    between the two. That window is one hop of the controller's event queue.
+    The bug was a window the length of a whole attempt - here 150ms, fifteen
+    polls at the interval below - so "never in two consecutive readings"
+    separates them with room to spare, and a strict "never" would be asserting
+    something the design does not claim.
     """
     evidence = pytester.path / "evidence"
     pytester.makeconftest(RERUN_CONFTEST)
@@ -960,6 +993,9 @@ def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
     polled: list[int] = []
     in_flight: list[int] = []
     seen_attempts: set = set()
+    #: Consecutive readings in which the totals were past the run's size, per
+    #: run directory. Reset by any reading that holds together.
+    crossing: dict[str, int] = {}
 
     def poll() -> None:
         for directory in evidence.glob("*/"):
@@ -980,8 +1016,12 @@ def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
                     for state in directory.glob("*.state")
                 )
             handed_out = sum(row["assigned"] for row in rows_here.values())
-            assert handed_out <= collected, (
-                f"{handed_out} tests handed out on a run of {collected}: {record}"
+            seen = crossing[directory.name] = (
+                crossing.get(directory.name, 0) + 1 if handed_out > collected else 0
+            )
+            assert seen < 2, (
+                f"{handed_out} tests handed out on a run of {collected}, in "
+                f"{seen} readings running: {record}"
             )
             for worker, row in rows_here.items():
                 assert row["completed"] <= row["assigned"], (worker, row)
@@ -1000,6 +1040,64 @@ def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
     # attempt of its test it was on. Nothing in the counts says either.
     assert in_flight and max(in_flight) >= 1, in_flight
     assert 2 in seen_attempts, seen_attempts
+
+
+#: Fails twice and passes on the third attempt, which is the run the counter
+#: has to survive: the attempt is cleared at the end of every teardown, so a
+#: test that only ever fails once cannot tell a counter that keeps count from
+#: one that starts again from the cleared value each time.
+TWICE_FAILING_SUITE = """
+import time
+from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.parametrize("i", range(6))
+def test_thing(i):
+    time.sleep(0.15)
+    if i not in (1, 4):
+        return
+    seen = Path(f"seen-{i}")
+    attempts = len(seen.read_text()) if seen.exists() else 0
+    if attempts < 2:
+        seen.write_text("x" * (attempts + 1))
+        assert False, f"attempt {attempts + 1} fails"
+"""
+
+
+@needs_xdist
+def test_a_third_attempt_says_it_is_the_third(pytester):
+    """The attempt is cleared with the test at the end of every teardown, the
+    way the node id is - so a counter that read the slot back would find it
+    cleared at the start of every attempt after the first and report every one
+    of them as the second. A test rerun twice is what tells those apart, and
+    it is also the run where the field is worth most: three test-lengths on
+    one node id with every count where it was.
+    """
+    evidence = pytester.path / "evidence"
+    pytester.makeconftest(rerun_conftest(attempts=3))
+    pytester.makepyfile(test_suite=TWICE_FAILING_SUITE)
+    pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
+
+    attempts: set = set()
+
+    def poll() -> None:
+        for directory in evidence.glob("*/"):
+            for state in directory.glob("*.state"):
+                attempts.add(read_state(state).get("attempt"))
+
+    with _polling(poll):
+        result = pytester.runpytest_subprocess(ENABLE_FLAG, "-n2", "--dist=load")
+
+    result.assert_outcomes(passed=6)
+    # Both tests failed twice and passed on the third attempt, which is the
+    # only run where a counter that restarts at every teardown is visible.
+    assert all(len((pytester.path / f"seen-{i}").read_text()) == 2 for i in (1, 4))
+    assert {1, 2, 3} <= attempts, attempts
+    # And it is cleared with the test rather than left standing on the last
+    # attempt a worker happened to run.
+    assert None in attempts, attempts
 
 
 @needs_xdist

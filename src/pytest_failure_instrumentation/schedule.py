@@ -91,10 +91,20 @@ STEAL_MIN_PENDING = 2
 #: The ``--dist`` modes that give a test to exactly one worker, which is what
 #: makes "who just finished this id" an answerable question - see
 #: :meth:`ScheduleTracker._worker_that_last_finished`. ``each`` is the one
-#: xdist mode deliberately outside it, and a scheduler supplied by some other
-#: plugin is outside it because nothing here knows what it does.
+#: xdist mode deliberately outside it: there every worker is given the whole
+#: collection, so one worker finishing a test and another starting that same
+#: test for the first time are the same event seen from the id.
+#:
+#: It is the requested mode that is read, not the scheduler in use, so a
+#: plugin that supplies its own scheduler under ``--dist load`` is trusted
+#: here along with xdist's. What that costs if such a scheduler hands one id
+#: to two workers is a count that reads one low for the rest of the run,
+#: floored back up by the worker's own in :func:`.topology._progress`; what
+#: reading the class instead would cost is every scheduler nobody has heard
+#: of, including the ones that behave.
 ONE_WORKER_PER_TEST = frozenset(
-    {"load", "loadscope", "loadfile", "loadgroup", "worksteal"}
+    # customgroup is xdist's own and hands a test out once, like the rest.
+    {"load", "loadscope", "loadfile", "loadgroup", "worksteal", "customgroup"}
 )
 
 #: Written beside ``owner.json`` at the top of a run's directory, and
@@ -244,6 +254,20 @@ class ScheduleTracker:
             self._last_finished[worker] = nodeid
         self._finished[worker] = self._finished.get(worker, 0) + 1
 
+    def saw_a_worker_go(self, worker: Optional[str]) -> None:
+        """xdist has let go of ``worker``; whatever it was doing, it is not.
+
+        The row it had is kept - a worker that died owing thirteen tests is
+        the case a reader wants one for - but a *rerun* is something it is
+        doing now, and a dead worker is doing nothing. Nothing else clears it:
+        the flag is taken off at that worker's next report, and a worker
+        killed inside an attempt sends no more, so without this the run's
+        count and the row would both say it was still rerunning at session
+        finish, on a run that had ended.
+        """
+        if worker:
+            self._rerunning.discard(worker)
+
     def saw_a_test_start(self, nodeid: Optional[str], worker: Optional[str] = None) -> bool:
         """A test is starting. Take its finish back if this is a rerun of it.
 
@@ -319,7 +343,8 @@ class ScheduleTracker:
         the number of tests - nothing in this module scales with the suite.
         Two workers holding the same id as their last finished test is the
         ``each``-shaped case this cannot judge, and it says so rather than
-        guessing; the modes below are the ones where a test is given out once.
+        guessing; :data:`ONE_WORKER_PER_TEST` is the rest, and what that gate
+        does and does not promise is written there.
         """
         if self.dist not in ONE_WORKER_PER_TEST:
             return None

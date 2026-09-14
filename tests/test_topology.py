@@ -96,29 +96,35 @@ def evidence(tmp_path):
                                 "time": time.time() - age, "run_id": run_id}) + "\n"
                 )
 
-        def schedule(self, **workers) -> None:
-            """What the controller writes about who was given what."""
-            (self.run / "schedule.json").write_text(
-                json.dumps(
-                    {
-                        "run_id": "the-reported-run-id",
-                        "updated_at": time.time(),
-                        "dist": "load",
-                        "scheduler": "LoadScheduling",
-                        "collected": 40,
-                        "unassigned": 12,
-                        "settled": False,
-                        "workers": {
-                            name: {
-                                "assigned": assigned,
-                                "completed": completed,
-                                "pending": assigned - completed,
-                            }
-                            for name, (assigned, completed) in workers.items()
-                        },
+        def schedule(self, rerunning=None, **workers) -> None:
+            """What the controller writes about who was given what.
+
+            A worker is ``(assigned, completed)``, or ``(assigned, completed,
+            rerunning)`` where the controller has it inside a rerun. Neither
+            that nor the run-level count is written at all unless asked for,
+            which is what a record from before those fields looks like.
+            """
+            record = {
+                "run_id": "the-reported-run-id",
+                "updated_at": time.time(),
+                "dist": "load",
+                "scheduler": "LoadScheduling",
+                "collected": 40,
+                "unassigned": 12,
+                "settled": False,
+                "workers": {
+                    name: {
+                        "assigned": row[0],
+                        "completed": row[1],
+                        "pending": row[0] - row[1],
+                        **({"rerunning": row[2]} if len(row) > 2 else {}),
                     }
-                )
-            )
+                    for name, row in workers.items()
+                },
+            }
+            if rerunning is not None:
+                record["rerunning"] = rerunning
+            (self.run / "schedule.json").write_text(json.dumps(record))
 
         def worker(self, name: str) -> dict:
             return topology.worker(self.run / f"{name}.state", time.time())
@@ -467,11 +473,7 @@ def test_the_controller_says_which_workers_it_believes_are_rerunning(evidence):
     collected twice, and the worker can."""
     evidence.state("gw0", attempt=2)
     evidence.beats("gw0")
-    evidence.schedule(gw0=(15, 2))
-    record = json.loads((evidence.run / "schedule.json").read_text())
-    record["workers"]["gw0"]["rerunning"] = True
-    record["rerunning"] = 1
-    (evidence.run / "schedule.json").write_text(json.dumps(record))
+    evidence.schedule(rerunning=1, gw0=(15, 2, True))
 
     described = topology.run(evidence.run)
 

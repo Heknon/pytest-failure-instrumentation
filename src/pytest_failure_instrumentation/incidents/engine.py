@@ -1368,6 +1368,12 @@ class IncidentEngine:
         # One fewer collection to wait for, which may be the one that was
         # holding a mismatch back.
         self._report_mismatch(partial=False)
+        # Whatever it was in the middle of, it is not any more. A worker
+        # killed inside a rerun sends no further report, and the flag that
+        # says it is rerunning comes off at a report - so without this the
+        # final record of a finished run says a dead worker is repeating a
+        # test.
+        self.schedule.saw_a_worker_go(worker)
         # The last reading anybody gets of this worker, and it is an accurate
         # one: xdist fires this hook *before* it takes the node out of the
         # scheduler, so the queue is still there to be read. Forced, and
