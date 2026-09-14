@@ -120,6 +120,15 @@ class WorkerState:
         self.nodeid_hash: str | None = None
         self.last_nodeid_hash: str | None = None
         self.phase: str | None = None
+        #: Which attempt of the test in flight is running: 1 for an ordinary
+        #: test, 2 upwards while a rerun plugin is repeating it, and None
+        #: between tests, like ``nodeid``. The counters beside it deliberately
+        #: collapse the attempts into one test - a rerun is the same test, and
+        #: a total that counted attempts was the bug that made this package
+        #: report 374 tests on a run of 368 - so this is the only thing in the
+        #: record that says an attempt is happening at all. None also means
+        #: "not said" for a record written by a version that did not have it.
+        self.attempt: int | None = None
         #: When the current phase began, and when the current *test* began
         #: (its setup). These clocks let the controller correlate death with
         #: the test's effective timeout; timing alone does not prove which
@@ -229,6 +238,7 @@ class WorkerState:
                 "nodeid_hash": self.nodeid_hash,
                 "last_nodeid_hash": self.last_nodeid_hash,
                 "phase": self.phase,
+                "attempt": self.attempt,
                 "phase_started": self.phase_started,
                 "test_started": self.test_started,
                 "timeout_settings": self.timeout_settings,

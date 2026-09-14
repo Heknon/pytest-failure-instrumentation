@@ -443,6 +443,60 @@ def test_a_total_the_worker_has_already_passed_is_the_stale_one(evidence):
     assert described["tests_queued"] == 0
 
 
+def test_a_row_says_which_attempt_of_its_test_is_running(evidence):
+    """The counts are counts of tests, and a rerun is one test however many
+    times it runs - so a worker three test-lengths into the same id moves
+    nothing, and nothing in the counts explains why. The attempt does, and it
+    comes from the worker, which sees the protocol boundary."""
+    evidence.state("gw0", attempt=3)
+    evidence.beats("gw0", cpu_step=0.9)
+    evidence.schedule(gw0=(15, 2))
+
+    described = topology.run(evidence.run)["workers"][0]
+
+    assert described["attempt"] == 3
+    # And it says nothing about the counts beside it: the test is still one
+    # test, started once and not yet finished.
+    assert (described["tests_finished"], described["tests_running"]) == (2, 1)
+
+
+def test_the_controller_says_which_workers_it_believes_are_rerunning(evidence):
+    """Its own reading of the same thing, from the take-back that keeps the
+    totals honest while a rerun runs. Reported beside the worker's attempt
+    rather than instead of it - this one cannot tell a rerun from the same id
+    collected twice, and the worker can."""
+    evidence.state("gw0", attempt=2)
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(15, 2))
+    record = json.loads((evidence.run / "schedule.json").read_text())
+    record["workers"]["gw0"]["rerunning"] = True
+    record["rerunning"] = 1
+    (evidence.run / "schedule.json").write_text(json.dumps(record))
+
+    described = topology.run(evidence.run)
+
+    assert described["workers"][0]["rerunning"] is True
+    assert described["schedule"]["rerunning"] == 1
+
+
+def test_a_record_from_before_the_attempt_was_recorded_says_nothing_of_it(evidence):
+    """None rather than 1, and None rather than 0. A worker that does not
+    write the field and a worker on its first attempt are different findings,
+    and so are a run with no reruns and a run whose reruns nobody counted -
+    every reader here has to keep upgrading in the middle of a run readable."""
+    evidence.state("gw0")  # a record as an older version wrote it
+    evidence.beats("gw0")
+    evidence.schedule(gw0=(15, 2))  # and a schedule record to match
+
+    described = topology.run(evidence.run)
+
+    assert described["workers"][0]["attempt"] is None
+    assert described["workers"][0]["rerunning"] is None
+    assert described["schedule"]["rerunning"] is None
+    # The counts are untouched by any of it.
+    assert described["workers"][0]["tests_assigned"] == 15
+
+
 def test_a_run_says_how_much_of_it_is_nobody_s_yet(evidence):
     """A total that is still growing is a progress bar whose end moves, so the
     queue behind it is reported beside it rather than left to be inferred."""
@@ -470,7 +524,7 @@ def test_a_run_with_no_schedule_says_nothing_rather_than_zero(evidence):
     assert described["workers"][0]["tests_queued"] is None
     assert described["schedule"] == {
         "dist": None, "collected": None, "unassigned": None,
-        "settled": None, "updated_at": None,
+        "settled": None, "updated_at": None, "rerunning": None,
     }
 
 

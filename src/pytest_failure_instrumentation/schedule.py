@@ -176,6 +176,14 @@ class ScheduleTracker:
         #: it from the next test. Cleared when that finish is taken back. See
         #: :meth:`saw_a_test_finish` and :meth:`saw_a_test_start`.
         self._last_finished: dict[str, str] = {}
+        #: The workers whose current test is a repeat attempt, as far as this
+        #: can tell: a finish was taken back for it and nothing has been
+        #: counted for that worker since. It is what the totals below cannot
+        #: say on their own - a rerun is deliberately not a test here, so a
+        #: reader watching a worker sit on the same id with the numbers still
+        #: has no way to tell a rerun from a slow test. Written down rather
+        #: than derived because the take-back is the only moment it is known.
+        self._rerunning: set[str] = set()
         #: The last row computed for each worker, kept so that one xdist has
         #: let go of still has its final numbers. A worker that died owing
         #: thirteen tests is exactly the case a reader wants them for, and
@@ -226,6 +234,10 @@ class ScheduleTracker:
         """
         if not worker:
             return
+        # Whatever this report turns out to be, the attempt it belongs to is
+        # over: either the test is finished or the next attempt has not begun.
+        # Set again at that attempt's start, which is where a rerun is known.
+        self._rerunning.discard(worker)
         if nodeid is not None:
             if self._last_finished.get(worker) == nodeid:
                 return
@@ -297,6 +309,7 @@ class ScheduleTracker:
             return False
         self._finished[worker] = counted - 1
         self._last_finished.pop(worker, None)
+        self._rerunning.add(worker)
         return True
 
     def _worker_that_last_finished(self, nodeid: str) -> Optional[str]:
@@ -330,11 +343,11 @@ class ScheduleTracker:
         given = _assigned_work(scheduler)
         if given is not None:
             for name, assigned in given.items():
-                self._rows[name] = _row(assigned, self._finished.get(name, 0))
+                self._rows[name] = _row(assigned, self._finished.get(name, 0), name in self._rerunning)
         else:
             for name, outstanding in (_outstanding(scheduler) or {}).items():
                 done = self._finished.get(name, 0)
-                self._rows[name] = _row(done + outstanding, done)
+                self._rows[name] = _row(done + outstanding, done, name in self._rerunning)
 
         # Before every worker has registered a collection there is no queue
         # yet, and an empty queue read then says "settled" about a run where
@@ -351,6 +364,11 @@ class ScheduleTracker:
             "collected": _collected(scheduler),
             "unassigned": unassigned,
             "settled": False if collecting else self._settled(scheduler, unassigned),
+            # How many workers are inside a rerun right now, which is what
+            # makes the totals beside it readable: a rerun is one test being
+            # run again, so it moves no number here at all, and a reader
+            # watching a run stand still deserves to be told which.
+            "rerunning": len(self._rerunning),
             "workers": {name: dict(row) for name, row in self._rows.items()},
         }
 
@@ -442,11 +460,17 @@ class ScheduleTracker:
         self._descriptor = None
 
 
-def _row(assigned: int, completed: int) -> dict[str, int]:
+def _row(assigned: int, completed: int, rerunning: bool = False) -> dict[str, Any]:
+    """One worker's line. ``rerunning`` is the only field here that is not a
+    count of tests: a rerun is the same test, so it moves none of them, and a
+    row where nothing moves for a whole test is what it is there to explain.
+    A reader of an older record will not find it - see
+    :func:`worker_rows`."""
     return {
         "assigned": assigned,
         "completed": completed,
         "pending": max(0, assigned - completed),
+        "rerunning": rerunning,
     }
 
 

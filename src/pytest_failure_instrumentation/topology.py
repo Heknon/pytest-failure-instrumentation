@@ -209,10 +209,16 @@ def _schedule_summary(schedule: dict[str, Any]) -> dict[str, Any]:
     left is what a worker's own numbers cannot say: how big the run is, how
     much of it is nobody's yet, and whether any of it can still move.
     """
-    return {
+    summary = {
         name: schedule.get(name)
         for name in ("dist", "collected", "unassigned", "settled", "updated_at")
     }
+    # How many workers are inside a rerun. Absent from a record written before
+    # this existed, where None is the honest answer: no rerun anywhere and
+    # nobody counting them look identical from such a record, and zero would
+    # be a claim this cannot make.
+    summary["rerunning"] = schedule.get("rerunning")
+    return summary
 
 
 def worker(
@@ -279,6 +285,12 @@ def worker(
         # anything was cut. See :mod:`.nodeid`.
         "nodeid_hash": record.get("nodeid_hash"),
         "phase": record.get("phase"),
+        # Which attempt of the test above is running - 1 ordinarily, 2 upwards
+        # under a rerun plugin, None between tests and from a worker too old
+        # to say. The counters below deliberately count a rerun as the one
+        # test it is, so this is the only field that says an attempt is
+        # happening; see :meth:`..capture.recorder.WorkerRecorder._phase`.
+        "attempt": record.get("attempt"),
         "tests_started": record.get("tests_started"),
         "tests_finished": record.get("tests_finished"),
         # The denominator for the two above, and the only figure here that
@@ -294,6 +306,14 @@ def worker(
         # _progress for why "what is left" was the wrong shape.
         "tests_running": running,
         "tests_queued": queued,
+        # The controller's own reading of the same thing, from the take-back
+        # that keeps the totals honest while a rerun runs - see
+        # :meth:`..schedule.ScheduleTracker.saw_a_test_start`. The worker's
+        # ``attempt`` is the one to believe where the two disagree: this is a
+        # report stream's inference, and it cannot tell a rerun from the same
+        # id collected twice. None where there is no schedule record at all,
+        # and where the record is older than the field.
+        "rerunning": (schedule or {}).get("rerunning"),
         "state_age_s": _age(now, record.get("time")),
         "rss_mb": beats[-1].get("rss_mb") if beats else None,
         "status": status,

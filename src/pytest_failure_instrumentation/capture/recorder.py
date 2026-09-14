@@ -440,16 +440,23 @@ class WorkerRecorder:
                 # The first setup of the protocol is the test starting.
                 self._counted = nodeid
                 self.state.tests_started += 1
-            elif self.state.tests_finished > 0:
+                self.state.attempt = 1
+            else:
                 # A second one is a rerun of the same test, which is not a
-                # test starting - see pytest_runtest_protocol - and the
-                # finish counted at the end of its last attempt was not a
-                # finish either. It is taken back rather than never counted,
-                # because at the end of a teardown nobody yet knows whether
-                # an attempt was the last; and it is taken back rather than
-                # left, because the row is read as ``started - finished``
-                # running, and that read zero beside a call phase in the slot.
-                self.state.tests_finished -= 1
+                # test starting - see pytest_runtest_protocol. The attempt is
+                # counted whatever the counters are doing, because it is the
+                # only field that says a rerun is happening at all; everything
+                # else here is about tests, of which this is still the one.
+                self.state.attempt = (self.state.attempt or 1) + 1
+                if self.state.tests_finished > 0:
+                    # And the finish counted at the end of the last attempt
+                    # was not a finish either. It is taken back rather than
+                    # never counted, because at the end of a teardown nobody
+                    # yet knows whether an attempt was the last; and taken
+                    # back rather than left, because the row is read as
+                    # ``started - finished`` running, and that read zero
+                    # beside a call phase in the slot.
+                    self.state.tests_finished -= 1
             # The whole test's clock, not the phase's: pytest-timeout and
             # faulthandler_timeout both time the item from its setup, so a
             # death is matched against a timeout by how long the *test* ran.
@@ -493,6 +500,11 @@ class WorkerRecorder:
             return
         self.slow_test.end_test()
         self.state.tests_finished += 1
+        # Cleared with the test rather than with the phase, exactly as the
+        # node id below is and for the same reason: between two tests there is
+        # no attempt in flight, and a row saying there is names one that is
+        # over. A rerun sets it again at its next setup, above.
+        self.state.attempt = None
         # The node id is cleared with the *test*, not with each phase. A worker
         # that dies or wedges in the gap between two tests has no test in
         # flight, and saying it had one names a test that already passed - to

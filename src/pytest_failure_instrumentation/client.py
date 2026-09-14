@@ -157,6 +157,11 @@ class ScheduleSummary(_Wire):
     #: Whether any worker's total can still change. A percentage drawn while
     #: this is false is a bar whose end moves - see :mod:`.schedule`.
     settled: Optional[bool] = None
+    #: How many workers are inside a rerun. A rerun is the same test run
+    #: again, so it moves none of the counts above, and a run that appears to
+    #: have stopped is often this. None from a server too old to say, which is
+    #: not zero.
+    rerunning: Optional[int] = None
     updated_at: Optional[float] = None
 
 
@@ -181,6 +186,15 @@ class Worker(_Wire):
     #: cases whose ids differ only in the middle elide to the same string.
     nodeid_hash: Optional[str] = None
     phase: Optional[str] = None
+    #: Which attempt of ``nodeid`` is running: 1 ordinarily, 2 upwards under a
+    #: rerun plugin, None between tests and from a server too old to say. The
+    #: counts below are counts of tests and a rerun is one test however many
+    #: times it runs, so this is what explains a worker holding the same id
+    #: while nothing moves.
+    attempt: Optional[int] = None
+    #: The controller's reading of the same thing, from its own bookkeeping.
+    #: ``attempt`` is the one to believe where they disagree.
+    rerunning: Optional[bool] = None
     tests_started: Optional[int] = None
     tests_finished: Optional[int] = None
     #: The denominator, and the only figure here not out of this worker's own

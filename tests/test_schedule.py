@@ -109,7 +109,7 @@ def test_a_worker_that_has_run_nothing_is_all_pending():
     scheduler = Pending(collection=range(10), pending=[4, 5], gw0=[0, 1], gw1=[2, 3])
     tracker = ScheduleTracker("load")
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 0, "pending": 2}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 0, "pending": 2, "rerunning": False}
 
 
 def test_the_total_grows_as_the_scheduler_hands_out_more():
@@ -123,7 +123,7 @@ def test_the_total_grows_as_the_scheduler_hands_out_more():
     scheduler.complete("gw0")
     scheduler.hand_out("gw0", 2)
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2, "rerunning": False}
 
 
 def test_what_a_worker_has_run_is_counted_rather_than_inferred():
@@ -136,7 +136,7 @@ def test_what_a_worker_has_run_is_counted_rather_than_inferred():
         tracker.saw_a_test_finish("gw0")
         scheduler.complete("gw0")
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 4, "completed": 3, "pending": 1}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 4, "completed": 3, "pending": 1, "rerunning": False}
 
 
 def test_a_rerun_of_the_same_test_is_not_a_second_finish():
@@ -152,7 +152,7 @@ def test_a_rerun_of_the_same_test_is_not_a_second_finish():
     tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")  # the rerun
     scheduler.complete("gw0")
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2, "rerunning": False}
 
     # The next test is the next test, and a rerun on another worker is that
     # worker's own affair.
@@ -160,7 +160,7 @@ def test_a_rerun_of_the_same_test_is_not_a_second_finish():
     tracker.saw_a_test_finish("gw1", "test_a.py::test_flaky")
     scheduler.complete("gw0")
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 2, "pending": 1}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 2, "pending": 1, "rerunning": False}
 
 
 def test_a_rerun_in_flight_is_not_counted_as_finished_and_still_owed_both():
@@ -178,7 +178,11 @@ def test_a_rerun_in_flight_is_not_counted_as_finished_and_still_owed_both():
     # node it came from.
     assert tracker.saw_a_test_start("test_a.py::test_flaky") is True
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 0, "pending": 3}
+    # And the row says so rather than leaving a reader to wonder why nothing
+    # is moving - see test_a_row_says_when_the_controller_believes_a_rerun...
+    assert rows(tracker, scheduler)["gw0"] == {
+        "assigned": 3, "completed": 0, "pending": 3, "rerunning": True
+    }
 
     # Taken back once, whichever of the two callers gets there first.
     assert tracker.saw_a_test_start("test_a.py::test_flaky", "gw0") is False
@@ -188,7 +192,7 @@ def test_a_rerun_in_flight_is_not_counted_as_finished_and_still_owed_both():
     tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")
     scheduler.complete("gw0")
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 1, "pending": 2, "rerunning": False}
 
 
 def test_the_next_test_starting_is_not_a_rerun_of_the_last_one():
@@ -205,8 +209,8 @@ def test_the_next_test_starting_is_not_a_rerun_of_the_last_one():
     assert tracker.saw_a_test_start(None) is False
     assert tracker.saw_a_test_start(None, "gw0") is False
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 1, "pending": 1}
-    assert rows(tracker, scheduler)["gw1"] == {"assigned": 2, "completed": 0, "pending": 2}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 1, "pending": 1, "rerunning": False}
+    assert rows(tracker, scheduler)["gw1"] == {"assigned": 2, "completed": 0, "pending": 2, "rerunning": False}
 
 
 def test_a_start_with_nothing_finished_behind_it_takes_nothing_back():
@@ -234,7 +238,9 @@ def test_an_id_alone_names_a_worker_only_where_a_test_has_one():
     assert tracker.saw_a_test_start("test_a.py::test_one") is False
     assert tracker.saw_a_test_start("test_a.py::test_one", "gw0") is True
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 0, "pending": 2}
+    assert rows(tracker, scheduler)["gw0"] == {
+        "assigned": 2, "completed": 0, "pending": 2, "rerunning": True
+    }
 
     # And where the mode does hand a test to one worker, two workers holding
     # the same last-finished id is still not a question an id can answer.
@@ -243,6 +249,30 @@ def test_an_id_alone_names_a_worker_only_where_a_test_has_one():
     tracker.saw_a_test_finish("gw1", "test_a.py::test_one")
 
     assert tracker.saw_a_test_start("test_a.py::test_one") is False
+
+
+def test_a_row_says_when_the_controller_believes_a_rerun_is_running():
+    """The take-back is the only moment a rerun is known here, so it is
+    written down rather than left to be inferred: every count in the row is a
+    count of tests, and a rerun moves none of them."""
+    scheduler = Pending(collection=range(3), pending=[], gw0=[0, 1, 2], gw1=[])
+    tracker = ScheduleTracker("load")
+
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")
+    assert tracker.record(scheduler)["rerunning"] == 0
+
+    tracker.saw_a_test_start("test_a.py::test_flaky")
+
+    assert rows(tracker, scheduler)["gw0"]["rerunning"] is True
+    assert rows(tracker, scheduler)["gw1"]["rerunning"] is False
+    assert tracker.record(scheduler)["rerunning"] == 1
+
+    # The attempt ends where it started: at the next report for that worker,
+    # which is either the test finishing or the attempt after this one.
+    tracker.saw_a_test_finish("gw0", "test_a.py::test_flaky")
+
+    assert rows(tracker, scheduler)["gw0"]["rerunning"] is False
+    assert tracker.record(scheduler)["rerunning"] == 0
 
 
 def test_a_finish_with_no_id_to_compare_is_counted():
@@ -267,7 +297,7 @@ def test_a_stolen_test_stops_being_this_worker_s_total():
 
     scheduler.steal("gw0", 2)
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 0, "pending": 2}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 0, "pending": 2, "rerunning": False}
 
 
 def test_the_loadscope_family_says_the_total_and_is_counted_for_the_rest():
@@ -286,8 +316,8 @@ def test_the_loadscope_family_says_the_total_and_is_counted_for_the_rest():
     tracker.saw_a_test_finish("gw1")
 
     assert rows(tracker, scheduler) == {
-        "gw0": {"assigned": 2, "completed": 1, "pending": 1},
-        "gw1": {"assigned": 1, "completed": 1, "pending": 0},
+        "gw0": {"assigned": 2, "completed": 1, "pending": 1, "rerunning": False},
+        "gw1": {"assigned": 1, "completed": 1, "pending": 0, "rerunning": False},
     }
 
 
@@ -332,7 +362,7 @@ def test_each_gives_every_worker_the_whole_collection():
     assert record["collected"] == 3
     assert record["unassigned"] == 0
     assert record["settled"] is True
-    assert record["workers"]["gw1"] == {"assigned": 3, "completed": 0, "pending": 3}
+    assert record["workers"]["gw1"] == {"assigned": 3, "completed": 0, "pending": 3, "rerunning": False}
 
 
 def test_a_scheduler_this_package_does_not_know_reports_nothing():
@@ -423,7 +453,7 @@ def test_a_worker_that_shut_down_cleanly_ran_everything_it_was_given():
         tracker.saw_a_test_finish("gw0")
         scheduler.complete("gw0")
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 2, "pending": 0}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 2, "completed": 2, "pending": 0, "rerunning": False}
 
 
 def test_a_worker_the_scheduler_has_dropped_keeps_what_it_was_owed():
@@ -436,7 +466,7 @@ def test_a_worker_the_scheduler_has_dropped_keeps_what_it_was_owed():
 
     del scheduler.node2pending[scheduler.node("gw0")]
 
-    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 0, "pending": 3}
+    assert rows(tracker, scheduler)["gw0"] == {"assigned": 3, "completed": 0, "pending": 3, "rerunning": False}
 
 
 # -- the file ----------------------------------------------------------------
@@ -467,7 +497,7 @@ def test_every_write_replaces_the_last_one_whole(tmp_path):
     scheduler.complete("gw0")
     assert tracker.write(scheduler, tmp_path) is True
     assert schedule.read(tmp_path)["workers"]["gw0"] == {
-        "assigned": 2, "completed": 1, "pending": 1
+        "assigned": 2, "completed": 1, "pending": 1, "rerunning": False
     }
 
     # A record that got shorter is not read as the longer one it overwrote.
@@ -928,6 +958,8 @@ def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
     pytester.makeini(f"[pytest]\nfailure_directory = {evidence}\n")
 
     polled: list[int] = []
+    in_flight: list[int] = []
+    seen_attempts: set = set()
 
     def poll() -> None:
         for directory in evidence.glob("*/"):
@@ -937,6 +969,16 @@ def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
             if not collected or not rows_here:
                 continue
             polled.append(collected)
+            if record.get("rerunning"):
+                # The window this test is about, named in the record rather
+                # than left for a reader to work out from numbers that do not
+                # move. The worker's own attempt says the same thing from the
+                # other side - see the slot check below.
+                in_flight.append(record["rerunning"])
+                seen_attempts.update(
+                    read_state(state).get("attempt")
+                    for state in directory.glob("*.state")
+                )
             handed_out = sum(row["assigned"] for row in rows_here.values())
             assert handed_out <= collected, (
                 f"{handed_out} tests handed out on a run of {collected}: {record}"
@@ -953,6 +995,11 @@ def test_the_totals_never_pass_the_run_while_a_rerun_is_in_flight(pytester):
     assert all((pytester.path / f"seen-{i}").exists() for i in (1, 4))
     assert "rerun" in result.stdout.str()
     assert len(polled) > 20, len(polled)
+    # And the reruns were visible while they ran, from both sides: the
+    # controller counting the workers inside one, and the worker saying which
+    # attempt of its test it was on. Nothing in the counts says either.
+    assert in_flight and max(in_flight) >= 1, in_flight
+    assert 2 in seen_attempts, seen_attempts
 
 
 @needs_xdist
