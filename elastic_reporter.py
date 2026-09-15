@@ -93,7 +93,7 @@ import threading
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from time import monotonic
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 import pytest
 
@@ -119,6 +119,13 @@ META_ATTR = "elastic_meta"
 #: silently.
 MAX_MESSAGE_CHARS = 2_000
 MAX_TRACEBACK_CHARS = 8_000
+
+#: How many reports may be waiting to be shipped, and how many send failures
+#: are worth describing. Both bound what an endpoint that has stopped
+#: answering can cost the run: a test never waits on the sender, so without a
+#: ceiling the queue behind it is the run's memory.
+MAX_QUEUED = 10_000
+MAX_ERRORS = 20
 
 #: The outcome strings that land in elastic, and the step name that goes with
 #: each phase. Remap a value here - or reassign either dict from a conftest -
@@ -270,9 +277,14 @@ class ElasticPlugin:
     that it got anything.
     """
 
+    #: The one this process is using, for code with no ``config`` to hand.
+    #: Read it through `reporter`, which is there even before a session is.
+    current: ClassVar["ElasticPlugin | None"] = None
+
     def __init__(self, attributes: CaseAttributes) -> None:
         """Answer for ``attributes``, which every half of a session shares."""
         self.attributes = attributes
+        ElasticPlugin.current = self
 
     def set(self, **attributes: object) -> None:
         """Set any of `SETTABLE` for this test and the tests after it."""
@@ -375,7 +387,8 @@ class MockElasticSender(CaseReportSender):
     This records the request instead of making it, so the whole path up to the
     socket is exercised: batching, serialisation, ordering, the ``last_report``
     flag. ``requests`` and ``documents`` are what a test of the plugin asserts
-    against.
+    against, and the one thing here that grows with the length of the run: a
+    real sender lets a batch go once it has been POSTed.
     """
 
     def __init__(self, url: str) -> None:
@@ -422,42 +435,54 @@ class BackgroundShipper:
         self._sender = sender
         self._batch_size = max(1, batch_size)
         self._flush_interval = max(0.05, flush_interval)
-        # None is the only thing put on the queue that is not a report: it says
-        # drain what is left and stop.
-        self._queue: queue.Queue[CaseReport | None] = queue.Queue()
+        self._queue: queue.Queue[CaseReport] = queue.Queue(MAX_QUEUED)
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="elastic-reporter", daemon=True)
         self.shipped = 0
+        self.dropped = 0
         self.errors: list[str] = []
+        self.failures = 0
 
     def start(self) -> None:
         """Start the shipping thread."""
         self._thread.start()
 
     def submit(self, report: CaseReport) -> None:
-        """Queue one report for the next batch."""
-        self._queue.put(report)
+        """Queue one report for the next batch, unless the queue is full.
+
+        Full means the endpoint is not keeping up with the run. A test must not
+        wait on the sender and the run must not be failed over telemetry, so
+        what is left is to drop the report and say how many went that way.
+        """
+        try:
+            self._queue.put_nowait(report)
+        except queue.Full:
+            self.dropped += 1
 
     def close(self, timeout: float) -> None:
         """Drain the queue and stop the thread, or record that it would not."""
         if not self._thread.is_alive():
             return
-        self._queue.put(None)
+        self._stop.set()
         self._thread.join(timeout)
         if self._thread.is_alive():
-            self.errors.append(f"sender did not drain within {timeout:g}s")
+            self._record(f"sender did not drain within {timeout:g}s")
 
     def _run(self) -> None:
         batch: list[CaseReport] = []
         deadline = monotonic() + self._flush_interval
         while True:
+            # Stopping, the wait goes to nothing: what is queued is drained as
+            # fast as it can be batched, and an empty queue then ends the run.
+            wait = 0.0 if self._stop.is_set() else max(0.0, deadline - monotonic())
             try:
-                report = self._queue.get(timeout=max(0.0, deadline - monotonic()))
+                report = self._queue.get(timeout=wait)
             except queue.Empty:
-                batch, deadline = self._flush(batch), monotonic() + self._flush_interval
+                batch = self._flush(batch)
+                if self._stop.is_set():
+                    return
+                deadline = monotonic() + self._flush_interval
                 continue
-            if report is None:
-                self._flush(batch)
-                return
             batch.append(report)
             if len(batch) >= self._batch_size:
                 batch, deadline = self._flush(batch), monotonic() + self._flush_interval
@@ -468,10 +493,21 @@ class BackgroundShipper:
         try:
             self._sender.send([report.to_dict() for report in batch])
         except Exception as exc:  # noqa: BLE001 - never fail a run over telemetry
-            self.errors.append(f"{len(batch)} report(s) dropped: {type(exc).__name__}: {exc}")
+            self.dropped += len(batch)
+            self._record(f"{len(batch)} report(s) dropped: {type(exc).__name__}: {exc}")
         else:
             self.shipped += len(batch)
         return []
+
+    def _record(self, error: str) -> None:
+        """Keep the first few failures, and count the rest.
+
+        An endpoint that is down says the same thing every batch, so the count
+        is the part that is news.
+        """
+        self.failures += 1
+        if len(self.errors) < MAX_ERRORS:
+            self.errors.append(error)
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +523,11 @@ class ReportAnnotator(ElasticPlugin):
     controller, so anything the reporter needs has to leave from here.
     """
 
+    def __init__(self, attributes: CaseAttributes) -> None:
+        """Answer for ``attributes``, and remember what has been annotated."""
+        super().__init__(attributes)
+        self._annotated: list[pytest.TestReport] = []
+
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_makereport(self, call: pytest.CallInfo[None]) -> ReportWrapper:
         """Attach this process's answers to the phase report."""
@@ -498,7 +539,19 @@ class ReportAnnotator(ElasticPlugin):
             "exception_message": truncate(message, MAX_MESSAGE_CHARS),
         }
         setattr(report, META_ATTR, meta)
+        self._annotated.append(report)
         return report
+
+    def pytest_runtest_logfinish(self) -> None:
+        """Drop what was annotated, now that it has been logged and sent.
+
+        The reports have gone to the controller by now, and pytest keeps them
+        for the rest of the session - without this, so would the dicts.
+        """
+        for report in self._annotated:
+            if hasattr(report, META_ATTR):
+                delattr(report, META_ATTR)
+        self._annotated.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +644,10 @@ class ElasticCaseReporter(ElasticPlugin):
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         """Turn one phase report into a case report."""
         meta: Meta = getattr(report, META_ATTR, None) or {}
+        # pytest keeps every report for the whole session, so what we hung on
+        # this one would be kept too. It has been read; let it go.
+        if hasattr(report, META_ATTR):
+            delattr(report, META_ATTR)
         case = self._case(report.nodeid)
         case.attributes = meta.get("attributes") or case.attributes
         if report.outcome == RERUN_OUTCOME:
@@ -782,8 +839,40 @@ def summarise(config: pytest.Config, reporter: ElasticCaseReporter) -> None:
     if config.option.verbose > 0 and isinstance(sender, MockElasticSender):
         for line in sender.describe():
             terminal.write_line("  " + line)
-    for error in reporter.shipper.errors:
+    shipper = reporter.shipper
+    for error in shipper.errors:
         terminal.write_line("  elastic-reporter: " + error, red=True)
+    if shipper.failures > len(shipper.errors):
+        terminal.write_line(
+            f"  elastic-reporter: and {shipper.failures - len(shipper.errors)} more failure(s)",
+            red=True,
+        )
+    if shipper.dropped:
+        terminal.write_line(
+            f"  elastic-reporter: {shipper.dropped} report(s) never reached elastic",
+            red=True,
+        )
+
+
+def reporter() -> ElasticPlugin:
+    """Return this process's plugin, for code with no ``config`` to hand.
+
+    ::
+
+        from elastic_reporter import reporter
+
+        def test_upgrade():
+            reporter().set(vc="fw-5.0.0")
+
+    The same object ``getplugin("elastic-reporter")`` returns, and the same
+    `ElasticPlugin.set`. Outside a session - the module imported but no pytest
+    configured, a unit test of your own helpers - it is one that accepts
+    attributes and drops them, so this never returns None and never raises.
+    """
+    current = ElasticPlugin.current
+    if current is None:
+        current = ElasticPlugin(CaseAttributes(ReporterConfig()))
+    return current
 
 
 def is_xdist_worker(config: pytest.Config) -> bool:
