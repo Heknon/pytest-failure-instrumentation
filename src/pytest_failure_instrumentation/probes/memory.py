@@ -19,12 +19,25 @@ from .platform_flags import IS_LINUX, IS_MACOS, IS_WINDOWS
 
 
 def resident_megabytes() -> tuple[int | None, str]:
-    """Current resident set size, and how it was obtained."""
+    """Current resident set size in whole megabytes, and how it was obtained."""
+    value, source = resident_kilobytes()
+    return (None if value is None else round(value / 1024)), source
+
+
+def resident_kilobytes() -> tuple[int | None, str]:
+    """The same reading, kept in kilobytes.
+
+    Whole megabytes are the figure a reader wants and the wrong one to do
+    arithmetic in: a test that keeps 300 KB reads as 0 MB, and two hundred
+    of them read as 0 MB two hundred times rather than as the 60 MB the
+    process actually grew. What is rounded is the reporting, not the
+    measurement.
+    """
     if IS_LINUX:
         try:
             with open("/proc/self/statm", "rb") as handle:
                 pages = int(handle.read().split()[1])
-            return round(pages * os.sysconf("SC_PAGE_SIZE") / 1048576), "procfs"
+            return round(pages * os.sysconf("SC_PAGE_SIZE") / 1024), "procfs"
         except (OSError, IndexError, ValueError):
             pass
 
@@ -35,7 +48,7 @@ def resident_megabytes() -> tuple[int | None, str]:
 
     if psutil is not None:
         try:
-            return round(psutil.Process().memory_info().rss / 1048576), "psutil"
+            return round(psutil.Process().memory_info().rss / 1024), "psutil"
         except Exception:
             pass
 
@@ -46,7 +59,7 @@ def resident_megabytes() -> tuple[int | None, str]:
             # ru_maxrss is bytes on macOS, and it is a *peak*: reported as
             # such so it is never mistaken for the current figure.
             peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            return round(peak / 1048576), "rusage-peak"
+            return round(peak / 1024), "rusage-peak"
         except Exception:
             pass
 
@@ -89,7 +102,8 @@ def _windows_memory_api() -> Any:
 
 
 def _windows_working_set() -> int | None:
-    """Current working set, with psutil fallback when the native read fails."""
+    """Current working set in kilobytes, with psutil fallback when the native
+    read fails."""
     try:
         import ctypes
 
@@ -100,7 +114,7 @@ def _windows_working_set() -> int | None:
             kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
         ):
             return None
-        return round(counters.WorkingSetSize / 1048576)
+        return round(counters.WorkingSetSize / 1024)
     except Exception:
         return None
 
@@ -120,6 +134,13 @@ def heap_in_use_megabytes() -> tuple[int | None, str]:
     ``sys.getallocatedblocks`` covers the small ones; the two together are
     the live heap.
     """
+    value, source = heap_in_use_kilobytes()
+    return (None if value is None else round(value / 1024)), source
+
+
+def heap_in_use_kilobytes() -> tuple[int | None, str]:
+    """The same reading in kilobytes - see :func:`resident_kilobytes` for
+    why the rounding belongs to the reporting and not to the measurement."""
     if not IS_LINUX:
         return None, "unavailable"
     try:
@@ -128,7 +149,7 @@ def heap_in_use_megabytes() -> tuple[int | None, str]:
         return None, "unavailable"
     if info is None:
         return None, "unavailable"
-    return round((info.uordblks + info.hblkhd) / 1048576), "mallinfo2"
+    return round((info.uordblks + info.hblkhd) / 1024), "mallinfo2"
 
 
 #: The libc handle once ``mallinfo2`` has been found in it, and False once it

@@ -254,6 +254,7 @@ class WorkerRecorder:
             Sampler(
                 log.write,
                 lambda: probes.resident_megabytes()[0],
+                resident_kilobytes=lambda: probes.resident_kilobytes()[0],
                 interval=settings.profile_interval,
                 worker=worker_id,
                 allocations=settings.profile_allocations,

@@ -92,13 +92,18 @@ class Thresholds:
     gc_share_percent: float = 10.0
     #: MB a test may leave behind, or climb by, before it is named.
     retained_mb: int = 100
-    #: MB a test may leave behind *on average*, over a run of them, before
-    #: the drift is named without waiting for ``retained_mb`` to accumulate.
-    #: A drift is unbounded where one test's retention is not - it is paid
-    #: again for every test in the suite - so the rate is what it is judged
-    #: on, and the total only decides whether there is enough of a run to
-    #: judge. 0 turns the rate off and leaves the total.
-    growth_per_test_mb: float = 1.0
+    #: MB a run's tests may add between them, in use, before the run is said
+    #: to be growing. This is the rule: memory adding up across a run is the
+    #: thing worth knowing, whether it arrived a little at a time or in one
+    #: step, and 20 MB is worth knowing where one megabyte is not. Well clear
+    #: of what a suite that leaks nothing measures, which is under a megabyte
+    #: over two hundred tests.
+    growth_mb: int = 20
+    #: MB the *typical* test must have left behind as well, for a run that
+    #: only wants a leak that repeats. 0, the default, asks nothing of the
+    #: shape: the finding says whether the memory recurred or arrived in
+    #: steps, and either is the run growing.
+    growth_per_test_mb: float = 0.0
     #: Consecutive tests that must each leave something before growth is
     #: called steady rather than a step.
     growth_tests: int = 4
@@ -205,6 +210,11 @@ class Finding:
     climb_total_mb: int = 0
     #: For steady growth: live objects added per test, when they were counted.
     growth_objects_per_test: Optional[int] = None
+    #: For steady growth: how much of the growth is what every test paid,
+    #: the rest having arrived in steps that did not repeat. The two read
+    #: differently and are fixed in different places, so the finding says
+    #: which it mostly is rather than leaving the reader to divide.
+    growth_recurring_mb: int = 0
     #: For allocator retention: the arenas at the end, the threads they serve,
     #: the free memory the allocator keeps mapped, and what a trim would return.
     arenas: Optional[int] = None
@@ -1101,6 +1111,15 @@ def _holders(
     return frame, stack, evidence
 
 
+#: The smallest per-test step worth calling a recurrence, in megabytes.
+#: Measured rather than chosen: a suite that leaks nothing reads a typical
+#: step of about three kilobytes and a ninetieth percentile of six, which is
+#: the cost of pytest's own bookkeeping and the reading's own jitter. Twenty
+#: kilobytes is several times clear of that, and it is what keeps a very long
+#: run from reporting its own floor - ten thousand tests at three kilobytes
+#: is thirty megabytes, over the bar for a run and nobody's leak.
+NOISE_FLOOR_MB = 0.02
+
 #: A rough size for one small-object block, to turn a block count into
 #: megabytes a reader can set against the resident figure. pymalloc blocks
 #: are at most 512 bytes and most are far smaller.
@@ -1172,31 +1191,31 @@ def _drift_rows(tests: list[dict[str, Any]], limits: Thresholds) -> list[dict[st
 
 def _drifting(
     rows: list[dict[str, Any]], limits: Thresholds
-) -> Optional[tuple[list[int], int, int, int, float]]:
+) -> Optional[tuple[list[float], float, float, int, float]]:
     """The steps, their total, the biggest, how many grew and what the
     typical one was - or None when these tests are not a drift.
 
-    What they kept *in use* between them, net, reaches the bar, no single
-    step is half of it, and at least half of them grew. In use, because
-    resident memory drifts up on its own as the allocator keeps pages a
-    fixture's worth of freed objects fragmented - twenty megabytes a test
-    that no line holds. Where the live heap and the object count were read,
-    the step is what they say; elsewhere it is the resident step, and the
-    object count is the tiebreak.
+    What they kept *in use* between them, net, reaches ``growth_mb``. In
+    use, because resident memory drifts up on its own as the allocator keeps
+    pages a fixture's worth of freed objects fragmented - twenty megabytes a
+    test that no line holds. Where the live heap and the object count were
+    read, the step is what they say; elsewhere it is the resident step, and
+    the object count is the tiebreak.
 
-    The bar is reached two ways, and the second is the one that matters.
-    ``retained_mb`` is what one test may keep, and a drift held to it waits
-    for a hundred megabytes to accumulate before it says anything - which
-    is a number the run's shape decides, not the code's: the same leak at
-    two and a half megabytes a test is fifty megabytes over twenty tests and
-    five hundred over two hundred. A drift is paid again for every test in
-    the suite, so it is judged on the rate: ``growth_per_test_mb`` on
-    average, over enough of a run to mean it, which is a quarter of
-    ``retained_mb`` in total. That floor is the one the CPU rule's
-    ``cpu_floor_seconds`` is - it is there so a handful of tests cannot
-    carry a rate on their own, and it binds on short runs only. A healthy
-    suite measures 0.00 MB a test, so there is no noise floor under this
-    beyond the whole megabyte the figures are read in.
+    ``retained_mb`` is what one *test* may keep and is the wrong bar for a
+    run: held to it, a run said nothing until a hundred megabytes had piled
+    up, which is a fact about how long the run was rather than about the
+    code. ``growth_mb`` is the bar for a run and it is low - 20 MB - which
+    the steps being read in kilobytes is what makes safe. A suite that leaks
+    nothing adds up to under a megabyte over two hundred tests, at a typical
+    step of three kilobytes, so 20 MB stands thirty times clear of the noise
+    rather than the two the whole-megabyte reading used to allow.
+
+    How the memory arrived does not decide whether there is a finding; it
+    decides what the finding says. ``typical``, the median step, is what
+    every test paid, and a module imported once by one test moves the total
+    and not the median - so the two together separate the leak that grows
+    with the suite from the cost paid once, and the evidence reports both.
     """
     # A growth_tests of 0 asks for no minimum, not for a rule over no rows.
     if not rows or len(rows) < limits.growth_tests:
@@ -1221,32 +1240,31 @@ def _drifting(
         for step, kept in zip(steps, blocks)
         if step >= 1 or (kept is not None and kept * BYTES_PER_BLOCK >= 1048576)
     )
-    # Half of them paid it, by the megabytes or by the object count - the
-    # second because a test whose step rounds to nothing can still be up by
-    # a fixture's worth of objects, which the megabytes do not see. This is
-    # the rule: what one test did once is not a drift at any size.
-    if growing < len(rows) / 2:
+    # The rule, and the whole of it: the tests added this much between them,
+    # in use. Memory adding up across a run is the thing worth knowing, and
+    # how it arrived is what the finding then says rather than what decides
+    # whether there is one.
+    if total < limits.growth_mb:
         return None
-    if limits.growth_per_test_mb <= 0:
-        # The rate turned off: the total alone, as it was before there was
-        # a rate, and the recurrence guard above still standing.
-        return (steps, total, biggest, growing, typical) if total >= limits.retained_mb else None
-    # The typical test pays the rate, over enough of a run to mean it: what
-    # recurs, across the tests it recurred in, reaches a quarter of what one
-    # test may keep - or they kept a whole test's worth between them however
-    # it arrived. The recurring part and not the total, because the total is
-    # what a one-time import inflates, and judging a recurrence by a number
-    # that import moved is how the import came to hide the leak beside it.
-    if typical < limits.growth_per_test_mb:
+    # And it is either a recurrence the reading can actually resolve, or it
+    # arrived in a step big enough to be worth a sentence on its own. What
+    # this excludes is the run so long that its own floor adds up: ten
+    # thousand tests at three kilobytes of pytest's bookkeeping is thirty
+    # megabytes, which clears the bar for a run and is nobody's leak.
+    if typical < NOISE_FLOOR_MB and biggest < limits.growth_mb / 2:
         return None
-    if typical * len(rows) < limits.retained_mb / 4 and total < limits.retained_mb:
+    # Unless a run has asked to hear only about what repeats, in which case
+    # the typical test must have paid it too - the median and not the mean,
+    # so that a module one test imported cannot supply the rate for tests
+    # that never paid it.
+    if limits.growth_per_test_mb > 0 and typical < limits.growth_per_test_mb:
         return None
     return steps, total, biggest, growing, typical
 
 
-def _during(rows: list[dict[str, Any]], steps: list[int]) -> str:
+def _during(rows: list[dict[str, Any]], steps: list[float]) -> str:
     """Which tests the memory arrived during, for the evidence."""
-    by_name: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    by_name: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
     for record, step in zip(rows, steps):
         entry = by_name[str(record["nodeid"]).split("[")[0]]
         entry[0] += step
@@ -1257,15 +1275,26 @@ def _during(rows: list[dict[str, Any]], steps: list[int]) -> str:
     return (
         "Most of it during: "
         + ", ".join(
-            f"{name} ({megabytes} MB over {count} test{'s' if count != 1 else ''})"
+            f"{name} ({round(megabytes)} MB over {int(count)} test{'s' if count != 1 else ''})"
             for name, (megabytes, count) in heaviest
-            if megabytes > 0
+            if megabytes >= 0.5
         )
         + "."
     )
 
 
-def _recurrence(total: int, typical: float, count: int, biggest: int) -> Optional[str]:
+def _recurring_rate(typical: float) -> float:
+    """The rate to report, or zero when there is no recurrence to name.
+
+    A median under the reading's own floor is not a rate the run is paying,
+    it is the floor - so it is reported as no recurrence rather than as
+    "about 0.003 MB per test", which is a true sentence that would send a
+    reader looking for a leak that is not there.
+    """
+    return round(typical, 2) if typical >= NOISE_FLOOR_MB else 0.0
+
+
+def _recurrence(total: float, typical: float, count: int, biggest: float) -> Optional[str]:
     """What of the total recurs and what arrived once, when the two differ.
 
     The headline figure is what the tests kept between them, and a reader
@@ -1275,14 +1304,20 @@ def _recurrence(total: int, typical: float, count: int, biggest: int) -> Optiona
     which is which costs a line and saves the reader the arithmetic that
     would mislead them.
     """
-    recurs = int(typical * count)
-    once = total - recurs
+    recurs = round(typical * count)
+    once = round(total) - recurs
     # A megabyte of rounding is not a one-time cost worth a sentence.
     if once < max(2, recurs // 4):
         return None
+    if not recurs:
+        return (
+            f"None of it is a cost the tests share: no test kept enough for a rate, and the "
+            f"biggest single step was {round(biggest)} MB. This is memory arriving in steps, "
+            "which is a size to plan for rather than a leak that grows with the suite."
+        )
     return (
         f"About {recurs} MB of that is the {typical:g} MB every test keeps, over {count} tests. "
-        f"The other {once} MB arrived in steps that did not repeat, the biggest {biggest} MB - "
+        f"The other {once} MB arrived in steps that did not repeat, the biggest {round(biggest)} MB - "
         "a cost paid once is not what grows with the suite."
     )
 
@@ -1309,7 +1344,8 @@ def _drift(
     measured = _drifting(rows, limits)
     if measured is None:
         return []
-    steps, total, biggest, growing, per_test = measured
+    steps, total, biggest, growing, typical = measured
+    per_test = _recurring_rate(typical)
     objects = _objects_per_test(rows)
     first, last = rows[0], rows[-1]
     resident = sum(_figures(record)[1] - _figures(record)[0] for record in rows)
@@ -1336,7 +1372,7 @@ def _drift(
         evidence.insert(1, note)
     evidence.append(
         f"Measured: {'traced memory' if traced else 'process'} {_figures(first)[0]} MB before the "
-        f"first of these tests, {_figures(last)[1]} MB after the last. Biggest single step {biggest} MB."
+        f"first of these tests, {_figures(last)[1]} MB after the last. Biggest single step {round(biggest)} MB."
         + (
             f" {total} MB of the {resident} MB increase is in use; the rest was freed and kept by "
             "the allocator."
@@ -1354,10 +1390,11 @@ def _drift(
             worker=worker,
             before_mb=_figures(first)[0],
             after_mb=_figures(last)[1],
-            delta_mb=total,
+            delta_mb=round(total),
             growth_tests=len(rows),
-            growth_per_test_mb=round(per_test, 1),
+            growth_per_test_mb=per_test,
             growth_objects_per_test=objects,
+            growth_recurring_mb=round(per_test * len(rows)),
             tests=[str(record["nodeid"]) for record in rows[:3]],
             test_count=len(rows),
             frame=frame,
@@ -1414,9 +1451,10 @@ def _fleet_drift(
     measured = _drifting(rows, limits)
     if measured is None:
         return []
-    steps, total, biggest, growing, per_test = measured
+    steps, total, biggest, growing, typical = measured
+    per_test = _recurring_rate(typical)
     kept_by_worker = {
-        worker: sum(_live_step(record) for record in worker_rows)
+        worker: round(sum(_live_step(record) for record in worker_rows))
         for worker, worker_rows in pooled.items()
     }
     if sum(1 for kept in kept_by_worker.values() if kept >= 1) < 2:
@@ -1484,7 +1522,7 @@ def _fleet_drift(
         # and a page mapped by every worker is in every worker's figure.
         # tracemalloc counts each process's own allocations and nothing else.
         + ("" if traced else ", which counts the pages they share once each")
-        + f". Biggest single step {biggest} MB."
+        + f". Biggest single step {round(biggest)} MB."
         + (f" +{objects:,d} Python objects per test." if objects else "")
     )
     return [
@@ -1495,10 +1533,11 @@ def _fleet_drift(
             nodeid=str(rows[0]["nodeid"]),
             before_mb=before,
             after_mb=after,
-            delta_mb=total,
+            delta_mb=round(total),
             growth_tests=len(rows),
-            growth_per_test_mb=round(per_test, 1),
+            growth_per_test_mb=per_test,
             growth_objects_per_test=objects,
+            growth_recurring_mb=round(per_test * len(rows)),
             worker_count=len(pooled),
             worker_rss=dict(sorted(kept_by_worker.items())),
             tests=[str(record["nodeid"]) for record in rows[:3]],
@@ -1530,17 +1569,50 @@ def _kept(record: dict[str, Any]) -> int:
     return max(resident, int(heap_after) - int(heap_before))
 
 
-def _live_step(record: dict[str, Any]) -> int:
+def _step(record: dict[str, Any], before: str, after: str) -> Optional[float]:
+    """One before/after pair as megabytes, from the kilobyte readings where
+    the record has them and the megabyte ones where it does not.
+
+    Whole megabytes are the wrong unit to subtract in. A test that keeps
+    300 KB reads as a step of 0 MB, and two hundred of them read as nothing
+    two hundred times over rather than as the 60 MB the process grew - so a
+    leak under a megabyte a test was invisible however long it ran. The
+    kilobyte figures are the same readings the megabyte ones are rounded
+    from; a record written without them, or on a platform that has none,
+    falls back and loses only what it never had.
+    """
+    fine_before, fine_after = record.get(f"{before}_kb"), record.get(f"{after}_kb")
+    if fine_before is not None and fine_after is not None:
+        return (int(fine_after) - int(fine_before)) / 1024
+    coarse_before, coarse_after = record.get(f"{before}_mb"), record.get(f"{after}_mb")
+    if coarse_before is None or coarse_after is None:
+        return None
+    return float(int(coarse_after) - int(coarse_before))
+
+
+def _live_step(record: dict[str, Any]) -> float:
     """What a test added to memory that is in use, for the drift rule: the
     C heap's step plus the small-object blocks' at their rough size, where
     both were read; the resident step where neither was."""
     if _figures(record)[3]:
-        return _kept(record)
-    heap_before, heap_after = record.get("heap_before_mb"), record.get("heap_after_mb")
+        return float(_kept(record))
+    heap = _step(record, "heap_before", "heap_after")
     blocks = _blocks_kept(record)
-    if heap_before is None or heap_after is None or blocks is None:
-        return _kept(record)
-    return int(heap_after) - int(heap_before) + int(blocks * BYTES_PER_BLOCK / 1048576)
+    if heap is not None and blocks is not None:
+        return heap + blocks * BYTES_PER_BLOCK / 1048576
+    return _kept_finely(record)
+
+
+def _kept_finely(record: dict[str, Any]) -> float:
+    """:func:`_kept` in the finer unit: the resident step, or the live-heap
+    step where that is larger, for the same reason - resident memory
+    understates what a test kept whenever it refilled pages an earlier test
+    freed and the allocator held on to."""
+    resident = _step(record, "rss_before", "rss_after")
+    if resident is None:
+        return float(_kept(record))
+    heap = _step(record, "heap_before", "heap_after")
+    return resident if heap is None else max(resident, heap)
 
 
 def _blocks_kept(record: dict[str, Any]) -> Optional[int]:

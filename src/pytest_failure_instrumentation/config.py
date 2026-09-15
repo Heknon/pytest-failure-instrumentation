@@ -308,14 +308,17 @@ class Settings:
     #: Resident megabytes no test may reach, whatever it started from. 0 is
     #: off. The retained threshold catches a climb; this catches a size.
     profile_peak_mb: int = 0
-    #: Megabytes a test may leave behind on average, over a run of them,
-    #: before the drift is raised without waiting for profile_retained_mb to
-    #: accumulate. A drift is paid again for every test in the suite where
-    #: one test's retention is paid once, so it is judged on the rate; the
-    #: total only has to reach a quarter of profile_retained_mb, so that a
-    #: handful of tests cannot carry a rate on their own. 0 turns the rate
-    #: off and leaves the total.
-    profile_growth_per_test_mb: float = 1.0
+    #: Megabytes a run's tests may add between them, in use, before the run
+    #: is said to be growing. profile_retained_mb is what one *test* may
+    #: keep and is the wrong bar for a run: held to it, a run said nothing
+    #: until a hundred megabytes had piled up, which is a fact about how
+    #: long the run was rather than about the code.
+    profile_growth_mb: int = 20
+    #: Megabytes the *typical* test must have left behind as well, for a run
+    #: that only wants to hear about a leak that repeats. 0, the default,
+    #: asks nothing of the shape: the finding says whether the memory
+    #: recurred or arrived in steps, and either is the run growing.
+    profile_growth_per_test_mb: float = 0.0
     #: Tests that must each leave something behind before the drift between
     #: them is called steady rather than a step. Lower it for a suite whose
     #: workers each run a handful of tests, where a leak reaches the rule
@@ -404,6 +407,7 @@ class Settings:
         )
         object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
         object.__setattr__(self, "profile_peak_mb", max(0, int(self.profile_peak_mb)))
+        object.__setattr__(self, "profile_growth_mb", max(1, int(self.profile_growth_mb)))
         object.__setattr__(
             self, "profile_growth_per_test_mb", max(0.0, float(self.profile_growth_per_test_mb))
         )
@@ -614,6 +618,7 @@ class Settings:
             "profile_cpu_floor_seconds": self.profile_cpu_floor_seconds,
             "profile_retained_mb": self.profile_retained_mb,
             "profile_peak_mb": self.profile_peak_mb,
+            "profile_growth_mb": self.profile_growth_mb,
             "profile_growth_per_test_mb": self.profile_growth_per_test_mb,
             "profile_growth_tests": self.profile_growth_tests,
             "profile_imbalance_ratio": self.profile_imbalance_ratio,
@@ -838,13 +843,20 @@ def add_options(parser: pytest.Parser) -> None:
         default="0",
     )
     parser.addini(
+        "failure_profile_growth_mb",
+        help="Megabytes a run's tests may add between them, in use, before "
+        "the run is raised as growing - whether the memory arrived a little "
+        "at a time or in one step, which the finding says. "
+        "failure_profile_retained_mb is what one test may keep and is a "
+        "separate question.",
+        default="20",
+    )
+    parser.addini(
         "failure_profile_growth_per_test_mb",
-        help="Megabytes a test may leave behind on average, over a run of "
-        "them, before the drift between them is raised as steady growth "
-        "without waiting for failure_profile_retained_mb to accumulate. The "
-        "total must still reach a quarter of that, so a handful of tests "
-        "cannot carry a rate on their own. 0 leaves only the total.",
-        default="1",
+        help="Megabytes the typical test must have left behind as well, for "
+        "a run that only wants to hear about a leak that repeats. 0, the "
+        "default, asks nothing of the shape.",
+        default="0",
     )
     parser.addini(
         "failure_profile_growth_tests",
@@ -1248,7 +1260,8 @@ def resolve(config: pytest.Config) -> Settings:
         profile_cpu_floor_seconds=_number(config, "failure_profile_cpu_floor_seconds", 0.5),
         profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
         profile_peak_mb=int(_number(config, "failure_profile_peak_mb", 0)),
-        profile_growth_per_test_mb=_number(config, "failure_profile_growth_per_test_mb", 1.0),
+        profile_growth_mb=int(_number(config, "failure_profile_growth_mb", 20)),
+        profile_growth_per_test_mb=_number(config, "failure_profile_growth_per_test_mb", 0.0),
         profile_growth_tests=int(_number(config, "failure_profile_growth_tests", 4)),
         profile_imbalance_ratio=_number(config, "failure_profile_imbalance_ratio", 2.0),
         profile_allocations=_flag(config, "failure_profile_allocations", False)

@@ -452,31 +452,30 @@ one; see below.
   it costs the worker's footprint, and hunting the code will find nothing.
 - `TRANSIENT_PEAK`: climbed `delta_mb` and came back. Costs peak memory, which
   is what decides how many workers fit on a machine.
-- `STEADY_GROWTH`: `worker` drifted up by `delta_mb` over `growth.tests`
-  tests, `growth.per_test_mb` each (and `growth.objects_per_test` live
-  objects, where the count was read), none of them enough to be raised alone
-  and at least half of them having kept something, which is what makes it a
-  drift rather than a cost paid once. `growth.per_test_mb` is the *typical*
-  test's step, the median and not the average, so a module one test imported
-  neither passes for a leak nor hides one: it is in `delta_mb` and in the
-  "biggest single step" evidence, and not in the rate. Read the rate, not
-  `delta_mb` divided by `growth.tests` — the evidence separates what recurs
-  from what arrived once when the two differ. The bar is reached two ways:
-  the tests kept `failure_profile_retained_mb` between them, or what recurs
-  reaches a quarter of it at `failure_profile_growth_per_test_mb` a test,
-  because a drift is paid again for every test in the suite where one test's
-  retention is paid once. When `workers` is
-  set the finding is
-  the run's rather than one process's: the same rule over the workers that
-  did not reach it alone, pooled, because xdist divides the tests between
-  them and divides a leak in the tests with them — `delta_mb` is what they
-  kept between them, `worker_rss` is each one's share, and `worker` is the
-  controller that raised it, not the process that leaked. Two megabytes a test is what a leak
-  looks like from outside, and the one thing a per-test check never sees;
-  `nodeid` is only the first of them. The evidence says when every one is a
-  parametrisation of the same test, and — with `--failure-profile-allocations` —
-  which lines held what the worker accumulated; without it, it says to rerun
-  with that flag.
+- `STEADY_GROWTH`: the run's tests added `delta_mb` between them, in use,
+  over `growth.tests` tests — past `failure_profile_growth_mb`, which is the
+  bar for a *run* and much lower than `failure_profile_retained_mb`, the bar
+  for one test. How the memory arrived is in the summary and in
+  `growth.recurring_mb`, and the two are fixed in different places. "Memory
+  growing across tests" with a `growth.per_test_mb` means a leak that scales
+  with the suite: every test pays it, and it is bigger on a longer run.
+  "Memory added over the run … in steps that did not repeat" means a cost
+  paid once, usually a module a test imported — a size to plan for, not a
+  leak, and hunting it in the tests will find an import. A summary naming
+  both is both, which is the common case: read `recurring_mb` for the leak
+  and the rest for the size. `growth.per_test_mb` is the *median* step, so a
+  one-time import neither supplies it nor hides it, and it is 0 when no rate
+  above the reading's floor (20 KB a test) was there to claim. Never divide
+  `delta_mb` by `growth.tests` — that is the number the import moved.
+  `nodeid` is only the first of the tests. The evidence says when every one
+  is a parametrisation of the same test, and — with
+  `--failure-profile-allocations` — which lines held what accumulated;
+  without it, it says to rerun with that flag. When `workers` is set the
+  finding is the run's rather than one process's: the same rule over the
+  workers that did not reach it alone, pooled, because xdist divides the
+  tests between them and divides a leak in the tests with them — `delta_mb`
+  is what they kept between them, `worker_rss` is each one's share, and
+  `worker` is the controller that raised it, not the process that leaked.
 - `WORKER_IMBALANCE`: `worker` peaked at `peak_mb` against a median of
   `median_mb` among its siblings (`worker_rss` has all of them), and `nodeid`
   is the test after which it first stood clear. Under xdist the worker that

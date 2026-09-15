@@ -440,7 +440,9 @@ StackKey = tuple[tuple[Any, Any, int], ...]
 class _Window:
     """What is being accumulated for one test, or for the gaps between them."""
 
-    def __init__(self, nodeid: Optional[str], rss_mb: Optional[int]) -> None:
+    def __init__(
+        self, nodeid: Optional[str], rss_mb: Optional[int], rss_kb: Optional[int] = None
+    ) -> None:
         self.nodeid = nodeid
         #: Taken once here rather than per record: the window outlives a
         #: test's six phase transitions and the id does not change within it.
@@ -449,11 +451,19 @@ class _Window:
         self.cpu_started = time.process_time()
         self.rss_before = rss_mb
         self.rss_peak = rss_mb
+        #: The same reading in kilobytes, where the platform gave one. Whole
+        #: megabytes are what a reader wants and the wrong unit to subtract
+        #: in: a test that keeps 300 KB reads as 0 MB, and two hundred of
+        #: them read as nothing two hundred times rather than as the 60 MB
+        #: the process grew. The drift rules do their arithmetic on these
+        #: and round for the report.
+        self.rss_before_kb = rss_kb
         #: The live heap at the start: what the allocator has handed out, and
         #: how many small-object blocks Python holds. Against the same two at
         #: the end they say whether memory the test left behind is still in
         #: use or merely still mapped.
-        self.heap_before = _heap_in_use()
+        self.heap_before_kb = _heap_in_use_kb()
+        self.heap_before = _megabytes(self.heap_before_kb)
         self.blocks_before = sys.getallocatedblocks()
         #: The allocator's own state: arenas, and the free memory it keeps
         #: mapped in each. Read at boundaries only - it walks every arena
@@ -507,6 +517,7 @@ class Sampler:
         record: Callable[[dict[str, Any]], None],
         resident_megabytes: Callable[[], Optional[int]],
         *,
+        resident_kilobytes: Optional[Callable[[], Optional[int]]] = None,
         interval: float = DEFAULT_INTERVAL,
         worker: str = "",
         allocations: bool = False,
@@ -514,6 +525,7 @@ class Sampler:
     ) -> None:
         self.record = record
         self.resident_megabytes = resident_megabytes
+        self.resident_kilobytes = resident_kilobytes
         self.interval = max(0.001, float(interval))
         self.worker = worker
         #: Whether tracemalloc is on and snapshots are taken around a test
@@ -575,7 +587,7 @@ class Sampler:
         #: cannot show: a test that fills pages an earlier test freed grows
         #: the heap and not the process.
         self._last_heap: Optional[int] = None
-        self._window = _Window(None, self._rss())
+        self._window = _Window(None, *self._rss_pair())
         self._background = self._window
         self._gc_started = 0.0
         self._stopped = False
@@ -678,7 +690,7 @@ class Sampler:
                     # time given back to the background's clock.
                     self._finish_test_window()
                 self._close_window(self._window)
-                self._window = _Window(nodeid, self._rss())
+                self._window = _Window(nodeid, *self._rss_pair())
                 self._paused = (time.monotonic(), time.process_time())
                 if self.tracing:
                     try:
@@ -1136,6 +1148,23 @@ class Sampler:
         except Exception:
             return None
 
+    def _rss_pair(self) -> tuple[Optional[int], Optional[int]]:
+        """Resident memory as (megabytes, kilobytes), from one reading.
+
+        The kilobyte source is optional: a caller that only has the megabyte
+        one - every test in this suite injects a fake - gets None for the
+        finer figure, and the records simply carry no ``*_kb`` field for the
+        analysis to prefer.
+        """
+        if self.resident_kilobytes is not None:
+            try:
+                kilobytes = self.resident_kilobytes()
+            except Exception:
+                kilobytes = None
+            if kilobytes is not None:
+                return _megabytes(kilobytes), kilobytes
+        return self._rss(), None
+
     # -- garbage collection ----------------------------------------------------
 
     def _on_gc(self, phase: str, info: dict[str, Any]) -> None:
@@ -1173,12 +1202,18 @@ class Sampler:
             self._close_window(window)
         except Exception:  # noqa: BLE001
             pass
-        rss_after = self._rss()
-        heap_after = _heap_in_use()
+        rss_after, rss_after_kb = self._rss_pair()
+        heap_after_kb = _heap_in_use_kb()
+        heap_after = _megabytes(heap_after_kb)
         blocks_after = sys.getallocatedblocks()
         allocator_after = _allocator_figures()
         try:
-            self.record(self._record_of(window, kind, now, rss_after, heap_after, blocks_after, allocator_after))
+            self.record(
+                self._record_of(
+                    window, kind, now, rss_after, heap_after, blocks_after, allocator_after,
+                    rss_after_kb, heap_after_kb,
+                )
+            )
         except Exception:  # noqa: BLE001 - a lost record beats a lost run
             pass
         # Whatever this window was, its aggregates are written now. The
@@ -1191,9 +1226,11 @@ class Sampler:
         window.started = now
         window.cpu_started = time.process_time()
         window.rss_before = rss_after
+        window.rss_before_kb = rss_after_kb
         window.rss_peak = rss_after
         window.rss_at = {}
         window.heap_before = heap_after
+        window.heap_before_kb = heap_after_kb
         window.blocks_before = blocks_after
         window.allocator_before = allocator_after
         window.threads_peak = 0
@@ -1210,6 +1247,8 @@ class Sampler:
         heap_after: Optional[int],
         blocks_after: int,
         allocator_after: Optional[dict[str, int]],
+        rss_after_kb: Optional[int] = None,
+        heap_after_kb: Optional[int] = None,
     ) -> dict[str, Any]:
         frames: dict[tuple[str, int, str], int] = {}
 
@@ -1284,6 +1323,15 @@ class Sampler:
             "rss_at": window.rss_at,
             "heap_before_mb": window.heap_before,
             "heap_after_mb": heap_after,
+            # The same two pairs in kilobytes, where the platform gave them.
+            # The drift rules subtract these and round for the report, so
+            # that a leak under a megabyte a test is not two hundred zeroes.
+            # Absent on a platform without the finer reading, and on records
+            # written before there was one: the analysis falls back.
+            "rss_before_kb": window.rss_before_kb,
+            "rss_after_kb": rss_after_kb,
+            "heap_before_kb": window.heap_before_kb,
+            "heap_after_kb": heap_after_kb,
             "blocks_before": window.blocks_before,
             "blocks_after": blocks_after,
             "allocator_before": window.allocator_before,
@@ -1491,12 +1539,20 @@ class _MachineClock:
 
 
 def _heap_in_use() -> Optional[int]:
+    return _megabytes(_heap_in_use_kb())
+
+
+def _heap_in_use_kb() -> Optional[int]:
     from .. import probes
 
     try:
-        return probes.heap_in_use_megabytes()[0]
+        return probes.heap_in_use_kilobytes()[0]
     except Exception:
         return None
+
+
+def _megabytes(kilobytes: Optional[int]) -> Optional[int]:
+    return None if kilobytes is None else round(kilobytes / 1024)
 
 
 def _allocator_figures() -> Optional[dict[str, int]]:

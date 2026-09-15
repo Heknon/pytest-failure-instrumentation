@@ -210,6 +210,11 @@ class MemoryGrowth(BaseModel):
     per_test_mb: float
     #: Live objects added per test, when the count was read.
     objects_per_test: Optional[int] = None
+    #: How much of the growth is what every test paid - ``per_test_mb`` over
+    #: ``tests`` - the rest having arrived in steps that did not repeat. A
+    #: module imported once moves the total and not the rate, and the two
+    #: are fixed in different places.
+    recurring_mb: int = 0
 
 
 class MemoryProfileIncident(Incident):
@@ -286,10 +291,32 @@ class MemoryProfileIncident(Incident):
             return f"Memory over the ceiling: {self.nodeid} reached {self.peak_mb} MB{ceiling}{on}"
         if self.verdict == "STEADY_GROWTH":
             growth = self.growth
-            tests = f" over {growth.tests} tests, about {growth.per_test_mb:g} MB per test" if growth else ""
+            # A run that grew because every test left something behind and a
+            # run that grew because one test imported a module are the same
+            # verdict and not the same sentence: the first is a leak that
+            # scales with the suite, the second is a cost paid once, and a
+            # reader who is told "about 0.1 MB per test" about the second
+            # has been told the least useful true thing available.
+            recurring = growth.recurring_mb if growth else 0
+            recurred = recurring * 2 >= (self.delta_mb or 0)
+            if growth and recurred:
+                shape = f" over {growth.tests} tests, about {growth.per_test_mb:g} MB per test"
+            elif growth and recurring:
+                # Both are real and the reader needs both: the steps are the
+                # size to plan for, and the rate is the thing that will be
+                # bigger next quarter.
+                shape = (
+                    f" over {growth.tests} tests, {recurring} MB of it recurring at "
+                    f"{growth.per_test_mb:g} MB per test"
+                )
+            elif growth:
+                shape = f" over {growth.tests} tests, in steps that did not repeat"
+            else:
+                shape = ""
+            grew = "Memory growing across tests" if recurred else "Memory added over the run"
             if self.workers:
-                return f"Memory growing across tests: the run kept {self.delta_mb} MB in use across {self.workers} workers{tests}"
-            return f"Memory growing across tests: worker {self.worker} kept {self.delta_mb} MB in use{tests}"
+                return f"{grew}: the run kept {self.delta_mb} MB in use across {self.workers} workers{shape}"
+            return f"{grew}: worker {self.worker} kept {self.delta_mb} MB in use{shape}"
         if self.verdict == "WORKER_IMBALANCE":
             return f"One worker much larger than the others: {self.worker} peaked at {self.peak_mb} MB, the median worker at {self.median_mb} MB"
         if self.verdict == "ALLOCATOR_RETENTION":
@@ -379,6 +406,7 @@ def build(finding: Finding, worker: str) -> Incident:
                 tests=finding.growth_tests,
                 per_test_mb=finding.growth_per_test_mb,
                 objects_per_test=finding.growth_objects_per_test,
+                recurring_mb=finding.growth_recurring_mb,
             )
             if finding.growth_tests
             else None
