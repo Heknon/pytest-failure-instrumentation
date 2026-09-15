@@ -45,9 +45,9 @@ What it reports
 Setting a test's attributes
 ---------------------------
 `machine`, `vc`, `cycle_id`, `owner` and the rest describe the test rather than
-the phase, and they come from everywhere - an option, a fixture that connects
-to the machine, the test body itself. So there is one way to set any of them,
-from anywhere that can see a pytest ``config``::
+the phase, and they come from everywhere - a conftest hook, a fixture that
+connects to the machine, the test body itself. So there is one way to set any
+of them, from anywhere that can see a pytest ``config``::
 
     reporter = request.config.pluginmanager.getplugin("elastic-reporter")
     reporter.set(vc="fw-4.2.1", machine="rack1-dut7")
@@ -60,8 +60,17 @@ or, with no ``config`` to hand, `reporter`::
         reporter().set(vc="fw-5.0.0")
 
 That is the whole API. It takes any of `SETTABLE` - every field of `CaseReport`
-except the ones a phase answers for itself - and it is there in every process,
-whether or not the plugin is switched on, so nothing has to be guarded.
+except the ones a phase answers for itself - and whatever is never set keeps
+the default the model gives it. The plugin adds no options of its own: a value
+for the whole run is a line in a conftest hook, reading it from wherever you
+keep it::
+
+    def pytest_sessionstart(session):
+        # runs in every process, controller and xdist worker alike
+        session.config.pluginmanager.getplugin("elastic-reporter").set(
+            vc=os.environ["FIRMWARE"],
+            cycle_id=int(os.environ["CYCLE"]),
+        )
 
 A value set anywhere in a test describes the whole test: its setup, call and
 teardown reports all carry it, whichever phase set it, because a test's reports
@@ -105,14 +114,14 @@ ran, the exception that was raised - is read on the worker by `ReportAnnotator`
 and attached to the report, which pytest serialises across for us. So setting
 an attribute on a worker needs nothing of the controller. It describes that
 worker's tests only, each worker being its own process, so a value meant for
-the whole run belongs where every process picks it up: an option, an ini key,
-or a hook in the rootdir conftest.
+the whole run belongs in a hook every process runs, like the
+``pytest_sessionstart`` above in the rootdir conftest.
 """
 
 import threading
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
@@ -280,16 +289,13 @@ class CaseReportHooks:
 
         One catch, and it is pytest's rather than this plugin's: implementing
         a hook nobody has declared is an error, so a conftest with this in it
-        cannot run without the plugin loaded. If that can happen - the plugin
-        is optional in your suite, or someone passes ``-p no:elastic_reporter``
-        - say so, and pytest will leave it alone instead::
+        cannot run without the plugin loaded - which is also how the reporting
+        is switched off, there being no option for it. Where that can happen,
+        say so, and pytest leaves the implementation alone instead::
 
             @pytest.hookimpl(optionalhook=True)
             def pytest_case_report(report):
                 ...
-
-        ``--elastic-off`` is not that case: the plugin is still loaded, it just
-        has nothing to say.
         """
 
 
@@ -306,22 +312,19 @@ def pytest_addhooks(pluginmanager: pytest.PytestPluginManager) -> None:
 class CaseAttributes:
     """Every report field that describes the test rather than the phase.
 
-    One store for all of them, because they come from everywhere: an option, a
-    fixture that connects to the machine, the test body. `set` takes any of
-    `SETTABLE` from any of those places, the values describe the whole test -
-    its reports are stamped when it ends, not as each phase finishes - and they
-    stick until changed, so a process can set one and forget it.
+    One store for all of them, because they come from everywhere: a conftest
+    hook, a fixture that connects to the machine, the test body. `set` takes
+    any of `SETTABLE` from any of those places, the values describe the whole
+    test - its reports are stamped when it ends, not as each phase finishes -
+    and they stick until changed, so a process can set one and forget it.
+
+    What is never set keeps the default `CaseReport` gives it.
     """
 
-    def __init__(self, config: "ReporterConfig") -> None:
-        """Start from what the config object says."""
+    def __init__(self) -> None:
+        """Start with nothing set: `CaseReport`'s own defaults stand in."""
         self._lock = threading.Lock()
-        self._values: dict[str, Any] = {
-            "vc": config.vc,
-            "owner": config.owner,
-            "cycle_id": config.cycle_id,
-            "labs3": config.labs3,
-        }
+        self._values: dict[str, Any] = {}
 
     def set(self, **attributes: object) -> None:
         """Set any of `SETTABLE` for this test and the tests after it."""
@@ -363,60 +366,6 @@ class ElasticPlugin:
     def set(self, **attributes: object) -> None:
         """Set any of `SETTABLE` for this test and the tests after it."""
         self.attributes.set(**attributes)
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-
-def setting(config: pytest.Config, name: str) -> str:
-    """Return one setting as given: on the command line, else in the ini file."""
-    value = getattr(config.option, name, None) or config.getini(name)
-    return str(value or "")
-
-
-@dataclass
-class ReporterConfig:
-    """Everything the reporter reads once, at configure time."""
-
-    cycle_id: int = 1
-    owner: str = "mock-owner"
-    vc: str = "mock-vc"
-    labs3: bool = True
-    enabled: bool = True
-
-    @classmethod
-    def from_pytest(cls, config: pytest.Config) -> Self:
-        """Read the run's settings off the command line, then the ini file."""
-        return cls(
-            cycle_id=int(setting(config, "elastic_cycle_id") or cls.cycle_id),
-            owner=setting(config, "elastic_owner") or cls.owner,
-            vc=setting(config, "elastic_vc") or cls.vc,
-            enabled=not config.getoption("elastic_off", default=False),
-        )
-
-
-#: Every setting, as ``(option, ini, help)``. Both interfaces, one table.
-SETTINGS = [
-    ("--elastic-cycle-id", "elastic_cycle_id", "cycle id for this run"),
-    ("--elastic-owner", "elastic_owner", "owner recorded on every report"),
-    ("--elastic-vc", "elastic_vc", "starting vc for this run"),
-]
-
-
-def pytest_addoption(parser: pytest.Parser) -> None:
-    """Register the plugin's command line options and ini keys."""
-    group = parser.getgroup("elastic-reporter", "report test cases to elastic")
-    for option, name, help_text in SETTINGS:
-        group.addoption(option, dest=name, help=help_text)
-        parser.addini(name, help_text, default="")
-    group.addoption(
-        "--elastic-off",
-        dest="elastic_off",
-        action="store_true",
-        help="build nothing and report nothing",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -492,15 +441,9 @@ class ElasticCaseReporter(ElasticPlugin):
     the session itself without xdist.
     """
 
-    def __init__(
-        self,
-        config: ReporterConfig,
-        hook: "HookRelay",
-        attributes: CaseAttributes,
-    ) -> None:
-        """Report what ``config`` says, through ``hook``, stamped from ``attributes``."""
+    def __init__(self, hook: "HookRelay", attributes: CaseAttributes) -> None:
+        """Report through ``hook``, stamped from ``attributes``."""
         super().__init__(attributes)
-        self.config = config
         self.hook = hook
         self._cases: dict[str, Case] = {}
         self._closed = False
@@ -773,7 +716,7 @@ def reporter() -> ElasticPlugin:
     """
     current = ElasticPlugin.current
     if current is None:
-        current = ElasticPlugin(CaseAttributes(ReporterConfig()))
+        current = ElasticPlugin(CaseAttributes())
     return current
 
 
@@ -791,13 +734,7 @@ def is_xdist_controller(config: pytest.Config) -> bool:
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register the half of the plugin this process is responsible for."""
-    settings = ReporterConfig.from_pytest(config)
-    attributes = CaseAttributes(settings)
-    if not settings.enabled:
-        # Registered anyway, so that a fixture setting attributes goes on
-        # working - it just has nobody listening.
-        config.pluginmanager.register(ElasticPlugin(attributes), PLUGIN_NAME)
-        return
+    attributes = CaseAttributes()
     worker, controller = is_xdist_worker(config), is_xdist_controller(config)
     if not controller:
         # Reports are made here, so this is where they can be annotated - and,
@@ -805,5 +742,4 @@ def pytest_configure(config: pytest.Config) -> None:
         annotator = ReportAnnotator(attributes)
         config.pluginmanager.register(annotator, PLUGIN_NAME if worker else ANNOTATOR_NAME)
     if not worker:
-        reporter = ElasticCaseReporter(settings, config.hook, attributes)
-        config.pluginmanager.register(reporter, PLUGIN_NAME)
+        config.pluginmanager.register(ElasticCaseReporter(config.hook, attributes), PLUGIN_NAME)

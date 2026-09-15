@@ -59,8 +59,21 @@ def test_to_dict_is_json_serialisable_with_json_default():
     assert document["test_case"] == "test_a"
 
 
+def test_unset_attributes_keep_the_models_defaults():
+    attributes = er.CaseAttributes()
+    assert attributes.snapshot() == {}
+    report = er.CaseReport(outcome="passed", test_suite="t.py", test_case="test_a")
+    er.stamp(report, attributes.snapshot())
+    assert (report.vc, report.owner, report.cycle_id, report.labs3) == (
+        "mock-vc",
+        "mock-owner",
+        1,
+        True,
+    )
+
+
 def test_attributes_reject_what_is_not_settable():
-    attributes = er.CaseAttributes(er.ReporterConfig())
+    attributes = er.CaseAttributes()
     attributes.set(vc="fw-1", machine="rack1")
     assert attributes.snapshot()["vc"] == "fw-1"
     with pytest.raises(ValueError, match="not a case attribute: outcome"):
@@ -68,7 +81,7 @@ def test_attributes_reject_what_is_not_settable():
 
 
 def test_attributes_survive_concurrent_writers():
-    attributes = er.CaseAttributes(er.ReporterConfig())
+    attributes = er.CaseAttributes()
     threads = [threading.Thread(target=attributes.set, kwargs={"vc": f"fw-{n}"}) for n in range(50)]
     for thread in threads:
         thread.start()
@@ -235,11 +248,30 @@ def test_attributes_describe_the_whole_test(run):
     assert {r["vc"] for r in cases["test_inherits_the_vc"]} == {"fw-5.0.0"}
 
 
-def test_options_and_ini_set_the_run_wide_attributes(run, pytester):
-    pytester.makeini("[pytest]\nelastic_owner = ini-owner\nelastic_cycle_id = 99\n")
-    _, documents = run("def test_a(): pass", "--elastic-vc=fw-from-cli")
-    assert {d["vc"] for d in documents} == {"fw-from-cli"}
-    assert {d["owner"] for d in documents} == {"ini-owner"}
+def test_a_conftest_hook_sets_the_run_wide_attributes(run):
+    """The plugin has no options: this is what replaces them, workers included."""
+    _, documents = run(
+        """
+        import pytest
+
+        @pytest.mark.parametrize("n", range(4))
+        def test_spread(n):
+            pass
+        """,
+        "-n",
+        "2",
+        conftest=RECORD
+        + """
+
+def pytest_sessionstart(session):
+    session.config.pluginmanager.getplugin("elastic-reporter").set(
+        vc="fw-from-conftest", owner="lab-team", cycle_id=99,
+    )
+""",
+    )
+    assert len(documents) == 12
+    assert {d["vc"] for d in documents} == {"fw-from-conftest"}
+    assert {d["owner"] for d in documents} == {"lab-team"}
     assert {d["cycle_id"] for d in documents} == {99}
 
 
@@ -310,18 +342,28 @@ def test_the_controller_owns_the_stream_under_xdist(run):
     assert sum(d["last_report"] for d in documents) == 8
 
 
-def test_switched_off_reports_nothing_and_still_takes_attributes(run):
-    result, documents = run(
+def test_without_the_plugin_loaded_nothing_reports_and_set_still_works(pytester):
+    """Not loading it is how the reporting is switched off."""
+    shutil.copy(er.__file__, pytester.path / "elastic_reporter.py")
+    pytester.makeconftest(
+        """
+        import pytest
+
+        @pytest.hookimpl(optionalhook=True)  # the plugin may not be loaded
+        def pytest_case_report(report):
+            raise AssertionError("nothing should be reporting")
+        """,
+    )
+    pytester.makepyfile(
         """
         import elastic_reporter as er
 
         def test_a():
-            er.reporter().set(vc="fw-1")  # must not raise with the plugin off
+            er.reporter().set(vc="fw-1")  # no session, no config, no plugin
         """,
-        "--elastic-off",
     )
+    result = pytester.runpytest_subprocess()
     result.assert_outcomes(passed=1)
-    assert documents == []
 
 
 def test_nothing_is_held_once_a_test_is_done(run):
