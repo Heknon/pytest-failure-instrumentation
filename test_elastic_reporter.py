@@ -13,9 +13,11 @@ import json
 import queue
 import shutil
 import threading
+from datetime import datetime
 from time import monotonic
 
 import pytest
+from pydantic import ValidationError
 
 import elastic_reporter as er
 
@@ -72,12 +74,24 @@ def test_stamp_only_writes_what_a_step_does_not_own():
     assert not hasattr(report, "nonsense")
 
 
-def test_to_dict_is_json_serialisable_with_json_default():
+def test_to_dict_is_ready_for_json_as_it_stands():
     report = er.CaseReport(test_suite="t.py", test_case="test_a")
-    document = json.loads(json.dumps(report.to_dict(), default=er.json_default))
-    assert document["@timestamp"] == report.time.isoformat()
+    document = json.loads(json.dumps(report.to_dict()))  # no default= needed
+    # Pydantic writes UTC as a trailing Z rather than +00:00. Both are ISO 8601
+    # and elastic reads either, so check the instant, not the spelling.
+    assert document["@timestamp"] == document["time"]
+    assert datetime.fromisoformat(document["@timestamp"]) == report.time
     assert document["test_case"] == "test_a"
     assert document["outcome"] is None  # no verdict unless it is the last report
+
+
+def test_the_model_refuses_what_elastic_should_not_be_asked_to_index():
+    with pytest.raises(ValidationError):
+        er.CaseReport(test_suite="t.py", test_case="test_a", macihne="typo")
+    with pytest.raises(ValidationError):
+        er.CaseReport(test_suite="t.py", test_case="test_a", cycle_id="seventy")
+    with pytest.raises(ValidationError):
+        er.CaseReport(test_case="test_a")  # a report belongs to a suite
 
 
 def test_attributes_reject_what_is_not_settable():
@@ -89,6 +103,20 @@ def test_attributes_reject_what_is_not_settable():
     # The identity comes from the nodeid; a typo must not rewrite every report.
     with pytest.raises(ValueError, match="not a case attribute: test_case"):
         attributes.set(test_case="upgrade-suite")
+
+
+def test_attributes_are_checked_against_the_model_where_they_are_set():
+    attributes = er.CaseAttributes()
+    with pytest.raises(ValidationError):
+        attributes.set(cycle_id="seventy-seven")
+    attributes.set(cycle_id="77")  # but a value the model can convert is converted
+    assert attributes.snapshot()["cycle_id"] == 77
+
+
+def test_a_vocabulary_that_is_not_strings_is_refused_at_startup():
+    er.check_vocabulary(("OUTCOMES", er.OUTCOMES), ("PHASE_STEPS", er.PHASE_STEPS))
+    with pytest.raises(TypeError, match=r"OUTCOMES\['passed'\]"):
+        er.check_vocabulary(("OUTCOMES", {**er.OUTCOMES, "passed": 1}))
 
 
 def test_unset_attributes_keep_the_models_defaults():
@@ -281,14 +309,11 @@ def test_a_test_that_logged_nothing_is_still_closed_out(monkeypatch):
 RECORD = """
 import json
 
-import elastic_reporter as er
-
 RECEIVED = []
 
 
 def pytest_case_reports(reports):
-    RECEIVED.extend(json.loads(json.dumps(r.to_dict(), default=er.json_default))
-                    for r in reports)
+    RECEIVED.extend(report.to_dict() for report in reports)
 
 
 def pytest_unconfigure(config):

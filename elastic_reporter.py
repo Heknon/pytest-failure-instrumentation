@@ -4,8 +4,8 @@
 
     pytest -p elastic_reporter
 
-Standalone: a single module, no package, nothing to install beyond pytest 8 or
-newer on Python 3.12 or newer. Drop it next to your ``conftest.py`` and load it
+Standalone: a single module, no package, nothing to install beyond pytest 8
+and pydantic 2 on Python 3.12 or newer. Drop it next to your ``conftest.py`` and load it
 with ``-p elastic_reporter``, or name it in ``pytest_plugins`` in the rootdir
 conftest.
 
@@ -15,16 +15,11 @@ The plugin builds the reports and calls `pytest_case_reports` with a batch of
 them. Sending is yours::
 
     # conftest.py
-    import json
-
     import httpx
-
-    from elastic_reporter import json_default
 
 
     def pytest_case_reports(reports):
-        body = [report.to_dict() for report in reports]
-        httpx.post(URL, content=json.dumps(body, default=json_default))
+        httpx.post(URL, json=[report.to_dict() for report in reports])
 
 It is called from a background thread in the process that owns the stream -
 the xdist controller, or the session itself - when a batch fills up or when
@@ -79,8 +74,8 @@ write them yourself after collection, where you know what was planned::
         send([CaseReport(test_suite=..., test_case=..., machine=...) for item in items])
 
 Leave outcome empty on those, and a test that never runs keeps no verdict.
-`CaseReport`, `CaseReport.to_dict` and `json_default` are exported so your
-documents match the plugin's exactly.
+`CaseReport` and `CaseReport.to_dict` are exported so your documents match
+the plugin's exactly, and the model checks what you built before it leaves.
 
 Setting a test's attributes
 ---------------------------
@@ -146,12 +141,13 @@ the whole run belongs in a hook every process runs, like the
 
 import queue
 import threading
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -242,9 +238,12 @@ type ReportWrapper = Generator[None, pytest.TestReport, pytest.TestReport]
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class CaseReport:
+class CaseReport(BaseModel):
     """Minimal case report model for elastic."""
+
+    # A misspelt field is a document elastic will happily index under a
+    # mapping you did not mean, so refuse it here instead.
+    model_config = ConfigDict(extra="forbid")
 
     test_suite: str
     test_case: str
@@ -256,7 +255,7 @@ class CaseReport:
     vc: str = "mock-vc"
     cycle_id: int = 1
     owner: str = "mock-owner"
-    time: datetime = field(default_factory=lambda: datetime.now(UTC))
+    time: datetime = Field(default_factory=lambda: datetime.now(UTC))
     exception: str | None = None
     exception_message: str | None = None
     exception_traceback: str | None = None
@@ -264,15 +263,23 @@ class CaseReport:
     labs3: bool = True
 
     def to_dict(self) -> Document:
-        """Convert to dict for elastic."""
-        result = self.__dict__.copy()
-        result["@timestamp"] = self.time
+        """Convert to dict for elastic.
+
+        Ready for ``json.dumps`` as it stands: the timestamps come out as ISO
+        8601 strings rather than datetimes.
+        """
+        result = self.model_dump(mode="json")
+        result["@timestamp"] = result["time"]
         return result
 
 
 @dataclass(frozen=True)
 class Failure:
-    """What went wrong in one step."""
+    """What went wrong in one step.
+
+    A dataclass and not a model: it never leaves the process, so there is
+    nothing here for validation to protect. The same goes for `Case`.
+    """
 
     exception: str | None = None
     message: str | None = None
@@ -305,7 +312,16 @@ PLUGIN_FIELDS = frozenset(
 
 #: Every attribute `CaseAttributes.set` will take, derived from the model, so a
 #: new field on `CaseReport` is settable without being named twice.
-SETTABLE = frozenset(f.name for f in fields(CaseReport)) - PLUGIN_FIELDS
+SETTABLE = frozenset(CaseReport.model_fields) - PLUGIN_FIELDS
+
+
+#: One validator per settable field, so `CaseAttributes.set` can check a value
+#: against the model without an instance to assign it to.
+FIELD_TYPES = {
+    name: TypeAdapter(field.annotation)
+    for name, field in CaseReport.model_fields.items()
+    if name in SETTABLE
+}
 
 
 def stamp(report: CaseReport, attributes: dict[str, Any]) -> None:
@@ -313,16 +329,6 @@ def stamp(report: CaseReport, attributes: dict[str, Any]) -> None:
     for name, value in attributes.items():
         if name in SETTABLE:
             setattr(report, name, value)
-
-
-def json_default(value: object) -> str:
-    """Render what `json` cannot: the timestamps, as ISO 8601.
-
-    ``json.dumps(report.to_dict(), default=json_default)`` is the payload.
-    """
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -346,8 +352,7 @@ class CaseReportHooks:
         and what to do with it is yours::
 
             def pytest_case_reports(reports):
-                body = [report.to_dict() for report in reports]
-                httpx.post(URL, content=json.dumps(body, default=json_default))
+                httpx.post(URL, json=[report.to_dict() for report in reports])
 
         Send data and nothing else from here, because it is not pytest's own
         thread. Raising is not fatal - the run does not exist to serve the
@@ -394,7 +399,13 @@ class CaseAttributes:
         self._values: dict[str, Any] = {}
 
     def set(self, **attributes: object) -> None:
-        """Set any of `SETTABLE` for this test and the tests after it."""
+        """Set any of `SETTABLE` for this test and the tests after it.
+
+        Each value is checked against the model here, where whoever wrote it
+        can see the error, rather than in the middle of a run or, worse, in
+        elastic. A value the model can convert is converted: ``cycle_id="77"``
+        is stored as the integer 77.
+        """
         unknown = sorted(set(attributes) - SETTABLE)
         if unknown:
             message = (
@@ -402,8 +413,11 @@ class CaseAttributes:
                 f"(settable: {', '.join(sorted(SETTABLE))})"
             )
             raise ValueError(message)
+        checked = {
+            name: FIELD_TYPES[name].validate_python(value) for name, value in attributes.items()
+        }
         with self._lock:
-            self._values.update(attributes)
+            self._values.update(checked)
 
     def snapshot(self) -> dict[str, Any]:
         """Return the attributes as they stand, to stamp a report with."""
@@ -978,8 +992,27 @@ def is_xdist_controller(config: pytest.Config) -> bool:
     return getattr(config.option, "dist", "no") not in ("no", None)
 
 
+def check_vocabulary(*tables: tuple[str, dict[str, Any]]) -> None:
+    """Fail now, not mid-run, if the vocabulary was remapped to non-strings.
+
+    `OUTCOMES` and `PHASE_STEPS` end up on a model that says these fields are
+    strings, so a conftest mapping one to, say, a status number would raise
+    out of a pytest hook halfway through the session. Better here.
+    """
+    wrong = sorted(
+        f"{name}[{key!r}]"
+        for name, table in tables
+        for key, value in table.items()
+        if not isinstance(value, str)
+    )
+    if wrong:
+        message = f"the vocabulary has to be strings: {', '.join(wrong)}"
+        raise TypeError(message)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Register the half of the plugin this process is responsible for."""
+    check_vocabulary(("OUTCOMES", OUTCOMES), ("PHASE_STEPS", PHASE_STEPS))
     attributes = CaseAttributes()
     detached = ElasticPlugin.current
     if type(detached) is ElasticPlugin:
