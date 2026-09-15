@@ -1435,6 +1435,11 @@ class IncidentEngine:
             cpu_floor_seconds=self.settings.profile_cpu_floor_seconds,
             retained_mb=self.settings.profile_retained_mb,
             peak_mb=self.settings.profile_peak_mb,
+            growth_mb=self.settings.profile_growth_mb,
+            step_mb=self.settings.profile_step_mb,
+            growth_per_test_mb=self.settings.profile_growth_per_test_mb,
+            growth_tests=self.settings.profile_growth_tests,
+            imbalance_ratio=self.settings.profile_imbalance_ratio,
             burst_cores=self.settings.profile_burst_cores,
             burst_seconds=self.settings.profile_burst_seconds,
         )
@@ -1536,9 +1541,17 @@ class IncidentEngine:
         for worker, facts in sorted(report.workers.items()):
             peak = f"peak {facts['peak_mb']} MB" if facts["peak_mb"] is not None else "peak unknown"
             end = f", {facts['end_mb']} MB at the end" if facts["end_mb"] is not None else ""
+            # A drift under every threshold is still what the reader watching
+            # the machine's memory saw, and under xdist it is the per-worker
+            # share of a leak the pooled growth rule reports as one number.
+            grew = ""
+            if facts["start_mb"] is not None and facts["end_mb"] is not None:
+                step = int(facts["end_mb"]) - int(facts["start_mb"])
+                if step > 0:
+                    grew = f", up {step} MB from {facts['start_mb']} MB"
             write(
                 f"  worker {worker}: {facts['tests']} test{'s' if facts['tests'] != 1 else ''}, "
-                f"{seconds(facts['cpu_s'])} CPU, {peak}{end}"
+                f"{seconds(facts['cpu_s'])} CPU, {peak}{end}{grew}"
             )
         # With tracing on the table is the tracer's own cost, not the tests'.
         if report.functions and not report.allocations:

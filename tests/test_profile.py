@@ -541,6 +541,54 @@ class TestDistributed:
         summary = Runner.only(incidents, "run_summary")
         assert summary.distributed is True
 
+    def test_a_leak_divided_between_workers_is_still_raised(self, distributed: Runner) -> None:
+        """The leak a worker count hid.
+
+        Twenty tests leaving four megabytes each is 80 MB of growth whoever
+        runs them, and over four workers it is 20 MB per process - under the
+        per-worker threshold, so the run reported nothing at all while the
+        same tests on one worker were reported. What a test leaves behind is
+        the test's property and not the worker count's, so the rule runs
+        again over the workers that did not reach it alone, pooled.
+
+        The figures sit a clear factor of two either side of the 40 MB these
+        runs are configured with, so a megabyte of noise on a platform whose
+        resident reading is coarser than procfs cannot decide the test.
+
+        loadfile with one file per worker, so the split is the same on every
+        run: dynamic distribution can hand one worker enough of the tests to
+        cross the threshold by itself, which is a different finding.
+        """
+        leaks = """
+            import pytest
+
+            LEAKED = []
+
+            @pytest.mark.parametrize("case", range(5))
+            def test_leaks_{index}(case):
+                blob = bytearray(4_000_000)
+                for offset in range(0, len(blob), 4096):
+                    blob[offset] = 1  # written, so it is resident
+                LEAKED.append(blob)
+            """
+        distributed.pytester.makepyfile(
+            **{f"test_leak_{index}": leaks.format(index=index) for index in range(4)}
+        )
+        incidents = profiled(distributed, "-n", "4", "--dist", "loadfile")
+
+        growth = [incident for incident in memory(incidents) if incident.verdict == "STEADY_GROWTH"]
+        assert len(growth) == 1
+        assert growth[0].workers == 4
+        assert growth[0].worker == "controller"
+        assert growth[0].growth.tests == 20
+        assert 2 <= growth[0].growth.per_test_mb <= 7
+        assert set(growth[0].worker_rss) == {"gw0", "gw1", "gw2", "gw3"}
+        assert "across 4 workers" in growth[0].summary()
+        # And no worker held enough for the per-worker rule, which is the point:
+        # failure_profile_retained_mb is 40 for these runs.
+        assert all(kept < 40 for kept in growth[0].worker_rss.values())
+        assert not [incident for incident in memory(incidents) if incident.verdict == "RETAINED_AFTER_TEST"]
+
     def test_findings_are_raised_once_on_the_controller(self, distributed: Runner) -> None:
         distributed.pytester.makepyfile(
             test_screens="""

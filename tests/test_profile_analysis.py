@@ -13,6 +13,7 @@ import sysconfig
 from typing import Any
 
 from pytest_failure_instrumentation.analysis.attribution import Attributor
+from pytest_failure_instrumentation.incidents import profile as profile_incident
 from pytest_failure_instrumentation.nodeid import hash_of, hashes_of
 from pytest_failure_instrumentation.profile import analysis
 from pytest_failure_instrumentation.profile.analysis import (
@@ -598,10 +599,12 @@ class TestGrowth:
 
         assert not findings_of(report, "STEADY_GROWTH")
 
-    def test_tests_that_kept_nothing_by_the_live_figures_are_not_growing(self) -> None:
+    def test_tests_that_kept_nothing_by_the_live_figures_are_not_counted_as_growing(self) -> None:
         # Three tests keep 40 MB each; four keep nothing but fifty blocks,
-        # which every test does. Fewer than half grew, so this is three
-        # steps, not a drift - however many blocks the others were up by.
+        # which every test does. The run grew 120 MB and is reported for it,
+        # and the three that paid are what the finding counts - the other
+        # four grew by nothing the live figures can see, however many blocks
+        # they were up by.
         records = [
             record(f"t::keeps[{case}]", [], [], rss=(100 + 40 * case, 140 + 40 * case, 140 + 40 * case), heap=(40 * case, 40 + 40 * case), blocks=(1000, 1050))
             for case in range(3)
@@ -612,7 +615,12 @@ class TestGrowth:
         ]
         report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
 
-        assert not findings_of(report, "STEADY_GROWTH")
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 120
+        # Three of seven paid, so the median test paid nothing and this is
+        # steps rather than something that recurs.
+        assert finding.growth_per_test_mb == 0.0
+        assert finding.growth_recurring_mb == 0
 
     def test_objects_per_test_is_over_the_tests_where_they_were_counted(self) -> None:
         records = [
@@ -631,6 +639,522 @@ class TestGrowth:
 
         assert not findings_of(report, "STEADY_GROWTH")
         assert findings_of(report, "RETAINED_AFTER_TEST")
+
+
+
+class TestGrowthRate:
+    """A drift is judged on the rate, not on a total the run's shape decides."""
+
+    @staticmethod
+    def leaking(tests: int, per_test: int, worker: str = "gw0", base: int = 100) -> list:
+        records = []
+        rss = base
+        for case in range(tests):
+            before = rss
+            rss += per_test
+            records.append(record(f"t::leaks[{case}]", [], [], worker=worker, rss=(before, rss, rss)))
+        return records
+
+    def test_a_rate_over_the_threshold_does_not_wait_for_a_whole_test_s_worth(self) -> None:
+        # 2.5 MB a test over 20 tests is 50 MB: under retained_mb, and the
+        # same leak as 500 MB over 200 tests. Held to the total it is
+        # reported only once enough tests have run to accumulate one test's
+        # worth, which is a fact about the run's length, not the code.
+        report = analyse(self.leaking(20, 5), attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 100
+        assert finding.growth_per_test_mb == 5.0
+
+    def test_a_recurrence_is_raised_while_it_is_still_small(self) -> None:
+        # Five tests keeping 2 MB each is 10 MB, which is nothing - and it
+        # is 2 MB every test the suite ever gains, which is the reason not
+        # to wait. A recurrence is judged on the fact that it repeats.
+        report = analyse(self.leaking(5, 2), attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 10
+        assert finding.growth_per_test_mb == 2.0
+
+    def test_a_cost_paid_once_is_judged_on_its_size_instead(self) -> None:
+        # The same 10 MB arriving in one test and never again is bounded: a
+        # module imported, and then never imported again. Under step_mb, so
+        # it is nobody's problem however low the bar for a recurrence is.
+        steps = [10] + [0] * 19
+        records, rss = [], 100
+        for index, step in enumerate(steps):
+            records.append(record(f"t::x[{index}]", [], [], rss=(rss, rss + step, rss + step)))
+            rss += step
+        limits = Thresholds(retained_mb=100, growth_tests=4)
+
+        assert not findings_of(analyse(records, attributor, limits), "STEADY_GROWTH")
+
+        # Twenty is a machine to size for, and is raised as the step it is.
+        bigger = [entry for entry in records]
+        bigger[0] = record("t::x[0]", [], [], rss=(100, 125, 125))
+        for index in range(1, 20):
+            bigger[index] = record(f"t::x[{index}]", [], [], rss=(125, 125, 125))
+        (finding,) = findings_of(analyse(bigger, attributor, limits), "STEADY_GROWTH")
+        assert finding.delta_mb == 25
+        assert finding.growth_per_test_mb == 0.0
+
+    def test_the_same_rate_over_enough_tests_is_raised(self) -> None:
+        # The same 2 MB a test, run for longer: 40 tests is 80 MB, over the
+        # floor and still under retained_mb.
+        report = analyse(self.leaking(40, 2), attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 80
+        assert finding.growth_per_test_mb == 2.0
+
+    def test_a_small_rate_that_still_adds_up_is_raised(self) -> None:
+        # 60 tests keeping half a megabyte each: 30 MB, which is what the
+        # run grew and what the rule is about. Nothing here is a whole
+        # test's worth and it adds up all the same.
+        records = [
+            record(f"t::leaks[{case}]", [], [], worker="gw0", rss=(100 + case // 2, 100 + (case + 1) // 2, 100 + (case + 1) // 2))
+            for case in range(60)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 30
+
+    def test_the_rate_asks_for_a_leak_that_repeats_and_is_off_by_default(self) -> None:
+        # A run that only wants what recurs sets the rate. One test keeping
+        # 60 MB among nineteen that keep nothing is 60 MB the run grew, and
+        # it is reported by default and filtered out by a rate of 1 MB,
+        # because the test that pays a typical megabyte does not exist.
+        steps = [60] + [0] * 19
+        records, rss = [], 100
+        for index, step in enumerate(steps):
+            records.append(record(f"t::x[{index}]", [], [], rss=(rss, rss + step, rss + step)))
+            rss += step
+
+        assert findings_of(analyse(records, attributor, Thresholds()), "STEADY_GROWTH")
+        only_repeats = Thresholds(growth_per_test_mb=1.0)
+        assert not findings_of(analyse(records, attributor, only_repeats), "STEADY_GROWTH")
+
+        # And a leak that does repeat passes the same filter.
+        (finding,) = findings_of(analyse(self.leaking(20, 4), attributor, only_repeats), "STEADY_GROWTH")
+        assert finding.delta_mb == 80
+
+    def test_a_lower_rate_is_a_setting(self) -> None:
+        # 60 tests at 1 MB is 60 MB and under the default rate's floor of a
+        # megabyte a test only by rounding; a suite that wants half of that
+        # says so.
+        limits = Thresholds(retained_mb=400, growth_tests=4, growth_per_test_mb=0.5)
+        report = analyse(self.leaking(120, 1), attributor, limits)
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 120
+        assert finding.growth_per_test_mb == 1.0
+
+    def test_a_worker_over_the_rate_and_under_a_test_s_worth_is_the_run_s_finding(self) -> None:
+        # Four workers each drifting 2.5 MB a test. Every one of them is over
+        # the rate and none kept a whole test's worth, so this is the suite
+        # leaking rather than four processes growing, and it is said once.
+        records = [
+            entry
+            for worker in range(4)
+            for entry in TestGrowthRate.leaking(10, 5, worker=f"gw{worker}")
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.worker is None
+        assert finding.worker_count == 4
+        assert finding.delta_mb == 200
+        assert finding.growth_tests == 40
+
+    def test_a_worker_that_kept_a_whole_test_s_worth_keeps_its_own_finding(self) -> None:
+        # gw0 kept 150 MB - a fact about that process, which is the one that
+        # gets OOM-killed - beside three workers merely over the rate. The
+        # process finding is not folded into the run's.
+        records = TestGrowthRate.leaking(15, 10, worker="gw0")
+        records += [
+            entry
+            for worker in range(1, 4)
+            for entry in TestGrowthRate.leaking(10, 5, worker=f"gw{worker}")
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        alone, pooled = findings_of(report, "STEADY_GROWTH")
+        assert alone.worker == "gw0"
+        assert alone.delta_mb == 150
+        assert pooled.worker_count == 3
+        assert pooled.delta_mb == 150
+        assert "gw0" not in pooled.worker_rss
+
+
+
+class TestFineSteps:
+    """Steps are read in kilobytes, so a leak under a megabyte a test is not
+    two hundred zeroes."""
+
+    @staticmethod
+    def leaking(tests: int, kb_per_test: float, base_mb: int = 100) -> list:
+        records, kb = [], base_mb * 1024.0
+        for case in range(tests):
+            before = kb
+            kb += kb_per_test
+            entry = record(
+                f"t::leaks[{case}]",
+                [],
+                [],
+                rss=(round(before / 1024), round(kb / 1024), round(kb / 1024)),
+            )
+            entry["rss_before_kb"] = round(before)
+            entry["rss_after_kb"] = round(kb)
+            records.append(entry)
+        return records
+
+    def test_a_leak_under_a_megabyte_a_test_is_seen(self) -> None:
+        # 300 KB a test over 200 tests is 58 MB the process grew. In whole
+        # megabytes every step read as 0 and the run reported nothing.
+        report = analyse(self.leaking(200, 300), attributor, Thresholds())
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 59
+        assert finding.growth_per_test_mb == 0.29
+
+    def test_the_readings_floor_is_not_a_leak_however_long_the_run(self) -> None:
+        # A suite that leaks nothing measures about 3 KB a test - pytest's
+        # own bookkeeping and the reading's jitter. Ten thousand tests of it
+        # is 29 MB, past the bar for a run and nobody's leak.
+        report = analyse(self.leaking(10_000, 3), attributor, Thresholds())
+
+        assert not findings_of(report, "STEADY_GROWTH")
+
+    def test_a_real_leak_of_the_same_length_is_seen(self) -> None:
+        report = analyse(self.leaking(10_000, 30), attributor, Thresholds())
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.growth_per_test_mb == 0.03
+
+    def test_a_record_without_the_finer_reading_falls_back(self) -> None:
+        # Written by an older sampler, or on a platform without the finer
+        # figure: the whole-megabyte steps are all there is and they still
+        # add up.
+        records = [
+            record(f"t::leaks[{case}]", [], [], rss=(100 + case, 101 + case, 101 + case))
+            for case in range(30)
+        ]
+        assert all("rss_before_kb" not in entry for entry in records)
+
+        (finding,) = findings_of(analyse(records, attributor, Thresholds()), "STEADY_GROWTH")
+        assert finding.delta_mb == 30
+
+
+class TestGrowthShape:
+    """How the memory arrived does not decide whether there is a finding. It
+    decides what the finding says."""
+
+    @staticmethod
+    def summary_of(steps: list) -> str:
+        records, mb = [], 100.0
+        for case, step in enumerate(steps):
+            entry = record(
+                f"t::x[{case}]", [], [], rss=(round(mb), round(mb + step), round(mb + step))
+            )
+            entry["rss_before_kb"] = round(mb * 1024)
+            mb += step
+            entry["rss_after_kb"] = round(mb * 1024)
+            records.append(entry)
+        (finding,) = findings_of(analyse(records, attributor, Thresholds()), "STEADY_GROWTH")
+        return profile_incident.build(finding, "main").summary()
+
+    def test_a_leak_every_test_pays_is_named_as_a_rate(self) -> None:
+        assert self.summary_of([1] * 30) == (
+            "Memory growing across tests: worker gw0 kept 30 MB in use over 30 tests, "
+            "about 1 MB per test"
+        )
+
+    def test_a_cost_paid_once_is_named_as_steps(self) -> None:
+        # A reader told "about 0.8 MB per test" about this would go looking
+        # for a leak in thirty tests that kept nothing.
+        assert self.summary_of([25] + [0] * 29) == (
+            "Memory added over the run: worker gw0 kept 25 MB in use over 30 tests, "
+            "in steps that did not repeat"
+        )
+
+    def test_both_at_once_are_both_named(self) -> None:
+        # The steps are the size to plan for and the rate is the thing that
+        # will be bigger next quarter. One number describes this worst.
+        summary = self.summary_of([60] + [1] * 29)
+        assert summary == (
+            "Memory added over the run: worker gw0 kept 89 MB in use over 30 tests, "
+            "30 MB of it recurring at 1 MB per test"
+        )
+
+    def test_the_evidence_separates_what_recurs_from_what_did_not(self) -> None:
+        records, mb = [], 100.0
+        for case, step in enumerate([60] + [1] * 29):
+            entry = record(f"t::x[{case}]", [], [], rss=(round(mb), round(mb + step), round(mb + step)))
+            entry["rss_before_kb"] = round(mb * 1024)
+            mb += step
+            entry["rss_after_kb"] = round(mb * 1024)
+            records.append(entry)
+        (finding,) = findings_of(analyse(records, attributor, Thresholds()), "STEADY_GROWTH")
+
+        assert any(
+            "About 30 MB of that is the 1 MB every test keeps, over 30 tests. The other 59 MB "
+            "arrived in steps that did not repeat, the biggest 60 MB" in line
+            for line in finding.evidence
+        )
+
+
+class TestFleetGrowth:
+    """The same drift under xdist, where the leak reaches the per-worker rule
+    already divided by the number of workers."""
+
+    @staticmethod
+    def leaking(workers: int, tests: int, per_test: int = 11, base: int = 100) -> list:
+        """``tests`` tests dealt round-robin over ``workers``, each leaving
+        ``per_test`` MB on whichever worker ran it."""
+        rss = {f"gw{index}": base for index in range(workers)}
+        records = []
+        for case in range(tests):
+            worker = f"gw{case % workers}"
+            before = rss[worker]
+            rss[worker] = before + per_test
+            records.append(
+                record(
+                    f"t::leaks[{case}]",
+                    [],
+                    [],
+                    worker=worker,
+                    rss=(before, rss[worker], rss[worker]),
+                )
+            )
+        return records
+
+    def test_a_leak_divided_between_workers_is_still_the_run_growing(self) -> None:
+        # 20 tests at 11 MB is 220 MB whoever runs them. Over four workers no
+        # one process keeps the 100 MB the per-worker rule wants, and before
+        # the pooled rule this run reported nothing at all.
+        report = analyse(self.leaking(4, 20), attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 220
+        assert finding.growth_tests == 20
+        assert finding.growth_per_test_mb == 11.0
+        assert finding.worker is None
+        assert finding.worker_count == 4
+        assert finding.worker_rss == {"gw0": 55, "gw1": 55, "gw2": 55, "gw3": 55}
+        assert any("No single worker kept enough" in line for line in finding.evidence)
+        assert any(
+            "gw3 55 MB over 5 tests" in line and "gw0 55 MB over 5 tests" in line
+            for line in finding.evidence
+        )
+
+    def test_the_same_leak_is_reported_however_many_workers_ran_it(self) -> None:
+        # The property being measured is the test's, not the pool's: 11 MB a
+        # test is 11 MB a test on one worker and on twelve, and 220 MB over
+        # twenty tests either way. At two workers each keeps 110 MB and is
+        # raised on its own - two findings of the one rule, which the
+        # engine's fingerprint folds back into one incident - and past that
+        # the pooled rule is what sees it.
+        for workers in (1, 2, 4, 8, 12):
+            report = analyse(
+                self.leaking(workers, 20), attributor, Thresholds(retained_mb=100, growth_tests=4)
+            )
+
+            found = findings_of(report, "STEADY_GROWTH")
+            assert found, workers
+            assert sum(finding.delta_mb for finding in found) == 220, workers
+            assert {finding.growth_per_test_mb for finding in found} == {11.0}, workers
+            assert sum(finding.growth_tests for finding in found) == 20, workers
+
+    def test_workers_running_fewer_tests_than_the_minimum_are_still_pooled(self) -> None:
+        # Twelve workers and twenty tests is one or two tests each, under the
+        # rule's own minimum: per worker there is nothing to be over.
+        report = analyse(self.leaking(12, 20), attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.worker_count == 12
+        assert finding.growth_tests == 20
+
+    def test_a_worker_raised_on_its_own_is_not_pooled_again(self) -> None:
+        # gw0 keeps 220 MB over its own 20 tests and is raised for it; gw1
+        # runs four clean tests. One finding, gw0's, and the pooled rule has
+        # one worker left, which is not a fleet.
+        records = [
+            record(f"t::leaks[{case}]", [], [], worker="gw0", rss=(100 + 11 * case, 111 + 11 * case, 111 + 11 * case))
+            for case in range(20)
+        ]
+        records += [record(f"t::clean[{case}]", [], [], worker="gw1", rss=(100, 100, 100)) for case in range(4)]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.worker == "gw0"
+        assert finding.worker_count == 0
+
+    def test_a_leak_on_one_worker_is_that_worker_and_not_diluted_into_the_run(self) -> None:
+        # gw0 keeps 99 MB over nine tests - 11 MB each, under the whole-test
+        # threshold and well over the rate - and seven clean workers run the
+        # rest. Pooled with their 28 empty tests the rate survives and the
+        # "half of them grew" guard does not, so the run-wide rule declines
+        # and gw0's own finding stands rather than being lost with it.
+        records = [
+            record(f"t::leaks[{case}]", [], [], worker="gw0", rss=(100 + 11 * case, 111 + 11 * case, 111 + 11 * case))
+            for case in range(9)
+        ]
+        records += [
+            record(f"t::clean[{worker}-{case}]", [], [], worker=f"gw{worker}", rss=(100, 100, 100))
+            for worker in range(1, 8)
+            for case in range(4)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.worker == "gw0"
+        assert finding.worker_count == 0
+        assert finding.delta_mb == 99
+        assert finding.growth_per_test_mb == 11.0
+
+    def test_a_worker_whose_own_rule_declined_for_its_test_count_needs_a_second(self) -> None:
+        # gw0 ran three tests keeping 50 MB each: 150 MB, and no finding of
+        # its own because three is under the minimum. Pooled with siblings
+        # that kept nothing it is still one worker's drift, and a finding
+        # about "the run across 4 workers" would be a finding about gw0.
+        records = [record(f"t::leaks[{case}]", [], [], worker="gw0", rss=(100 + 50 * case, 150 + 50 * case, 150 + 50 * case)) for case in range(3)]
+        records += [
+            record(f"t::clean[{worker}-{case}]", [], [], worker=f"gw{worker}", rss=(100, 100, 100))
+            for worker in range(1, 4)
+            for case in range(1)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        assert not findings_of(report, "STEADY_GROWTH")
+
+    def test_a_leak_two_files_put_on_two_workers_of_six_is_still_the_run_leaking(self) -> None:
+        # loadfile with two heavy files: 50 tests keeping 2 MB each is the
+        # 100 MB the run kept, and the four workers that drew the quick files
+        # do not make it less of a leak.
+        records = []
+        for worker in range(2):
+            rss = 100
+            for case in range(25):
+                records.append(
+                    record(f"t::leaks{worker}[{case}]", [], [], worker=f"gw{worker}", rss=(rss, rss + 2, rss + 2))
+                )
+                rss += 2
+        records += [
+            record(f"t::quick{worker}[{case}]", [], [], worker=f"gw{worker}", rss=(100, 100, 100))
+            for worker in range(2, 6)
+            for case in range(3)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 100
+        assert finding.worker_count == 6
+        assert finding.worker_rss["gw0"] == 50
+        assert finding.worker_rss["gw5"] == 0
+
+    def test_a_warm_up_on_each_worker_is_reported_as_steps_and_not_as_a_leak(self) -> None:
+        # Every worker's first test imports 30 MB of the product and the rest
+        # keep nothing. Eight workers is 240 MB the run grew, which is worth
+        # knowing - and it is a cost paid once per worker, not a leak, so the
+        # finding says so rather than dividing it into "0.6 MB per test".
+        records = []
+        for worker in range(8):
+            records.append(record(f"t::first[{worker}]", [], [], worker=f"gw{worker}", rss=(100, 130, 130)))
+            records += [
+                record(f"t::rest[{worker}-{case}]", [], [], worker=f"gw{worker}", rss=(130, 130, 130))
+                for case in range(4)
+            ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 240
+        assert finding.growth_per_test_mb == 0.0
+        assert finding.growth_recurring_mb == 0
+        incident = profile_incident.build(finding, "controller")
+        assert incident.summary().startswith("Memory added over the run")
+        assert "in steps that did not repeat" in incident.summary()
+        # And a run that only wants what recurs never sees it at all.
+        assert not findings_of(
+            analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4, growth_per_test_mb=1.0)),
+            "STEADY_GROWTH",
+        )
+
+    def test_one_big_step_does_not_hide_the_recurrence_beside_it(self) -> None:
+        # One test imports 90 MB and five more keep 5 MB each. Judged by the
+        # total, the import is most of it and the whole window is thrown
+        # away - which throws away the five tests that each paid, the only
+        # part that recurs. The typical step is 5 MB either way.
+        records = [
+            record("t::big", [], [], worker="gw0", rss=(100, 190, 190)),
+            record("t::small[0]", [], [], worker="gw0", rss=(190, 195, 195)),
+            record("t::small[1]", [], [], worker="gw1", rss=(100, 105, 105)),
+            record("t::small[2]", [], [], worker="gw1", rss=(105, 110, 110)),
+            record("t::small[3]", [], [], worker="gw2", rss=(100, 105, 105)),
+            record("t::small[4]", [], [], worker="gw2", rss=(105, 110, 110)),
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.growth_per_test_mb == 5.0
+        assert any("Biggest single step 90 MB" in line for line in finding.evidence)
+
+    def test_a_step_with_nothing_recurring_beside_it_is_still_not_a_drift(self) -> None:
+        # The same 90 MB import with tests that kept nothing around it. What
+        # rejects this is that five of the six tests paid nothing, not the
+        # size of the one that did - so it is rejected however big it is.
+        records = [record("t::big", [], [], worker="gw0", rss=(100, 190, 190))]
+        records += [
+            record(f"t::small[{case}]", [], [], worker=f"gw{case % 3}", rss=(100, 100, 100))
+            for case in range(5)
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        assert not findings_of(report, "STEADY_GROWTH")
+
+    def test_the_workers_raised_on_their_own_are_named_rather_than_contradicted(self) -> None:
+        # gw0 drifts 220 MB over its own 20 tests and is raised for it; three
+        # more workers keep 110 MB between them over ten tests. Saying "no
+        # worker kept enough" beside gw0's own finding is a contradiction a
+        # reader pays for, so the pooled finding says which it is about.
+        records = [
+            record(f"t::leaks[{case}]", [], [], worker="gw0", rss=(100 + 11 * case, 111 + 11 * case, 111 + 11 * case))
+            for case in range(20)
+        ]
+        for worker in range(1, 4):
+            records += [
+                record(
+                    f"t::drifts[{worker}-{case}]",
+                    [],
+                    [],
+                    worker=f"gw{worker}",
+                    rss=(100 + 11 * case, 111 + 11 * case, 111 + 11 * case),
+                )
+                for case in range(4)
+            ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        alone, pooled = findings_of(report, "STEADY_GROWTH")
+        assert alone.worker == "gw0"
+        assert pooled.worker_count == 3
+        assert any(
+            "Worker gw0 reached the rule alone and is reported separately" in line
+            for line in pooled.evidence
+        )
+        assert not any("No single worker kept enough" in line for line in pooled.evidence)
+
+    def test_the_summary_says_the_run_rather_than_naming_a_worker(self) -> None:
+        from pytest_failure_instrumentation.incidents import profile as profile_incident
+
+        report = analyse(self.leaking(4, 20), attributor, Thresholds(retained_mb=100, growth_tests=4))
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        incident = profile_incident.build(finding, "controller")
+
+        assert incident.workers == 4
+        assert incident.summary() == (
+            "Memory growing across tests: the run kept 220 MB in use across 4 workers "
+            "over 20 tests, about 11 MB per test"
+        )
 
 
 class TestImbalance:
@@ -682,6 +1206,19 @@ class TestReport:
         assert report.process_cpu_s == 5.5
         assert report.tests == 1
         assert report.workers["gw0"]["tests"] == 1
+
+    def test_the_worker_table_says_what_each_one_grew_by(self) -> None:
+        """A drift under every threshold is still what somebody watching the
+        machine's memory saw, and the table said only the peak and the end."""
+        records = [
+            record("t::a", [], [], worker="gw0", rss=(40, 60, 60)),
+            record("t::b", [], [], worker="gw0", rss=(60, 80, 80)),
+        ]
+        report = analyse(records, attributor, Thresholds())
+
+        assert report.workers["gw0"]["start_mb"] == 40
+        assert report.workers["gw0"]["end_mb"] == 80
+
 
     def test_a_record_without_cpu_weighting_marks_the_report(self) -> None:
         frames = [frame(PRODUCT, 1, "f")]

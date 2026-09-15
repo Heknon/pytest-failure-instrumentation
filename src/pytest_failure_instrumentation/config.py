@@ -308,6 +308,31 @@ class Settings:
     #: Resident megabytes no test may reach, whatever it started from. 0 is
     #: off. The retained threshold catches a climb; this catches a size.
     profile_peak_mb: int = 0
+    #: Megabytes a run's tests may add between them, in use, before the run
+    #: is said to be growing. profile_retained_mb is what one *test* may
+    #: keep and is the wrong bar for a run: held to it, a run said nothing
+    #: until a hundred megabytes had piled up, which is a fact about how
+    #: long the run was rather than about the code. Low, because what it is
+    #: really the bar for is a cost that recurs, and a recurrence is
+    #: unbounded - it is paid again for every test the suite ever gains.
+    profile_growth_mb: int = 5
+    #: Megabytes one test must have added on its own for memory that did
+    #: *not* recur to be worth raising. A cost paid once is bounded - a
+    #: module a test imported, and then never again - so it is judged on
+    #: its size where a recurrence is judged on the fact that it repeats.
+    profile_step_mb: int = 20
+    #: Megabytes the *typical* test must have left behind as well, for a run
+    #: that only wants to hear about a leak that repeats. 0, the default,
+    #: asks nothing of the shape: the finding says whether the memory
+    #: recurred or arrived in steps, and either is the run growing.
+    profile_growth_per_test_mb: float = 0.0
+    #: Tests that must each leave something behind before the drift between
+    #: them is called steady rather than a step. Lower it for a suite whose
+    #: workers each run a handful of tests, where a leak reaches the rule
+    #: already divided between them.
+    profile_growth_tests: int = 4
+    #: Times the median a worker must hold to be called imbalanced.
+    profile_imbalance_ratio: float = 2.0
     #: Trace allocations with tracemalloc as well, so a memory finding names
     #: the lines holding the memory and a memory flame graph is written.
     #: Several times slower on allocation-heavy code: for a rerun of the
@@ -389,6 +414,15 @@ class Settings:
         )
         object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
         object.__setattr__(self, "profile_peak_mb", max(0, int(self.profile_peak_mb)))
+        object.__setattr__(self, "profile_growth_mb", max(1, int(self.profile_growth_mb)))
+        object.__setattr__(self, "profile_step_mb", max(1, int(self.profile_step_mb)))
+        object.__setattr__(
+            self, "profile_growth_per_test_mb", max(0.0, float(self.profile_growth_per_test_mb))
+        )
+        object.__setattr__(self, "profile_growth_tests", max(0, int(self.profile_growth_tests)))
+        object.__setattr__(
+            self, "profile_imbalance_ratio", max(1.0, float(self.profile_imbalance_ratio))
+        )
         object.__setattr__(self, "profile_allocations", bool(self.profile_allocations))
         object.__setattr__(self, "profile_allocation_depth", max(1, int(self.profile_allocation_depth)))
         object.__setattr__(self, "profile_burst_cores", max(0.05, float(self.profile_burst_cores)))
@@ -592,6 +626,11 @@ class Settings:
             "profile_cpu_floor_seconds": self.profile_cpu_floor_seconds,
             "profile_retained_mb": self.profile_retained_mb,
             "profile_peak_mb": self.profile_peak_mb,
+            "profile_growth_mb": self.profile_growth_mb,
+            "profile_step_mb": self.profile_step_mb,
+            "profile_growth_per_test_mb": self.profile_growth_per_test_mb,
+            "profile_growth_tests": self.profile_growth_tests,
+            "profile_imbalance_ratio": self.profile_imbalance_ratio,
             "profile_allocations": self.profile_allocations,
             "profile_allocation_depth": self.profile_allocation_depth,
             "profile_burst_cores": self.profile_burst_cores,
@@ -811,6 +850,43 @@ def add_options(parser: pytest.Parser) -> None:
         "a test that does is raised with the code that was running while "
         "the memory climbed. 0 is off.",
         default="0",
+    )
+    parser.addini(
+        "failure_profile_growth_mb",
+        help="Megabytes a run's tests may add between them, in use, before "
+        "the run is raised as growing. Low, because what it is really the "
+        "bar for is a cost that recurs, and a recurrence is paid again for "
+        "every test the suite ever gains. failure_profile_retained_mb is "
+        "what one test may keep and is a separate question.",
+        default="5",
+    )
+    parser.addini(
+        "failure_profile_step_mb",
+        help="Megabytes one test must have added on its own for memory that "
+        "did not recur to be worth raising. A cost paid once is bounded - a "
+        "module a test imported - so it is judged on its size where a "
+        "recurrence is judged on the fact that it repeats.",
+        default="20",
+    )
+    parser.addini(
+        "failure_profile_growth_per_test_mb",
+        help="Megabytes the typical test must have left behind as well, for "
+        "a run that only wants to hear about a leak that repeats. 0, the "
+        "default, asks nothing of the shape.",
+        default="0",
+    )
+    parser.addini(
+        "failure_profile_growth_tests",
+        help="Tests that must each leave something behind before the drift "
+        "between them is raised as steady growth. Counted per worker, and "
+        "again over the workers that did not reach the rule alone.",
+        default="4",
+    )
+    parser.addini(
+        "failure_profile_imbalance_ratio",
+        help="Times the median sibling's peak a worker must hold to be raised "
+        "as imbalanced.",
+        default="2",
     )
     parser.addini(
         "failure_profile_allocations",
@@ -1201,6 +1277,11 @@ def resolve(config: pytest.Config) -> Settings:
         profile_cpu_floor_seconds=_number(config, "failure_profile_cpu_floor_seconds", 0.5),
         profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
         profile_peak_mb=int(_number(config, "failure_profile_peak_mb", 0)),
+        profile_growth_mb=int(_number(config, "failure_profile_growth_mb", 5)),
+        profile_step_mb=int(_number(config, "failure_profile_step_mb", 20)),
+        profile_growth_per_test_mb=_number(config, "failure_profile_growth_per_test_mb", 0.0),
+        profile_growth_tests=int(_number(config, "failure_profile_growth_tests", 4)),
+        profile_imbalance_ratio=_number(config, "failure_profile_imbalance_ratio", 2.0),
         profile_allocations=_flag(config, "failure_profile_allocations", False)
         or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
         profile_allocation_depth=int(_number(config, "failure_profile_allocation_depth", 12)),

@@ -2184,7 +2184,7 @@ the burst, blamed like a hotspot:
 | `RETAINED_AFTER_TEST` | the worker was left holding more than it started with, still in use, with the phase it arrived in — `setup` is a fixture |
 | `HEAP_NOT_RETURNED` | it was left holding more, but none of it is in use: the allocator kept freed pages mapped. Fragmentation, not a leak |
 | `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
-| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — two megabytes a test, which is the shape of a leak and the one no per-test check sees |
+| `STEADY_GROWTH` | the run's tests added memory between them, in use, and no one of them kept enough to be raised alone — the leak no per-test check sees. The *typical* test's step decides which bar applies and what the finding says: a cost that **recurs** is unbounded and is raised at `failure_profile_growth_mb` (5 MB) while it is still small, a cost paid **once** is bounded and is raised only at `failure_profile_step_mb` (20 MB) in one test, and a run with both is told both. The typical step and not the average, so a module imported once by one test can neither pass for a leak nor hide one. Under xdist the same rule runs again over the workers that did not reach it alone, pooled: what a test leaves behind is the test's property, not the worker count's, and ten megabytes a test is two hundred on one worker and fifty on each of four. That finding names the run rather than a worker, and `worker_rss` carries each one's share |
 | `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
 | `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
 | `ALLOCATOR_RETENTION` | the worker grew by the threshold over its run and nothing is using the growth: memory the allocator was handed back and kept mapped. One finding for the run, saying which of the two causes it is — thread arenas each keeping what they freed, which `MALLOC_ARENA_MAX=2` fixes, or one main heap fragmented by small survivors, which `malloc_trim` fixes and the arena variable does not |
@@ -2221,6 +2221,100 @@ had there is the sentence that separates a leak from fragmentation, and
 `ALLOCATOR_RETENTION` is not raised at all. Rerunning with
 `--failure-profile-allocations` is the answer on those platforms: tracemalloc
 measures Python's own live allocations everywhere.
+
+**Memory that adds up across a run** is the other case no per-test rule can
+name. `failure_profile_retained_mb` is what one *test* may keep, and a run
+held to the same number says nothing until a hundred megabytes have piled up
+— which is a fact about how long the run was rather than about the code. Two
+and a half megabytes a test is fifty megabytes over twenty tests and five
+hundred over two hundred; it is one leak, and the run that was short enough
+never heard about it.
+
+So a run has a bar of its own, `failure_profile_growth_mb`, and it is low:
+**5 MB**. What makes that safe is that the steps are read in *kilobytes*. A
+test that keeps 300 KB used to read as a step of 0 MB, and two hundred of
+them read as nothing two hundred times over rather than as the 60 MB the
+process actually grew, so anything under a megabyte a test was invisible
+however long it ran. Measured on a suite that leaks nothing, the typical
+step is about **3 KB** and the total over two hundred tests is under a
+megabyte — so a 5 MB bar still stands clear of the floor by several times,
+where the whole-megabyte reading could not have told the two apart at all.
+
+**A recurrence and a cost paid once are not judged the same way**, because
+they are not alike in what they cost. A recurrence is unbounded: 5 MB over
+the tests that have run is 5 MB more over the next lot and 500 MB on a suite
+a hundred times the size, so it is worth raising while it is still small —
+which is what the low bar is for. A cost paid once is bounded: a module a
+test imported, and then never imported again. It cannot grow with the suite,
+so it is judged on its *size* instead, against `failure_profile_step_mb` —
+**20 MB**, because five megabytes of import is nobody's problem and twenty is
+a machine to size for. Both are settings; lower the first to hear about
+smaller leaks, raise the second to hear about fewer imports.
+
+**How the memory arrived does not decide whether there is a finding. It
+decides what the finding says.** The two shapes are fixed in different
+places, so the finding names which it is, using the *typical* step — the
+median, which a module imported once by one test moves not at all:
+
+```
+Memory growing across tests: the run kept 48 MB in use across 4 workers over 20 tests, about 2.4 MB per test
+Memory added over the run: the run kept 96 MB in use across 4 workers over 200 tests, in steps that did not repeat
+Memory added over the run: the run kept 258 MB in use across 4 workers over 30 tests, 29 MB of it recurring at 1 MB per test
+```
+
+The first is a leak, and it is the number that will be bigger next quarter.
+The second is a cost paid once — a module a test imported — and it is a size
+to plan for. The third is both, which is the common case and the one a single
+number describes worst: a reader told only "258 MB" goes looking for the
+import, and a reader told only "1 MB per test" under-orders the machine.
+
+Using the median rather than the average is also what stops the one hiding
+the other. A sixty-megabyte import beside fifty-nine tests that each kept a
+megabyte is most of the window, and a rule that asked whether the biggest
+step was half the total threw the whole window away — the import, and the
+fifty-nine tests that were the actual leak, together. The bigger the import,
+the better it hid what was next to it. A median cannot be moved that way.
+
+A run that wants to hear only about what repeats sets
+`failure_profile_growth_per_test_mb`, and the typical test must then have
+paid that much as well. It is 0 by default, which asks nothing of the shape.
+Below the reading's own floor — 20 KB a test — no rate is claimed at all,
+which is what keeps a very long run from reporting its own bookkeeping: ten
+thousand tests at three kilobytes is thirty megabytes, past any bar for a run
+and nobody's leak.
+
+
+**It was divided by the worker count.** The rule is over one process, so
+under xdist a leak reaches it already divided: ten megabytes a test over
+twenty tests is 200 MB on one worker and 50 MB on each of four — the same
+suite, leaking the same way, reported only when it is run with few enough
+workers, and at `-n 12` with fewer tests per worker than the rule's minimum
+there is nothing for it to be over at all. What a test leaves behind is the
+test's property, not the worker count's, so the rule runs a second time over
+the workers that did not reach it alone, pooled. A worker that kept a whole
+test's worth is reported as itself — that is the process that gets
+OOM-killed — and workers merely over the rate are the suite leaking, which
+is said once for the run rather than once per slice of the same number:
+
+```
+Memory growing across tests: the run kept 220 MB in use across 4 workers over 20 tests, about 11 MB per test   [memory_profile STEADY_GROWTH, customer-code, informational]
+    No single worker kept enough to be reported on its own, and no single test did either. 20 of the 20 tests they ran between them each ended with more in use than they started with.
+    Kept per worker: gw0 55 MB over 5 tests, gw1 55 MB over 5 tests, gw2 55 MB over 5 tests, gw3 55 MB over 5 tests.
+    xdist divides the tests between the workers, so a leak in the tests is divided with them: this is what the run as a whole kept, whatever each process shows.
+    All of them are cases of tests/test_leak.py::test_leaks_a_little.
+    Look at: rerun those tests with --failure-profile-allocations to see which lines hold the memory.
+    Measured: the workers held 136 MB in total before their first of these tests and 356 MB after their last, summed over 4 processes, which counts the pages they share once each. Biggest single step 11 MB. +81 Python objects per test.
+```
+
+Every guard is the per-worker one applied over the pool: the tests reached
+the bar between them, and the shape decides which bar. A worker already
+raised on its own is left out of the pool and named in the finding rather
+than counted twice, two of the remaining workers must have kept something so
+that a finding about a run means the run, and `failure_profile_growth_tests`
+is the minimum number of tests either pass needs — lower it for a suite whose
+workers each run a handful. A leak confined to one worker keeps that worker's
+own finding: the pooled rule dilutes it with its siblings' clean tests and
+declines, and the per-worker one it would have replaced stands.
 
 The worker that "freed everything and still sits at four gigabytes" is the
 one case none of the per-test rules can name, because no test did it: a few
@@ -2359,11 +2453,12 @@ CPU burst: tests/test_index.py::test_index_is_complete ran at 1.0 cores for 2.7 
 ```
 
 The same run prints a summary at the end of the terminal output — the run's
-CPU against its wall time, what each worker peaked at, and the top functions:
+CPU against its wall time, what each worker peaked at and grew by, and the top
+functions:
 
 ```
 Profile: 74 tests, 27 s of wall time, 18 s CPU (0.69 cores on average), 2.5 s of it in garbage collection
-  worker main: 74 tests, 18 s CPU, peak 1532 MB, 882 MB at the end
+  worker main: 74 tests, 18 s CPU, peak 1532 MB, 882 MB at the end, up 840 MB from 42 MB
 Functions using the most CPU:
    16.8%    2.98 s  build_graph  test_allocation.py  [customer-code]  in 2 tests
    14.3%    2.53 s  render_report  reports.py  [product]  in 2 tests
@@ -2615,6 +2710,11 @@ accepted and inert.
 | `failure_profile_cpu_floor_seconds` | `0.5` | Seconds of CPU one function must have used before its share counts, so that a short run does not raise the first thing it sampled |
 | `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
 | `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
+| `failure_profile_growth_mb` | `5` | Megabytes a run's tests may add between them, in use, before the run is raised as growing. Low, because what it is really the bar for is a cost that **recurs**, and a recurrence is paid again for every test the suite ever gains. `failure_profile_retained_mb` is what one *test* may keep and is a separate question |
+| `failure_profile_step_mb` | `20` | Megabytes one test must have added on its own for memory that did **not** recur to be worth raising. A cost paid once is bounded — a module a test imported — so it is judged on its size, where a recurrence is judged on the fact that it repeats |
+| `failure_profile_growth_per_test_mb` | `0` | Megabytes the *typical* test must have left behind as well, for a run that only wants to hear about a leak that repeats. 0 asks nothing of the shape |
+| `failure_profile_growth_tests` | `4` | Tests that must each leave something behind before the drift between them is raised as steady growth — per worker, and again over the workers that did not reach the rule alone |
+| `failure_profile_imbalance_ratio` | `2` | Times the median sibling's peak a worker must hold to be raised as imbalanced |
 | `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; tens of times slower on allocation-heavy pure-Python code, so for a rerun of the tests an untraced run named (`--failure-profile-allocations` for one run, which implies `--failure-profile`) |
 | `failure_profile_allocation_depth` | `12` | Frames kept per allocation when tracing |
 | `failure_profile_burst_cores` | `0.7` | Cores' worth of CPU a tenth-of-a-second window must hold to be part of a burst |
