@@ -2184,7 +2184,7 @@ the burst, blamed like a hotspot:
 | `RETAINED_AFTER_TEST` | the worker was left holding more than it started with, still in use, with the phase it arrived in — `setup` is a fixture |
 | `HEAP_NOT_RETURNED` | it was left holding more, but none of it is in use: the allocator kept freed pages mapped. Fragmentation, not a leak |
 | `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
-| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — a megabyte a test, which is the shape of a leak and the one no per-test check sees. Judged on what the *typical* test kept (`failure_profile_growth_per_test_mb`) rather than on a total, because a drift is paid again for every test in the suite where one test's retention is paid once: the same leak is fifty megabytes over twenty tests and five hundred over two hundred, and only the rate is the same number both times. The typical test and not the average one, so that a module imported once cannot pass for a leak — and cannot hide one either. Under xdist the same rule runs again over the workers that did not reach it alone, pooled: what a test leaves behind is the test's property, not the worker count's, and ten megabytes a test is two hundred on one worker and fifty on each of four. That finding names the run rather than a worker, and `worker_rss` carries each one's share |
+| `STEADY_GROWTH` | the run's tests added memory between them, in use, and no one of them kept enough to be raised alone — the leak no per-test check sees. The *typical* test's step decides which bar applies and what the finding says: a cost that **recurs** is unbounded and is raised at `failure_profile_growth_mb` (5 MB) while it is still small, a cost paid **once** is bounded and is raised only at `failure_profile_step_mb` (20 MB) in one test, and a run with both is told both. The typical step and not the average, so a module imported once by one test can neither pass for a leak nor hide one. Under xdist the same rule runs again over the workers that did not reach it alone, pooled: what a test leaves behind is the test's property, not the worker count's, and ten megabytes a test is two hundred on one worker and fifty on each of four. That finding names the run rather than a worker, and `worker_rss` carries each one's share |
 | `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
 | `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
 | `ALLOCATOR_RETENTION` | the worker grew by the threshold over its run and nothing is using the growth: memory the allocator was handed back and kept mapped. One finding for the run, saying which of the two causes it is — thread arenas each keeping what they freed, which `MALLOC_ARENA_MAX=2` fixes, or one main heap fragmented by small survivors, which `malloc_trim` fixes and the arena variable does not |
@@ -2306,17 +2306,15 @@ Memory growing across tests: the run kept 220 MB in use across 4 workers over 20
     Measured: the workers held 136 MB in total before their first of these tests and 356 MB after their last, summed over 4 processes, which counts the pages they share once each. Biggest single step 11 MB. +81 Python objects per test.
 ```
 
-Every guard is the per-worker one over the pool — the tests reached the bar
-between them, no single test is half of it, at least half of them grew, which
-is what keeps the one-time cost every worker pays on its first test from
-adding up to a leak across enough of them. A worker already raised on its own
-is left out of the pool and named in the finding rather than counted twice,
-two of the remaining workers must have kept something so that a finding about
-a run means the run, and `failure_profile_growth_tests` is the minimum number
-of tests either pass needs — lower it for a suite whose workers each run a
-handful. A leak confined to one worker keeps that worker's own finding: the
-pooled rule dilutes it with its siblings' clean tests and declines, and the
-per-worker one it would have replaced stands.
+Every guard is the per-worker one applied over the pool: the tests reached
+the bar between them, and the shape decides which bar. A worker already
+raised on its own is left out of the pool and named in the finding rather
+than counted twice, two of the remaining workers must have kept something so
+that a finding about a run means the run, and `failure_profile_growth_tests`
+is the minimum number of tests either pass needs — lower it for a suite whose
+workers each run a handful. A leak confined to one worker keeps that worker's
+own finding: the pooled rule dilutes it with its siblings' clean tests and
+declines, and the per-worker one it would have replaced stands.
 
 The worker that "freed everything and still sits at four gigabytes" is the
 one case none of the per-test rules can name, because no test did it: a few

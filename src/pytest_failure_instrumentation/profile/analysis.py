@@ -1431,28 +1431,27 @@ def _fleet_drift(
     """The same drift, spread thin across workers: the leak no one process
     holds enough of.
 
-    :func:`_drift` is over one process and its threshold is a whole number of
-    megabytes, so under xdist the leak reaches that rule already divided by
-    the number of workers. Ten megabytes a test over twenty tests is 200 MB
-    on one worker and 50 MB on each of four: the same suite, leaking the
-    same way, reported only when it is run with few enough workers. Worse at
-    the top end, where a worker runs fewer tests than the rule's minimum and
-    there is nothing for it to be over at all.
+    :func:`_drift` is over one process and its bar is a number of megabytes,
+    so under xdist a leak reaches that rule already divided by the number of
+    workers. Ten megabytes a test over twenty tests is 200 MB on one worker
+    and 50 MB on each of four: the same suite, leaking the same way,
+    reported only when it is run with few enough workers. Worse at the top
+    end, where a worker runs fewer tests than the rule's minimum and there
+    is nothing for it to be over at all. The rate is the same on every
+    worker and the total is not, so the lower the bar the less of this is
+    left - but a worker running two tests still has no run to be a rate of.
 
     What a test leaves behind is a property of the test, not of how many
-    processes ran it, so the rule runs again over the workers that did not
-    reach it alone, pooled. Every guard is the per-worker one over the pool:
-    the tests kept the threshold between them, no single test is half of it,
-    and at least half of them grew - which is what keeps a one-time cost
-    every worker pays, a lazy import on its first test, from adding up to a
-    leak across enough of them.
+    processes ran it, so :func:`_drifting` runs again over the workers that
+    did not reach it alone, pooled, and every guard in it is the per-worker
+    one over that pool.
 
-    A worker holding all of it cannot reach the pool: a worker that kept the
-    threshold was raised alone and left out. What is left is the worker whose
-    own rule declined for a different reason - too few tests to be steady,
+    A worker holding all of it cannot reach the pool: a worker that kept
+    enough was raised alone and left out. What is left is the worker whose
+    own rule declined for a different reason - too few tests to be judged,
     most often, which is the same worker count pressing from the other side.
     Two workers must have kept something, so that a finding about a run says
-    the run and means it; beyond that the guards above decide, and a leak
+    the run and means it; beyond that :func:`_drifting` decides, and a leak
     two heavy files put on two workers of six is still the run's leak.
     """
     pooled: dict[str, list[dict[str, Any]]] = {}
