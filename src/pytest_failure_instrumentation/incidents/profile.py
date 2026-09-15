@@ -233,8 +233,12 @@ class MemoryProfileIncident(Incident):
     #: median worker.
     delta_mb: Optional[int] = None
     growth: Optional[MemoryGrowth] = None
-    #: Every worker's peak, for an imbalance.
+    #: Every worker's peak, for an imbalance; every worker's share of the
+    #: growth, for a STEADY_GROWTH the run has rather than one worker.
     worker_rss: dict[str, int] = Field(default_factory=dict)
+    #: For a STEADY_GROWTH pooled across processes: how many they were. Unset
+    #: for a finding about one worker, whose name is in ``worker``.
+    workers: Optional[int] = None
     median_mb: Optional[int] = None
     tests: list[str] = Field(default_factory=list)
     #: The sha256 of each of those ids, in the same order.
@@ -283,6 +287,8 @@ class MemoryProfileIncident(Incident):
         if self.verdict == "STEADY_GROWTH":
             growth = self.growth
             tests = f" over {growth.tests} tests, about {growth.per_test_mb:g} MB per test" if growth else ""
+            if self.workers:
+                return f"Memory growing across tests: the run kept {self.delta_mb} MB in use across {self.workers} workers{tests}"
             return f"Memory growing across tests: worker {self.worker} kept {self.delta_mb} MB in use{tests}"
         if self.verdict == "WORKER_IMBALANCE":
             return f"One worker much larger than the others: {self.worker} peaked at {self.peak_mb} MB, the median worker at {self.median_mb} MB"
@@ -378,6 +384,7 @@ def build(finding: Finding, worker: str) -> Incident:
             else None
         ),
         worker_rss=dict(finding.worker_rss),
+        workers=finding.worker_count or None,
         median_mb=finding.median_mb,
         tests=list(finding.tests),
         test_hashes=list(finding.test_hashes),

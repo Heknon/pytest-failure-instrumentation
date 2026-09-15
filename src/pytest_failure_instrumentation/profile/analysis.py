@@ -30,7 +30,8 @@ and for memory:
 ``RETAINED_AFTER_TEST`` the worker was left holding more than it started with
 ``HEAP_NOT_RETURNED``   legacy verdict; incomplete heap counters cannot establish this
 ``TRANSIENT_PEAK``      a test climbed and came back down
-``STEADY_GROWTH``       a run of tests each left a little behind
+``STEADY_GROWTH``       a run of tests each left a little behind - on one
+                        worker, or across the workers between them
 ``WORKER_IMBALANCE``    one worker holds far more than its siblings
 ``PEAK_OVER_CEILING``   a test reached the absolute size nothing may reach
 ``ALLOCATOR_RETENTION`` the worker grew and nothing is using it: memory the
@@ -333,7 +334,20 @@ def analyse(
     cpu_weighted = True
     per_thread = True
     workers: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"tests": 0, "cpu_s": 0.0, "wall_s": 0.0, "peak_mb": None, "end_mb": None, "gc_s": 0.0}
+        lambda: {
+            "tests": 0,
+            "cpu_s": 0.0,
+            "wall_s": 0.0,
+            # What the process held before the first record that carried a
+            # figure, so the terminal can say what it grew by: a worker that
+            # ends 60 MB above where it started is the thing a reader
+            # watching the machine's memory saw, whether or not the drift
+            # crossed a threshold.
+            "start_mb": None,
+            "peak_mb": None,
+            "end_mb": None,
+            "gc_s": 0.0,
+        }
     )
     gc_by_test: dict[str, float] = defaultdict(float)
     native_by_name: Counter = Counter()
@@ -349,6 +363,8 @@ def analyse(
         peak = record.get("rss_peak_mb")
         if peak is not None and (summary["peak_mb"] is None or peak > summary["peak_mb"]):
             summary["peak_mb"] = peak
+        if record.get("rss_before_mb") is not None and summary["start_mb"] is None:
+            summary["start_mb"] = record["rss_before_mb"]
         if record.get("rss_after_mb") is not None:
             summary["end_mb"] = record["rss_after_mb"]
         if record.get("record") == TEST_RECORD:
@@ -722,6 +738,7 @@ def _memory_findings(
         if record.get("record") == BACKGROUND_RECORD and record.get("holders_session")
     }
 
+    drifted: set[str] = set()
     for worker, tests in by_worker.items():
         for record in tests:
             before, after, peak, traced = _figures(record)
@@ -858,8 +875,14 @@ def _memory_findings(
                         climb_total_mb=climb_total,
                     )
                 )
-        findings.extend(_drift(worker, tests, limits, session_holders.get(worker), attributor))
+        drift = _drift(worker, tests, limits, session_holders.get(worker), attributor)
+        if drift:
+            drifted.add(worker)
+        findings.extend(drift)
 
+    # And again over the workers that did not reach the rule alone, pooled:
+    # a leak divided between processes is the same leak.
+    findings.extend(_fleet_drift(by_worker, limits, drifted, session_holders, attributor))
     findings.extend(_imbalance(by_worker, limits))
     findings.extend(_allocator_retention(by_worker, limits))
     return findings
@@ -1112,35 +1135,37 @@ def _phase_of_step(rss_at: dict[str, Any], threshold_mb: int) -> Optional[str]:
     return best[1]
 
 
-def _drift(
-    worker: str,
-    tests: list[dict[str, Any]],
-    limits: Thresholds,
-    session: Optional[dict[str, Any]],
-    attributor: Attributor,
-) -> list[Finding]:
-    """The worker drifted upward over its tests: the leak no single test shows.
+def _drift_rows(tests: list[dict[str, Any]], limits: Thresholds) -> list[dict[str, Any]]:
+    """The tests a drift rule is over: the ones no finding of their own names.
 
-    Two megabytes a test is nothing; over fifty tests it is a hundred, and
-    over a five-hour worker it is the OOM kill. The rule is over the whole
-    worker: what its tests kept *in use* between them, net, reaches the
-    threshold, no single step is half of it, and at least half of them grew.
-    In use, because resident memory drifts up on its own as the allocator
-    keeps pages a fixture's worth of freed objects fragmented - twenty
-    megabytes a test that no line holds. Where the live heap and the object
-    count were read, the step is what they say; elsewhere it is the resident
-    step, and the object count is the tiebreak. A test raised on its own is
-    left out, and so is the test that gave a fixture's worth back, or the
-    release of a module fixture would cancel the leak beside it.
+    A test raised on its own is left out, and so is the test that gave a
+    fixture's worth back, or the release of a module fixture would cancel
+    the leak beside it.
     """
-    rows = [
+    return [
         record
         for record in tests
         if abs(_kept(record)) < limits.retained_mb and abs(_live_step(record)) < limits.retained_mb
     ]
+
+
+def _drifting(
+    rows: list[dict[str, Any]], limits: Thresholds
+) -> Optional[tuple[list[int], int, int, int]]:
+    """The steps, their total, the biggest and how many grew - or None when
+    these tests are not a drift.
+
+    What they kept *in use* between them, net, reaches the threshold, no
+    single step is half of it, and at least half of them grew. In use,
+    because resident memory drifts up on its own as the allocator keeps
+    pages a fixture's worth of freed objects fragmented - twenty megabytes a
+    test that no line holds. Where the live heap and the object count were
+    read, the step is what they say; elsewhere it is the resident step, and
+    the object count is the tiebreak.
+    """
     # A growth_tests of 0 asks for no minimum, not for a rule over no rows.
     if not rows or len(rows) < limits.growth_tests:
-        return []
+        return None
     steps = [_live_step(record) for record in rows]
     total = sum(steps)
     biggest = max(steps)
@@ -1156,35 +1181,64 @@ def _drift(
         if step >= 1 or (kept is not None and kept * BYTES_PER_BLOCK >= 1048576)
     )
     if total < limits.retained_mb or biggest >= total / 2 or growing < len(rows) / 2:
-        return []
-    counted = [kept for kept in blocks if kept is not None]
-    objects = sum(counted) // len(counted) if counted else None
-    first, last = rows[0], rows[-1]
-    per_test = total / len(rows)
+        return None
+    return steps, total, biggest, growing
+
+
+def _during(rows: list[dict[str, Any]], steps: list[int]) -> str:
+    """Which tests the memory arrived during, for the evidence."""
     by_name: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     for record, step in zip(rows, steps):
         entry = by_name[str(record["nodeid"]).split("[")[0]]
         entry[0] += step
         entry[1] += 1
+    if len(by_name) == 1:
+        return f"All of them are cases of {next(iter(by_name))}."
+    heaviest = sorted(by_name.items(), key=lambda item: -item[1][0])[:3]
+    return (
+        "Most of it during: "
+        + ", ".join(
+            f"{name} ({megabytes} MB over {count} test{'s' if count != 1 else ''})"
+            for name, (megabytes, count) in heaviest
+            if megabytes > 0
+        )
+        + "."
+    )
+
+
+def _objects_per_test(rows: list[dict[str, Any]]) -> Optional[int]:
+    counted = [kept for kept in (_blocks_kept(record) for record in rows) if kept is not None]
+    return sum(counted) // len(counted) if counted else None
+
+
+def _drift(
+    worker: str,
+    tests: list[dict[str, Any]],
+    limits: Thresholds,
+    session: Optional[dict[str, Any]],
+    attributor: Attributor,
+) -> list[Finding]:
+    """The worker drifted upward over its tests: the leak no single test shows.
+
+    Two megabytes a test is nothing; over fifty tests it is a hundred, and
+    over a five-hour worker it is the OOM kill. The rule is over the whole
+    worker - see :func:`_drifting` for what makes a run of steps a drift.
+    """
+    rows = _drift_rows(tests, limits)
+    measured = _drifting(rows, limits)
+    if measured is None:
+        return []
+    steps, total, biggest, growing = measured
+    objects = _objects_per_test(rows)
+    first, last = rows[0], rows[-1]
+    per_test = total / len(rows)
     resident = sum(_figures(record)[1] - _figures(record)[0] for record in rows)
     traced = _figures(first)[3]
     evidence = [
         f"No single test kept enough to be reported on its own. {growing} of the {len(rows)} "
         "tests each ended with more in use than they started with.",
+        _during(rows, steps),
     ]
-    if len(by_name) == 1:
-        evidence.append(f"All of them are cases of {next(iter(by_name))}.")
-    else:
-        heaviest = sorted(by_name.items(), key=lambda item: -item[1][0])[:3]
-        evidence.append(
-            "Most of it during: "
-            + ", ".join(
-                f"{name} ({megabytes} MB over {count} test{'s' if count != 1 else ''})"
-                for name, (megabytes, count) in heaviest
-                if megabytes > 0
-            )
-            + "."
-        )
     frame: Optional[FrameRef] = None
     stack: list[str] = []
     if session is not None:
@@ -1221,6 +1275,147 @@ def _drift(
             growth_tests=len(rows),
             growth_per_test_mb=round(per_test, 1),
             growth_objects_per_test=objects,
+            tests=[str(record["nodeid"]) for record in rows[:3]],
+            test_count=len(rows),
+            frame=frame,
+            stack=stack,
+        )
+    ]
+
+
+def _fleet_drift(
+    by_worker: dict[str, list[dict[str, Any]]],
+    limits: Thresholds,
+    drifted: set[str],
+    session_holders: dict[str, dict[str, Any]],
+    attributor: Attributor,
+) -> list[Finding]:
+    """The same drift, spread thin across workers: the leak no one process
+    holds enough of.
+
+    :func:`_drift` is over one process and its threshold is a whole number of
+    megabytes, so under xdist the leak reaches that rule already divided by
+    the number of workers. Ten megabytes a test over twenty tests is 200 MB
+    on one worker and 50 MB on each of four: the same suite, leaking the
+    same way, reported only when it is run with few enough workers. Worse at
+    the top end, where a worker runs fewer tests than the rule's minimum and
+    there is nothing for it to be over at all.
+
+    What a test leaves behind is a property of the test, not of how many
+    processes ran it, so the rule runs again over the workers that did not
+    reach it alone, pooled. Every guard is the per-worker one over the pool:
+    the tests kept the threshold between them, no single test is half of it,
+    and at least half of them grew - which is what keeps a one-time cost
+    every worker pays, a lazy import on its first test, from adding up to a
+    leak across enough of them.
+
+    A worker holding all of it cannot reach the pool: a worker that kept the
+    threshold was raised alone and left out. What is left is the worker whose
+    own rule declined for a different reason - too few tests to be steady,
+    most often, which is the same worker count pressing from the other side.
+    Two workers must have kept something, so that a finding about a run says
+    the run and means it; beyond that the guards above decide, and a leak
+    two heavy files put on two workers of six is still the run's leak.
+    """
+    pooled: dict[str, list[dict[str, Any]]] = {}
+    for worker, tests in by_worker.items():
+        if worker in drifted:
+            continue
+        rows = _drift_rows(tests, limits)
+        if rows:
+            pooled[worker] = rows
+    # One worker's drift is the per-worker rule's to raise or to leave.
+    if len(pooled) < 2:
+        return []
+    rows = [record for worker in pooled for record in pooled[worker]]
+    measured = _drifting(rows, limits)
+    if measured is None:
+        return []
+    steps, total, biggest, growing = measured
+    kept_by_worker = {
+        worker: sum(_live_step(record) for record in worker_rows)
+        for worker, worker_rows in pooled.items()
+    }
+    if sum(1 for kept in kept_by_worker.values() if kept >= 1) < 2:
+        return []
+    objects = _objects_per_test(rows)
+    per_test = total / len(rows)
+    traced = _figures(rows[0])[3]
+    before = sum(_figures(worker_rows[0])[0] for worker_rows in pooled.values())
+    after = sum(_figures(worker_rows[-1])[1] for worker_rows in pooled.values())
+    worst = max(kept_by_worker, key=lambda worker: kept_by_worker[worker])
+    shown = sorted(kept_by_worker.items(), key=lambda item: -item[1])
+    breakdown = ", ".join(
+        f"{worker} {kept} MB over {len(pooled[worker])} test{'s' if len(pooled[worker]) != 1 else ''}"
+        for worker, kept in shown[:6]
+    )
+    if len(shown) > 6:
+        breakdown += f", and {len(shown) - 6} more"
+    raised = sorted(worker for worker in drifted if worker)
+    evidence = [
+        (
+            f"None of these {len(pooled)} workers kept enough to be reported on its own, and no "
+            "single test did either."
+            if raised
+            else "No single worker kept enough to be reported on its own, and no single test did "
+            "either."
+        )
+        + f" {growing} of the {len(rows)} tests they ran between them each ended with more in "
+        "use than they started with.",
+        f"Kept per worker: {breakdown}.",
+        "xdist divides the tests between the workers, so a leak in the tests is divided with "
+        "them: this is what the run as a whole kept, whatever each process shows.",
+        _during(rows, steps),
+    ]
+    if raised:
+        # Saying "no worker kept enough" while one of them is reported two
+        # lines above is the kind of contradiction that costs a reader the
+        # rest of the finding.
+        evidence.insert(
+            1,
+            ("Worker " if len(raised) == 1 else "Workers ")
+            + ", ".join(raised)
+            + (" reached the rule alone and is" if len(raised) == 1 else " reached the rule alone and are")
+            + " reported separately; this is what the rest kept between them.",
+        )
+    frame: Optional[FrameRef] = None
+    stack: list[str] = []
+    session = session_holders.get(worst)
+    if session is not None:
+        frame, stack, held = _holders(
+            session, "holders_session", f"Held at the end of {worst}", attributor, None, []
+        )
+        evidence.extend(held)
+    else:
+        evidence.append(
+            "Look at: rerun those tests with --failure-profile-allocations to see which lines "
+            "hold the memory."
+        )
+    evidence.append(
+        f"Measured: the workers {'traced' if traced else 'held'} {before} MB in total before "
+        f"their first of these tests and {after} MB after their last, summed over "
+        f"{len(pooled)} processes"
+        # Only the resident figures are a per-process total of mapped pages,
+        # and a page mapped by every worker is in every worker's figure.
+        # tracemalloc counts each process's own allocations and nothing else.
+        + ("" if traced else ", which counts the pages they share once each")
+        + f". Biggest single step {biggest} MB."
+        + (f" +{objects:,d} Python objects per test." if objects else "")
+    )
+    return [
+        Finding(
+            kind="memory_profile",
+            verdict="STEADY_GROWTH",
+            evidence=evidence,
+            nodeid=str(rows[0]["nodeid"]),
+            before_mb=before,
+            after_mb=after,
+            delta_mb=total,
+            growth_tests=len(rows),
+            growth_per_test_mb=round(per_test, 1),
+            growth_objects_per_test=objects,
+            worker_count=len(pooled),
+            worker_rss=dict(sorted(kept_by_worker.items())),
             tests=[str(record["nodeid"]) for record in rows[:3]],
             test_count=len(rows),
             frame=frame,

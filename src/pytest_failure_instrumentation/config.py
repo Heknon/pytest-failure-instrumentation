@@ -308,6 +308,13 @@ class Settings:
     #: Resident megabytes no test may reach, whatever it started from. 0 is
     #: off. The retained threshold catches a climb; this catches a size.
     profile_peak_mb: int = 0
+    #: Tests that must each leave something behind before the drift between
+    #: them is called steady rather than a step. Lower it for a suite whose
+    #: workers each run a handful of tests, where a leak reaches the rule
+    #: already divided between them.
+    profile_growth_tests: int = 4
+    #: Times the median a worker must hold to be called imbalanced.
+    profile_imbalance_ratio: float = 2.0
     #: Trace allocations with tracemalloc as well, so a memory finding names
     #: the lines holding the memory and a memory flame graph is written.
     #: Several times slower on allocation-heavy code: for a rerun of the
@@ -389,6 +396,10 @@ class Settings:
         )
         object.__setattr__(self, "profile_retained_mb", max(1, int(self.profile_retained_mb)))
         object.__setattr__(self, "profile_peak_mb", max(0, int(self.profile_peak_mb)))
+        object.__setattr__(self, "profile_growth_tests", max(0, int(self.profile_growth_tests)))
+        object.__setattr__(
+            self, "profile_imbalance_ratio", max(1.0, float(self.profile_imbalance_ratio))
+        )
         object.__setattr__(self, "profile_allocations", bool(self.profile_allocations))
         object.__setattr__(self, "profile_allocation_depth", max(1, int(self.profile_allocation_depth)))
         object.__setattr__(self, "profile_burst_cores", max(0.05, float(self.profile_burst_cores)))
@@ -592,6 +603,8 @@ class Settings:
             "profile_cpu_floor_seconds": self.profile_cpu_floor_seconds,
             "profile_retained_mb": self.profile_retained_mb,
             "profile_peak_mb": self.profile_peak_mb,
+            "profile_growth_tests": self.profile_growth_tests,
+            "profile_imbalance_ratio": self.profile_imbalance_ratio,
             "profile_allocations": self.profile_allocations,
             "profile_allocation_depth": self.profile_allocation_depth,
             "profile_burst_cores": self.profile_burst_cores,
@@ -811,6 +824,19 @@ def add_options(parser: pytest.Parser) -> None:
         "a test that does is raised with the code that was running while "
         "the memory climbed. 0 is off.",
         default="0",
+    )
+    parser.addini(
+        "failure_profile_growth_tests",
+        help="Tests that must each leave something behind before the drift "
+        "between them is raised as steady growth. Counted per worker, and "
+        "again over the workers that did not reach the rule alone.",
+        default="4",
+    )
+    parser.addini(
+        "failure_profile_imbalance_ratio",
+        help="Times the median sibling's peak a worker must hold to be raised "
+        "as imbalanced.",
+        default="2",
     )
     parser.addini(
         "failure_profile_allocations",
@@ -1201,6 +1227,8 @@ def resolve(config: pytest.Config) -> Settings:
         profile_cpu_floor_seconds=_number(config, "failure_profile_cpu_floor_seconds", 0.5),
         profile_retained_mb=int(_number(config, "failure_profile_retained_mb", 100)),
         profile_peak_mb=int(_number(config, "failure_profile_peak_mb", 0)),
+        profile_growth_tests=int(_number(config, "failure_profile_growth_tests", 4)),
+        profile_imbalance_ratio=_number(config, "failure_profile_imbalance_ratio", 2.0),
         profile_allocations=_flag(config, "failure_profile_allocations", False)
         or bool(_option(config, PROFILE_ALLOCATIONS_OPTION)),
         profile_allocation_depth=int(_number(config, "failure_profile_allocation_depth", 12)),

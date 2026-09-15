@@ -455,7 +455,12 @@ one; see below.
 - `STEADY_GROWTH`: `worker` drifted up by `delta_mb` over `growth.tests`
   tests, `growth.per_test_mb` each (and `growth.objects_per_test` live
   objects, where the count was read), none of them enough to be raised alone
-  and no single step half of the total. Two megabytes a test is what a leak
+  and no single step half of the total. When `workers` is set the finding is
+  the run's rather than one process's: the same rule over the workers that
+  did not reach it alone, pooled, because xdist divides the tests between
+  them and divides a leak in the tests with them — `delta_mb` is what they
+  kept between them, `worker_rss` is each one's share, and `worker` is the
+  controller that raised it, not the process that leaked. Two megabytes a test is what a leak
   looks like from outside, and the one thing a per-test check never sees;
   `nodeid` is only the first of them. The evidence says when every one is a
   parametrisation of the same test, and — with `--failure-profile-allocations` —
