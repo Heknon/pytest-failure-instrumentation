@@ -31,7 +31,9 @@ and for memory:
 ``HEAP_NOT_RETURNED``   legacy verdict; incomplete heap counters cannot establish this
 ``TRANSIENT_PEAK``      a test climbed and came back down
 ``STEADY_GROWTH``       a run of tests each left a little behind - on one
-                        worker, or across the workers between them
+                        worker, or across the workers between them. The
+                        typical test's step, so a module imported once by
+                        one test neither passes for this nor hides it
 ``WORKER_IMBALANCE``    one worker holds far more than its siblings
 ``PEAK_OVER_CEILING``   a test reached the absolute size nothing may reach
 ``ALLOCATOR_RETENTION`` the worker grew and nothing is using it: memory the
@@ -1170,9 +1172,9 @@ def _drift_rows(tests: list[dict[str, Any]], limits: Thresholds) -> list[dict[st
 
 def _drifting(
     rows: list[dict[str, Any]], limits: Thresholds
-) -> Optional[tuple[list[int], int, int, int]]:
-    """The steps, their total, the biggest and how many grew - or None when
-    these tests are not a drift.
+) -> Optional[tuple[list[int], int, int, int, float]]:
+    """The steps, their total, the biggest, how many grew and what the
+    typical one was - or None when these tests are not a drift.
 
     What they kept *in use* between them, net, reaches the bar, no single
     step is half of it, and at least half of them grew. In use, because
@@ -1202,6 +1204,12 @@ def _drifting(
     steps = [_live_step(record) for record in rows]
     total = sum(steps)
     biggest = max(steps)
+    # What the *typical* test left behind, which is the whole question: a
+    # module imported once by one test is 50 MB in the mean of twenty tests
+    # and nothing in the median of them, and it is a cost paid once. The
+    # mean cannot tell that from a megabyte left behind by every test, and
+    # the median cannot be moved by it at all.
+    typical = median(steps)
     blocks = [_blocks_kept(record) for record in rows]
     # A test grew when it kept a megabyte by the live figures - the step,
     # or the blocks at their rough size where the step is the resident one.
@@ -1213,18 +1221,27 @@ def _drifting(
         for step, kept in zip(steps, blocks)
         if step >= 1 or (kept is not None and kept * BYTES_PER_BLOCK >= 1048576)
     )
-    # Either enough of it to be a test's worth on its own, or a rate held
-    # over enough of a run to be believed.
-    rate_is_enough = (
-        limits.growth_per_test_mb > 0
-        and total / len(rows) >= limits.growth_per_test_mb
-        and total >= limits.retained_mb / 4
-    )
-    if not (total >= limits.retained_mb or rate_is_enough):
+    # Half of them paid it, by the megabytes or by the object count - the
+    # second because a test whose step rounds to nothing can still be up by
+    # a fixture's worth of objects, which the megabytes do not see. This is
+    # the rule: what one test did once is not a drift at any size.
+    if growing < len(rows) / 2:
         return None
-    if biggest >= total / 2 or growing < len(rows) / 2:
+    if limits.growth_per_test_mb <= 0:
+        # The rate turned off: the total alone, as it was before there was
+        # a rate, and the recurrence guard above still standing.
+        return (steps, total, biggest, growing, typical) if total >= limits.retained_mb else None
+    # The typical test pays the rate, over enough of a run to mean it: what
+    # recurs, across the tests it recurred in, reaches a quarter of what one
+    # test may keep - or they kept a whole test's worth between them however
+    # it arrived. The recurring part and not the total, because the total is
+    # what a one-time import inflates, and judging a recurrence by a number
+    # that import moved is how the import came to hide the leak beside it.
+    if typical < limits.growth_per_test_mb:
         return None
-    return steps, total, biggest, growing
+    if typical * len(rows) < limits.retained_mb / 4 and total < limits.retained_mb:
+        return None
+    return steps, total, biggest, growing, typical
 
 
 def _during(rows: list[dict[str, Any]], steps: list[int]) -> str:
@@ -1245,6 +1262,28 @@ def _during(rows: list[dict[str, Any]], steps: list[int]) -> str:
             if megabytes > 0
         )
         + "."
+    )
+
+
+def _recurrence(total: int, typical: float, count: int, biggest: int) -> Optional[str]:
+    """What of the total recurs and what arrived once, when the two differ.
+
+    The headline figure is what the tests kept between them, and a reader
+    who divides it by the number of tests gets a number that is not the
+    rate whenever a one-time cost is in the window - the module one test
+    imported, which is in the total and in nobody's recurrence. Saying
+    which is which costs a line and saves the reader the arithmetic that
+    would mislead them.
+    """
+    recurs = int(typical * count)
+    once = total - recurs
+    # A megabyte of rounding is not a one-time cost worth a sentence.
+    if once < max(2, recurs // 4):
+        return None
+    return (
+        f"About {recurs} MB of that is the {typical:g} MB every test keeps, over {count} tests. "
+        f"The other {once} MB arrived in steps that did not repeat, the biggest {biggest} MB - "
+        "a cost paid once is not what grows with the suite."
     )
 
 
@@ -1270,10 +1309,9 @@ def _drift(
     measured = _drifting(rows, limits)
     if measured is None:
         return []
-    steps, total, biggest, growing = measured
+    steps, total, biggest, growing, per_test = measured
     objects = _objects_per_test(rows)
     first, last = rows[0], rows[-1]
-    per_test = total / len(rows)
     resident = sum(_figures(record)[1] - _figures(record)[0] for record in rows)
     traced = _figures(first)[3]
     evidence = [
@@ -1293,6 +1331,9 @@ def _drift(
             "Look at: rerun those tests with --failure-profile-allocations to see which lines "
             "hold the memory."
         )
+    note = _recurrence(total, per_test, len(rows), biggest)
+    if note:
+        evidence.insert(1, note)
     evidence.append(
         f"Measured: {'traced memory' if traced else 'process'} {_figures(first)[0]} MB before the "
         f"first of these tests, {_figures(last)[1]} MB after the last. Biggest single step {biggest} MB."
@@ -1373,7 +1414,7 @@ def _fleet_drift(
     measured = _drifting(rows, limits)
     if measured is None:
         return []
-    steps, total, biggest, growing = measured
+    steps, total, biggest, growing, per_test = measured
     kept_by_worker = {
         worker: sum(_live_step(record) for record in worker_rows)
         for worker, worker_rows in pooled.items()
@@ -1381,7 +1422,6 @@ def _fleet_drift(
     if sum(1 for kept in kept_by_worker.values() if kept >= 1) < 2:
         return []
     objects = _objects_per_test(rows)
-    per_test = total / len(rows)
     traced = _figures(rows[0])[3]
     before = sum(_figures(worker_rows[0])[0] for worker_rows in pooled.values())
     after = sum(_figures(worker_rows[-1])[1] for worker_rows in pooled.values())
@@ -1409,6 +1449,9 @@ def _fleet_drift(
         "them: this is what the run as a whole kept, whatever each process shows.",
         _during(rows, steps),
     ]
+    note = _recurrence(total, per_test, len(rows), biggest)
+    if note:
+        evidence.insert(1, note)
     if raised:
         # Saying "no worker kept enough" while one of them is reported two
         # lines above is the kind of contradiction that costs a reader the

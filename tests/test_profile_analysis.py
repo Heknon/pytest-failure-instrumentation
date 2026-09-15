@@ -910,7 +910,11 @@ class TestFleetGrowth:
 
         assert not findings_of(report, "STEADY_GROWTH")
 
-    def test_one_test_that_is_half_the_pool_is_a_step_not_a_drift(self) -> None:
+    def test_one_big_step_does_not_hide_the_recurrence_beside_it(self) -> None:
+        # One test imports 90 MB and five more keep 5 MB each. Judged by the
+        # total, the import is most of it and the whole window is thrown
+        # away - which throws away the five tests that each paid, the only
+        # part that recurs. The typical step is 5 MB either way.
         records = [
             record("t::big", [], [], worker="gw0", rss=(100, 190, 190)),
             record("t::small[0]", [], [], worker="gw0", rss=(190, 195, 195)),
@@ -918,6 +922,21 @@ class TestFleetGrowth:
             record("t::small[2]", [], [], worker="gw1", rss=(105, 110, 110)),
             record("t::small[3]", [], [], worker="gw2", rss=(100, 105, 105)),
             record("t::small[4]", [], [], worker="gw2", rss=(105, 110, 110)),
+        ]
+        report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
+
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.growth_per_test_mb == 5.0
+        assert any("Biggest single step 90 MB" in line for line in finding.evidence)
+
+    def test_a_step_with_nothing_recurring_beside_it_is_still_not_a_drift(self) -> None:
+        # The same 90 MB import with tests that kept nothing around it. What
+        # rejects this is that five of the six tests paid nothing, not the
+        # size of the one that did - so it is rejected however big it is.
+        records = [record("t::big", [], [], worker="gw0", rss=(100, 190, 190))]
+        records += [
+            record(f"t::small[{case}]", [], [], worker=f"gw{case % 3}", rss=(100, 100, 100))
+            for case in range(5)
         ]
         report = analyse(records, attributor, Thresholds(retained_mb=100, growth_tests=4))
 

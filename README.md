@@ -2184,7 +2184,7 @@ the burst, blamed like a hotspot:
 | `RETAINED_AFTER_TEST` | the worker was left holding more than it started with, still in use, with the phase it arrived in — `setup` is a fixture |
 | `HEAP_NOT_RETURNED` | it was left holding more, but none of it is in use: the allocator kept freed pages mapped. Fragmentation, not a leak |
 | `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
-| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — a megabyte a test, which is the shape of a leak and the one no per-test check sees. Judged on the rate (`failure_profile_growth_per_test_mb`) rather than only on a total, because a drift is paid again for every test in the suite where one test's retention is paid once: the same leak is fifty megabytes over twenty tests and five hundred over two hundred, and only the rate is the same number both times. Under xdist the same rule runs again over the workers that did not reach it alone, pooled: what a test leaves behind is the test's property, not the worker count's, and ten megabytes a test is two hundred on one worker and fifty on each of four. That finding names the run rather than a worker, and `worker_rss` carries each one's share |
+| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — a megabyte a test, which is the shape of a leak and the one no per-test check sees. Judged on what the *typical* test kept (`failure_profile_growth_per_test_mb`) rather than on a total, because a drift is paid again for every test in the suite where one test's retention is paid once: the same leak is fifty megabytes over twenty tests and five hundred over two hundred, and only the rate is the same number both times. The typical test and not the average one, so that a module imported once cannot pass for a leak — and cannot hide one either. Under xdist the same rule runs again over the workers that did not reach it alone, pooled: what a test leaves behind is the test's property, not the worker count's, and ten megabytes a test is two hundred on one worker and fifty on each of four. That finding names the run rather than a worker, and `worker_rss` carries each one's share |
 | `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
 | `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
 | `ALLOCATOR_RETENTION` | the worker grew by the threshold over its run and nothing is using the growth: memory the allocator was handed back and kept mapped. One finding for the run, saying which of the two causes it is — thread arenas each keeping what they freed, which `MALLOC_ARENA_MAX=2` fixes, or one main heap fragmented by small survivors, which `malloc_trim` fixes and the arena variable does not |
@@ -2234,11 +2234,32 @@ the rate is the same number both times. A drift is also the thing that
 compounds: one test's retention is paid once, a drift is paid again for every
 test in the suite, and suites grow. So it is judged on
 `failure_profile_growth_per_test_mb` — a megabyte a test by default — with
-the total only having to reach a quarter of `failure_profile_retained_mb`, so
-that a handful of tests cannot carry a rate on their own. That floor is the
-one `failure_profile_cpu_floor_seconds` is, and it binds on short runs only.
-A suite that leaks nothing measures 0.00 MB a test, so there is no noise
-floor under this beyond the whole megabyte the figures are read in.
+what recurs only having to reach a quarter of `failure_profile_retained_mb`,
+so that a handful of tests cannot carry a rate on their own. That floor is
+the one `failure_profile_cpu_floor_seconds` is, and it binds on short runs
+only. A suite that leaks nothing measures 0.00 MB a test, so there is no
+noise floor under this beyond the whole megabyte the figures are read in.
+
+**The rate is the typical test's step, not the average one**, and that is the
+whole of what separates a leak from a cost paid once. A module one test
+imports is fifty megabytes in the average of twenty tests and nothing in the
+median of them, so it is never mistaken for a leak — and, which matters more,
+it can no longer hide one. Judged by totals, a sixty-megabyte import sitting
+beside fifty-nine tests that each kept a megabyte is most of the window, and
+the rule that asked whether the biggest step was half the total threw the
+whole window away: the import, and the fifty-nine tests that were the actual
+leak, together. The bigger the import, the better it hid what was next to it.
+The median is not movable that way, and the finding reports both parts —
+what recurs, and what arrived once — rather than one number that is neither:
+
+```
+    About 30 MB of that is the 1 MB every test keeps, over 30 tests. The other 242 MB arrived in steps that did not repeat, the biggest 59 MB - a cost paid once is not what grows with the suite.
+```
+
+What makes a drift is that the cost *repeats*: at least half the tests in the
+window must each have kept something, by the megabytes or by the object
+count. One test doing it once is not a drift at any size, and a leak in
+fewer than half the tests of a window is left to the total to catch.
 
 **It was divided by the worker count.** The rule is over one process, so
 under xdist a leak reaches it already divided: ten megabytes a test over

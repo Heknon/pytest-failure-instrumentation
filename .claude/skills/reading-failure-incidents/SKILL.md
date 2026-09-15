@@ -455,12 +455,17 @@ one; see below.
 - `STEADY_GROWTH`: `worker` drifted up by `delta_mb` over `growth.tests`
   tests, `growth.per_test_mb` each (and `growth.objects_per_test` live
   objects, where the count was read), none of them enough to be raised alone
-  and no single step half of the total. The bar is reached two ways: the
-  tests kept `failure_profile_retained_mb` between them, or they kept
-  `failure_profile_growth_per_test_mb` on average over a quarter of it — the
-  rate, because a drift is paid again for every test in the suite where one
-  test's retention is paid once, so `growth.per_test_mb` is the number to
-  read and `delta_mb` is what this run's length made of it. When `workers` is
+  and at least half of them having kept something, which is what makes it a
+  drift rather than a cost paid once. `growth.per_test_mb` is the *typical*
+  test's step, the median and not the average, so a module one test imported
+  neither passes for a leak nor hides one: it is in `delta_mb` and in the
+  "biggest single step" evidence, and not in the rate. Read the rate, not
+  `delta_mb` divided by `growth.tests` — the evidence separates what recurs
+  from what arrived once when the two differ. The bar is reached two ways:
+  the tests kept `failure_profile_retained_mb` between them, or what recurs
+  reaches a quarter of it at `failure_profile_growth_per_test_mb` a test,
+  because a drift is paid again for every test in the suite where one test's
+  retention is paid once. When `workers` is
   set the finding is
   the run's rather than one process's: the same rule over the workers that
   did not reach it alone, pooled, because xdist divides the tests between
