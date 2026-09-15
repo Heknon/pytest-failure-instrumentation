@@ -666,13 +666,37 @@ class TestGrowthRate:
         assert finding.delta_mb == 100
         assert finding.growth_per_test_mb == 5.0
 
-    def test_a_handful_of_tests_cannot_carry_a_rate_on_their_own(self) -> None:
-        # Five tests keeping 2 MB each is the rate and 10 MB of drift, under
-        # the quarter of retained_mb the rule wants before it believes a
-        # rate. The floor is cpu_floor_seconds' - it binds on short runs.
+    def test_a_recurrence_is_raised_while_it_is_still_small(self) -> None:
+        # Five tests keeping 2 MB each is 10 MB, which is nothing - and it
+        # is 2 MB every test the suite ever gains, which is the reason not
+        # to wait. A recurrence is judged on the fact that it repeats.
         report = analyse(self.leaking(5, 2), attributor, Thresholds(retained_mb=100, growth_tests=4))
 
-        assert not findings_of(report, "STEADY_GROWTH")
+        (finding,) = findings_of(report, "STEADY_GROWTH")
+        assert finding.delta_mb == 10
+        assert finding.growth_per_test_mb == 2.0
+
+    def test_a_cost_paid_once_is_judged_on_its_size_instead(self) -> None:
+        # The same 10 MB arriving in one test and never again is bounded: a
+        # module imported, and then never imported again. Under step_mb, so
+        # it is nobody's problem however low the bar for a recurrence is.
+        steps = [10] + [0] * 19
+        records, rss = [], 100
+        for index, step in enumerate(steps):
+            records.append(record(f"t::x[{index}]", [], [], rss=(rss, rss + step, rss + step)))
+            rss += step
+        limits = Thresholds(retained_mb=100, growth_tests=4)
+
+        assert not findings_of(analyse(records, attributor, limits), "STEADY_GROWTH")
+
+        # Twenty is a machine to size for, and is raised as the step it is.
+        bigger = [entry for entry in records]
+        bigger[0] = record("t::x[0]", [], [], rss=(100, 125, 125))
+        for index in range(1, 20):
+            bigger[index] = record(f"t::x[{index}]", [], [], rss=(125, 125, 125))
+        (finding,) = findings_of(analyse(bigger, attributor, limits), "STEADY_GROWTH")
+        assert finding.delta_mb == 25
+        assert finding.growth_per_test_mb == 0.0
 
     def test_the_same_rate_over_enough_tests_is_raised(self) -> None:
         # The same 2 MB a test, run for longer: 40 tests is 80 MB, over the

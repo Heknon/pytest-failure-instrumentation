@@ -93,12 +93,20 @@ class Thresholds:
     #: MB a test may leave behind, or climb by, before it is named.
     retained_mb: int = 100
     #: MB a run's tests may add between them, in use, before the run is said
-    #: to be growing. This is the rule: memory adding up across a run is the
-    #: thing worth knowing, whether it arrived a little at a time or in one
-    #: step, and 20 MB is worth knowing where one megabyte is not. Well clear
-    #: of what a suite that leaks nothing measures, which is under a megabyte
-    #: over two hundred tests.
-    growth_mb: int = 20
+    #: to be growing. Low, because what it is really the bar for is a cost
+    #: that *recurs*, and a recurrence is unbounded: five megabytes over the
+    #: tests that have run is five more over the next lot, and five hundred
+    #: on a suite a hundred times the size. Well clear of what a suite that
+    #: leaks nothing measures, which is under a megabyte over two hundred
+    #: tests at a typical step of three kilobytes.
+    growth_mb: int = 5
+    #: MB one test must have added, on its own, for memory that did *not*
+    #: recur to be worth raising. A cost paid once is bounded - a module a
+    #: test imported, and then never again - so it is judged on its size
+    #: where a recurrence is judged on the fact that it repeats. Five
+    #: megabytes of import is nobody's problem; twenty is a machine to
+    #: size for.
+    step_mb: int = 20
     #: MB the *typical* test must have left behind as well, for a run that
     #: only wants a leak that repeats. 0, the default, asks nothing of the
     #: shape: the finding says whether the memory recurred or arrived in
@@ -1205,17 +1213,26 @@ def _drifting(
     ``retained_mb`` is what one *test* may keep and is the wrong bar for a
     run: held to it, a run said nothing until a hundred megabytes had piled
     up, which is a fact about how long the run was rather than about the
-    code. ``growth_mb`` is the bar for a run and it is low - 20 MB - which
+    code. A run has ``growth_mb``, and it is low - five megabytes - which
     the steps being read in kilobytes is what makes safe. A suite that leaks
     nothing adds up to under a megabyte over two hundred tests, at a typical
-    step of three kilobytes, so 20 MB stands thirty times clear of the noise
-    rather than the two the whole-megabyte reading used to allow.
+    step of three kilobytes, so five megabytes still stands clear of the
+    floor by several times where the whole-megabyte reading could not have
+    told the two apart at all.
 
-    How the memory arrived does not decide whether there is a finding; it
-    decides what the finding says. ``typical``, the median step, is what
-    every test paid, and a module imported once by one test moves the total
-    and not the median - so the two together separate the leak that grows
-    with the suite from the cost paid once, and the evidence reports both.
+    It is low because what it is really the bar for is a cost that *recurs*,
+    and the two shapes are not alike in what they cost. A recurrence is
+    unbounded: five megabytes over the tests that have run is five more over
+    the next lot and five hundred on a suite a hundred times the size, so it
+    is worth raising while it is still small. A cost paid once is bounded -
+    a module a test imported, and then never again - so it is judged on its
+    size instead, against ``step_mb``, and five megabytes of import is
+    nobody's problem where twenty is a machine to size for.
+
+    ``typical``, the median step, is what tells them apart, because a module
+    imported once by one test moves the total and not the median. It decides
+    which bar applies and what the finding then says, and the evidence
+    reports both parts where there are both.
     """
     # A growth_tests of 0 asks for no minimum, not for a rule over no rows.
     if not rows or len(rows) < limits.growth_tests:
@@ -1246,12 +1263,13 @@ def _drifting(
     # whether there is one.
     if total < limits.growth_mb:
         return None
-    # And it is either a recurrence the reading can actually resolve, or it
-    # arrived in a step big enough to be worth a sentence on its own. What
-    # this excludes is the run so long that its own floor adds up: ten
-    # thousand tests at three kilobytes of pytest's bookkeeping is thirty
-    # megabytes, which clears the bar for a run and is nobody's leak.
-    if typical < NOISE_FLOOR_MB and biggest < limits.growth_mb / 2:
+    # The bar above is the one for a cost that recurs, and a recurrence has
+    # to be one the reading can actually resolve: under the floor there is
+    # no rate, only the floor. Memory that did not recur is bounded and is
+    # judged on its size instead. What this excludes is the run so long that
+    # its own bookkeeping adds up - ten thousand tests at three kilobytes is
+    # thirty megabytes, which clears any bar for a run and is nobody's leak.
+    if typical < NOISE_FLOOR_MB and biggest < limits.step_mb:
         return None
     # Unless a run has asked to hear only about what repeats, in which case
     # the typical test must have paid it too - the median and not the mean,

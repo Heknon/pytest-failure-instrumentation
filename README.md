@@ -2231,14 +2231,25 @@ hundred over two hundred; it is one leak, and the run that was short enough
 never heard about it.
 
 So a run has a bar of its own, `failure_profile_growth_mb`, and it is low:
-**20 MB**. What makes that safe is that the steps are read in *kilobytes*. A
+**5 MB**. What makes that safe is that the steps are read in *kilobytes*. A
 test that keeps 300 KB used to read as a step of 0 MB, and two hundred of
 them read as nothing two hundred times over rather than as the 60 MB the
 process actually grew, so anything under a megabyte a test was invisible
 however long it ran. Measured on a suite that leaks nothing, the typical
 step is about **3 KB** and the total over two hundred tests is under a
-megabyte — so a 20 MB bar stands some thirty times clear of the floor, where
-the whole-megabyte reading could not have told the two apart at all.
+megabyte — so a 5 MB bar still stands clear of the floor by several times,
+where the whole-megabyte reading could not have told the two apart at all.
+
+**A recurrence and a cost paid once are not judged the same way**, because
+they are not alike in what they cost. A recurrence is unbounded: 5 MB over
+the tests that have run is 5 MB more over the next lot and 500 MB on a suite
+a hundred times the size, so it is worth raising while it is still small —
+which is what the low bar is for. A cost paid once is bounded: a module a
+test imported, and then never imported again. It cannot grow with the suite,
+so it is judged on its *size* instead, against `failure_profile_step_mb` —
+**20 MB**, because five megabytes of import is nobody's problem and twenty is
+a machine to size for. Both are settings; lower the first to hear about
+smaller leaks, raise the second to hear about fewer imports.
 
 **How the memory arrived does not decide whether there is a finding. It
 decides what the finding says.** The two shapes are fixed in different
@@ -2269,7 +2280,7 @@ A run that wants to hear only about what repeats sets
 paid that much as well. It is 0 by default, which asks nothing of the shape.
 Below the reading's own floor — 20 KB a test — no rate is claimed at all,
 which is what keeps a very long run from reporting its own bookkeeping: ten
-thousand tests at three kilobytes is thirty megabytes, over the bar for a run
+thousand tests at three kilobytes is thirty megabytes, past any bar for a run
 and nobody's leak.
 
 
@@ -2701,7 +2712,8 @@ accepted and inert.
 | `failure_profile_cpu_floor_seconds` | `0.5` | Seconds of CPU one function must have used before its share counts, so that a short run does not raise the first thing it sampled |
 | `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
 | `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
-| `failure_profile_growth_mb` | `20` | Megabytes a run's tests may add between them, in use, before the run is raised as growing — whether the memory arrived a little at a time or in one step, which the finding says. `failure_profile_retained_mb` is what one *test* may keep and is a separate question |
+| `failure_profile_growth_mb` | `5` | Megabytes a run's tests may add between them, in use, before the run is raised as growing. Low, because what it is really the bar for is a cost that **recurs**, and a recurrence is paid again for every test the suite ever gains. `failure_profile_retained_mb` is what one *test* may keep and is a separate question |
+| `failure_profile_step_mb` | `20` | Megabytes one test must have added on its own for memory that did **not** recur to be worth raising. A cost paid once is bounded — a module a test imported — so it is judged on its size, where a recurrence is judged on the fact that it repeats |
 | `failure_profile_growth_per_test_mb` | `0` | Megabytes the *typical* test must have left behind as well, for a run that only wants to hear about a leak that repeats. 0 asks nothing of the shape |
 | `failure_profile_growth_tests` | `4` | Tests that must each leave something behind before the drift between them is raised as steady growth — per worker, and again over the workers that did not reach the rule alone |
 | `failure_profile_imbalance_ratio` | `2` | Times the median sibling's peak a worker must hold to be raised as imbalanced |

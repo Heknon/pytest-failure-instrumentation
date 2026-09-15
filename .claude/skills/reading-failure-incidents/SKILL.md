@@ -453,9 +453,12 @@ one; see below.
 - `TRANSIENT_PEAK`: climbed `delta_mb` and came back. Costs peak memory, which
   is what decides how many workers fit on a machine.
 - `STEADY_GROWTH`: the run's tests added `delta_mb` between them, in use,
-  over `growth.tests` tests — past `failure_profile_growth_mb`, which is the
-  bar for a *run* and much lower than `failure_profile_retained_mb`, the bar
-  for one test. How the memory arrived is in the summary and in
+  over `growth.tests` tests — past `failure_profile_growth_mb` (5 MB) if it
+  recurred, or past `failure_profile_step_mb` (20 MB) in one test if it did
+  not. Both are bars for a *run* and both are far below
+  `failure_profile_retained_mb`, the bar for one test. The two differ
+  because a recurrence is unbounded and a cost paid once is not, so the
+  first is raised while it is still small and the second is judged on size. How the memory arrived is in the summary and in
   `growth.recurring_mb`, and the two are fixed in different places. "Memory
   growing across tests" with a `growth.per_test_mb` means a leak that scales
   with the suite: every test pays it, and it is bigger on a longer run.

@@ -1436,6 +1436,7 @@ class IncidentEngine:
             retained_mb=self.settings.profile_retained_mb,
             peak_mb=self.settings.profile_peak_mb,
             growth_mb=self.settings.profile_growth_mb,
+            step_mb=self.settings.profile_step_mb,
             growth_per_test_mb=self.settings.profile_growth_per_test_mb,
             growth_tests=self.settings.profile_growth_tests,
             imbalance_ratio=self.settings.profile_imbalance_ratio,
