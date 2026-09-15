@@ -11,18 +11,25 @@ What it does
 * One :class:`CaseReport` per pytest phase - setup, call, teardown - of every
   test, whatever the outcome, plus one per collection error.
 * Every case ends with a terminal report. A test that started and never reached
-  teardown (the session was interrupted, something called ``pytest.exit``, a
-  test brought the run down) gets a synthetic ``crashed`` teardown report at
-  session finish, so a consumer never waits on a phase that will not arrive.
-* Exactly one report carries ``last_report=True``. The newest report is held
-  back until the next one arrives, so the flag lands on a report that has not
-  been shipped yet - see :meth:`ElasticCaseReporter._submit`.
+  teardown (the session was interrupted, something called ``pytest.exit``, the
+  xdist worker holding it died) gets a synthetic ``crashed`` teardown report,
+  so a consumer never waits on a phase that will not arrive.
+* Exactly one report in the run carries ``last_report=True``. The newest report
+  is held back until the next one arrives, so the flag lands on a report that
+  has not been shipped yet - see :meth:`ElasticCaseReporter._submit`.
 * Reports are queued and shipped in batches from a background thread; a test
   never waits on the sender. The queue is drained at session finish.
 * Shipping is a mock. :class:`MockElasticSender` records the POST it would have
   made to the forwarding API - the endpoint that takes a body of case reports
   and forwards them to elastic. Swap it in :func:`pytest_configure` for the
   real one; anything with a ``send(list[dict])`` method fits.
+
+The vocabulary
+--------------
+:data:`OUTCOMES` and :data:`PHASE_STEPS` are the only place the strings that
+land in elastic are decided. Remap a value there, or reassign either dict from
+a conftest, if your index speaks differently - ``OUTCOMES["error"] = "failed"``
+folds setup and teardown failures back into plain failures, for instance.
 
 Updating state from anywhere
 ----------------------------
@@ -40,10 +47,18 @@ fixture running on a thread of its own is safe.
 
 Under xdist
 -----------
-The plugin registers on the workers, where the ``pytest.Function`` objects that
-``machine`` needs actually live, and stays off the controller. Each worker
-therefore ships its own stream and flags its own last report: expect one
-``last_report=True`` per worker, not one per run.
+The controller owns the stream. Every worker's reports reach it through
+``pytest_runtest_logreport``, so a run has one ordered stream and one
+``last_report=True`` however many workers it used. What only a worker can know
+- the machine for a live item, the exception that was raised, the run-wide
+state as the phase ended - is read on the worker by :class:`MachineAnnotator`
+and attached to the report, which pytest serialises across for us. So
+``set_vc`` from a test works the same under xdist as without it: the value
+rides along on that worker's reports rather than having to reach the
+controller. It changes that worker's reports only, each worker being its own
+process, so a switch meant for the whole run belongs where every process runs
+it - ``--elastic-vc``, or a hook in the rootdir conftest. A worker that dies
+mid-test is a crashed teardown report like any other unfinished case.
 """
 
 from __future__ import annotations
@@ -58,14 +73,38 @@ from typing import Any
 
 import pytest
 
-# The name the instance is registered under. Deliberately not the module
-# name: loading the module with `-p elastic_reporter` already claims that.
+# The name the stream owner is registered under, and the one test code reaches
+# for. Deliberately not the module name: loading the module with
+# `-p elastic_reporter` already claims that.
 PLUGIN_NAME = "elastic-case-reporter"
+ANNOTATOR_NAME = "elastic-case-reporter-annotator"
+
+# Set by the annotator on every test report, read by the reporter - possibly in
+# another process. pytest round-trips unknown report attributes through its own
+# serialiser, which is what carries this from an xdist worker.
+META_ATTR = "elastic_meta"
 
 # Elastic will take a larger string than any of these, but a 200k traceback in
 # an alerting index helps nobody. Both are cut with a marker, never silently.
 MAX_MESSAGE_CHARS = 2_000
 MAX_TRACEBACK_CHARS = 8_000
+
+# The outcome strings that land in elastic, and the step name that goes with
+# each phase. Remap a value here - or reassign either dict from a conftest - if
+# your index speaks a different vocabulary.
+OUTCOMES = {
+    "passed": "passed",
+    "failed": "failed",
+    "error": "error",  # a setup or teardown that failed: the test got no verdict
+    "skipped": "skipped",
+    "xfailed": "xfailed",
+    "xpassed": "xpassed",
+    "crashed": "crashed",  # started, never finished
+}
+
+PHASE_STEPS = {"setup": "Setup", "call": "Test Case", "teardown": "Teardown"}
+
+COLLECTION_STEP = "Collection"
 
 
 # ---------------------------------------------------------------------------
@@ -316,39 +355,21 @@ class BackgroundShipper:
 
 
 # ---------------------------------------------------------------------------
-# The plugin
+# Run-wide state
 # ---------------------------------------------------------------------------
 
 
-PHASE_STEPS = {"setup": "Setup", "call": "Test Case", "teardown": "Teardown"}
+class RunState:
+    """The report fields that belong to the run rather than to a test."""
 
-
-class ElasticCaseReporter:
-    """Turns pytest reports into case reports and hands them to the shipper."""
-
-    def __init__(self, config: ReporterConfig, sender: CaseReportSender) -> None:
-        self.config = config
-        self.sender = sender
-        self.shipper = BackgroundShipper(sender, config.batch_size, config.flush_interval)
+    def __init__(self, config: ReporterConfig) -> None:
         self._lock = threading.Lock()
-        self._state: dict[str, Any] = {
+        self._fields: dict[str, Any] = {
             "vc": config.vc,
             "owner": config.owner,
             "cycle_id": config.cycle_id,
             "labs3": config.labs3,
         }
-        # Started and not yet torn down. Whatever is still in here when the
-        # session ends never finished, and is reported as crashed.
-        self._inflight: dict[str, pytest.Item] = {}
-        self._pending: CaseReport | None = None  # holdback, see _submit
-        self._closed = False
-        self.built = 0
-
-    # -- state, mutable from anywhere holding a config -----------------------
-
-    def set_vc(self, vc: str) -> None:
-        """Set the vc recorded on every report built from now on."""
-        self.update(vc=vc)
 
     def update(self, **fields: Any) -> None:
         unknown = sorted(set(fields) - MUTABLE_FIELDS)
@@ -358,12 +379,94 @@ class ElasticCaseReporter:
                 f"(settable: {', '.join(sorted(MUTABLE_FIELDS))})"
             )
         with self._lock:
-            self._state.update(fields)
+            self._fields.update(fields)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._fields)
+
+
+class StateAccess:
+    """The half of the plugin API that is the same wherever a test runs.
+
+    Under xdist a test reaching for ``getplugin`` gets the worker's annotator
+    and not the controller's reporter, so both have to answer to this.
+    """
+
+    def __init__(self, state: RunState) -> None:
+        self.run_state = state
+
+    def set_vc(self, vc: str) -> None:
+        """Set the vc recorded on every report built from now on."""
+        self.run_state.update(vc=vc)
+
+    def update(self, **fields: Any) -> None:
+        """Set any of `MUTABLE_FIELDS` for every report built from now on."""
+        self.run_state.update(**fields)
 
     @property
     def state(self) -> dict[str, Any]:
-        with self._lock:
-            return dict(self._state)
+        return self.run_state.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# The worker half
+# ---------------------------------------------------------------------------
+
+
+class MachineAnnotator(StateAccess):
+    """Reads what only a live item can answer for, and pins it to the report.
+
+    Registered wherever tests actually run - an xdist worker, or the session
+    itself without xdist. The report is the only thing that crosses to the
+    controller, so anything the reporter needs has to leave from here.
+    """
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(self, item: pytest.Item, call: pytest.CallInfo):
+        outcome = yield
+        report: pytest.TestReport = outcome.get_result()
+        exc_type, exc_message = describe_exception(call)
+        setattr(
+            report,
+            META_ATTR,
+            {
+                "machine": safe_machine(item),
+                "exception": exc_type,
+                "exception_message": truncate(exc_message, MAX_MESSAGE_CHARS),
+                # Snapshotted per phase: a test that sets the vc mid-run is
+                # describing the reports from that point on, and under xdist
+                # this is the only way that reaches the controller.
+                "state": self.state,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# The stream owner
+# ---------------------------------------------------------------------------
+
+
+class ElasticCaseReporter(StateAccess):
+    """Turns pytest reports into case reports and hands them to the shipper.
+
+    Registered where the reports all come together: the xdist controller, or
+    the session itself without xdist.
+    """
+
+    def __init__(self, config: ReporterConfig, sender: CaseReportSender, state: RunState) -> None:
+        super().__init__(state)
+        self.config = config
+        self.sender = sender
+        self.shipper = BackgroundShipper(sender, config.batch_size, config.flush_interval)
+        self._lock = threading.Lock()
+        # Started and not yet torn down, against the metadata its setup report
+        # carried. Whatever is still in here when the session ends never
+        # finished, and is reported as crashed.
+        self._inflight: dict[str, dict[str, Any]] = {}
+        self._pending: CaseReport | None = None  # holdback, see _submit
+        self._closed = False
+        self.built = 0
 
     # -- building ------------------------------------------------------------
 
@@ -372,28 +475,36 @@ class ElasticCaseReporter:
         nodeid: str,
         outcome: str,
         step_name: str,
-        item: pytest.Item | None = None,
+        meta: dict[str, Any] | None = None,
         exception: str | None = None,
         exception_message: str | None = None,
         exception_traceback: str | None = None,
     ) -> CaseReport:
-        suite, case, arguments = split_nodeid(nodeid)
-        state = self.state
+        meta = meta or {}
+        # The state the phase ended in, which under xdist was captured on the
+        # worker. Only a report built here - a collection error - falls back to
+        # this process's own.
+        state = dict(meta.get("state") or self.state)
         # `machine` is per-item, so the resolver wins; a value set through
         # update() is the fallback for items it cannot answer for. Popped
         # unconditionally - it is passed positionally below, not in **state.
         fallback = state.pop("machine", None)
-        machine = safe_machine(item) or fallback
+        suite, case, arguments = split_nodeid(nodeid)
         self.built += 1
         return CaseReport(
             outcome=outcome,
             test_suite=suite,
             test_case=case,
             arguments=arguments,
-            machine=machine,
+            machine=meta.get("machine") or fallback,
             step_name=step_name,
-            exception=exception,
-            exception_message=truncate(exception_message, MAX_MESSAGE_CHARS),
+            exception=exception if exception is not None else meta.get("exception"),
+            exception_message=truncate(
+                exception_message
+                if exception_message is not None
+                else meta.get("exception_message"),
+                MAX_MESSAGE_CHARS,
+            ),
             exception_traceback=truncate(exception_traceback, MAX_TRACEBACK_CHARS),
             **state,
         )
@@ -414,23 +525,35 @@ class ElasticCaseReporter:
 
     # -- hooks ---------------------------------------------------------------
 
-    @pytest.hookimpl(hookwrapper=True)
-    def pytest_runtest_makereport(self, item: pytest.Item, call: pytest.CallInfo):
-        outcome = yield
-        report: pytest.TestReport = outcome.get_result()
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        meta = getattr(report, META_ATTR, None) or {}
+        if report.when not in PHASE_STEPS:
+            # Not a phase at all: xdist's stand-in report for a worker that
+            # died with this test in its hands. Nothing else will close the
+            # case out, so this is its terminal report - described by what its
+            # setup report carried, since the stand-in knows only the nodeid.
+            meta = self._inflight.pop(report.nodeid, None) or meta
+            self._submit(
+                self._build(
+                    nodeid=report.nodeid,
+                    outcome=OUTCOMES["crashed"],
+                    step_name=PHASE_STEPS["teardown"],
+                    meta=meta,
+                    exception="WorkerCrash",
+                    exception_message=report.longreprtext or "the worker running it died",
+                )
+            )
+            return
         if report.when == "setup":
-            self._inflight[report.nodeid] = item
+            self._inflight[report.nodeid] = meta
         elif report.when == "teardown":
             self._inflight.pop(report.nodeid, None)
-        exc_type, exc_message = describe_exception(call)
         self._submit(
             self._build(
                 nodeid=report.nodeid,
                 outcome=outcome_of(report),
-                step_name=PHASE_STEPS.get(report.when or "", "Test Case"),
-                item=item,
-                exception=exc_type,
-                exception_message=exc_message,
+                step_name=PHASE_STEPS[report.when],
+                meta=meta,
                 exception_traceback=report.longreprtext or None,
             )
         )
@@ -438,12 +561,14 @@ class ElasticCaseReporter:
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         # A collection error means no test of that module will ever produce a
         # phase report, so this is the only trace elastic would otherwise get.
+        # Under xdist the controller re-fires this for the worker that failed,
+        # deduplicated across workers, so it arrives here exactly once.
         if report.failed:
             self._submit(
                 self._build(
                     nodeid=report.nodeid,
-                    outcome="error",
-                    step_name="Collection",
+                    outcome=OUTCOMES["error"],
+                    step_name=COLLECTION_STEP,
                     exception="CollectError",
                     exception_message=f"collection of {report.nodeid} failed",
                     exception_traceback=report.longreprtext or None,
@@ -465,7 +590,7 @@ class ElasticCaseReporter:
         if self._closed:
             return
         self._closed = True
-        for nodeid, item in list(self._inflight.items()):
+        for nodeid, meta in list(self._inflight.items()):
             # It started and never reached teardown, so nothing else will close
             # this case out. The step is Teardown on purpose: every case in the
             # index then ends with one, crashed or not.
@@ -473,9 +598,9 @@ class ElasticCaseReporter:
             self._submit(
                 self._build(
                     nodeid=nodeid,
-                    outcome="crashed",
-                    step_name="Teardown",
-                    item=item,
+                    outcome=OUTCOMES["crashed"],
+                    step_name=PHASE_STEPS["teardown"],
+                    meta=meta,
                     exception="TestIncomplete",
                     exception_message=f"never reached teardown: {reason}",
                 )
@@ -510,12 +635,12 @@ def outcome_of(report: pytest.TestReport) -> str:
     itself never got a verdict.
     """
     if getattr(report, "wasxfail", None) is not None:
-        return "xpassed" if report.passed and report.when == "call" else "xfailed"
+        return OUTCOMES["xpassed" if report.passed and report.when == "call" else "xfailed"]
     if report.skipped:
-        return "skipped"
+        return OUTCOMES["skipped"]
     if report.passed:
-        return "passed"
-    return "failed" if report.when == "call" else "error"
+        return OUTCOMES["passed"]
+    return OUTCOMES["failed" if report.when == "call" else "error"]
 
 
 def describe_exception(call: pytest.CallInfo | None) -> tuple[str | None, str | None]:
@@ -571,23 +696,39 @@ def summarise(config: pytest.Config, reporter: ElasticCaseReporter) -> None:
         terminal.write_line("  elastic-reporter: " + error, red=True)
 
 
-def get_reporter(config: pytest.Config) -> ElasticCaseReporter | None:
-    """The registered reporter, or None when it is switched off."""
+def get_reporter(config: pytest.Config) -> StateAccess | None:
+    """Whatever this process registered, or None when the plugin is off.
+
+    The stream owner everywhere except an xdist worker, where it is that
+    worker's annotator. Both answer `set_vc`, `update` and `state`.
+    """
     return config.pluginmanager.get_plugin(PLUGIN_NAME)
 
 
+def is_xdist_worker(config: pytest.Config) -> bool:
+    return hasattr(config, "workerinput")
+
+
 def is_xdist_controller(config: pytest.Config) -> bool:
-    if hasattr(config, "workerinput"):
-        return False  # a worker
+    if is_xdist_worker(config):
+        return False
     return getattr(config.option, "dist", "no") not in ("no", None)
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "machine(name): machine this test runs against")
     settings = ReporterConfig.from_pytest(config)
-    if not settings.enabled or is_xdist_controller(config):
+    if not settings.enabled:
         return
-    # The one line to change for a real run: anything with .send(list[dict]).
-    reporter = ElasticCaseReporter(settings, MockElasticSender(settings.url))
-    reporter.shipper.start()
-    config.pluginmanager.register(reporter, PLUGIN_NAME)
+    state = RunState(settings)
+    worker, controller = is_xdist_worker(config), is_xdist_controller(config)
+    if not controller:
+        # Items run here, so this is where a machine can be resolved - and,
+        # on a worker, what test code reaching for `getplugin` finds.
+        annotator = MachineAnnotator(state)
+        config.pluginmanager.register(annotator, PLUGIN_NAME if worker else ANNOTATOR_NAME)
+    if not worker:
+        # The one line to change for a real run: anything with .send(list[dict]).
+        reporter = ElasticCaseReporter(settings, MockElasticSender(settings.url), state)
+        reporter.shipper.start()
+        config.pluginmanager.register(reporter, PLUGIN_NAME)
