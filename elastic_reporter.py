@@ -466,7 +466,15 @@ class ReportQueue:
     def __init__(self, hook: "HookRelay") -> None:
         """Hand batches to ``hook`` from a thread of its own."""
         self._hook = hook
-        self._queue: queue.Queue[CaseReport] = queue.Queue(MAX_QUEUED)
+        # The batch is filled on the test's own thread and handed over whole.
+        # Handing over one report at a time means waking the thread once per
+        # report, and a thread woken twelve thousand times takes the GIL off
+        # the run that often: measured at 0.38ms a test, against 0.03ms for
+        # the work itself.
+        self._lock = threading.Lock()
+        self._filling: list[CaseReport] = []
+        self._waiting = 0
+        self._queue: queue.Queue[list[CaseReport]] = queue.Queue()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="elastic-reporter", daemon=True)
         self.sent = 0
@@ -488,16 +496,28 @@ class ReportQueue:
         self._thread.start()
 
     def submit(self, report: CaseReport) -> None:
-        """Queue one report for the next batch, unless the queue is full.
+        """Add one report to the batch being filled, unless too many wait.
 
-        Full means the hook is not keeping up with the run. A test must not
-        wait on the reporting and the run must not be failed over it, so what
-        is left is to drop the report and say how many went that way.
+        Too many means the hook is not keeping up with the run. A test must
+        not wait on the reporting and the run must not be failed over it, so
+        what is left is to drop the report and say how many went that way.
         """
-        try:
-            self._queue.put_nowait(report)
-        except queue.Full:
-            self._dropped_full += 1
+        with self._lock:
+            if self._waiting >= MAX_QUEUED:
+                self._dropped_full += 1
+                return
+            self._filling.append(report)
+            self._waiting += 1
+            if len(self._filling) < BATCH_SIZE:
+                return
+            batch, self._filling = self._filling, []
+        self._queue.put(batch)  # one wake-up per batch, not per report
+
+    def _take(self) -> list[CaseReport]:
+        """Take the batch being filled, however full it is."""
+        with self._lock:
+            batch, self._filling = self._filling, []
+        return batch
 
     def close(self, timeout: float | None = None) -> None:
         """Drain the queue and stop the thread, or record that it would not."""
@@ -506,15 +526,14 @@ class ReportQueue:
         timeout = SHUTDOWN_TIMEOUT if timeout is None else timeout
         self._stop.set()
         if not self._thread.is_alive():
-            if not self._queue.empty():
-                self._record(f"the thread was gone with {self._queue.qsize()} report(s) left")
+            if self._waiting:
+                self._record(f"the thread was gone with {self._waiting} report(s) left")
             return
         self._thread.join(timeout)
         if self._thread.is_alive():
             self._record(f"the hook did not drain the queue within {timeout:g}s")
 
     def _run(self) -> None:
-        batch: list[CaseReport] = []
         deadline = monotonic() + FLUSH_INTERVAL
         while True:
             # Never block for longer than a poll: stopping has to be noticed
@@ -523,22 +542,21 @@ class ReportQueue:
             stopping = self._stop.is_set()
             wait = 0.0 if stopping else min(POLL_INTERVAL, max(0.0, deadline - monotonic()))
             try:
-                report = self._queue.get(timeout=wait)
+                batch = self._queue.get(timeout=wait)
             except queue.Empty:
+                if stopping or monotonic() >= deadline:
+                    # Nothing handed over, so take the part-full batch: the
+                    # interval has passed, or the run is over.
+                    self._flush(self._take())
+                    deadline = monotonic() + FLUSH_INTERVAL
                 if stopping:
-                    # Told to stop with nothing left to take: send and finish.
-                    self._flush(batch)
                     return
-                if monotonic() >= deadline:
-                    batch, deadline = self._flush(batch), monotonic() + FLUSH_INTERVAL
                 continue
-            batch.append(report)
-            if len(batch) >= BATCH_SIZE or monotonic() >= deadline:
-                batch, deadline = self._flush(batch), monotonic() + FLUSH_INTERVAL
+            self._flush(batch)
 
-    def _flush(self, batch: list[CaseReport]) -> list[CaseReport]:
+    def _flush(self, batch: list[CaseReport]) -> None:
         if not batch:
-            return []
+            return
         try:
             self._hook.pytest_case_reports(reports=batch)
         # BaseException rather than Exception: a SystemExit out of an
@@ -549,7 +567,8 @@ class ReportQueue:
             self._record(f"{len(batch)} report(s) dropped: {type(exc).__name__}: {exc}")
         else:
             self.sent += len(batch)
-        return []
+        with self._lock:
+            self._waiting -= len(batch)
 
     def _record(self, error: str) -> None:
         """Keep the first few failures, and count the rest.

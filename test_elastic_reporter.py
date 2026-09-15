@@ -224,7 +224,7 @@ def test_queue_drops_rather_than_growing_without_limit(monkeypatch):
     reports.start()
     for n in range(200):
         reports.submit(a_report(f"test_{n}"))
-    assert reports._queue.qsize() <= 10
+    assert reports._waiting <= 10
     assert reports.dropped >= 180  # the rest never reached elastic, and said so
     blocked.set()
     reports.close(timeout=5)
@@ -277,12 +277,22 @@ def test_queue_close_is_safe_twice_and_before_start():
     reports.close(timeout=5)
 
 
-def test_queue_is_bounded_by_the_constant():
-    reports = er.ReportQueue(FakeHook())
-    assert reports._queue.maxsize == er.MAX_QUEUED
-    with pytest.raises(queue.Full):
-        for _ in range(er.MAX_QUEUED + 1):
-            reports._queue.put_nowait(a_report("t"))
+def test_queue_is_bounded_by_the_constant(monkeypatch):
+    monkeypatch.setattr(er, "MAX_QUEUED", 5)
+    reports = er.ReportQueue(FakeHook())  # never started, so nothing drains
+    for _ in range(12):
+        reports.submit(a_report("t"))
+    assert reports._waiting == 5
+    assert reports.dropped == 7
+
+
+def test_the_thread_is_woken_once_per_batch_not_once_per_report(monkeypatch):
+    """Waking it per report takes the GIL off the run twelve thousand times."""
+    monkeypatch.setattr(er, "BATCH_SIZE", 100)
+    reports = er.ReportQueue(FakeHook())  # never started: count what it was handed
+    for n in range(1000):
+        reports.submit(a_report(f"test_{n}"))
+    assert reports._queue.qsize() == 10  # ten hand-overs for a thousand reports
 
 
 def test_a_test_that_logged_nothing_is_still_closed_out(monkeypatch):
