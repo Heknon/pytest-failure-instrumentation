@@ -139,6 +139,7 @@ the whole run belongs in a hook every process runs, like the
 ``pytest_sessionstart`` above in the rootdir conftest.
 """
 
+import contextlib
 import queue
 import threading
 from dataclasses import dataclass, field
@@ -186,15 +187,11 @@ FLUSH_INTERVAL = 5.0
 #: and saying so, rather than hanging the run on a dead endpoint.
 SHUTDOWN_TIMEOUT = 15.0
 
-#: How long the thread ever blocks in one go. It is not the flush interval: a
-#: thread blocked for FLUSH_INTERVAL would not notice the end of the run until
-#: it expired, and every run would pay that on the way out.
-POLL_INTERVAL = 0.1
-
 #: How many reports may be waiting, and how many failing hook calls are worth
 #: describing. Both bound what an endpoint that has stopped answering can cost
 #: the run: a test never waits on the hook, so without a ceiling the queue
-#: behind it is the run's memory.
+#: behind it is the run's memory. What waits is whole batches, so this is
+#: rounded down to BATCH_SIZE of them, and never below one.
 MAX_QUEUED = 10_000
 MAX_ERRORS = 20
 
@@ -473,45 +470,40 @@ class ReportQueue:
         # the work itself.
         self._lock = threading.Lock()
         self._filling: list[CaseReport] = []
-        self._waiting = 0
-        self._queue: queue.Queue[list[CaseReport]] = queue.Queue()
+        # The ceiling is the queue's own: it holds at most this many batches,
+        # plus the one being filled. A count kept alongside it would be one
+        # more thing to keep in step, and this cannot drift from what is held.
+        self._queue: queue.Queue[list[CaseReport]] = queue.Queue(max(1, MAX_QUEUED // BATCH_SIZE))
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="elastic-reporter", daemon=True)
         self.sent = 0
         self.failures = 0
+        self.dropped = 0
         self.errors: list[str] = []
-        # One counter per thread: `+=` is a read, an add and a store, so a
-        # single one shared between the producer and the consumer would lose
-        # updates - and this is the number a degraded run exists to report.
-        self._dropped_full = 0
-        self._dropped_failed = 0
-
-    @property
-    def dropped(self) -> int:
-        """How many reports never reached the hook, for whatever reason."""
-        return self._dropped_full + self._dropped_failed
 
     def start(self) -> None:
         """Start the reporting thread."""
         self._thread.start()
 
     def submit(self, report: CaseReport) -> None:
-        """Add one report to the batch being filled, unless too many wait.
+        """Add one report to the batch being filled, and hand it over when full.
 
-        Too many means the hook is not keeping up with the run. A test must
+        A full queue means the hook is not keeping up with the run. A test must
         not wait on the reporting and the run must not be failed over it, so
-        what is left is to drop the report and say how many went that way.
+        what is left is to drop the batch and say how many went that way.
         """
         with self._lock:
-            if self._waiting >= MAX_QUEUED:
-                self._dropped_full += 1
-                return
             self._filling.append(report)
-            self._waiting += 1
             if len(self._filling) < BATCH_SIZE:
                 return
             batch, self._filling = self._filling, []
-        self._queue.put(batch)  # one wake-up per batch, not per report
+            # Handed over under the lock `_take` holds too, so a batch cannot
+            # overtake one still being filled, and the thread cannot find the
+            # queue empty while a full batch is on its way to it.
+            try:
+                self._queue.put_nowait(batch)  # one wake-up per batch, not per report
+            except queue.Full:
+                self.dropped += len(batch)
 
     def _take(self) -> list[CaseReport]:
         """Take the batch being filled, however full it is."""
@@ -526,33 +518,47 @@ class ReportQueue:
         timeout = SHUTDOWN_TIMEOUT if timeout is None else timeout
         self._stop.set()
         if not self._thread.is_alive():
-            if self._waiting:
-                self._record(f"the thread was gone with {self._waiting} report(s) left")
+            stranded = self._unsent()
+            if stranded:
+                self._record(f"the thread was gone with {stranded} report(s) left", stranded)
             return
+        # Nudge it: it is waiting on the queue, not on the stop flag.
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait([])
         self._thread.join(timeout)
         if self._thread.is_alive():
             self._record(f"the hook did not drain the queue within {timeout:g}s")
 
+    def _unsent(self) -> int:
+        """Empty what is held and say how many reports it was."""
+        left = len(self._take())
+        while True:
+            try:
+                left += len(self._queue.get_nowait())
+            except queue.Empty:
+                return left
+
     def _run(self) -> None:
         deadline = monotonic() + FLUSH_INTERVAL
         while True:
-            # Never block for longer than a poll: stopping has to be noticed
-            # promptly, and the flush interval is kept by the deadline below
-            # rather than by how long this waits.
+            # The wait is the whole interval: `close` nudges the queue, so the
+            # end of a run is noticed at once without an idle run waking this
+            # thread ten times a second to ask.
             stopping = self._stop.is_set()
-            wait = 0.0 if stopping else min(POLL_INTERVAL, max(0.0, deadline - monotonic()))
+            wait = 0.0 if stopping else max(0.0, deadline - monotonic())
             try:
                 batch = self._queue.get(timeout=wait)
             except queue.Empty:
-                if stopping or monotonic() >= deadline:
-                    # Nothing handed over, so take the part-full batch: the
-                    # interval has passed, or the run is over.
-                    self._flush(self._take())
-                    deadline = monotonic() + FLUSH_INTERVAL
+                # Nothing was handed over, so take the part-full batch: the
+                # interval has passed, or the run is over.
+                self._flush(self._take())
                 if stopping:
                     return
-                continue
-            self._flush(batch)
+            else:
+                self._flush(batch)
+            # After either, so that the hook is called once an interval at
+            # most however the batches arrive.
+            deadline = monotonic() + FLUSH_INTERVAL
 
     def _flush(self, batch: list[CaseReport]) -> None:
         if not batch:
@@ -563,22 +569,25 @@ class ReportQueue:
         # implementation would otherwise end this thread without a word, and
         # every report after it would pile up in a queue nobody is draining.
         except BaseException as exc:  # noqa: BLE001 - never fail a run over telemetry
-            self._dropped_failed += len(batch)
-            self._record(f"{len(batch)} report(s) dropped: {type(exc).__name__}: {exc}")
+            self._record(
+                f"{len(batch)} report(s) dropped: {type(exc).__name__}: {exc}",
+                len(batch),
+            )
         else:
             self.sent += len(batch)
-        with self._lock:
-            self._waiting -= len(batch)
 
-    def _record(self, error: str) -> None:
-        """Keep the first few failures, and count the rest.
+    def _record(self, error: str, dropped: int = 0) -> None:
+        """Keep the first few failures, count the rest, and what they lost.
 
         An endpoint that is down says the same thing every batch, so the count
-        is the part that is news.
+        is the part that is news. Written from the reporting thread and from
+        the end of the run, so it takes the lock: no caller may hold it.
         """
-        self.failures += 1
-        if len(self.errors) < MAX_ERRORS:
-            self.errors.append(error)
+        with self._lock:
+            self.failures += 1
+            self.dropped += dropped
+            if len(self.errors) < MAX_ERRORS:
+                self.errors.append(error)
 
 
 # ---------------------------------------------------------------------------
@@ -637,18 +646,19 @@ class ReportAnnotator(ElasticPlugin):
 class Case:
     """What the reporter remembers about one test while it runs.
 
-    ``statuses`` is what the steps of the current attempt did, which decides
-    the verdict; ``attributes`` is the latest answer from wherever the test
-    ran; ``held`` is the teardown report, waiting for pytest to say the test is
-    finished so it can carry that verdict; ``running`` says setup was seen and
-    teardown was not; and ``rerun_pending`` says this attempt is to be retried,
-    so the test is not done yet.
+    ``identity`` is its nodeid split into suite, case and arguments, done once
+    rather than on each of its three reports; ``statuses`` is what the steps of
+    the current attempt did, which decides the verdict; ``attributes`` is the
+    latest answer from wherever the test ran; ``held`` is the teardown report,
+    waiting for pytest to say the test is finished so it can carry that
+    verdict; and ``rerun_pending`` says this attempt is to be retried, so the
+    test is not done yet.
     """
 
+    identity: tuple[str, str, str | None]
     statuses: list[str] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
     held: CaseReport | None = None
-    running: bool = False
     rerun_pending: bool = False
 
 
@@ -671,14 +681,13 @@ class ElasticCaseReporter(ElasticPlugin):
 
     def _build(
         self,
-        nodeid: str,
         step_name: str,
         status: str,
         case: Case,
         failure: Failure = NO_FAILURE,
     ) -> CaseReport:
         """Build what the step itself answers for, stamped with the test's."""
-        suite, name, arguments = split_nodeid(nodeid)
+        suite, name, arguments = case.identity
         self.built += 1
         report = CaseReport(
             test_suite=suite,
@@ -697,7 +706,11 @@ class ElasticCaseReporter(ElasticPlugin):
         return report
 
     def _case(self, nodeid: str) -> Case:
-        return self._cases.setdefault(nodeid, Case())
+        """Return the case for ``nodeid``, made the first time its test is seen."""
+        case = self._cases.get(nodeid)
+        if case is None:
+            case = self._cases[nodeid] = Case(identity=split_nodeid(nodeid))
+        return case
 
     def _finish(self, nodeid: str, case: Case, report: CaseReport) -> None:
         """Send a test's last report, carrying the verdict, and forget the test."""
@@ -733,23 +746,20 @@ class ElasticCaseReporter(ElasticPlugin):
             return
         case.statuses.append(status)
         built = self._build(
-            report.nodeid,
             PHASE_STEPS[report.when],
             status,
             case,
             Failure(
                 exception=meta.get("exception"),
                 message=meta.get("exception_message"),
-                traceback=report.longreprtext or None,
+                traceback=longrepr_of(report),
             ),
         )
         if report.when == "teardown":
             # The only one held: a moment later pytest says the test is done,
             # and then this report can carry the verdict.
-            case.running = False
             case.held = built
         else:
-            case.running = case.running or report.when == "setup"
             self.queue.submit(built)
 
     def pytest_runtest_logfinish(self, nodeid: str) -> None:
@@ -765,7 +775,6 @@ class ElasticCaseReporter(ElasticPlugin):
             return
         if held is None:
             held = self._build(
-                nodeid,
                 PHASE_STEPS["teardown"],
                 "crashed",
                 case,
@@ -788,14 +797,13 @@ class ElasticCaseReporter(ElasticPlugin):
                 report.nodeid,
                 case,
                 self._build(
-                    report.nodeid,
                     COLLECTION_STEP,
                     "error",
                     case,
                     Failure(
                         exception="CollectError",
                         message=f"collection of {report.nodeid} failed",
-                        traceback=report.longreprtext or None,
+                        traceback=longrepr_of(report),
                     ),
                 ),
             )
@@ -825,7 +833,6 @@ class ElasticCaseReporter(ElasticPlugin):
         the worker said before it died. It is the last unless the test is being
         re-queued, which pytest-rerunfailures says by rewriting the outcome.
         """
-        case.running = False
         case.statuses.append("crashed")
         held, case.held = case.held, None
         if held is not None:
@@ -834,13 +841,12 @@ class ElasticCaseReporter(ElasticPlugin):
             # is what the test did, so it still goes.
             self.queue.submit(held)
         built = self._build(
-            report.nodeid,
             PHASE_STEPS["teardown"],
             "crashed",
             case,
             Failure(
                 exception="WorkerCrash",
-                message=report.longreprtext or "the worker running it died",
+                message=longrepr_of(report) or "the worker running it died",
             ),
         )
         if case.rerun_pending:
@@ -870,7 +876,6 @@ class ElasticCaseReporter(ElasticPlugin):
                     nodeid,
                     case,
                     self._build(
-                        nodeid,
                         PHASE_STEPS["teardown"],
                         "crashed",
                         case,
@@ -896,6 +901,18 @@ def split_nodeid(nodeid: str) -> tuple[str, str, str | None]:
     case, bracket, arguments = name.partition("[")
     suite = "::".join([path, *parts[:-1]]) if parts else path
     return suite, case, arguments[:-1] if bracket else None
+
+
+def longrepr_of(report: "pytest.TestReport | pytest.CollectReport") -> str | None:
+    """Return the report's traceback text, or None where there is none.
+
+    ``longreprtext`` builds a terminal writer to render into whether or not
+    there is anything to render, and in a green run three reports in four have
+    nothing: asking first is forty times cheaper than being told.
+    """
+    if report.longrepr is None:
+        return None
+    return report.longreprtext or None
 
 
 def status_of(report: pytest.TestReport) -> str:

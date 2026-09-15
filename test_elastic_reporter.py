@@ -10,7 +10,6 @@ tests that exercise them.
 
 import collections
 import json
-import queue
 import shutil
 import threading
 from datetime import datetime
@@ -224,7 +223,7 @@ def test_queue_drops_rather_than_growing_without_limit(monkeypatch):
     reports.start()
     for n in range(200):
         reports.submit(a_report(f"test_{n}"))
-    assert reports._waiting <= 10
+    assert reports._queue.qsize() <= 10
     assert reports.dropped >= 180  # the rest never reached elastic, and said so
     blocked.set()
     reports.close(timeout=5)
@@ -279,11 +278,47 @@ def test_queue_close_is_safe_twice_and_before_start():
 
 def test_queue_is_bounded_by_the_constant(monkeypatch):
     monkeypatch.setattr(er, "MAX_QUEUED", 5)
+    monkeypatch.setattr(er, "BATCH_SIZE", 1)
     reports = er.ReportQueue(FakeHook())  # never started, so nothing drains
     for _ in range(12):
         reports.submit(a_report("t"))
-    assert reports._waiting == 5
+    assert reports._queue.qsize() == 5  # the ceiling is the queue's own
     assert reports.dropped == 7
+
+
+def test_a_batch_is_never_handed_over_outside_the_lock(monkeypatch):
+    """The end of a run takes the lock to look; a batch handed over without it is lost.
+
+    The thread stops when it finds the queue empty and the part-full batch
+    taken. A batch put on the queue after that - swapped out under the lock,
+    put on the queue after releasing it - is on a queue nobody reads again.
+    """
+    monkeypatch.setattr(er, "BATCH_SIZE", 2)
+    reports = er.ReportQueue(FakeHook())  # never started: watch the hand-over
+    held = []
+    put = reports._queue.put_nowait
+
+    def watched(batch):
+        held.append(reports._lock.locked())
+        put(batch)
+
+    monkeypatch.setattr(reports._queue, "put_nowait", watched)
+    for n in range(4):
+        reports.submit(a_report(f"test_{n}"))
+    assert held == [True, True]
+
+
+def test_queue_loses_nothing_on_the_way_out(monkeypatch):
+    """Every report is sent or counted: a hand-over at the end must not strand one."""
+    monkeypatch.setattr(er, "BATCH_SIZE", 10)
+    monkeypatch.setattr(er, "FLUSH_INTERVAL", 0.01)
+    for _ in range(50):  # the loss was a race, so once proves nothing
+        reports = er.ReportQueue(FakeHook())
+        reports.start()
+        for n in range(95):  # not a whole number of batches
+            reports.submit(a_report(f"test_{n}"))
+        reports.close(timeout=5)
+        assert reports.sent + reports.dropped == 95
 
 
 def test_the_thread_is_woken_once_per_batch_not_once_per_report(monkeypatch):
