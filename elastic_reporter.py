@@ -26,30 +26,32 @@ What it does
   forwards them to elastic. Swap it in `pytest_configure` for the real one;
   anything with a ``send(list[dict])`` method fits.
 
-One component for the test's attributes
----------------------------------------
-`machine`, `vc`, `cycle_id`, `owner` and the rest describe the test, not the
-phase, and they are answered in all sorts of places - a command line option, a
-resolver that reads the item, a fixture that connects to the machine, the test
-body itself. So they are one component, `CaseAttributes`, and one call sets any
-of them from anywhere that can see a pytest ``config``::
+Setting a test's attributes
+---------------------------
+`machine`, `vc`, `cycle_id`, `owner` and the rest describe the test rather than
+the phase, and they come from everywhere - an option, a fixture that connects
+to the machine, the test body itself. So there is one way to set any of them,
+from anywhere that can see a pytest ``config``::
 
-    def test_something(request):
-        reporter = request.config.pluginmanager.getplugin("elastic-case-reporter")
-        reporter.set(vc="vc-4.2.1", owner="qa")
+    reporter = request.config.pluginmanager.getplugin("elastic-reporter")
+    reporter.set(vc="fw-4.2.1", machine="rack1-dut7")
+
+That is the whole API. It takes any of `SETTABLE` - every field of `CaseReport`
+except the ones a phase answers for itself - and it is there in every process,
+whether or not the plugin is switched on, so nothing has to be guarded.
 
 A value set anywhere in a test describes the whole test: its setup, call and
 teardown reports all carry it, whichever phase set it, because a test's reports
 are stamped when the test ends rather than as each phase finishes. Values stick
-until changed, so a process can set the vc once and forget it. ``machine`` is
-the exception, because it belongs to the test rather than the run:
-`resolve_machine` is asked again at the start of every test, so one test's
-machine cannot leak into the next - and a test that sets its own still wins,
-having set it later.
+until changed, so a process can set one and forget it.
 
-`SETTABLE` is every field of `CaseReport` except the ones a phase answers for
-itself (its outcome, its step, its exception, its time, its flag), so adding a
-field to the model is enough to make it settable.
+Where a test's machine is the test's own, set it where you know it - the
+fixture that allocates it, or one that reads it off the item::
+
+    @pytest.fixture(autouse=True)
+    def record_machine(request):
+        reporter = request.config.pluginmanager.getplugin("elastic-reporter")
+        reporter.set(machine=machine_for(request.node))
 
 Reruns
 ------
@@ -77,7 +79,7 @@ The controller owns the stream. Every worker's reports reach it through
 ``pytest_runtest_logreport``, so a run has one ordered stream however many
 workers it used, and one ``last_report`` per test rather than per worker. What
 only a worker can know - the test's attributes as it ran, the exception that
-was raised - is read on the worker by `MachineAnnotator` and attached to the
+was raised - is read on the worker by `ReportAnnotator` and attached to the
 report, which pytest serialises across for us. So setting an attribute on a
 worker needs nothing of the controller. It describes that worker's tests only,
 each worker being its own process, so a value meant for the whole run belongs
@@ -104,8 +106,8 @@ RERUN_OUTCOME = "rerun"
 #: The name the stream owner is registered under, and the one test code reaches
 #: for. Deliberately not the module name: loading the module with
 #: ``-p elastic_reporter`` already claims that.
-PLUGIN_NAME = "elastic-case-reporter"
-ANNOTATOR_NAME = "elastic-case-reporter-annotator"
+PLUGIN_NAME = "elastic-reporter"
+ANNOTATOR_NAME = "elastic-reporter-annotator"
 
 #: Set by the annotator on every test report, read by the reporter - possibly
 #: in another process. pytest round-trips unknown report attributes through its
@@ -146,9 +148,6 @@ type Document = dict[str, Any]
 
 #: A makereport wrapper: hand the report on, having read it.
 type ReportWrapper = Generator[None, pytest.TestReport, pytest.TestReport]
-
-#: A setup wrapper: nothing to read, something to do first.
-type SetupWrapper = Generator[None, None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -219,35 +218,6 @@ def stamp(report: CaseReport, attributes: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Where `machine` comes from
-# ---------------------------------------------------------------------------
-
-
-def resolve_machine(item: pytest.Item) -> str | None:
-    """Return the machine a test is about to run against, or None.
-
-    PLACEHOLDER - replace the body with your own lookup. It is called once at
-    the start of every test with the live item (a ``pytest.Function`` for an
-    ordinary test), before any fixture has run, so it can read markers,
-    ``item.callspec.params`` or anything else the item carries on its own.
-    Whatever a fixture or the test body sets later wins over it, and it must
-    not raise; see `safe_machine`.
-    """
-    marker = item.get_closest_marker("machine")
-    if marker is not None and marker.args:
-        return str(marker.args[0])
-    return None
-
-
-def safe_machine(item: pytest.Item) -> str | None:
-    """Return `resolve_machine`, or None if it was not in a position to answer."""
-    try:
-        return resolve_machine(item)
-    except Exception:  # noqa: BLE001 - a lookup of someone else's is not worth a failed run
-        return None
-
-
-# ---------------------------------------------------------------------------
 # The attributes of a test
 # ---------------------------------------------------------------------------
 
@@ -255,15 +225,11 @@ def safe_machine(item: pytest.Item) -> str | None:
 class CaseAttributes:
     """Every report field that describes the test rather than the phase.
 
-    One component for all of them, because they come from everywhere: an
-    option, `resolve_machine`, a fixture that connects to the machine, the test
-    body. `set` takes any of `SETTABLE`, from any of those places, and the
-    values describe the whole test - its reports are stamped when it ends, not
-    as each phase finishes.
-
-    Values stick until changed, so a process can set one and forget it.
-    ``machine`` is answered again at the start of every test, so one test's
-    cannot leak into the next.
+    One store for all of them, because they come from everywhere: an option, a
+    fixture that connects to the machine, the test body. `set` takes any of
+    `SETTABLE` from any of those places, the values describe the whole test -
+    its reports are stamped when it ends, not as each phase finishes - and they
+    stick until changed, so a process can set one and forget it.
     """
 
     def __init__(self, config: "ReporterConfig") -> None:
@@ -288,25 +254,24 @@ class CaseAttributes:
         with self._lock:
             self._values.update(attributes)
 
-    def start_test(self, item: pytest.Item) -> None:
-        """Answer ``machine`` afresh for a test that is about to run."""
-        self.set(machine=safe_machine(item))
-
     def snapshot(self) -> dict[str, Any]:
         """Return the attributes as they stand, to stamp one test's reports."""
         with self._lock:
             return dict(self._values)
 
 
-class AttributeSetter:
-    """What both halves of the plugin answer, so test code can ignore which.
+class ElasticPlugin:
+    """What ``getplugin("elastic-reporter")`` hands you, in any process.
 
-    Under xdist a test reaching for ``getplugin`` gets the worker's annotator
-    and not the controller's reporter. Both set the same attributes.
+    A session registers one of these under that name whatever it is doing: the
+    reporter where the stream is built, the annotator on an xdist worker, and
+    this plain one when the plugin is switched off. They all set attributes the
+    same way, so nothing that sets one needs to know which it got, or to check
+    that it got anything.
     """
 
     def __init__(self, attributes: CaseAttributes) -> None:
-        """Answer for ``attributes``, which both halves of a session share."""
+        """Answer for ``attributes``, which every half of a session shares."""
         self.attributes = attributes
 
     def set(self, **attributes: object) -> None:
@@ -514,8 +479,8 @@ class BackgroundShipper:
 # ---------------------------------------------------------------------------
 
 
-class MachineAnnotator(AttributeSetter):
-    """Answers for the test where the test runs, and pins it to the report.
+class ReportAnnotator(ElasticPlugin):
+    """Pins what this process knows about the test to its phase reports.
 
     Registered wherever tests actually run - an xdist worker, or the session
     itself without xdist. The report is the only thing that crosses to the
@@ -523,19 +488,8 @@ class MachineAnnotator(AttributeSetter):
     """
 
     @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_setup(self, item: pytest.Item) -> SetupWrapper:
-        """Ask `resolve_machine` about this test, before its fixtures run."""
-        self.attributes.start_test(item)
-        return (yield)
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_makereport(
-        self,
-        item: pytest.Item,
-        call: pytest.CallInfo[None],
-    ) -> ReportWrapper:
+    def pytest_runtest_makereport(self, call: pytest.CallInfo[None]) -> ReportWrapper:
         """Attach this process's answers to the phase report."""
-        del item  # the attributes were read from it at the start of the test
         report = yield
         exception, message = describe_exception(call)
         meta: Meta = {
@@ -569,7 +523,7 @@ class Case:
     rerun_pending: bool = False
 
 
-class ElasticCaseReporter(AttributeSetter):
+class ElasticCaseReporter(ElasticPlugin):
     """Turns pytest reports into case reports and hands them to the shipper.
 
     Registered where the reports all come together: the xdist controller, or
@@ -832,18 +786,6 @@ def summarise(config: pytest.Config, reporter: ElasticCaseReporter) -> None:
         terminal.write_line("  elastic-reporter: " + error, red=True)
 
 
-def case_attributes(config: pytest.Config) -> CaseAttributes | None:
-    """Return the component every attribute is set through, or None when off."""
-    plugin = config.pluginmanager.get_plugin(PLUGIN_NAME)
-    return plugin.attributes if isinstance(plugin, AttributeSetter) else None
-
-
-def get_reporter(config: pytest.Config) -> ElasticCaseReporter | None:
-    """Return the stream owner, which an xdist worker does not have."""
-    plugin = config.pluginmanager.get_plugin(PLUGIN_NAME)
-    return plugin if isinstance(plugin, ElasticCaseReporter) else None
-
-
 def is_xdist_worker(config: pytest.Config) -> bool:
     """Say whether this process is an xdist worker."""
     return hasattr(config, "workerinput")
@@ -858,16 +800,18 @@ def is_xdist_controller(config: pytest.Config) -> bool:
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register the half of the plugin this process is responsible for."""
-    config.addinivalue_line("markers", "machine(name): machine this test runs against")
     settings = ReporterConfig.from_pytest(config)
-    if not settings.enabled:
-        return
     attributes = CaseAttributes(settings)
+    if not settings.enabled:
+        # Registered anyway, so that a fixture setting attributes goes on
+        # working - it just has nobody listening.
+        config.pluginmanager.register(ElasticPlugin(attributes), PLUGIN_NAME)
+        return
     worker, controller = is_xdist_worker(config), is_xdist_controller(config)
     if not controller:
-        # Items run here, so this is where the test can be asked about itself -
-        # and, on a worker, what test code reaching for `getplugin` finds.
-        annotator = MachineAnnotator(attributes)
+        # Reports are made here, so this is where they can be annotated - and,
+        # on a worker, what test code reaching for `getplugin` finds.
+        annotator = ReportAnnotator(attributes)
         config.pluginmanager.register(annotator, PLUGIN_NAME if worker else ANNOTATOR_NAME)
     if not worker:
         # The one line to change for a real run: anything with .send(list[dict]).
