@@ -190,6 +190,11 @@ FLUSH_INTERVAL = 5.0
 #: and saying so, rather than hanging the run on a dead endpoint.
 SHUTDOWN_TIMEOUT = 15.0
 
+#: How long the thread ever blocks in one go. It is not the flush interval: a
+#: thread blocked for FLUSH_INTERVAL would not notice the end of the run until
+#: it expired, and every run would pay that on the way out.
+POLL_INTERVAL = 0.1
+
 #: How many reports may be waiting, and how many failing hook calls are worth
 #: describing. Both bound what an endpoint that has stopped answering can cost
 #: the run: a test never waits on the hook, so without a ceiling the queue
@@ -479,16 +484,20 @@ class ReportQueue:
         batch: list[CaseReport] = []
         deadline = monotonic() + FLUSH_INTERVAL
         while True:
-            # Stopping, the wait goes to nothing: what is queued is drained as
-            # fast as it can be batched, and an empty queue then ends the run.
-            wait = 0.0 if self._stop.is_set() else max(0.0, deadline - monotonic())
+            # Never block for longer than a poll: stopping has to be noticed
+            # promptly, and the flush interval is kept by the deadline below
+            # rather than by how long this waits.
+            stopping = self._stop.is_set()
+            wait = 0.0 if stopping else min(POLL_INTERVAL, max(0.0, deadline - monotonic()))
             try:
                 report = self._queue.get(timeout=wait)
             except queue.Empty:
-                batch = self._flush(batch)
-                if self._stop.is_set():
+                if stopping:
+                    # Told to stop with nothing left to take: send and finish.
+                    self._flush(batch)
                     return
-                deadline = monotonic() + FLUSH_INTERVAL
+                if monotonic() >= deadline:
+                    batch, deadline = self._flush(batch), monotonic() + FLUSH_INTERVAL
                 continue
             batch.append(report)
             if len(batch) >= BATCH_SIZE:
@@ -869,9 +878,15 @@ def exit_reason(session: pytest.Session, exitstatus: int) -> str:
 
 
 def summarise(config: pytest.Config, plugin: ElasticCaseReporter) -> None:
-    """Write what was reported, and anything the hook made of it."""
+    """Write what was reported, and anything the hook made of it.
+
+    Nothing at all when nobody implements the hook, so a plugin installed for
+    one suite says nothing in every other suite in that environment. By now
+    every conftest has been loaded, including the ones in subdirectories,
+    which is why this is decided here and not at configure time.
+    """
     terminal = config.pluginmanager.get_plugin("terminalreporter")
-    if terminal is None:
+    if terminal is None or not config.hook.pytest_case_reports.get_hookimpls():
         return
     reports = plugin.queue
     terminal.write_sep("-", f"elastic-reporter: {reports.sent}/{plugin.built} case report(s)")

@@ -13,6 +13,7 @@ import json
 import queue
 import shutil
 import threading
+from time import monotonic
 
 import pytest
 
@@ -165,6 +166,18 @@ def test_queue_sends_on_the_interval_without_a_full_batch(monkeypatch):
     threading.Event().wait(0.5)  # longer than the interval, without a sleep
     assert hook.batches, "the interval should have sent a part-full batch"
     reports.close(timeout=5)
+
+
+def test_queue_shuts_down_without_waiting_for_the_interval(monkeypatch):
+    """A thread blocked for the whole interval would tax every run on the way out."""
+    monkeypatch.setattr(er, "FLUSH_INTERVAL", 30.0)
+    reports = er.ReportQueue(FakeHook())
+    reports.start()
+    reports.submit(a_report("test_a"))
+    started = monotonic()
+    reports.close(timeout=5)
+    assert monotonic() - started < 1.0
+    assert reports.sent == 1
 
 
 def test_queue_drops_rather_than_growing_without_limit(monkeypatch):
