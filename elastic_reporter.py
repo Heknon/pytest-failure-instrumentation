@@ -132,9 +132,11 @@ OUTCOMES = {
     "crashed": "crashed",  # started, never finished
 }
 
-PHASE_STEPS = {"setup": "Setup", "call": "Test Case", "teardown": "Teardown"}
+#: pytest's own names for the phases, and for the collection that precedes
+#: them. Remapped like `OUTCOMES`, if elastic wants them said differently.
+PHASE_STEPS = {"setup": "setup", "call": "call", "teardown": "teardown"}
 
-COLLECTION_STEP = "Collection"
+COLLECTION_STEP = "collect"
 
 #: What the annotator reads off a live item for the reporter to build with.
 type Meta = dict[str, Any]
@@ -170,7 +172,7 @@ class CaseReport:
     exception: str | None = None
     exception_message: str | None = None
     exception_traceback: str | None = None
-    step_name: str = "Test Case"
+    step_name: str = "call"
     last_report: bool = False  # Whether its the last report to be written.
     labs3: bool = True
 
