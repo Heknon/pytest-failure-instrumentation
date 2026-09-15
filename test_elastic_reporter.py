@@ -86,6 +86,9 @@ def test_attributes_reject_what_is_not_settable():
     assert attributes.snapshot()["vc"] == "fw-1"
     with pytest.raises(ValueError, match="not a case attribute: outcome"):
         attributes.set(outcome="passed")
+    # The identity comes from the nodeid; a typo must not rewrite every report.
+    with pytest.raises(ValueError, match="not a case attribute: test_case"):
+        attributes.set(test_case="upgrade-suite")
 
 
 def test_unset_attributes_keep_the_models_defaults():
@@ -111,8 +114,8 @@ def test_attributes_survive_concurrent_writers():
     assert attributes.snapshot()["vc"].startswith("fw-")
 
 
-def test_reporter_works_outside_a_session():
-    er.ElasticPlugin.current = None
+def test_reporter_works_outside_a_session(monkeypatch):
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)  # restored afterwards
     er.reporter().set(vc="fw-nowhere")  # must not raise, must not need a config
     assert er.reporter().attributes.snapshot()["vc"] == "fw-nowhere"
 
@@ -213,6 +216,19 @@ def test_queue_survives_a_hook_that_raises(monkeypatch):
     assert "the api is down" in reports.errors[0]
 
 
+def test_queue_survives_a_hook_that_raises_a_base_exception(monkeypatch):
+    """A SystemExit would otherwise end the thread and silently strand the rest."""
+    monkeypatch.setattr(er, "BATCH_SIZE", 1)
+    monkeypatch.setattr(er, "FLUSH_INTERVAL", 60.0)
+    reports = er.ReportQueue(FakeHook(error=SystemExit("a config error")))
+    reports.start()
+    for n in range(3):
+        reports.submit(a_report(f"test_{n}"))
+    reports.close(timeout=5)
+    assert reports.dropped == 3
+    assert reports.failures == 3  # it stayed alive for all three, not just the first
+
+
 def test_queue_keeps_only_the_first_errors(monkeypatch):
     monkeypatch.setattr(er, "BATCH_SIZE", 1)
     monkeypatch.setattr(er, "FLUSH_INTERVAL", 60.0)
@@ -239,6 +255,21 @@ def test_queue_is_bounded_by_the_constant():
     with pytest.raises(queue.Full):
         for _ in range(er.MAX_QUEUED + 1):
             reports._queue.put_nowait(a_report("t"))
+
+
+def test_a_test_that_logged_nothing_is_still_closed_out(monkeypatch):
+    """It started, so it is not a test the run never reached."""
+    monkeypatch.setattr(er, "BATCH_SIZE", 1)
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)
+    hook = FakeHook()
+    plugin = er.ElasticCaseReporter(hook, er.CaseAttributes())
+    plugin.queue.start()
+    plugin.pytest_runtest_logstart(nodeid="t.py::test_a")  # and then the run died
+    plugin._close(reason="the session ended (interrupted)")
+    documents = [report for batch in hook.batches for report in batch]
+    assert [(d.test_case, d.step_name, d.outcome, d.last_report) for d in documents] == [
+        ("test_a", "teardown", "crashed", True),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +372,22 @@ def test_step_status_on_every_report_and_a_verdict_only_on_the_last(run):
     assert cases["test_xfails"][-1]["outcome"] == "xfailed"
     assert cases["test_setup_error"][0]["step_status"] == "error"
     assert cases["test_setup_error"][-1]["outcome"] == "error"
+    # A skip and an expected failure raise, but neither went wrong, so neither
+    # leaves an exception behind for a "what failed" query to trip over.
+    assert cases["test_skipped"][0]["exception"] is None
+    assert cases["test_xfails"][1]["exception"] is None
+
+
+def test_a_long_exception_message_is_cut_once(run):
+    _, documents = run(
+        """
+        def test_long():
+            raise ValueError("x" * 50_000)
+        """,
+    )
+    message = by_case(documents)["test_long"][1]["exception_message"]
+    assert message.count("truncated") == 1
+    assert f"{50_000 - er.MAX_MESSAGE_CHARS} more characters" in message
 
 
 def test_a_report_carries_what_was_set_when_its_step_ended(run):
@@ -374,6 +421,7 @@ def test_a_report_carries_what_was_set_when_its_step_ended(run):
 
 def test_a_conftest_hook_sets_the_run_wide_attributes(run):
     """The plugin has no options: this is what replaces them, workers included."""
+    pytest.importorskip("xdist")
     _, documents = run(
         """
         import pytest
@@ -429,6 +477,7 @@ def test_collection_error_is_reported_once(run):
 
 
 def test_only_the_final_attempt_of_a_rerun_carries_the_verdict(run):
+    pytest.importorskip("pytest_rerunfailures")
     _, documents = run(
         """
         import pathlib
@@ -453,6 +502,7 @@ def test_only_the_final_attempt_of_a_rerun_carries_the_verdict(run):
 
 
 def test_the_controller_owns_the_stream_under_xdist(run):
+    pytest.importorskip("xdist")
     _, documents = run(
         """
         import pytest

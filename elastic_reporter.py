@@ -283,10 +283,15 @@ class Failure:
 NO_FAILURE = Failure()
 
 
-#: What a step answers for itself. Everything else describes the test, and so
-#: belongs to `CaseAttributes`.
-STEP_FIELDS = frozenset(
+#: What the plugin fills in itself: what a step did, and which test it was.
+#: Everything else describes the test and belongs to `CaseAttributes`, which
+#: must not be able to rewrite a report's identity - `set(test_case=...)`, one
+#: keystroke from `set(test_suite=...)`, would collapse a run into one case.
+PLUGIN_FIELDS = frozenset(
     {
+        "test_suite",
+        "test_case",
+        "arguments",
         "outcome",
         "step_name",
         "step_status",
@@ -300,7 +305,7 @@ STEP_FIELDS = frozenset(
 
 #: Every attribute `CaseAttributes.set` will take, derived from the model, so a
 #: new field on `CaseReport` is settable without being named twice.
-SETTABLE = frozenset(f.name for f in fields(CaseReport)) - STEP_FIELDS
+SETTABLE = frozenset(f.name for f in fields(CaseReport)) - PLUGIN_FIELDS
 
 
 def stamp(report: CaseReport, attributes: dict[str, Any]) -> None:
@@ -451,9 +456,18 @@ class ReportQueue:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="elastic-reporter", daemon=True)
         self.sent = 0
-        self.dropped = 0
         self.failures = 0
         self.errors: list[str] = []
+        # One counter per thread: `+=` is a read, an add and a store, so a
+        # single one shared between the producer and the consumer would lose
+        # updates - and this is the number a degraded run exists to report.
+        self._dropped_full = 0
+        self._dropped_failed = 0
+
+    @property
+    def dropped(self) -> int:
+        """How many reports never reached the hook, for whatever reason."""
+        return self._dropped_full + self._dropped_failed
 
     def start(self) -> None:
         """Start the reporting thread."""
@@ -469,13 +483,18 @@ class ReportQueue:
         try:
             self._queue.put_nowait(report)
         except queue.Full:
-            self.dropped += 1
+            self._dropped_full += 1
 
-    def close(self, timeout: float = SHUTDOWN_TIMEOUT) -> None:
+    def close(self, timeout: float | None = None) -> None:
         """Drain the queue and stop the thread, or record that it would not."""
-        if not self._thread.is_alive():
-            return
+        # Read now rather than bound as a default, so that reassigning the
+        # constant from a conftest works the way it does for the others.
+        timeout = SHUTDOWN_TIMEOUT if timeout is None else timeout
         self._stop.set()
+        if not self._thread.is_alive():
+            if not self._queue.empty():
+                self._record(f"the thread was gone with {self._queue.qsize()} report(s) left")
+            return
         self._thread.join(timeout)
         if self._thread.is_alive():
             self._record(f"the hook did not drain the queue within {timeout:g}s")
@@ -500,7 +519,7 @@ class ReportQueue:
                     batch, deadline = self._flush(batch), monotonic() + FLUSH_INTERVAL
                 continue
             batch.append(report)
-            if len(batch) >= BATCH_SIZE:
+            if len(batch) >= BATCH_SIZE or monotonic() >= deadline:
                 batch, deadline = self._flush(batch), monotonic() + FLUSH_INTERVAL
 
     def _flush(self, batch: list[CaseReport]) -> list[CaseReport]:
@@ -508,8 +527,11 @@ class ReportQueue:
             return []
         try:
             self._hook.pytest_case_reports(reports=batch)
-        except Exception as exc:  # noqa: BLE001 - never fail a run over telemetry
-            self.dropped += len(batch)
+        # BaseException rather than Exception: a SystemExit out of an
+        # implementation would otherwise end this thread without a word, and
+        # every report after it would pile up in a queue nobody is draining.
+        except BaseException as exc:  # noqa: BLE001 - never fail a run over telemetry
+            self._dropped_failed += len(batch)
             self._record(f"{len(batch)} report(s) dropped: {type(exc).__name__}: {exc}")
         else:
             self.sent += len(batch)
@@ -548,7 +570,10 @@ class ReportAnnotator(ElasticPlugin):
     def pytest_runtest_makereport(self, call: pytest.CallInfo[None]) -> ReportWrapper:
         """Attach this process's answers to the step report."""
         report = yield
-        exception, message = describe_exception(call)
+        # A skip and an expected failure both raise, and neither is something
+        # that went wrong, so neither leaves an exception on the report. Any
+        # query for "did anything go wrong" would otherwise count them all.
+        exception, message = (None, None) if report.skipped else describe_exception(call)
         meta: Meta = {
             "attributes": self.attributes.snapshot(),
             "exception": exception,
@@ -629,7 +654,10 @@ class ElasticCaseReporter(ElasticPlugin):
             step_name=step_name,
             step_status=OUTCOMES[status],
             exception=failure.exception,
-            exception_message=truncate(failure.message, MAX_MESSAGE_CHARS),
+            # Already bounded: the annotator cuts the message before sending it
+            # across, and the ones built here are a sentence. Cutting twice
+            # would eat the first marker and miscount what was dropped.
+            exception_message=failure.message,
             exception_traceback=truncate(failure.traceback, MAX_TRACEBACK_CHARS),
         )
         stamp(report, case.attributes)
@@ -746,8 +774,14 @@ class ElasticCaseReporter(ElasticPlugin):
         summarise(session.config, self)
 
     def pytest_unconfigure(self) -> None:
-        """Back stop: sessionfinish is not reached if configure-time work blew up."""
+        """Back stop: sessionfinish is not reached if configure-time work blew up.
+
+        Also lets go of the session: `ElasticPlugin.current` holds this, which
+        holds the hook relay, which holds pytest's whole config. A process that
+        runs pytest more than once would keep every one of them.
+        """
         self._close(reason="the session was unconfigured")
+        ElasticPlugin.current = None
 
     # -- the tests that do not end by themselves -----------------------------
 
@@ -760,6 +794,12 @@ class ElasticCaseReporter(ElasticPlugin):
         """
         case.running = False
         case.statuses.append("crashed")
+        held, case.held = case.held, None
+        if held is not None:
+            # Its teardown was made and the worker died before pytest could say
+            # the test was finished. It is not the last report any more, but it
+            # is what the test did, so it still goes.
+            self.queue.submit(held)
         built = self._build(
             report.nodeid,
             PHASE_STEPS["teardown"],
@@ -785,10 +825,13 @@ class ElasticCaseReporter(ElasticPlugin):
                 # Its teardown was made but the test never closed, so the run
                 # ended in between. It is the last report either way.
                 self._finish(nodeid, case, held)
-            elif case.running:
-                # It started and never reached teardown, so nothing else will
-                # close this test out. The step is teardown on purpose: every
-                # test in the index then ends with one, crashed or not.
+            else:
+                # It is in here at all because it started, and it is still in
+                # here because it never finished: it never reached teardown, or
+                # its rerun never happened, or it died before its first step
+                # was reported. Nothing else will close it out. The step is
+                # teardown on purpose: every test in the index then ends with
+                # one, crashed or not.
                 case.statuses.append("crashed")
                 self._finish(
                     nodeid,
@@ -804,8 +847,6 @@ class ElasticCaseReporter(ElasticPlugin):
                         ),
                     ),
                 )
-            else:
-                self._cases.pop(nodeid, None)
         self.queue.close()
 
 
@@ -940,6 +981,12 @@ def is_xdist_controller(config: pytest.Config) -> bool:
 def pytest_configure(config: pytest.Config) -> None:
     """Register the half of the plugin this process is responsible for."""
     attributes = CaseAttributes()
+    detached = ElasticPlugin.current
+    if type(detached) is ElasticPlugin:
+        # Something set attributes through `reporter` before there was a
+        # session - a conftest at import time, say. Those would otherwise be
+        # written to a plugin nobody reports through and quietly lost.
+        attributes.set(**detached.attributes.snapshot())
     worker, controller = is_xdist_worker(config), is_xdist_controller(config)
     if not controller:
         # Reports are made here, so this is where they can be annotated - and,
