@@ -1435,6 +1435,7 @@ class IncidentEngine:
             cpu_floor_seconds=self.settings.profile_cpu_floor_seconds,
             retained_mb=self.settings.profile_retained_mb,
             peak_mb=self.settings.profile_peak_mb,
+            growth_per_test_mb=self.settings.profile_growth_per_test_mb,
             growth_tests=self.settings.profile_growth_tests,
             imbalance_ratio=self.settings.profile_imbalance_ratio,
             burst_cores=self.settings.profile_burst_cores,

@@ -2184,7 +2184,7 @@ the burst, blamed like a hotspot:
 | `RETAINED_AFTER_TEST` | the worker was left holding more than it started with, still in use, with the phase it arrived in — `setup` is a fixture |
 | `HEAP_NOT_RETURNED` | it was left holding more, but none of it is in use: the allocator kept freed pages mapped. Fragmentation, not a leak |
 | `TRANSIENT_PEAK` | the test climbed and came back down: what decides how many workers fit on the machine |
-| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — two megabytes a test, which is the shape of a leak and the one no per-test check sees. Under xdist the same rule runs again over the workers that did not reach it alone, pooled: what a test leaves behind is the test's property, not the worker count's, and ten megabytes a test is two hundred on one worker and fifty on each of four. That finding names the run rather than a worker, and `worker_rss` carries each one's share |
+| `STEADY_GROWTH` | the worker drifted upward over its tests, none of them enough to be raised alone and no single step half of it, with the live-object count rising — a megabyte a test, which is the shape of a leak and the one no per-test check sees. Judged on the rate (`failure_profile_growth_per_test_mb`) rather than only on a total, because a drift is paid again for every test in the suite where one test's retention is paid once: the same leak is fifty megabytes over twenty tests and five hundred over two hundred, and only the rate is the same number both times. Under xdist the same rule runs again over the workers that did not reach it alone, pooled: what a test leaves behind is the test's property, not the worker count's, and ten megabytes a test is two hundred on one worker and fifty on each of four. That finding names the run rather than a worker, and `worker_rss` carries each one's share |
 | `WORKER_IMBALANCE` | one worker peaked at twice its siblings, with the test after which it stood clear |
 | `PEAK_OVER_CEILING` | a test climbed to `failure_profile_peak_mb` or past it, whatever it started from — the size is the finding, and it is raised even when the memory came back |
 | `ALLOCATOR_RETENTION` | the worker grew by the threshold over its run and nothing is using the growth: memory the allocator was handed back and kept mapped. One finding for the run, saying which of the two causes it is — thread arenas each keeping what they freed, which `MALLOC_ARENA_MAX=2` fixes, or one main heap fragmented by small survivors, which `malloc_trim` fixes and the arena variable does not |
@@ -2222,16 +2222,35 @@ had there is the sentence that separates a leak from fragmentation, and
 `--failure-profile-allocations` is the answer on those platforms: tracemalloc
 measures Python's own live allocations everywhere.
 
-A leak spread thin is the other case no per-test rule can name, and under
-xdist it is spread thinner still. `STEADY_GROWTH` is a rule over one process
-and its threshold is a whole number of megabytes, so a leak reaches it
-already divided by the worker count: ten megabytes a test over twenty tests
-is 200 MB on one worker and 50 MB on each of four — the same suite, leaking
-the same way, reported only when it is run with few enough workers, and at
-`-n 12` with fewer tests per worker than the rule's minimum there is nothing
-for it to be over at all. What a test leaves behind is the test's property,
-not the worker count's, so the rule runs a second time over the workers that
-did not reach it alone, pooled:
+A leak spread thin is the other case no per-test rule can name, and two
+things used to hide it.
+
+**It was held to a total.** `failure_profile_retained_mb` is what one *test*
+may keep, and a drift held to the same number waits for a hundred megabytes
+to pile up before it says anything — which is a fact about how long the run
+was, not about the code. Two and a half megabytes a test is fifty megabytes
+over twenty tests and five hundred over two hundred; it is one leak, and only
+the rate is the same number both times. A drift is also the thing that
+compounds: one test's retention is paid once, a drift is paid again for every
+test in the suite, and suites grow. So it is judged on
+`failure_profile_growth_per_test_mb` — a megabyte a test by default — with
+the total only having to reach a quarter of `failure_profile_retained_mb`, so
+that a handful of tests cannot carry a rate on their own. That floor is the
+one `failure_profile_cpu_floor_seconds` is, and it binds on short runs only.
+A suite that leaks nothing measures 0.00 MB a test, so there is no noise
+floor under this beyond the whole megabyte the figures are read in.
+
+**It was divided by the worker count.** The rule is over one process, so
+under xdist a leak reaches it already divided: ten megabytes a test over
+twenty tests is 200 MB on one worker and 50 MB on each of four — the same
+suite, leaking the same way, reported only when it is run with few enough
+workers, and at `-n 12` with fewer tests per worker than the rule's minimum
+there is nothing for it to be over at all. What a test leaves behind is the
+test's property, not the worker count's, so the rule runs a second time over
+the workers that did not reach it alone, pooled. A worker that kept a whole
+test's worth is reported as itself — that is the process that gets
+OOM-killed — and workers merely over the rate are the suite leaking, which
+is said once for the run rather than once per slice of the same number:
 
 ```
 Memory growing across tests: the run kept 220 MB in use across 4 workers over 20 tests, about 11 MB per test   [memory_profile STEADY_GROWTH, customer-code, informational]
@@ -2243,15 +2262,17 @@ Memory growing across tests: the run kept 220 MB in use across 4 workers over 20
     Measured: the workers held 136 MB in total before their first of these tests and 356 MB after their last, summed over 4 processes, which counts the pages they share once each. Biggest single step 11 MB. +81 Python objects per test.
 ```
 
-Every guard is the per-worker one over the pool — the tests kept the
-threshold between them, no single test is half of it, at least half of them
-grew, which is what keeps the one-time cost every worker pays on its first
-test from adding up to a leak across enough of them. A worker already raised
-on its own is left out of the pool and named in the finding rather than
-counted twice, two of the remaining workers must have kept something so that
-a finding about a run means the run, and `failure_profile_growth_tests` is
-the minimum number of tests either pass needs — lower it for a suite whose
-workers each run a handful.
+Every guard is the per-worker one over the pool — the tests reached the bar
+between them, no single test is half of it, at least half of them grew, which
+is what keeps the one-time cost every worker pays on its first test from
+adding up to a leak across enough of them. A worker already raised on its own
+is left out of the pool and named in the finding rather than counted twice,
+two of the remaining workers must have kept something so that a finding about
+a run means the run, and `failure_profile_growth_tests` is the minimum number
+of tests either pass needs — lower it for a suite whose workers each run a
+handful. A leak confined to one worker keeps that worker's own finding: the
+pooled rule dilutes it with its siblings' clean tests and declines, and the
+per-worker one it would have replaced stands.
 
 The worker that "freed everything and still sits at four gigabytes" is the
 one case none of the per-test rules can name, because no test did it: a few
@@ -2647,6 +2668,7 @@ accepted and inert.
 | `failure_profile_cpu_floor_seconds` | `0.5` | Seconds of CPU one function must have used before its share counts, so that a short run does not raise the first thing it sampled |
 | `failure_profile_retained_mb` | `100` | Megabytes a test may keep, or climb by, before it is raised |
 | `failure_profile_peak_mb` | `0` | Resident megabytes no test may reach, whatever it started from; 0 is off |
+| `failure_profile_growth_per_test_mb` | `1` | Megabytes a test may leave behind on average, over a run of them, before the drift is raised without waiting for `failure_profile_retained_mb` to accumulate — a drift is paid again for every test in the suite where one test's retention is paid once. The total must still reach a quarter of that threshold, so a handful of tests cannot carry a rate on their own; 0 leaves only the total |
 | `failure_profile_growth_tests` | `4` | Tests that must each leave something behind before the drift between them is raised as steady growth — per worker, and again over the workers that did not reach the rule alone |
 | `failure_profile_imbalance_ratio` | `2` | Times the median sibling's peak a worker must hold to be raised as imbalanced |
 | `failure_profile_allocations` | `false` | Trace allocations with tracemalloc as well, naming the lines that hold the memory and writing memory flame graphs; tens of times slower on allocation-heavy pure-Python code, so for a rerun of the tests an untraced run named (`--failure-profile-allocations` for one run, which implies `--failure-profile`) |

@@ -69,6 +69,7 @@ DEFAULTS = {
     "failure_profile_cpu_floor_seconds": "0.5",
     "failure_profile_retained_mb": "100",
     "failure_profile_peak_mb": "0",
+    "failure_profile_growth_per_test_mb": "1",
     "failure_profile_growth_tests": "4",
     "failure_profile_imbalance_ratio": "2",
     "failure_profile_allocations": "false",

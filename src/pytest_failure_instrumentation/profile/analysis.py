@@ -90,6 +90,13 @@ class Thresholds:
     gc_share_percent: float = 10.0
     #: MB a test may leave behind, or climb by, before it is named.
     retained_mb: int = 100
+    #: MB a test may leave behind *on average*, over a run of them, before
+    #: the drift is named without waiting for ``retained_mb`` to accumulate.
+    #: A drift is unbounded where one test's retention is not - it is paid
+    #: again for every test in the suite - so the rate is what it is judged
+    #: on, and the total only decides whether there is enough of a run to
+    #: judge. 0 turns the rate off and leaves the total.
+    growth_per_test_mb: float = 1.0
     #: Consecutive tests that must each leave something before growth is
     #: called steady rather than a step.
     growth_tests: int = 4
@@ -739,6 +746,7 @@ def _memory_findings(
     }
 
     drifted: set[str] = set()
+    by_rate: dict[str, Finding] = {}
     for worker, tests in by_worker.items():
         for record in tests:
             before, after, peak, traced = _figures(record)
@@ -875,14 +883,25 @@ def _memory_findings(
                         climb_total_mb=climb_total,
                     )
                 )
-        drift = _drift(worker, tests, limits, session_holders.get(worker), attributor)
-        if drift:
-            drifted.add(worker)
-        findings.extend(drift)
+        for drift in _drift(worker, tests, limits, session_holders.get(worker), attributor):
+            # A worker that kept a whole test's worth is a fact about that
+            # process - it is the one that gets OOM-killed - and it is
+            # reported as itself. A worker over the rate and under that is
+            # the suite leaking, which every worker running those tests
+            # shows, and saying it once for the run beats saying it four
+            # times for four slices of one number.
+            if (drift.delta_mb or 0) >= limits.retained_mb:
+                drifted.add(worker)
+                findings.append(drift)
+            else:
+                by_rate[worker] = drift
 
-    # And again over the workers that did not reach the rule alone, pooled:
-    # a leak divided between processes is the same leak.
-    findings.extend(_fleet_drift(by_worker, limits, drifted, session_holders, attributor))
+    # And again over every worker not already reported, pooled: a leak
+    # divided between processes is the same leak, and the run-wide figure is
+    # the one the reader wants. Where the pool has nothing to say, the
+    # per-worker findings it would have replaced stand.
+    pooled = _fleet_drift(by_worker, limits, drifted, session_holders, attributor)
+    findings.extend(pooled or by_rate.values())
     findings.extend(_imbalance(by_worker, limits))
     findings.extend(_allocator_retention(by_worker, limits))
     return findings
@@ -1155,13 +1174,27 @@ def _drifting(
     """The steps, their total, the biggest and how many grew - or None when
     these tests are not a drift.
 
-    What they kept *in use* between them, net, reaches the threshold, no
-    single step is half of it, and at least half of them grew. In use,
-    because resident memory drifts up on its own as the allocator keeps
-    pages a fixture's worth of freed objects fragmented - twenty megabytes a
-    test that no line holds. Where the live heap and the object count were
-    read, the step is what they say; elsewhere it is the resident step, and
-    the object count is the tiebreak.
+    What they kept *in use* between them, net, reaches the bar, no single
+    step is half of it, and at least half of them grew. In use, because
+    resident memory drifts up on its own as the allocator keeps pages a
+    fixture's worth of freed objects fragmented - twenty megabytes a test
+    that no line holds. Where the live heap and the object count were read,
+    the step is what they say; elsewhere it is the resident step, and the
+    object count is the tiebreak.
+
+    The bar is reached two ways, and the second is the one that matters.
+    ``retained_mb`` is what one test may keep, and a drift held to it waits
+    for a hundred megabytes to accumulate before it says anything - which
+    is a number the run's shape decides, not the code's: the same leak at
+    two and a half megabytes a test is fifty megabytes over twenty tests and
+    five hundred over two hundred. A drift is paid again for every test in
+    the suite, so it is judged on the rate: ``growth_per_test_mb`` on
+    average, over enough of a run to mean it, which is a quarter of
+    ``retained_mb`` in total. That floor is the one the CPU rule's
+    ``cpu_floor_seconds`` is - it is there so a handful of tests cannot
+    carry a rate on their own, and it binds on short runs only. A healthy
+    suite measures 0.00 MB a test, so there is no noise floor under this
+    beyond the whole megabyte the figures are read in.
     """
     # A growth_tests of 0 asks for no minimum, not for a rule over no rows.
     if not rows or len(rows) < limits.growth_tests:
@@ -1180,7 +1213,16 @@ def _drifting(
         for step, kept in zip(steps, blocks)
         if step >= 1 or (kept is not None and kept * BYTES_PER_BLOCK >= 1048576)
     )
-    if total < limits.retained_mb or biggest >= total / 2 or growing < len(rows) / 2:
+    # Either enough of it to be a test's worth on its own, or a rate held
+    # over enough of a run to be believed.
+    rate_is_enough = (
+        limits.growth_per_test_mb > 0
+        and total / len(rows) >= limits.growth_per_test_mb
+        and total >= limits.retained_mb / 4
+    )
+    if not (total >= limits.retained_mb or rate_is_enough):
+        return None
+    if biggest >= total / 2 or growing < len(rows) / 2:
         return None
     return steps, total, biggest, growing
 

@@ -455,7 +455,13 @@ one; see below.
 - `STEADY_GROWTH`: `worker` drifted up by `delta_mb` over `growth.tests`
   tests, `growth.per_test_mb` each (and `growth.objects_per_test` live
   objects, where the count was read), none of them enough to be raised alone
-  and no single step half of the total. When `workers` is set the finding is
+  and no single step half of the total. The bar is reached two ways: the
+  tests kept `failure_profile_retained_mb` between them, or they kept
+  `failure_profile_growth_per_test_mb` on average over a quarter of it — the
+  rate, because a drift is paid again for every test in the suite where one
+  test's retention is paid once, so `growth.per_test_mb` is the number to
+  read and `delta_mb` is what this run's length made of it. When `workers` is
+  set the finding is
   the run's rather than one process's: the same rule over the workers that
   did not reach it alone, pooled, because xdist divides the tests between
   them and divides a leak in the tests with them — `delta_mb` is what they
