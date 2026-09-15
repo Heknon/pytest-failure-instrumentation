@@ -3,14 +3,13 @@
     pytest -p pytester test_elastic_reporter.py
 
 `-p pytester` is what the end-to-end half needs: it runs a real pytest in a
-subprocess, plugin and all, and reads back what the mock sender was handed.
-pytest-xdist and pytest-rerunfailures have to be installed for the two tests
-that exercise them.
+subprocess, plugin and all, and reads back what `pytest_case_report` was
+handed. pytest-xdist and pytest-rerunfailures have to be installed for the two
+tests that exercise them.
 """
 
 import collections
 import json
-import queue
 import shutil
 import threading
 
@@ -53,10 +52,10 @@ def test_stamp_only_writes_settable_fields():
     assert not hasattr(report, "nonsense")
 
 
-def test_to_dict_carries_the_elastic_timestamp():
+def test_to_dict_is_json_serialisable_with_json_default():
     report = er.CaseReport(outcome="passed", test_suite="t.py", test_case="test_a")
-    document = report.to_dict()
-    assert document["@timestamp"] == report.time
+    document = json.loads(json.dumps(report.to_dict(), default=er.json_default))
+    assert document["@timestamp"] == report.time.isoformat()
     assert document["test_case"] == "test_a"
 
 
@@ -85,123 +84,40 @@ def test_reporter_works_outside_a_session():
 
 
 # ---------------------------------------------------------------------------
-# the shipper
-# ---------------------------------------------------------------------------
-
-
-def a_report(name):
-    return er.CaseReport(outcome="passed", test_suite="t.py", test_case=name)
-
-
-def test_shipper_batches_in_order_and_drains_on_close():
-    sender = er.MockElasticSender("https://example.invalid")
-    shipper = er.BackgroundShipper(sender, batch_size=3, flush_interval=60)
-    shipper.start()
-    for n in range(7):
-        shipper.submit(a_report(f"test_{n}"))
-    shipper.close(timeout=5)
-    assert [d["test_case"] for d in sender.documents] == [f"test_{n}" for n in range(7)]
-    assert [r["count"] for r in sender.requests] == [3, 3, 1]
-    assert shipper.shipped == 7
-    assert shipper.dropped == 0
-
-
-def test_shipper_drops_rather_than_growing_without_limit(monkeypatch):
-    monkeypatch.setattr(er, "MAX_QUEUED", 10)
-    blocked = threading.Event()
-
-    class Blocked:
-        def send(self, body):
-            blocked.wait(timeout=5)
-
-    shipper = er.BackgroundShipper(Blocked(), batch_size=1, flush_interval=60)
-    shipper.start()
-    for n in range(200):
-        shipper.submit(a_report(f"test_{n}"))
-    assert shipper._queue.qsize() <= 10
-    assert shipper.dropped >= 180  # the rest never reached elastic, and said so
-    blocked.set()
-    shipper.close(timeout=5)
-
-
-def test_shipper_survives_a_sender_that_raises():
-    class Broken:
-        def send(self, body):
-            raise RuntimeError("503")
-
-    shipper = er.BackgroundShipper(Broken(), batch_size=2, flush_interval=60)
-    shipper.start()
-    for n in range(6):
-        shipper.submit(a_report(f"test_{n}"))
-    shipper.close(timeout=5)
-    assert shipper.shipped == 0
-    assert shipper.dropped == 6
-    assert shipper.failures == 3
-    assert "503" in shipper.errors[0]
-
-
-def test_shipper_keeps_only_the_first_errors():
-    class Broken:
-        def send(self, body):
-            raise RuntimeError("503")
-
-    shipper = er.BackgroundShipper(Broken(), batch_size=1, flush_interval=60)
-    shipper.start()
-    for n in range(er.MAX_ERRORS + 15):
-        shipper.submit(a_report(f"test_{n}"))
-    shipper.close(timeout=5)
-    assert len(shipper.errors) == er.MAX_ERRORS
-    assert shipper.failures == er.MAX_ERRORS + 15
-
-
-def test_shipper_close_is_safe_twice_and_before_start():
-    shipper = er.BackgroundShipper(er.MockElasticSender("u"), batch_size=1, flush_interval=60)
-    shipper.close(timeout=1)  # never started
-    shipper.start()
-    shipper.close(timeout=5)
-    shipper.close(timeout=5)
-
-
-def test_queue_is_bounded_by_the_constant():
-    shipper = er.BackgroundShipper(er.MockElasticSender("u"), batch_size=1, flush_interval=60)
-    assert shipper._queue.maxsize == er.MAX_QUEUED
-    with pytest.raises(queue.Full):
-        for _ in range(er.MAX_QUEUED + 1):
-            shipper._queue.put_nowait(a_report("t"))
-
-
-# ---------------------------------------------------------------------------
 # the plugin, run by a real pytest, from the outside
 # ---------------------------------------------------------------------------
 
-
-DUMP = """
+#: An implementation of the hook that keeps what it was given, so a test can
+#: read it back. It is also the shortest example of one.
+RECORD = """
 import json
 
 import elastic_reporter as er
 
+RECEIVED = []
+
+
+def pytest_case_report(report):
+    RECEIVED.append(json.loads(json.dumps(report.to_dict(), default=er.json_default)))
+
 
 def pytest_unconfigure(config):
-    reporter = config.pluginmanager.getplugin(er.PLUGIN_NAME)
-    if not isinstance(reporter, er.ElasticCaseReporter):
-        return
-    documents = [json.loads(json.dumps(d, default=er.json_default))
-                 for d in reporter.sender.documents]
-    (config.rootpath / "shipped.json").write_text(json.dumps(documents))
+    if not hasattr(config, "workerinput"):  # the controller owns the stream
+        (config.rootpath / "reported.json").write_text(json.dumps(RECEIVED))
 """
 
 
 @pytest.fixture
 def run(pytester):
-    """Run an inner pytest with the plugin, and return what it shipped."""
+    """Run an inner pytest with the plugin, and return what the hook received."""
     shutil.copy(er.__file__, pytester.path / "elastic_reporter.py")
 
-    def _run(source, *args, conftest=""):
-        pytester.makeconftest(DUMP + conftest)
+    def _run(source, *args, conftest=RECORD):
+        pytester.makeconftest(conftest)
         pytester.makepyfile(source)
         result = pytester.runpytest_subprocess("-p", "elastic_reporter", *args)
-        shipped = pytester.path / "shipped.json"
-        return result, json.loads(shipped.read_text()) if shipped.exists() else []
+        reported = pytester.path / "reported.json"
+        return result, json.loads(reported.read_text()) if reported.exists() else []
 
     return _run
 
@@ -255,6 +171,47 @@ def test_every_phase_of_every_outcome(run):
     assert [r["step_name"] for r in cases["test_skipped"]] == ["setup", "teardown"]
     assert cases["test_xfails"][1]["outcome"] == "xfailed"
     assert cases["test_setup_error"][0]["outcome"] == "error"
+
+
+def test_the_hook_is_called_once_per_report_in_order(run):
+    result, _ = run(
+        """
+        def test_a(): pass
+        def test_b(): pass
+        """,
+        "-s",
+        conftest="""
+import elastic_reporter as er
+
+
+def pytest_case_report(report):
+    print(f"HOOK {report.test_case}/{report.step_name} last={report.last_report}")
+""",
+    )
+    # pytest's own progress output shares the line, so cut from the marker.
+    hooked = [line[line.index("HOOK") :] for line in result.outlines if "HOOK" in line]
+    assert hooked == [
+        "HOOK test_a/setup last=False",
+        "HOOK test_a/call last=False",
+        "HOOK test_a/teardown last=True",
+        "HOOK test_b/setup last=False",
+        "HOOK test_b/call last=False",
+        "HOOK test_b/teardown last=True",
+    ]
+
+
+def test_a_hook_that_raises_is_counted_not_fatal(run):
+    result, _ = run(
+        "def test_a(): pass",
+        conftest="""
+def pytest_case_report(report):
+    raise RuntimeError("the api is down")
+""",
+    )
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0
+    assert "elastic-reporter: 3 case report(s)" in "\n".join(result.outlines)
+    assert any("RuntimeError: the api is down" in line for line in result.outlines)
 
 
 def test_attributes_describe_the_whole_test(run):
@@ -353,7 +310,7 @@ def test_the_controller_owns_the_stream_under_xdist(run):
     assert sum(d["last_report"] for d in documents) == 8
 
 
-def test_switched_off_ships_nothing_and_still_takes_attributes(run):
+def test_switched_off_reports_nothing_and_still_takes_attributes(run):
     result, documents = run(
         """
         import elastic_reporter as er
