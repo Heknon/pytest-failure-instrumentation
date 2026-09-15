@@ -3,13 +3,14 @@
     pytest -p pytester test_elastic_reporter.py
 
 `-p pytester` is what the end-to-end half needs: it runs a real pytest in a
-subprocess, plugin and all, and reads back what `pytest_case_report` was
+subprocess, plugin and all, and reads back what `pytest_case_reports` was
 handed. pytest-xdist and pytest-rerunfailures have to be installed for the two
 tests that exercise them.
 """
 
 import collections
 import json
+import queue
 import shutil
 import threading
 
@@ -44,32 +45,38 @@ def test_truncate():
     assert "40 more characters" in cut
 
 
-def test_stamp_only_writes_settable_fields():
-    report = er.CaseReport(outcome="passed", test_suite="t.py", test_case="test_a")
-    er.stamp(report, {"vc": "fw-1", "machine": "rack1", "outcome": "TAMPERED", "nonsense": 1})
+@pytest.mark.parametrize(
+    ("statuses", "verdict"),
+    [
+        (["passed", "passed", "passed"], "passed"),
+        (["passed", "failed", "passed"], "failed"),
+        (["error", "passed"], "error"),
+        (["skipped", "passed"], "skipped"),
+        (["passed", "xfailed", "passed"], "xfailed"),
+        (["passed", "xpassed", "passed"], "xpassed"),
+        (["passed", "passed", "error"], "error"),  # a teardown that blew up
+        (["passed", "failed", "crashed"], "crashed"),
+        ([], "crashed"),  # nothing we can describe means it never finished
+    ],
+)
+def test_verdict_of(statuses, verdict):
+    assert er.verdict_of(statuses) == verdict
+
+
+def test_stamp_only_writes_what_a_step_does_not_own():
+    report = er.CaseReport(test_suite="t.py", test_case="test_a", step_status="passed")
+    er.stamp(report, {"vc": "fw-1", "machine": "rack1", "step_status": "TAMPERED", "nonsense": 1})
     assert (report.vc, report.machine) == ("fw-1", "rack1")
-    assert report.outcome == "passed"  # a phase answers for its own
+    assert report.step_status == "passed"
     assert not hasattr(report, "nonsense")
 
 
 def test_to_dict_is_json_serialisable_with_json_default():
-    report = er.CaseReport(outcome="passed", test_suite="t.py", test_case="test_a")
+    report = er.CaseReport(test_suite="t.py", test_case="test_a")
     document = json.loads(json.dumps(report.to_dict(), default=er.json_default))
     assert document["@timestamp"] == report.time.isoformat()
     assert document["test_case"] == "test_a"
-
-
-def test_unset_attributes_keep_the_models_defaults():
-    attributes = er.CaseAttributes()
-    assert attributes.snapshot() == {}
-    report = er.CaseReport(outcome="passed", test_suite="t.py", test_case="test_a")
-    er.stamp(report, attributes.snapshot())
-    assert (report.vc, report.owner, report.cycle_id, report.labs3) == (
-        "mock-vc",
-        "mock-owner",
-        1,
-        True,
-    )
+    assert document["outcome"] is None  # no verdict unless it is the last report
 
 
 def test_attributes_reject_what_is_not_settable():
@@ -78,6 +85,19 @@ def test_attributes_reject_what_is_not_settable():
     assert attributes.snapshot()["vc"] == "fw-1"
     with pytest.raises(ValueError, match="not a case attribute: outcome"):
         attributes.set(outcome="passed")
+
+
+def test_unset_attributes_keep_the_models_defaults():
+    attributes = er.CaseAttributes()
+    assert attributes.snapshot() == {}
+    report = er.CaseReport(test_suite="t.py", test_case="test_a")
+    er.stamp(report, attributes.snapshot())
+    assert (report.vc, report.owner, report.cycle_id, report.labs3) == (
+        "mock-vc",
+        "mock-owner",
+        1,
+        True,
+    )
 
 
 def test_attributes_survive_concurrent_writers():
@@ -97,6 +117,118 @@ def test_reporter_works_outside_a_session():
 
 
 # ---------------------------------------------------------------------------
+# the queue behind the hook
+# ---------------------------------------------------------------------------
+
+
+class FakeHook:
+    """Stands in for pytest's hook relay, recording the batches it is given."""
+
+    def __init__(self, error=None):
+        """Record batches, or raise ``error`` instead of taking them."""
+        self.batches = []
+        self.error = error
+
+    def pytest_case_reports(self, reports):
+        """Take one batch, the way a conftest implementation would."""
+        if self.error is not None:
+            raise self.error
+        self.batches.append(list(reports))
+
+
+def a_report(name):
+    return er.CaseReport(test_suite="t.py", test_case=name, step_status="passed")
+
+
+def test_queue_batches_in_order_and_drains_on_close(monkeypatch):
+    monkeypatch.setattr(er, "BATCH_SIZE", 3)
+    monkeypatch.setattr(er, "FLUSH_INTERVAL", 60.0)
+    hook = FakeHook()
+    reports = er.ReportQueue(hook)
+    reports.start()
+    for n in range(7):
+        reports.submit(a_report(f"test_{n}"))
+    reports.close(timeout=5)
+    assert [len(batch) for batch in hook.batches] == [3, 3, 1]
+    assert [r.test_case for batch in hook.batches for r in batch] == [f"test_{n}" for n in range(7)]
+    assert reports.sent == 7
+    assert reports.dropped == 0
+
+
+def test_queue_sends_on_the_interval_without_a_full_batch(monkeypatch):
+    monkeypatch.setattr(er, "BATCH_SIZE", 1000)
+    monkeypatch.setattr(er, "FLUSH_INTERVAL", 0.05)
+    hook = FakeHook()
+    reports = er.ReportQueue(hook)
+    reports.start()
+    reports.submit(a_report("test_alone"))
+    threading.Event().wait(0.5)  # longer than the interval, without a sleep
+    assert hook.batches, "the interval should have sent a part-full batch"
+    reports.close(timeout=5)
+
+
+def test_queue_drops_rather_than_growing_without_limit(monkeypatch):
+    monkeypatch.setattr(er, "MAX_QUEUED", 10)
+    monkeypatch.setattr(er, "BATCH_SIZE", 1)
+    blocked = threading.Event()
+
+    class Blocked:
+        def pytest_case_reports(self, reports):
+            blocked.wait(timeout=5)
+
+    reports = er.ReportQueue(Blocked())
+    reports.start()
+    for n in range(200):
+        reports.submit(a_report(f"test_{n}"))
+    assert reports._queue.qsize() <= 10
+    assert reports.dropped >= 180  # the rest never reached elastic, and said so
+    blocked.set()
+    reports.close(timeout=5)
+
+
+def test_queue_survives_a_hook_that_raises(monkeypatch):
+    monkeypatch.setattr(er, "BATCH_SIZE", 2)
+    monkeypatch.setattr(er, "FLUSH_INTERVAL", 60.0)
+    reports = er.ReportQueue(FakeHook(error=RuntimeError("the api is down")))
+    reports.start()
+    for n in range(6):
+        reports.submit(a_report(f"test_{n}"))
+    reports.close(timeout=5)
+    assert reports.sent == 0
+    assert reports.dropped == 6
+    assert reports.failures == 3
+    assert "the api is down" in reports.errors[0]
+
+
+def test_queue_keeps_only_the_first_errors(monkeypatch):
+    monkeypatch.setattr(er, "BATCH_SIZE", 1)
+    monkeypatch.setattr(er, "FLUSH_INTERVAL", 60.0)
+    reports = er.ReportQueue(FakeHook(error=RuntimeError("503")))
+    reports.start()
+    for n in range(er.MAX_ERRORS + 15):
+        reports.submit(a_report(f"test_{n}"))
+    reports.close(timeout=5)
+    assert len(reports.errors) == er.MAX_ERRORS
+    assert reports.failures == er.MAX_ERRORS + 15
+
+
+def test_queue_close_is_safe_twice_and_before_start():
+    reports = er.ReportQueue(FakeHook())
+    reports.close(timeout=1)  # never started
+    reports.start()
+    reports.close(timeout=5)
+    reports.close(timeout=5)
+
+
+def test_queue_is_bounded_by_the_constant():
+    reports = er.ReportQueue(FakeHook())
+    assert reports._queue.maxsize == er.MAX_QUEUED
+    with pytest.raises(queue.Full):
+        for _ in range(er.MAX_QUEUED + 1):
+            reports._queue.put_nowait(a_report("t"))
+
+
+# ---------------------------------------------------------------------------
 # the plugin, run by a real pytest, from the outside
 # ---------------------------------------------------------------------------
 
@@ -110,8 +242,9 @@ import elastic_reporter as er
 RECEIVED = []
 
 
-def pytest_case_report(report):
-    RECEIVED.append(json.loads(json.dumps(report.to_dict(), default=er.json_default)))
+def pytest_case_reports(reports):
+    RECEIVED.extend(json.loads(json.dumps(r.to_dict(), default=er.json_default))
+                    for r in reports)
 
 
 def pytest_unconfigure(config):
@@ -146,17 +279,19 @@ def by_case(documents):
     return cases
 
 
-def assert_one_last_report_per_case(documents):
+def assert_one_verdict_per_case(documents):
     for name, reports in by_case(documents).items():
-        flagged = [r for r in reports if r["last_report"]]
-        assert len(flagged) == 1, f"{name}: {len(flagged)} last_report flags"
-        assert flagged[0] is reports[-1], f"{name}: the flag is not on its last report"
+        with_outcome = [r for r in reports if r["outcome"] is not None]
+        assert len(with_outcome) == 1, f"{name}: {len(with_outcome)} reports carry a verdict"
+        assert with_outcome[0] is reports[-1], f"{name}: the verdict is not on its last report"
+        assert with_outcome[0]["last_report"] is True, f"{name}: the verdict is not flagged last"
+        assert all(not r["last_report"] for r in reports[:-1]), f"{name}: more than one last report"
 
 
 # ---------------------------------------------------------------------------
 
 
-def test_every_phase_of_every_outcome(run):
+def test_step_status_on_every_report_and_a_verdict_only_on_the_last(run):
     result, documents = run(
         """
         import pytest
@@ -173,79 +308,55 @@ def test_every_phase_of_every_outcome(run):
         """,
     )
     result.assert_outcomes(passed=1, failed=1, skipped=1, xfailed=1, errors=1)
-    assert_one_last_report_per_case(documents)
+    assert_one_verdict_per_case(documents)
     cases = by_case(documents)
-    assert [r["step_name"] for r in cases["test_passes"]] == ["setup", "call", "teardown"]
-    assert [r["outcome"] for r in cases["test_passes"]] == ["passed"] * 3
-    assert [r["outcome"] for r in cases["test_fails"]] == ["passed", "failed", "passed"]
+
+    steps = [(r["step_name"], r["step_status"], r["outcome"]) for r in cases["test_fails"]]
+    assert steps == [
+        ("setup", "passed", None),
+        ("call", "failed", None),
+        ("teardown", "passed", "failed"),
+    ]
     assert cases["test_fails"][1]["exception"] == "AssertionError"
     assert cases["test_fails"][1]["exception_traceback"]
-    # A skipped test never runs its call phase, so it has no call report.
+
+    assert [r["step_status"] for r in cases["test_passes"]] == ["passed"] * 3
+    assert cases["test_passes"][-1]["outcome"] == "passed"
+    # A skipped test never runs its call step, so it has no call report.
     assert [r["step_name"] for r in cases["test_skipped"]] == ["setup", "teardown"]
-    assert cases["test_xfails"][1]["outcome"] == "xfailed"
-    assert cases["test_setup_error"][0]["outcome"] == "error"
+    assert cases["test_skipped"][-1]["outcome"] == "skipped"
+    assert cases["test_xfails"][-1]["outcome"] == "xfailed"
+    assert cases["test_setup_error"][0]["step_status"] == "error"
+    assert cases["test_setup_error"][-1]["outcome"] == "error"
 
 
-def test_the_hook_is_called_once_per_report_in_order(run):
-    result, _ = run(
-        """
-        def test_a(): pass
-        def test_b(): pass
-        """,
-        "-s",
-        conftest="""
-import elastic_reporter as er
-
-
-def pytest_case_report(report):
-    print(f"HOOK {report.test_case}/{report.step_name} last={report.last_report}")
-""",
-    )
-    # pytest's own progress output shares the line, so cut from the marker.
-    hooked = [line[line.index("HOOK") :] for line in result.outlines if "HOOK" in line]
-    assert hooked == [
-        "HOOK test_a/setup last=False",
-        "HOOK test_a/call last=False",
-        "HOOK test_a/teardown last=True",
-        "HOOK test_b/setup last=False",
-        "HOOK test_b/call last=False",
-        "HOOK test_b/teardown last=True",
-    ]
-
-
-def test_a_hook_that_raises_is_counted_not_fatal(run):
-    result, _ = run(
-        "def test_a(): pass",
-        conftest="""
-def pytest_case_report(report):
-    raise RuntimeError("the api is down")
-""",
-    )
-    result.assert_outcomes(passed=1)
-    assert result.ret == 0
-    assert "elastic-reporter: 3 case report(s)" in "\n".join(result.outlines)
-    assert any("RuntimeError: the api is down" in line for line in result.outlines)
-
-
-def test_attributes_describe_the_whole_test(run):
+def test_a_report_carries_what_was_set_when_its_step_ended(run):
     _, documents = run(
         """
         import elastic_reporter as er
+        import pytest
 
-        def test_sets_in_call():
-            er.reporter().set(vc="fw-5.0.0", machine="rack1")
+        @pytest.fixture
+        def allocated():
+            er.reporter().set(machine="rack1")
 
-        def test_inherits_the_vc():
+        def test_set_in_setup(allocated):
             pass
+
+        def test_set_in_the_body():
+            er.reporter().set(vc="fw-5.0.0")
         """,
     )
-    assert_one_last_report_per_case(documents)
+    assert_one_verdict_per_case(documents)
     cases = by_case(documents)
-    # Set in the call phase, but the setup report carries it too.
-    assert {r["vc"] for r in cases["test_sets_in_call"]} == {"fw-5.0.0"}
-    assert {r["machine"] for r in cases["test_sets_in_call"]} == {"rack1"}
-    # And it sticks for the test after it.
-    assert {r["vc"] for r in cases["test_inherits_the_vc"]} == {"fw-5.0.0"}
+    # A fixture sets it during setup, so every report of that test has it.
+    assert {r["machine"] for r in cases["test_set_in_setup"]} == {"rack1"}
+    # The body sets it after the setup report was already sent, so that one
+    # does not have it, and the two after it do.
+    body = cases["test_set_in_the_body"]
+    assert [r["vc"] for r in body] == ["mock-vc", "fw-5.0.0", "fw-5.0.0"]
+    # And it sticks, so the machine from the test before is still there.
+    assert {r["machine"] for r in body} == {"rack1"}
 
 
 def test_a_conftest_hook_sets_the_run_wide_attributes(run):
@@ -285,11 +396,13 @@ def test_a_test_that_never_reaches_teardown_is_crashed(run):
         def test_never_runs(): pass
         """,
     )
-    assert_one_last_report_per_case(documents)
+    assert_one_verdict_per_case(documents)
     cases = by_case(documents)
     assert [r["step_name"] for r in cases["test_exits"]] == ["setup", "teardown"]
     assert cases["test_exits"][-1]["outcome"] == "crashed"
     assert cases["test_exits"][-1]["exception"] == "TestIncomplete"
+    # Its setup report went out before the run died, with no verdict on it.
+    assert cases["test_exits"][0]["outcome"] is None
     assert "test_never_runs" not in cases
 
 
@@ -297,11 +410,12 @@ def test_collection_error_is_reported_once(run):
     _, documents = run("import definitely_not_a_real_module")
     assert len(documents) == 1
     assert documents[0]["step_name"] == "collect"
+    assert documents[0]["step_status"] == "error"
     assert documents[0]["outcome"] == "error"
     assert documents[0]["last_report"] is True
 
 
-def test_every_attempt_of_a_rerun_is_one_case(run):
+def test_only_the_final_attempt_of_a_rerun_carries_the_verdict(run):
     _, documents = run(
         """
         import pathlib
@@ -316,13 +430,13 @@ def test_every_attempt_of_a_rerun_is_one_case(run):
         "--reruns",
         "2",
     )
-    assert_one_last_report_per_case(documents)
+    assert_one_verdict_per_case(documents)
     reports = by_case(documents)["test_flaky"]
-    assert len(reports) == 9  # three attempts of three phases
-    assert [r["outcome"] for r in reports] == (
+    assert len(reports) == 9  # three attempts of three steps
+    assert [r["step_status"] for r in reports] == (
         ["passed", "rerun", "passed"] * 2 + ["passed", "passed", "passed"]
     )
-    assert reports[-1]["last_report"] is True
+    assert reports[-1]["outcome"] == "passed"
 
 
 def test_the_controller_owns_the_stream_under_xdist(run):
@@ -337,9 +451,9 @@ def test_the_controller_owns_the_stream_under_xdist(run):
         "-n",
         "2",
     )
-    assert_one_last_report_per_case(documents)
-    assert len(documents) == 24  # 8 tests, 3 phases, one stream
-    assert sum(d["last_report"] for d in documents) == 8
+    assert_one_verdict_per_case(documents)
+    assert len(documents) == 24  # 8 tests, 3 steps, one stream
+    assert sum(d["outcome"] is not None for d in documents) == 8
 
 
 def test_without_the_plugin_loaded_nothing_reports_and_set_still_works(pytester):
@@ -350,7 +464,7 @@ def test_without_the_plugin_loaded_nothing_reports_and_set_still_works(pytester)
         import pytest
 
         @pytest.hookimpl(optionalhook=True)  # the plugin may not be loaded
-        def pytest_case_report(report):
+        def pytest_case_reports(reports):
             raise AssertionError("nothing should be reporting")
         """,
     )
@@ -378,5 +492,5 @@ def test_nothing_is_held_once_a_test_is_done(run):
             assert len(er.reporter()._cases) <= 1  # only the test running now
         """,
     )
-    assert_one_last_report_per_case(documents)
+    assert_one_verdict_per_case(documents)
     assert len(documents) == 75
