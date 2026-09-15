@@ -11,34 +11,58 @@ conftest.
 
 What it does
 ------------
-* One :class:`CaseReport` per pytest phase - setup, call, teardown - of every
-  attempt at every test, whatever the outcome, plus one per collection error.
+* One `CaseReport` per pytest phase - setup, call, teardown - of every attempt
+  at every test, whatever the outcome, plus one per collection error.
 * ``last_report=True`` marks the end of a *test*, not the end of the run: each
-  test contributes exactly one, on the final report of its final attempt, so a
-  consumer can close the case out and decide its verdict. See `_hold`.
+  test contributes exactly one, on the last report it produces, so a consumer
+  can close the case out and decide its verdict.
 * Every case ends with one. A test that started and never reached teardown -
   the session was interrupted, the xdist worker holding it died - gets a
   synthetic ``crashed`` teardown report instead.
 * Reports are queued and shipped in batches from a background thread; a test
   never waits on the sender. The queue is drained at session finish.
-* Shipping is a mock. :class:`MockElasticSender` records the POST it would have
-  made to the forwarding API - the endpoint that takes a body of case reports
-  and forwards them to elastic. Swap it in `pytest_configure` for the real
-  one; anything with a ``send(list[dict])`` method fits.
+* Shipping is a mock. `MockElasticSender` records the POST it would have made
+  to the forwarding API - the endpoint that takes a body of case reports and
+  forwards them to elastic. Swap it in `pytest_configure` for the real one;
+  anything with a ``send(list[dict])`` method fits.
+
+One component for the test's attributes
+---------------------------------------
+`machine`, `vc`, `cycle_id`, `owner` and the rest describe the test, not the
+phase, and they are answered in all sorts of places - a command line option, a
+resolver that reads the item, a fixture that connects to the machine, the test
+body itself. So they are one component, `CaseAttributes`, and one call sets any
+of them from anywhere that can see a pytest ``config``::
+
+    def test_something(request):
+        reporter = request.config.pluginmanager.getplugin("elastic-case-reporter")
+        reporter.set(vc="vc-4.2.1", owner="qa")
+
+A value set anywhere in a test describes the whole test: its setup, call and
+teardown reports all carry it, whichever phase set it, because a test's reports
+are stamped when the test ends rather than as each phase finishes. Values stick
+until changed, so a process can set the vc once and forget it. ``machine`` is
+the exception, because it belongs to the test rather than the run:
+`resolve_machine` is asked again at the start of every test, so one test's
+machine cannot leak into the next - and a test that sets its own still wins,
+having set it later.
+
+`SETTABLE` is every field of `CaseReport` except the ones a phase answers for
+itself (its outcome, its step, its exception, its time, its flag), so adding a
+field to the model is enough to make it settable.
 
 Reruns
 ------
 A test can be attempted more than once: pytest-rerunfailures retries a failure
-in place, and under xdist it also re-queues a test whose worker died. Only the
-last attempt may carry the flag, and no attempt knows at the time whether it is
-the last one - so each test's newest report is held back rather than shipped,
-and released when the next report for that test displaces it. What releases it
-*flagged* is ``pytest_runtest_logfinish`` without a rerun pending, where
-"pending" means this attempt logged a report that pytest-rerunfailures marked
-``rerun`` (it marks the failing report of an attempt it is about to retry, and
-rewrites the crashed-worker report the same way before the controller sees it).
-Anything still held when the session ends is flagged there, so a retry that
-never happened cannot leave a case open.
+in place, and under xdist it also re-queues a test whose worker died. Every
+attempt belongs to the same case, so they are all held together and shipped
+when the test is done, with the flag on the final report of the final attempt.
+What says a test is done is ``pytest_runtest_logfinish`` without a rerun
+pending, where "pending" means this attempt logged a report that
+pytest-rerunfailures marked ``rerun`` (it marks the failing report of an
+attempt it is about to retry, and rewrites the crashed-worker report the same
+way before the controller sees it). Anything still held when the session ends
+is shipped there, so a retry that never happened cannot leave a case open.
 
 The vocabulary
 --------------
@@ -47,38 +71,24 @@ elastic are decided. Remap a value there, or reassign either dict from a
 conftest, if your index speaks differently - ``OUTCOMES["error"] = "failed"``
 folds setup and teardown failures back into plain failures, for instance.
 
-Updating state from anywhere
-----------------------------
-``vc`` and the other run-wide fields live on the plugin instance, which is
-registered under the name ``elastic-case-reporter``, and so reachable from
-anywhere that can see a pytest ``config``::
-
-    def test_something(request):
-        reporter = request.config.pluginmanager.getplugin("elastic-case-reporter")
-        reporter.set_vc("vc-4.2.1")          # or reporter.update(owner="qa")
-
-Set once and forget: every report built afterwards carries it, the remaining
-phases of the test that set it included. The state is mutated under a lock, so
-a fixture running on a thread of its own is safe.
-
 Under xdist
 -----------
 The controller owns the stream. Every worker's reports reach it through
 ``pytest_runtest_logreport``, so a run has one ordered stream however many
 workers it used, and one ``last_report`` per test rather than per worker. What
-only a worker can know - the machine for a live item, the exception that was
-raised, the run-wide state as the phase ended - is read on the worker by
-`MachineAnnotator` and attached to the report, which pytest serialises across
-for us. So a worker's ``set_vc`` describes that worker's later reports without
-having to reach the controller. It describes that worker's only, each being
-its own process, so a switch meant for the whole run belongs where every
-process runs it: ``--elastic-vc``, or a hook in the rootdir conftest.
+only a worker can know - the test's attributes as it ran, the exception that
+was raised - is read on the worker by `MachineAnnotator` and attached to the
+report, which pytest serialises across for us. So setting an attribute on a
+worker needs nothing of the controller. It describes that worker's tests only,
+each worker being its own process, so a value meant for the whole run belongs
+where every process picks it up: an option, an ini key, or a hook in the
+rootdir conftest.
 """
 
 import json
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Self
@@ -132,8 +142,11 @@ type Meta = dict[str, Any]
 #: One case report on its way to elastic.
 type Document = dict[str, Any]
 
-#: An old-style makereport wrapper: hand the report on, having read it.
+#: A makereport wrapper: hand the report on, having read it.
 type ReportWrapper = Generator[None, pytest.TestReport, pytest.TestReport]
+
+#: A setup wrapper: nothing to read, something to do first.
+type SetupWrapper = Generator[None, None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +162,9 @@ class CaseReport:
     test_suite: str
     test_case: str
     arguments: str | None = None
-    machine: str | None = None  # resolved from the `pytest.Function`
-    vc: str = "mock-vc"  # run-wide state, settable through `getplugin`
-    cycle_id: int = 1  # comes off the config object
+    machine: str | None = None  # set per test, see `CaseAttributes`
+    vc: str = "mock-vc"
+    cycle_id: int = 1
     owner: str = "mock-owner"
     time: datetime = field(default_factory=lambda: datetime.now(UTC))
     exception: str | None = None
@@ -177,10 +190,30 @@ class Failure:
     traceback: str | None = None
 
 
-#: The fields `StateAccess.update` will let you rewrite at runtime. Everything
-#: else is either per-report (the outcome, the exception) or identity (the test
-#: names).
-MUTABLE_FIELDS = frozenset({"vc", "owner", "cycle_id", "machine", "labs3"})
+#: What a phase answers for itself. Everything else describes the test, and so
+#: belongs to `CaseAttributes`.
+PHASE_FIELDS = frozenset(
+    {
+        "outcome",
+        "step_name",
+        "exception",
+        "exception_message",
+        "exception_traceback",
+        "time",
+        "last_report",
+    },
+)
+
+#: Every attribute `CaseAttributes.set` will take, derived from the model, so a
+#: new field on `CaseReport` is settable without being named twice.
+SETTABLE = frozenset(f.name for f in fields(CaseReport)) - PHASE_FIELDS
+
+
+def stamp(report: CaseReport, attributes: dict[str, Any]) -> None:
+    """Write a test's attributes onto one of its reports."""
+    for name, value in attributes.items():
+        if name in SETTABLE:
+            setattr(report, name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -189,17 +222,94 @@ MUTABLE_FIELDS = frozenset({"vc", "owner", "cycle_id", "machine", "labs3"})
 
 
 def resolve_machine(item: pytest.Item) -> str | None:
-    """Return the machine a test ran against, or None.
+    """Return the machine a test is about to run against, or None.
 
-    PLACEHOLDER - replace the body with your own lookup. It is called once per
-    phase with the live item (a ``pytest.Function`` for an ordinary test), so
-    it can read markers, ``item.funcargs``, ``item.callspec.params`` or
-    anything else the item carries. It must not raise; see `safe_machine`.
+    PLACEHOLDER - replace the body with your own lookup. It is called once at
+    the start of every test with the live item (a ``pytest.Function`` for an
+    ordinary test), before any fixture has run, so it can read markers,
+    ``item.callspec.params`` or anything else the item carries on its own.
+    Whatever a fixture or the test body sets later wins over it, and it must
+    not raise; see `safe_machine`.
     """
     marker = item.get_closest_marker("machine")
     if marker is not None and marker.args:
         return str(marker.args[0])
     return None
+
+
+def safe_machine(item: pytest.Item) -> str | None:
+    """Return `resolve_machine`, or None if it was not in a position to answer."""
+    try:
+        return resolve_machine(item)
+    except Exception:  # noqa: BLE001 - a lookup of someone else's is not worth a failed run
+        return None
+
+
+# ---------------------------------------------------------------------------
+# The attributes of a test
+# ---------------------------------------------------------------------------
+
+
+class CaseAttributes:
+    """Every report field that describes the test rather than the phase.
+
+    One component for all of them, because they come from everywhere: an
+    option, `resolve_machine`, a fixture that connects to the machine, the test
+    body. `set` takes any of `SETTABLE`, from any of those places, and the
+    values describe the whole test - its reports are stamped when it ends, not
+    as each phase finishes.
+
+    Values stick until changed, so a process can set one and forget it.
+    ``machine`` is answered again at the start of every test, so one test's
+    cannot leak into the next.
+    """
+
+    def __init__(self, config: "ReporterConfig") -> None:
+        """Start from what the config object says."""
+        self._lock = threading.Lock()
+        self._values: dict[str, Any] = {
+            "vc": config.vc,
+            "owner": config.owner,
+            "cycle_id": config.cycle_id,
+            "labs3": config.labs3,
+        }
+
+    def set(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for this test and the tests after it."""
+        unknown = sorted(set(attributes) - SETTABLE)
+        if unknown:
+            message = (
+                f"not a case attribute: {', '.join(unknown)} "
+                f"(settable: {', '.join(sorted(SETTABLE))})"
+            )
+            raise ValueError(message)
+        with self._lock:
+            self._values.update(attributes)
+
+    def start_test(self, item: pytest.Item) -> None:
+        """Answer ``machine`` afresh for a test that is about to run."""
+        self.set(machine=safe_machine(item))
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return the attributes as they stand, to stamp one test's reports."""
+        with self._lock:
+            return dict(self._values)
+
+
+class AttributeSetter:
+    """What both halves of the plugin answer, so test code can ignore which.
+
+    Under xdist a test reaching for ``getplugin`` gets the worker's annotator
+    and not the controller's reporter. Both set the same attributes.
+    """
+
+    def __init__(self, attributes: CaseAttributes) -> None:
+        """Answer for ``attributes``, which both halves of a session share."""
+        self.attributes = attributes
+
+    def set(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for this test and the tests after it."""
+        self.attributes.set(**attributes)
 
 
 # ---------------------------------------------------------------------------
@@ -398,78 +508,23 @@ class BackgroundShipper:
 
 
 # ---------------------------------------------------------------------------
-# Run-wide state
-# ---------------------------------------------------------------------------
-
-
-class RunState:
-    """The report fields that belong to the run rather than to a test."""
-
-    def __init__(self, config: ReporterConfig) -> None:
-        """Start from what the config object says."""
-        self._lock = threading.Lock()
-        self._fields: dict[str, Any] = {
-            "vc": config.vc,
-            "owner": config.owner,
-            "cycle_id": config.cycle_id,
-            "labs3": config.labs3,
-        }
-
-    def update(self, **fields: object) -> None:
-        """Set any of `MUTABLE_FIELDS` for every report built from now on."""
-        unknown = sorted(set(fields) - MUTABLE_FIELDS)
-        if unknown:
-            message = (
-                f"not run-wide report state: {', '.join(unknown)} "
-                f"(settable: {', '.join(sorted(MUTABLE_FIELDS))})"
-            )
-            raise ValueError(message)
-        with self._lock:
-            self._fields.update(fields)
-
-    def snapshot(self) -> dict[str, Any]:
-        """Return the state as it stands, to build one report from."""
-        with self._lock:
-            return dict(self._fields)
-
-
-class StateAccess:
-    """The half of the plugin API that is the same wherever a test runs.
-
-    Under xdist a test reaching for ``getplugin`` gets the worker's annotator
-    and not the controller's reporter, so both have to answer to this.
-    """
-
-    def __init__(self, state: RunState) -> None:
-        """Answer for ``state``, which the reporter and annotator may share."""
-        self.run_state = state
-
-    def set_vc(self, vc: str) -> None:
-        """Set the vc recorded on every report built from now on."""
-        self.run_state.update(vc=vc)
-
-    def update(self, **fields: object) -> None:
-        """Set any of `MUTABLE_FIELDS` for every report built from now on."""
-        self.run_state.update(**fields)
-
-    @property
-    def state(self) -> dict[str, Any]:
-        """The run-wide fields as they stand."""
-        return self.run_state.snapshot()
-
-
-# ---------------------------------------------------------------------------
 # The worker half
 # ---------------------------------------------------------------------------
 
 
-class MachineAnnotator(StateAccess):
-    """Reads what only a live item can answer for, and pins it to the report.
+class MachineAnnotator(AttributeSetter):
+    """Answers for the test where the test runs, and pins it to the report.
 
     Registered wherever tests actually run - an xdist worker, or the session
     itself without xdist. The report is the only thing that crosses to the
     controller, so anything the reporter needs has to leave from here.
     """
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_setup(self, item: pytest.Item) -> SetupWrapper:
+        """Ask `resolve_machine` about this test, before its fixtures run."""
+        self.attributes.start_test(item)
+        return (yield)
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_makereport(
@@ -478,16 +533,13 @@ class MachineAnnotator(StateAccess):
         call: pytest.CallInfo[None],
     ) -> ReportWrapper:
         """Attach this process's answers to the phase report."""
+        del item  # the attributes were read from it at the start of the test
         report = yield
         exception, message = describe_exception(call)
         meta: Meta = {
-            "machine": safe_machine(item),
+            "attributes": self.attributes.snapshot(),
             "exception": exception,
             "exception_message": truncate(message, MAX_MESSAGE_CHARS),
-            # Snapshotted per phase: a test that sets the vc mid-run is
-            # describing the reports from that point on, and under xdist this
-            # is the only way that reaches the controller.
-            "state": self.state,
         }
         setattr(report, META_ATTR, meta)
         return report
@@ -500,30 +552,36 @@ class MachineAnnotator(StateAccess):
 
 @dataclass
 class Case:
-    """What the reporter remembers about one test between its reports.
+    """One test's reports, held until the test is done.
 
-    ``held`` is the report that will carry ``last_report`` if nothing displaces
-    it; ``meta`` is what the current attempt's setup arrived with, so a crash
-    can be described without an item; ``running`` says setup was seen and
-    teardown was not; ``rerun_pending`` says this attempt is to be retried.
+    ``reports`` is every phase of every attempt, in order; ``attributes`` is the
+    latest answer from wherever the test ran, which all of them are stamped
+    with; ``running`` says setup was seen and teardown was not; and
+    ``rerun_pending`` says this attempt is to be retried, so the test is not
+    done yet.
     """
 
-    held: CaseReport | None = None
-    meta: Meta = field(default_factory=dict)
+    reports: list[CaseReport] = field(default_factory=list)
+    attributes: dict[str, Any] = field(default_factory=dict)
     running: bool = False
     rerun_pending: bool = False
 
 
-class ElasticCaseReporter(StateAccess):
+class ElasticCaseReporter(AttributeSetter):
     """Turns pytest reports into case reports and hands them to the shipper.
 
     Registered where the reports all come together: the xdist controller, or
     the session itself without xdist.
     """
 
-    def __init__(self, config: ReporterConfig, sender: CaseReportSender, state: RunState) -> None:
-        """Ship what ``config`` says, through ``sender``, tagged from ``state``."""
-        super().__init__(state)
+    def __init__(
+        self,
+        config: ReporterConfig,
+        sender: CaseReportSender,
+        attributes: CaseAttributes,
+    ) -> None:
+        """Ship what ``config`` says, through ``sender``, stamped from ``attributes``."""
+        super().__init__(attributes)
         self.config = config
         self.sender = sender
         self.shipper = BackgroundShipper(sender, config.batch_size, config.flush_interval)
@@ -533,24 +591,8 @@ class ElasticCaseReporter(StateAccess):
 
     # -- the stream ----------------------------------------------------------
 
-    def _build(
-        self,
-        nodeid: str,
-        outcome: str,
-        step_name: str,
-        meta: Meta | None = None,
-        failure: Failure | None = None,
-    ) -> CaseReport:
-        meta = meta or {}
-        failure = failure or Failure()
-        # The state the phase ended in, which under xdist was captured on the
-        # worker. Only a report built here - a collection error - falls back to
-        # this process's own.
-        state = dict(meta.get("state") or self.state)
-        # `machine` is per-item, so the resolver wins; a value set through
-        # update() is the fallback for items it cannot answer for. Popped
-        # unconditionally - it is passed by name below, not in **state.
-        fallback = state.pop("machine", None)
+    def _build(self, nodeid: str, outcome: str, step_name: str, failure: Failure) -> CaseReport:
+        """Build what the phase itself answers for. `stamp` adds the rest."""
         suite, case, arguments = split_nodeid(nodeid)
         self.built += 1
         return CaseReport(
@@ -558,44 +600,31 @@ class ElasticCaseReporter(StateAccess):
             test_suite=suite,
             test_case=case,
             arguments=arguments,
-            machine=meta.get("machine") or fallback,
             step_name=step_name,
-            exception=failure.exception or meta.get("exception"),
-            exception_message=truncate(
-                failure.message or meta.get("exception_message"),
-                MAX_MESSAGE_CHARS,
-            ),
+            exception=failure.exception,
+            exception_message=truncate(failure.message, MAX_MESSAGE_CHARS),
             exception_traceback=truncate(failure.traceback, MAX_TRACEBACK_CHARS),
-            **state,
         )
-
-    def _hold(self, nodeid: str, report: CaseReport) -> None:
-        """Make ``report`` the case's candidate for ``last_report``.
-
-        Nothing can tell at the time whether a report is a test's last: another
-        phase may follow, and after the last phase a rerun may follow. So the
-        newest report waits here and the one it displaces ships unflagged. What
-        is still held when the test is done - or when the run is - is the one
-        that was last, and `_release` flags it there.
-        """
-        case = self._case(nodeid)
-        previous, case.held = case.held, report
-        if previous is not None:
-            self.shipper.submit(previous)
-
-    def _release(self, nodeid: str, *, terminal: bool) -> None:
-        case = self._cases.get(nodeid)
-        if case is None:
-            return
-        if terminal:
-            del self._cases[nodeid]  # nothing left to remember about it
-        report, case.held = case.held, None
-        if report is not None:
-            report.last_report = terminal
-            self.shipper.submit(report)
 
     def _case(self, nodeid: str) -> Case:
         return self._cases.setdefault(nodeid, Case())
+
+    def _ship(self, nodeid: str) -> None:
+        """Ship everything one test produced, stamped and closed out.
+
+        Nothing can tell as a phase ends whether it was the test's last - more
+        phases may follow, and after the last phase a rerun may follow - and
+        the attributes are not final until the test is. So a case is kept here
+        until the test is done, and leaves in one piece: every report stamped
+        with what the test finally said about itself, the last one flagged.
+        """
+        case = self._cases.pop(nodeid, None)
+        if case is None or not case.reports:
+            return
+        case.reports[-1].last_report = True
+        for report in case.reports:
+            stamp(report, case.attributes)
+            self.shipper.submit(report)
 
     # -- hooks ---------------------------------------------------------------
 
@@ -607,6 +636,7 @@ class ElasticCaseReporter(StateAccess):
         """Turn one phase report into a case report."""
         meta: Meta = getattr(report, META_ATTR, None) or {}
         case = self._case(report.nodeid)
+        case.attributes = meta.get("attributes") or case.attributes
         if report.outcome == RERUN_OUTCOME:
             # pytest-rerunfailures marks the failure it is about to retry, and
             # rewrites the crashed-worker report below the same way.
@@ -615,17 +645,19 @@ class ElasticCaseReporter(StateAccess):
             self._worker_crashed(report, case)
             return
         if report.when == "setup":
-            case.meta, case.running = meta, True
+            case.running = True
         elif report.when == "teardown":
             case.running = False
-        self._hold(
-            report.nodeid,
+        case.reports.append(
             self._build(
                 report.nodeid,
                 outcome_of(report),
                 PHASE_STEPS[report.when],
-                meta=meta,
-                failure=Failure(traceback=report.longreprtext or None),
+                Failure(
+                    exception=meta.get("exception"),
+                    message=meta.get("exception_message"),
+                    traceback=report.longreprtext or None,
+                ),
             ),
         )
 
@@ -633,7 +665,7 @@ class ElasticCaseReporter(StateAccess):
         """Close the case out, unless another attempt at it is coming."""
         case = self._cases.get(nodeid)
         if case is not None and not case.rerun_pending:
-            self._release(nodeid, terminal=True)
+            self._ship(nodeid)
 
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         """Report a collection error, which no phase report will describe.
@@ -642,20 +674,21 @@ class ElasticCaseReporter(StateAccess):
         deduplicated across workers, so it arrives here exactly once.
         """
         if report.failed:
-            self._hold(
-                report.nodeid,
+            case = self._case(report.nodeid)
+            case.attributes = self.attributes.snapshot()
+            case.reports.append(
                 self._build(
                     report.nodeid,
                     OUTCOMES["error"],
                     COLLECTION_STEP,
-                    failure=Failure(
+                    Failure(
                         exception="CollectError",
                         message=f"collection of {report.nodeid} failed",
                         traceback=report.longreprtext or None,
                     ),
                 ),
             )
-            self._release(report.nodeid, terminal=True)
+            self._ship(report.nodeid)
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
@@ -673,25 +706,23 @@ class ElasticCaseReporter(StateAccess):
         """Turn xdist's stand-in for a dead worker into a terminal report.
 
         The stand-in knows only the nodeid, so the case is described by what
-        its setup report carried. It is terminal unless the test is being
+        the worker said before it died. It is terminal unless the test is being
         re-queued, which pytest-rerunfailures says by rewriting the outcome.
         """
         case.running = False
-        self._hold(
-            report.nodeid,
+        case.reports.append(
             self._build(
                 report.nodeid,
                 OUTCOMES["crashed"],
                 PHASE_STEPS["teardown"],
-                meta=case.meta,
-                failure=Failure(
+                Failure(
                     exception="WorkerCrash",
                     message=report.longreprtext or "the worker running it died",
                 ),
             ),
         )
         if not case.rerun_pending:
-            self._release(report.nodeid, terminal=True)
+            self._ship(report.nodeid)
 
     def _close(self, reason: str) -> None:
         if self._closed:
@@ -702,14 +733,12 @@ class ElasticCaseReporter(StateAccess):
                 # It started and never reached teardown, so nothing else will
                 # close this case out. The step is Teardown on purpose: every
                 # case in the index then ends with one, crashed or not.
-                self._hold(
-                    nodeid,
+                case.reports.append(
                     self._build(
                         nodeid,
                         OUTCOMES["crashed"],
                         PHASE_STEPS["teardown"],
-                        meta=case.meta,
-                        failure=Failure(
+                        Failure(
                             exception="TestIncomplete",
                             message=f"never reached teardown: {reason}",
                         ),
@@ -717,7 +746,7 @@ class ElasticCaseReporter(StateAccess):
                 )
             # Held because a rerun was expected that the run never got to, or
             # because the case never finished. Either way this was its last.
-            self._release(nodeid, terminal=True)
+            self._ship(nodeid)
         self.shipper.close(self.config.shutdown_timeout)
 
 
@@ -761,16 +790,6 @@ def describe_exception(call: pytest.CallInfo[None] | None) -> tuple[str | None, 
     return excinfo.typename, str(excinfo.value)
 
 
-def safe_machine(item: pytest.Item | None) -> str | None:
-    """Return `resolve_machine`, or None if it was not in a position to answer."""
-    if item is None:
-        return None
-    try:
-        return resolve_machine(item)
-    except Exception:  # noqa: BLE001 - a lookup of someone else's is not worth a failed run
-        return None
-
-
 def truncate(text: str | None, limit: int) -> str | None:
     """Cut ``text`` to ``limit`` characters, saying so where it was cut."""
     if text is None or len(text) <= limit:
@@ -811,15 +830,16 @@ def summarise(config: pytest.Config, reporter: ElasticCaseReporter) -> None:
         terminal.write_line("  elastic-reporter: " + error, red=True)
 
 
-def get_reporter(config: pytest.Config) -> StateAccess | None:
-    """Return whatever this process registered, or None when the plugin is off.
-
-    The stream owner everywhere except an xdist worker, where it is that
-    worker's annotator. Both answer `StateAccess.set_vc`, `StateAccess.update`
-    and `StateAccess.state`.
-    """
+def case_attributes(config: pytest.Config) -> CaseAttributes | None:
+    """Return the component every attribute is set through, or None when off."""
     plugin = config.pluginmanager.get_plugin(PLUGIN_NAME)
-    return plugin if isinstance(plugin, StateAccess) else None
+    return plugin.attributes if isinstance(plugin, AttributeSetter) else None
+
+
+def get_reporter(config: pytest.Config) -> ElasticCaseReporter | None:
+    """Return the stream owner, which an xdist worker does not have."""
+    plugin = config.pluginmanager.get_plugin(PLUGIN_NAME)
+    return plugin if isinstance(plugin, ElasticCaseReporter) else None
 
 
 def is_xdist_worker(config: pytest.Config) -> bool:
@@ -840,15 +860,15 @@ def pytest_configure(config: pytest.Config) -> None:
     settings = ReporterConfig.from_pytest(config)
     if not settings.enabled:
         return
-    state = RunState(settings)
+    attributes = CaseAttributes(settings)
     worker, controller = is_xdist_worker(config), is_xdist_controller(config)
     if not controller:
-        # Items run here, so this is where a machine can be resolved - and, on
-        # a worker, what test code reaching for `getplugin` finds.
-        annotator = MachineAnnotator(state)
+        # Items run here, so this is where the test can be asked about itself -
+        # and, on a worker, what test code reaching for `getplugin` finds.
+        annotator = MachineAnnotator(attributes)
         config.pluginmanager.register(annotator, PLUGIN_NAME if worker else ANNOTATOR_NAME)
     if not worker:
         # The one line to change for a real run: anything with .send(list[dict]).
-        reporter = ElasticCaseReporter(settings, MockElasticSender(settings.url), state)
+        reporter = ElasticCaseReporter(settings, MockElasticSender(settings.url), attributes)
         reporter.shipper.start()
         config.pluginmanager.register(reporter, PLUGIN_NAME)
