@@ -49,8 +49,8 @@ the phase, and they come from everywhere - a conftest hook, a fixture that
 connects to the machine, the test body itself. So there is one way to set any
 of them, from anywhere that can see a pytest ``config``::
 
-    reporter = request.config.pluginmanager.getplugin("elastic-reporter")
-    reporter.set(vc="fw-4.2.1", machine="rack1-dut7")
+    plugin = request.config.pluginmanager.getplugin("elastic-reporter")
+    plugin.set(vc="fw-4.2.1", machine="rack1-dut7")
 
 or, with no ``config`` to hand, `reporter`::
 
@@ -82,8 +82,8 @@ fixture that allocates it, or one that reads it off the item::
 
     @pytest.fixture(autouse=True)
     def record_machine(request):
-        reporter = request.config.pluginmanager.getplugin("elastic-reporter")
-        reporter.set(machine=machine_for(request.node))
+        plugin = request.config.pluginmanager.getplugin("elastic-reporter")
+        plugin.set(machine=machine_for(request.node))
 
 Reruns
 ------
@@ -174,7 +174,7 @@ PHASE_STEPS = {"setup": "setup", "call": "call", "teardown": "teardown"}
 
 COLLECTION_STEP = "collect"
 
-#: What the annotator reads off a live item for the reporter to build with.
+#: What the annotator sends with a report for the reporter to build from.
 type Meta = dict[str, Any]
 
 #: One case report, as elastic wants it.
@@ -347,11 +347,11 @@ class CaseAttributes:
 class ElasticPlugin:
     """What ``getplugin("elastic-reporter")`` hands you, in any process.
 
-    A session registers one of these under that name whatever it is doing: the
-    reporter where the stream is built, the annotator on an xdist worker, and
-    this plain one when the plugin is switched off. They all set attributes the
-    same way, so nothing that sets one needs to know which it got, or to check
-    that it got anything.
+    A session registers one under that name whichever half it needs: the
+    reporter where the stream is built, the annotator on an xdist worker. This
+    plain one is what `reporter` answers with outside a session, where there is
+    nobody to report to. All three set attributes the same way, so nothing that
+    sets one needs to know which it got.
     """
 
     #: The one this process is using, for code with no ``config`` to hand.
@@ -684,17 +684,17 @@ def exit_reason(session: pytest.Session, exitstatus: int) -> str:
     return f"the session ended ({status})"
 
 
-def summarise(config: pytest.Config, reporter: ElasticCaseReporter) -> None:
+def summarise(config: pytest.Config, plugin: ElasticCaseReporter) -> None:
     """Write what was reported, and anything the hook made of it."""
     terminal = config.pluginmanager.get_plugin("terminalreporter")
     if terminal is None:
         return
-    terminal.write_sep("-", f"elastic-reporter: {reporter.emitted} case report(s)")
-    for error in reporter.errors:
+    terminal.write_sep("-", f"elastic-reporter: {plugin.emitted} case report(s)")
+    for error in plugin.errors:
         terminal.write_line("  elastic-reporter: pytest_case_report raised " + error, red=True)
-    if reporter.failures > len(reporter.errors):
+    if plugin.failures > len(plugin.errors):
         terminal.write_line(
-            f"  elastic-reporter: and {reporter.failures - len(reporter.errors)} more like it",
+            f"  elastic-reporter: and {plugin.failures - len(plugin.errors)} more like it",
             red=True,
         )
 
