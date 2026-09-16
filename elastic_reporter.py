@@ -97,8 +97,8 @@ the plugin's exactly, and the model checks what you built before it leaves.
 
 Setting a test's attributes
 ---------------------------
-`machine`, `vc`, `cycle_id`, `owner` and the rest describe the test rather than
-the step, and they come from everywhere - a conftest hook, a fixture that
+`machine`, `vc`, `cycle_id`, `cycle_start_time`, `owner` and the rest describe
+the test rather than the step, and they come from everywhere - a conftest hook, a fixture that
 connects to the machine, the test body itself. There are two ways to set one,
 and which you want is the question of how long it is true for.
 
@@ -149,6 +149,16 @@ and `set_global` and `set_test` take it, checked against the type you gave it,
 and it is in every document from then on. `SETTABLE` is derived from the model,
 so there is no second list to keep up to date.
 
+Text, a number or a boolean, though - because an attribute set on an xdist
+worker travels to the controller on pytest's own report, and that wire carries
+nothing else. For a time, use `Timestamp`, which takes a datetime or an ISO
+string and stores one UTC string::
+
+    cycle_start_time: Timestamp | None = None
+
+Anything else is refused where it is set, naming the field, rather than inside
+xdist with no tests run.
+
 Reruns
 ------
 A test can be attempted more than once: pytest-rerunfailures retries a failure
@@ -187,10 +197,10 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -277,6 +287,39 @@ type ReportWrapper = Generator[None, pytest.TestReport, pytest.TestReport]
 # ---------------------------------------------------------------------------
 
 
+def as_utc_text(value: object) -> object:
+    """Turn a time into one unambiguous string, or say why it is not a time.
+
+    A datetime or an ISO 8601 string in, ``2026-04-01T09:00:00Z`` out: UTC,
+    with the same `Z` that the model's own timestamps carry, so two fields of
+    one document never disagree about what a time looks like. A datetime with
+    no timezone is taken as UTC, because guessing the machine's offset is how
+    a cycle ends up an hour wide in elastic.
+
+    A string, and not a `datetime`, because an attribute crosses from an xdist
+    worker to the controller on pytest's report - and that wire carries
+    strings and numbers, nothing else. See `check_attributes`.
+    """
+    if isinstance(value, datetime):
+        moment = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    elif isinstance(value, str):
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            message = f"not a time: {value!r} (try 2026-04-01T09:00:00Z)"
+            raise ValueError(message) from None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+    else:
+        return value  # let the model say what it thinks of it
+    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+#: A time on a case report: given a datetime or an ISO string, stored as one
+#: UTC string. `as_utc_text` says why it is text and not a `datetime`.
+Timestamp = Annotated[str, BeforeValidator(as_utc_text)]
+
+
 class CaseReport(BaseModel):
     """Minimal case report model for elastic."""
 
@@ -293,6 +336,7 @@ class CaseReport(BaseModel):
     machine: str | None = None  # set per test, see `CaseAttributes`
     vc: str = "mock-vc"
     cycle_id: int = 1
+    cycle_start_time: Timestamp | None = None  # when the cycle this ran in began
     owner: str = "mock-owner"
     time: datetime = Field(default_factory=lambda: datetime.now(UTC))
     exception: str | None = None
@@ -354,6 +398,10 @@ PLUGIN_FIELDS = frozenset(
 SETTABLE = frozenset(CaseReport.model_fields) - PLUGIN_FIELDS
 
 
+#: What an attribute may be by the time it is stored: what pytest's report
+#: serialiser and xdist's wire will both carry, and nothing else.
+WIRE_TYPES = (str, int, float, bool, type(None))
+
 #: One validator per settable field, so `check_attributes` can check a value
 #: against the model without an instance to assign it to.
 FIELD_TYPES = {
@@ -376,7 +424,27 @@ def check_attributes(attributes: dict[str, object]) -> dict[str, Any]:
             f"(settable: {', '.join(sorted(SETTABLE))})"
         )
         raise ValueError(message)
-    return {name: FIELD_TYPES[name].validate_python(value) for name, value in attributes.items()}
+    checked = {
+        name: FIELD_TYPES[name].validate_python(value) for name, value in attributes.items()
+    }
+    # An attribute set on an xdist worker reaches the controller on pytest's
+    # report, and that wire takes strings, numbers and booleans. A field typed
+    # as anything else would not fail here - it would fail inside xdist's
+    # dispatcher, as an INTERNALERROR with no tests run. Say it here instead,
+    # naming the field, before a single test has been collected.
+    unsendable = sorted(
+        f"{name}={type(value).__name__}"
+        for name, value in checked.items()
+        if not isinstance(value, WIRE_TYPES)
+    )
+    if unsendable:
+        message = (
+            f"a case attribute has to be text, a number or a boolean, so that it can "
+            f"reach the controller from an xdist worker: {', '.join(unsendable)} "
+            f"(a time belongs in a `Timestamp` field, which is text)"
+        )
+        raise TypeError(message)
+    return checked
 
 
 def stamp(report: CaseReport, attributes: dict[str, Any]) -> None:

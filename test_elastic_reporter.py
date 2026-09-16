@@ -12,11 +12,11 @@ import collections
 import json
 import shutil
 import threading
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from time import monotonic
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 import elastic_reporter as er
 
@@ -986,3 +986,86 @@ def test_a_new_attribute_is_one_line_on_the_model():
     """`SETTABLE` is derived, so a new field needs naming nowhere else."""
     assert frozenset(er.CaseReport.model_fields) - er.PLUGIN_FIELDS == er.SETTABLE
     assert set(er.FIELD_TYPES) == er.SETTABLE
+
+
+# ---------------------------------------------------------------------------
+# times on a case report
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("given", "stored"),
+    [
+        (datetime(2026, 4, 1, 9, 0, tzinfo=UTC), "2026-04-01T09:00:00Z"),
+        (datetime(2026, 4, 1, 9, 0), "2026-04-01T09:00:00Z"),  # noqa: DTZ001 - naive, on purpose
+        (datetime(2026, 4, 1, 12, 0, tzinfo=timezone(timedelta(hours=3))), "2026-04-01T09:00:00Z"),
+        ("2026-04-01T09:00:00Z", "2026-04-01T09:00:00Z"),
+        ("2026-04-01T09:00:00+03:00", "2026-04-01T06:00:00Z"),
+        ("2026-04-01T09:00:00", "2026-04-01T09:00:00Z"),
+        ("2026-04-01", "2026-04-01T00:00:00Z"),
+        (None, None),
+    ],
+)
+def test_a_cycle_start_time_is_stored_as_one_utc_string(given, stored):
+    attributes = er.CaseAttributes()
+    attributes.set_global(cycle_start_time=given)
+    assert attributes.snapshot()["cycle_start_time"] == stored
+
+
+def test_a_cycle_start_time_that_is_not_a_time_is_refused_where_it_is_set():
+    attributes = er.CaseAttributes()
+    with pytest.raises(ValidationError, match="not a time: 'yesterday'"):
+        attributes.set_test(cycle_start_time="yesterday")
+    with pytest.raises(ValidationError):
+        attributes.set_test(cycle_start_time=1_775_000_000)
+
+
+def test_a_time_comes_out_of_the_document_the_way_the_other_one_does():
+    """Two timestamps in one document must not disagree about what a time is."""
+    attributes = er.CaseAttributes()
+    attributes.set_global(cycle_start_time=datetime(2026, 4, 1, 9, 0, tzinfo=UTC))
+    report = er.CaseReport(test_suite="t.py", test_case="test_a")
+    er.stamp(report, attributes.snapshot())
+    document = report.to_dict()
+    assert document["cycle_start_time"] == "2026-04-01T09:00:00Z"
+    assert document["time"].endswith("Z")
+
+
+def test_an_attribute_that_could_not_cross_the_wire_is_refused(monkeypatch):
+    """Attributes ride to the controller on the report, and that wire is basic types.
+
+    Without this it is an INTERNALERROR inside xdist's dispatcher with no
+    tests run, which is a long way from the line that caused it.
+    """
+    monkeypatch.setitem(er.FIELD_TYPES, "machine", TypeAdapter(datetime))
+    attributes = er.CaseAttributes()
+    with pytest.raises(TypeError, match="machine=datetime"):
+        attributes.set_global(machine=datetime(2026, 4, 1, tzinfo=UTC))
+
+
+def test_a_cycle_start_time_reaches_the_controller_from_every_worker(run):
+    pytest.importorskip("xdist")
+    _, documents = run(
+        """
+        import pytest
+
+        @pytest.mark.parametrize("n", range(4))
+        def test_spread(n):
+            pass
+        """,
+        "-n",
+        "2",
+        conftest=RECORD
+        + """
+import datetime
+
+def pytest_sessionstart(session):
+    session.config.pluginmanager.getplugin("elastic-reporter").set_global(
+        cycle_id=7,
+        cycle_start_time=datetime.datetime(2026, 4, 1, 9, 0, tzinfo=datetime.UTC),
+    )
+""",
+    )
+    assert len(documents) == 12
+    assert {d["cycle_start_time"] for d in documents} == {"2026-04-01T09:00:00Z"}
+    assert {d["cycle_id"] for d in documents} == {7}
