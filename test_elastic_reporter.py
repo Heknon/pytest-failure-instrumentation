@@ -12,6 +12,7 @@ import collections
 import json
 import shutil
 import threading
+import types
 from datetime import UTC, datetime, timedelta, timezone
 from time import monotonic
 
@@ -1069,3 +1070,102 @@ def pytest_sessionstart(session):
     assert len(documents) == 12
     assert {d["cycle_start_time"] for d in documents} == {"2026-04-01T09:00:00Z"}
     assert {d["cycle_id"] for d in documents} == {7}
+
+
+def test_the_run_decides_the_cycle_start_time_not_each_process(run):
+    """Three workers start at three moments. One run began once."""
+    pytest.importorskip("xdist")
+    _, documents = run(
+        """
+        import pytest
+
+        @pytest.mark.parametrize("n", range(6))
+        def test_spread(n):
+            pass
+        """,
+        "-n",
+        "3",
+    )
+    assert len(documents) == 18
+    starts = {d["cycle_start_time"] for d in documents}
+    assert len(starts) == 1
+    assert starts.pop().endswith("Z")
+
+
+def test_a_worker_started_late_reports_the_cycle_that_began_early(run):
+    """The one that matters: a worker replacing a dead one began much later."""
+    pytest.importorskip("xdist")
+    result, documents = run(
+        """
+        import os
+        import pathlib
+        import time
+
+        import pytest
+
+        CRASHED = pathlib.Path(__file__).parent / "crashed.txt"
+
+        def test_kills_its_worker():
+            if not CRASHED.exists():
+                CRASHED.write_text("once")
+                os._exit(1)
+
+        @pytest.mark.parametrize("n", range(3))
+        def test_after(n):
+            time.sleep(0.4)  # so a replacement worker starts a second later
+        """,
+        "-n",
+        "2",
+        "--max-worker-restart",
+        "4",
+    )
+    assert result.ret != 0  # the crash is a failure, which is not our business
+    assert len({d["cycle_start_time"] for d in documents}) == 1
+    revived = [d for d in documents if d["test_case"] == "test_kills_its_worker"]
+    assert revived
+    assert {d["cycle_start_time"] for d in revived} == {
+        d["cycle_start_time"] for d in documents
+    }
+
+
+def test_the_controller_can_say_when_the_cycle_began(run):
+    """A cycle that began before pytest did. The workers are told, not asked."""
+    pytest.importorskip("xdist")
+    _, documents = run(
+        """
+        import pytest
+
+        @pytest.mark.parametrize("n", range(4))
+        def test_spread(n):
+            pass
+        """,
+        "-n",
+        "2",
+        conftest=RECORD
+        + """
+import elastic_reporter as er
+
+def pytest_configure(config):
+    if hasattr(config, "workerinput"):
+        return  # the controller decides; the workers are told
+    er.reporter().set_global(cycle_start_time="2026-04-01T09:00:00Z")
+""",
+    )
+    assert len(documents) == 12
+    assert {d["cycle_start_time"] for d in documents} == {"2026-04-01T09:00:00Z"}
+
+
+def a_worker(**workerinput):
+    """Stand in for a config carrying what the controller told this worker."""
+    return types.SimpleNamespace(workerinput=workerinput)
+
+
+def test_run_started_takes_the_controllers_answer_over_its_own():
+    told = a_worker(**{er.WORKER_START: "2026-04-01T09:00:00Z"})
+    assert er.run_started(told) == "2026-04-01T09:00:00Z"
+    # A controller without this plugin tells a worker nothing, and a run
+    # without xdist has nobody to be told by: both begin when they begin.
+    assert er.run_started(a_worker()).endswith("Z")
+    assert er.run_started(object()).endswith("Z")
+    # The controller has no cycle start time, so neither has the worker.
+    assert er.run_started(a_worker(**{er.WORKER_START: None})) is None

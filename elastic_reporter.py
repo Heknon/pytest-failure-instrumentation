@@ -139,6 +139,27 @@ gives it. Where both scopes name the same attribute, the test wins. The plugin
 adds no options of its own: a value for the whole run is the line above,
 reading it from wherever you keep it.
 
+When the cycle began
+--------------------
+`cycle_start_time` is filled in for you: the moment the run began, as one UTC
+string, the same one in every process of that run. The controller decides it
+and tells each xdist worker, so a worker that started a minute later - or was
+started to replace one that died - reports the cycle that began, not the moment
+it personally woke up. Without that, three workers are three cycle start times
+in one run, which is what a dashboard grouping by cycle cannot have.
+
+If your cycle began before pytest did - a CI job that built something first -
+say so on the controller, before the workers are made, and they are told rather
+than asked::
+
+    def pytest_sessionstart(session):
+        if hasattr(session.config, "workerinput"):
+            return                                    # the controller decides
+        reporter().set_global(cycle_start_time=os.environ["CYCLE_START"])
+
+`pytest_configure` works the same way. A value every process computes
+identically - an environment variable, not ``datetime.now()`` - needs no guard.
+
 Adding an attribute of your own
 -------------------------------
 One line. A field on `CaseReport`::
@@ -204,8 +225,18 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from typing import Protocol
 
     from pluggy import HookRelay
+
+    class WorkerNode(Protocol):
+        """The part of an xdist worker node this plugin touches.
+
+        Spelt out rather than imported: xdist is optional, and this is the
+        whole of what a controller needs from a node it is setting up.
+        """
+
+        workerinput: dict[str, Any]
 
 #: A test report's outcome when pytest-rerunfailures is about to retry it.
 RERUN_OUTCOME = "rerun"
@@ -215,6 +246,11 @@ RERUN_OUTCOME = "rerun"
 #: ``-p elastic_reporter`` already claims that.
 PLUGIN_NAME = "elastic-reporter"
 ANNOTATOR_NAME = "elastic-reporter-annotator"
+
+#: The key the controller puts its own start time under in each xdist
+#: worker's ``workerinput``. One run, one cycle start time, however many
+#: processes it takes and however many of them are started late.
+WORKER_START = "elastic_cycle_start_time"
 
 #: Set by the annotator on every test report, read by the reporter - possibly
 #: in another process. pytest round-trips unknown report attributes through its
@@ -285,6 +321,26 @@ type ReportWrapper = Generator[None, pytest.TestReport, pytest.TestReport]
 # ---------------------------------------------------------------------------
 # The report
 # ---------------------------------------------------------------------------
+
+
+def now_text() -> str:
+    """Return this moment, the way a `Timestamp` field stores one."""
+    return datetime.now(UTC).astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def run_started(config: pytest.Config) -> str | None:
+    """Return when the run began: the same answer in every process of it.
+
+    An xdist worker is told by the controller, through ``workerinput``, and
+    takes that answer even when it is None - a worker that started a minute
+    later, or was started to replace one that died, must not report a cycle
+    that began a minute later. Any other process began when it began.
+    """
+    inherited = getattr(config, "workerinput", {})
+    if WORKER_START in inherited:
+        value = inherited[WORKER_START]
+        return value if isinstance(value, str) else None
+    return now_text()
 
 
 def as_utc_text(value: object) -> object:
@@ -1089,6 +1145,20 @@ class ElasticCaseReporter(ElasticPlugin):
                 ),
             )
 
+    # optionalhook: this is xdist's hookspec, and most runs have no xdist.
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_configure_node(self, node: "WorkerNode") -> None:
+        """Give a worker the run's start time, so every process reports the same one.
+
+        Read from the attributes rather than remembered, so that a conftest
+        that set its own `cycle_start_time` before the workers started - a
+        cycle that began before pytest did - is the one they are told about.
+        """
+        try:
+            node.workerinput[WORKER_START] = self.attributes.snapshot().get("cycle_start_time")
+        except Exception as exc:  # noqa: BLE001 - see `ElasticPlugin.fault`
+            self.fault("pytest_configure_node", exc)
+
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         """Close every test the run left open, then drain the queue."""
@@ -1415,6 +1485,9 @@ def pytest_configure(config: pytest.Config) -> None:
     """Register the half of the plugin this process is responsible for."""
     check_vocabulary(("OUTCOMES", OUTCOMES), ("PHASE_STEPS", PHASE_STEPS))
     attributes = CaseAttributes()
+    # The run's own start time, before the detached values below and before
+    # any conftest hook, so that either can say otherwise and be obeyed.
+    attributes.set_global(cycle_start_time=run_started(config))
     detached = ElasticPlugin.current
     if type(detached) is ElasticPlugin:
         # Something set attributes through `reporter` before there was a
