@@ -160,6 +160,11 @@ than asked::
 `pytest_configure` works the same way. A value every process computes
 identically - an environment variable, not ``datetime.now()`` - needs no guard.
 
+Set it per process and each worker reports a cycle of its own, which is the
+one thing this is here to prevent. That is allowed, because refusing what
+somebody asked for is worse, but it is not silent: the worker says so, naming
+both times and the line that did it.
+
 Adding an attribute of your own
 -------------------------------
 One line. A field on `CaseReport`::
@@ -618,7 +623,7 @@ class ReportingFault(UserWarning):
     """
 
 
-def warn(message: str) -> None:
+def warn(message: str, stacklevel: int = 3) -> None:
     """Say something about the reporting, without a chance of failing the run.
 
     A suite with ``filterwarnings = error`` turns a warning into an exception,
@@ -627,7 +632,7 @@ def warn(message: str) -> None:
     # BaseException: a warning filter can raise anything it likes, and then
     # the run hears nothing about the reporting and carries on running.
     with contextlib.suppress(BaseException):
-        warnings.warn(f"elastic-reporter: {message}", ReportingFault, stacklevel=3)
+        warnings.warn(f"elastic-reporter: {message}", ReportingFault, stacklevel=stacklevel)
 
 
 class ElasticPlugin:
@@ -878,10 +883,49 @@ class ReportAnnotator(ElasticPlugin):
     controller, so anything the reporter needs has to leave from here.
     """
 
-    def __init__(self, attributes: CaseAttributes) -> None:
-        """Answer for ``attributes``, and remember what has been annotated."""
+    def __init__(self, attributes: CaseAttributes, told: str | None = None) -> None:
+        """Answer for ``attributes``, and remember what has been annotated.
+
+        ``told`` is what the controller said the run's cycle start time was,
+        on an xdist worker, and None anywhere else.
+        """
         super().__init__(attributes)
         self._annotated: list[pytest.TestReport] = []
+        self.told = told
+
+    def set_global(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for this test and every test after it."""
+        self.check_the_cycle(attributes)
+        super().set_global(**attributes)
+
+    def set_test(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for the test running now, and no other."""
+        self.check_the_cycle(attributes)
+        super().set_test(**attributes)
+
+    def check_the_cycle(self, attributes: dict[str, object]) -> None:
+        """Say so if this worker is giving the run a cycle start time of its own.
+
+        A run has one. A worker that sets its own - ``datetime.now()`` in a
+        hook that every process runs, which is the obvious way to write it -
+        gives its own tests a different one from every other worker's, and a
+        dashboard grouping by cycle cannot have that. It is allowed, because
+        refusing what somebody asked for is worse, but it is not silent. Set
+        it on the controller instead and the workers are told.
+        """
+        if self.told is None or "cycle_start_time" not in attributes:
+            return
+        try:
+            wanted = as_utc_text(attributes["cycle_start_time"])
+        except Exception:  # noqa: BLE001 - not a time at all, which `set` will say
+            return
+        if wanted != self.told:
+            warn(
+                f"this worker is reporting a cycle that began at {wanted}, and the rest "
+                f"of the run one that began at {self.told}. A run has one cycle start "
+                f"time: set it on the controller, and every worker is told.",
+                stacklevel=4,  # whoever called `set_global`, not this plugin
+            )
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_makereport(self, call: pytest.CallInfo[None]) -> ReportWrapper:
@@ -1487,7 +1531,8 @@ def pytest_configure(config: pytest.Config) -> None:
     attributes = CaseAttributes()
     # The run's own start time, before the detached values below and before
     # any conftest hook, so that either can say otherwise and be obeyed.
-    attributes.set_global(cycle_start_time=run_started(config))
+    started = run_started(config)
+    attributes.set_global(cycle_start_time=started)
     detached = ElasticPlugin.current
     if type(detached) is ElasticPlugin:
         # Something set attributes through `reporter` before there was a
@@ -1499,7 +1544,9 @@ def pytest_configure(config: pytest.Config) -> None:
         if not controller:
             # Reports are made here, so this is where they can be annotated -
             # and, on a worker, what test code reaching for `getplugin` finds.
-            annotator = ReportAnnotator(attributes)
+            # On a worker, `started` came from the controller, and is what
+            # this process is held to if it tries to set its own.
+            annotator = ReportAnnotator(attributes, told=started if worker else None)
             config.pluginmanager.register(annotator, PLUGIN_NAME if worker else ANNOTATOR_NAME)
         if not worker:
             plugin = ElasticCaseReporter(config.hook, attributes)

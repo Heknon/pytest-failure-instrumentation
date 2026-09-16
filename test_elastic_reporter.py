@@ -13,6 +13,7 @@ import json
 import shutil
 import threading
 import types
+import warnings
 from datetime import UTC, datetime, timedelta, timezone
 from time import monotonic
 
@@ -1169,3 +1170,57 @@ def test_run_started_takes_the_controllers_answer_over_its_own():
     assert er.run_started(object()).endswith("Z")
     # The controller has no cycle start time, so neither has the worker.
     assert er.run_started(a_worker(**{er.WORKER_START: None})) is None
+
+
+def test_a_worker_giving_the_run_its_own_cycle_start_time_says_so(monkeypatch):
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)
+    worker = er.ReportAnnotator(er.CaseAttributes(), told="2026-04-01T09:00:00Z")
+    with pytest.warns(er.ReportingFault, match="one cycle start time"):
+        worker.set_global(cycle_start_time="2026-04-01T10:00:00Z")
+    # Said, not refused: what somebody asked for still happens.
+    assert worker.attributes.snapshot()["cycle_start_time"] == "2026-04-01T10:00:00Z"
+
+
+def test_a_worker_told_the_same_moment_says_nothing(monkeypatch):
+    """The same constant in every process is the same cycle, however it is written."""
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)
+    worker = er.ReportAnnotator(er.CaseAttributes(), told="2026-04-01T09:00:00Z")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        same = datetime(2026, 4, 1, 12, 0, tzinfo=timezone(timedelta(hours=3)))
+        worker.set_global(cycle_start_time=same)  # 09:00 UTC, written differently
+        worker.set_test(machine="rack1")  # nothing to do with the cycle
+        worker.set_global(owner="lab-team")
+
+
+def test_without_xdist_there_is_nobody_to_disagree_with(monkeypatch):
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)
+    alone = er.ReportAnnotator(er.CaseAttributes())  # told nothing: no controller above
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        alone.set_global(cycle_start_time="2026-04-01T10:00:00Z")
+
+
+def test_a_run_whose_workers_each_set_their_own_cycle_is_told_about_it(run):
+    pytest.importorskip("xdist")
+    result, documents = run(
+        """
+        def test_a(): pass
+        def test_b(): pass
+        """,
+        "-n",
+        "2",
+        conftest=RECORD
+        + """
+from datetime import UTC, datetime
+
+import elastic_reporter as er
+
+def pytest_sessionstart(session):
+    er.reporter().set_global(cycle_start_time=datetime.now(UTC))  # the drifting way
+""",
+    )
+    result.assert_outcomes(passed=2)  # said, not refused
+    assert len({d["cycle_start_time"] for d in documents}) > 1
+    # A worker's warning comes back on the controller's stderr, not its stdout.
+    assert "A run has one cycle start time" in result.stdout.str() + result.stderr.str()
