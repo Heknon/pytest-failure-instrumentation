@@ -99,32 +99,55 @@ Setting a test's attributes
 ---------------------------
 `machine`, `vc`, `cycle_id`, `owner` and the rest describe the test rather than
 the step, and they come from everywhere - a conftest hook, a fixture that
-connects to the machine, the test body itself. So there is one way to set any
-of them, from anywhere that can see a pytest ``config``::
+connects to the machine, the test body itself. There are two ways to set one,
+and which you want is the question of how long it is true for.
 
-    plugin = request.config.pluginmanager.getplugin("elastic-reporter")
-    plugin.set(vc="fw-4.2.1", machine="rack1-dut7")
-
-or, with no ``config`` to hand, `reporter`::
-
-    from elastic_reporter import reporter
-
-    def test_upgrade():
-        reporter().set(vc="fw-5.0.0")
-
-It takes any of `SETTABLE` - every field of `CaseReport` except the ones a step
-answers for itself - and whatever is never set keeps the default the model
-gives it. The plugin adds no options of its own: a value for the whole run is a
-line in a conftest hook, reading it from wherever you keep it::
+`ElasticPlugin.set_global` is for what is true of the whole run. Set it once,
+in a hook every process runs::
 
     def pytest_sessionstart(session):
         # runs in every process, controller and xdist worker alike
-        session.config.pluginmanager.getplugin("elastic-reporter").set(
+        session.config.pluginmanager.getplugin("elastic-reporter").set_global(
             vc=os.environ["FIRMWARE"],
             cycle_id=int(os.environ["CYCLE"]),
         )
 
-Values stick until changed, so a process can set one and forget it.
+`ElasticPlugin.set_test` is for what one test answers for. It applies to the
+test running now and to no other: the next test starts without it, whatever
+this one did - passed, failed, or killed the worker it was running on. Nothing
+has to be put back by hand::
+
+    @pytest.fixture
+    def dut(request):
+        device = lab.allocate(...)
+        request.config.pluginmanager.getplugin("elastic-reporter").set_test(
+            machine=device.name, hostname=socket.gethostname()
+        )
+        yield device
+        device.close()
+
+Either one, with no ``config`` to hand, through `reporter`::
+
+    from elastic_reporter import reporter
+
+    def test_upgrade():
+        reporter().set_test(vc="fw-5.0.0")
+
+Both take any of `SETTABLE` - every field of `CaseReport` except the ones a
+step answers for itself - and whatever is never set keeps the default the model
+gives it. Where both scopes name the same attribute, the test wins. The plugin
+adds no options of its own: a value for the whole run is the line above,
+reading it from wherever you keep it.
+
+Adding an attribute of your own
+-------------------------------
+One line. A field on `CaseReport`::
+
+    hostname: str | None = None
+
+and `set_global` and `set_test` take it, checked against the type you gave it,
+and it is in every document from then on. `SETTABLE` is derived from the model,
+so there is no second list to keep up to date.
 
 Reruns
 ------
@@ -326,18 +349,34 @@ PLUGIN_FIELDS = frozenset(
     },
 )
 
-#: Every attribute `CaseAttributes.set` will take, derived from the model, so a
-#: new field on `CaseReport` is settable without being named twice.
+#: Every attribute `CaseAttributes` will take, derived from the model, so a new
+#: field on `CaseReport` is settable without being named anywhere a second time.
 SETTABLE = frozenset(CaseReport.model_fields) - PLUGIN_FIELDS
 
 
-#: One validator per settable field, so `CaseAttributes.set` can check a value
+#: One validator per settable field, so `check_attributes` can check a value
 #: against the model without an instance to assign it to.
 FIELD_TYPES = {
     name: TypeAdapter(field.annotation)
     for name, field in CaseReport.model_fields.items()
     if name in SETTABLE
 }
+
+
+def check_attributes(attributes: dict[str, object]) -> dict[str, Any]:
+    """Check attributes against the model, where whoever wrote them can see it.
+
+    Rather than in the middle of a run or, worse, in elastic. A value the model
+    can convert is converted: ``cycle_id="77"`` is stored as the integer 77.
+    """
+    unknown = sorted(set(attributes) - SETTABLE)
+    if unknown:
+        message = (
+            f"not a case attribute: {', '.join(unknown)} "
+            f"(settable: {', '.join(sorted(SETTABLE))})"
+        )
+        raise ValueError(message)
+    return {name: FIELD_TYPES[name].validate_python(value) for name, value in attributes.items()}
 
 
 def stamp(report: CaseReport, attributes: dict[str, Any]) -> None:
@@ -400,10 +439,15 @@ def pytest_addhooks(pluginmanager: pytest.PytestPluginManager) -> None:
 class CaseAttributes:
     """Every report field that describes the test rather than the step.
 
-    One store for all of them, because they come from everywhere: a conftest
-    hook, a fixture that connects to the machine, the test body. `set` takes
-    any of `SETTABLE` from any of those places, and the values stick until
-    changed, so a process can set one and forget it.
+    Two scopes, because these come from two kinds of place. What is true of
+    the whole run - the firmware under test, the cycle, the team that owns it
+    - is set once with `set_global` and stays set. What is true of one test -
+    the machine it was given, the host that ran it - is set with `set_test`
+    and is gone by the time the next test starts.
+
+    Nothing leaks from one test into the next, and nothing has to be put back
+    by hand: the test scope is emptied at the start of every test, in every
+    process. Where both scopes name the same attribute, the test wins.
 
     Each report carries what was set by the time its step ended. What is never
     set keeps the default `CaseReport` gives it.
@@ -412,33 +456,32 @@ class CaseAttributes:
     def __init__(self) -> None:
         """Start with nothing set: `CaseReport`'s own defaults stand in."""
         self._lock = threading.Lock()
-        self._values: dict[str, Any] = {}
+        self._run: dict[str, Any] = {}
+        self._test: dict[str, Any] = {}
 
-    def set(self, **attributes: object) -> None:
-        """Set any of `SETTABLE` for this test and the tests after it.
-
-        Each value is checked against the model here, where whoever wrote it
-        can see the error, rather than in the middle of a run or, worse, in
-        elastic. A value the model can convert is converted: ``cycle_id="77"``
-        is stored as the integer 77.
-        """
-        unknown = sorted(set(attributes) - SETTABLE)
-        if unknown:
-            message = (
-                f"not a case attribute: {', '.join(unknown)} "
-                f"(settable: {', '.join(sorted(SETTABLE))})"
-            )
-            raise ValueError(message)
-        checked = {
-            name: FIELD_TYPES[name].validate_python(value) for name, value in attributes.items()
-        }
+    def set_global(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for this test and every test after it."""
+        checked = check_attributes(attributes)
         with self._lock:
-            self._values.update(checked)
+            self._run.update(checked)
+
+    def set_test(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for the test running now, and no other."""
+        checked = check_attributes(attributes)
+        with self._lock:
+            self._test.update(checked)
+
+    def clear_test(self) -> None:
+        """Forget what a test set, which is what the start of the next one does."""
+        with self._lock:
+            self._test.clear()
 
     def snapshot(self) -> dict[str, Any]:
         """Return the attributes as they stand, to stamp a report with."""
         with self._lock:
-            return dict(self._values)
+            if not self._test:
+                return dict(self._run)
+            return {**self._run, **self._test}
 
 
 class ReportingFault(UserWarning):
@@ -485,9 +528,22 @@ class ElasticPlugin:
         self.previous = ElasticPlugin.current
         ElasticPlugin.current = self
 
-    def set(self, **attributes: object) -> None:
-        """Set any of `SETTABLE` for this test and the tests after it."""
-        self.attributes.set(**attributes)
+    def set_global(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for this test and every test after it.
+
+        For what is true of the whole run: the firmware under test, the cycle,
+        the team that owns it. Set it once, in a hook every process runs.
+        """
+        self.attributes.set_global(**attributes)
+
+    def set_test(self, **attributes: object) -> None:
+        """Set any of `SETTABLE` for the test running now, and no other.
+
+        For what one test answers for: the machine it was given, the host that
+        ran it. The next test starts without it, whatever this one did - it
+        passed, it failed, it killed the worker it was running on.
+        """
+        self.attributes.set_test(**attributes)
 
     def fault(self, where: str, exc: BaseException) -> None:
         """Keep a reporting bug, and say it once. Never raises, whatever it is.
@@ -728,6 +784,10 @@ class ReportAnnotator(ElasticPlugin):
             self.fault("pytest_runtest_makereport", exc)
         return report
 
+    def pytest_runtest_logstart(self) -> None:
+        """Start the test with nothing the last one set still in place."""
+        self.attributes.clear_test()
+
     def pytest_unconfigure(self) -> None:
         """Let go of the session, so the next one in this process starts clean."""
         self.detach()
@@ -836,6 +896,10 @@ class ElasticCaseReporter(ElasticPlugin):
     def pytest_runtest_logstart(self, nodeid: str) -> None:
         """Note that a fresh attempt at this test has begun."""
         try:
+            # Belt and braces with the annotator, which does this too: under
+            # xdist they are different processes, and without xdist they are
+            # the same store cleared twice at the same moment, which is free.
+            self.attributes.clear_test()
             case = self._case(nodeid)
             case.rerun_pending = False
             case.statuses.clear()
@@ -1216,12 +1280,13 @@ def reporter() -> ElasticPlugin:
         from elastic_reporter import reporter
 
         def test_upgrade():
-            reporter().set(vc="fw-5.0.0")
+            reporter().set_test(vc="fw-5.0.0")
 
-    The same object ``getplugin("elastic-reporter")`` returns, and the same
-    `ElasticPlugin.set`. Outside a session - the module imported but no pytest
-    configured, a unit test of your own helpers - it is one that accepts
-    attributes and drops them, so this never returns None and never raises.
+    The same object ``getplugin("elastic-reporter")`` returns, with the same
+    `ElasticPlugin.set_global` and `ElasticPlugin.set_test`. Outside a session
+    - the module imported but no pytest configured, a unit test of your own
+    helpers - it is one that accepts attributes and drops them, so this never
+    returns None and never raises.
     """
     current = ElasticPlugin.current
     if current is None:
@@ -1287,7 +1352,7 @@ def pytest_configure(config: pytest.Config) -> None:
         # Something set attributes through `reporter` before there was a
         # session - a conftest at import time, say. Those would otherwise be
         # written to a plugin nobody reports through and quietly lost.
-        attributes.set(**detached.attributes.snapshot())
+        attributes.set_global(**detached.attributes.snapshot())
     try:
         worker, controller = is_xdist_worker(config), is_xdist_controller(config)
         if not controller:

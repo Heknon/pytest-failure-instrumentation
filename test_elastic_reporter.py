@@ -95,20 +95,22 @@ def test_the_model_refuses_what_elastic_should_not_be_asked_to_index():
 
 def test_attributes_reject_what_is_not_settable():
     attributes = er.CaseAttributes()
-    attributes.set(vc="fw-1", machine="rack1")
+    attributes.set_global(vc="fw-1", machine="rack1")
     assert attributes.snapshot()["vc"] == "fw-1"
     with pytest.raises(ValueError, match="not a case attribute: outcome"):
-        attributes.set(outcome="passed")
+        attributes.set_global(outcome="passed")
+    with pytest.raises(ValueError, match="not a case attribute: outcome"):
+        attributes.set_test(outcome="passed")
     # The identity comes from the nodeid; a typo must not rewrite every report.
     with pytest.raises(ValueError, match="not a case attribute: test_case"):
-        attributes.set(test_case="upgrade-suite")
+        attributes.set_test(test_case="upgrade-suite")
 
 
 def test_attributes_are_checked_against_the_model_where_they_are_set():
     attributes = er.CaseAttributes()
     with pytest.raises(ValidationError):
-        attributes.set(cycle_id="seventy-seven")
-    attributes.set(cycle_id="77")  # but a value the model can convert is converted
+        attributes.set_test(cycle_id="seventy-seven")
+    attributes.set_global(cycle_id="77")  # but a value the model can convert is converted
     assert attributes.snapshot()["cycle_id"] == 77
 
 
@@ -133,7 +135,11 @@ def test_unset_attributes_keep_the_models_defaults():
 
 def test_attributes_survive_concurrent_writers():
     attributes = er.CaseAttributes()
-    threads = [threading.Thread(target=attributes.set, kwargs={"vc": f"fw-{n}"}) for n in range(50)]
+    threads = [
+        threading.Thread(target=setter, kwargs={"vc": f"fw-{n}"})
+        for n in range(50)
+        for setter in (attributes.set_global, attributes.set_test)
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -143,7 +149,7 @@ def test_attributes_survive_concurrent_writers():
 
 def test_reporter_works_outside_a_session(monkeypatch):
     monkeypatch.setattr(er.ElasticPlugin, "current", None)  # restored afterwards
-    er.reporter().set(vc="fw-nowhere")  # must not raise, must not need a config
+    er.reporter().set_global(vc="fw-nowhere")  # must not raise, must not need a config
     assert er.reporter().attributes.snapshot()["vc"] == "fw-nowhere"
 
 
@@ -468,13 +474,13 @@ def test_a_report_carries_what_was_set_when_its_step_ended(run):
 
         @pytest.fixture
         def allocated():
-            er.reporter().set(machine="rack1")
+            er.reporter().set_test(machine="rack1")
 
         def test_set_in_setup(allocated):
             pass
 
         def test_set_in_the_body():
-            er.reporter().set(vc="fw-5.0.0")
+            er.reporter().set_test(vc="fw-5.0.0")
         """,
     )
     assert_one_verdict_per_case(documents)
@@ -485,8 +491,8 @@ def test_a_report_carries_what_was_set_when_its_step_ended(run):
     # does not have it, and the two after it do.
     body = cases["test_set_in_the_body"]
     assert [r["vc"] for r in body] == ["mock-vc", "fw-5.0.0", "fw-5.0.0"]
-    # And it sticks, so the machine from the test before is still there.
-    assert {r["machine"] for r in body} == {"rack1"}
+    # And the machine the test before was given is not on this one.
+    assert {r["machine"] for r in body} == {None}
 
 
 def test_a_conftest_hook_sets_the_run_wide_attributes(run):
@@ -506,7 +512,7 @@ def test_a_conftest_hook_sets_the_run_wide_attributes(run):
         + """
 
 def pytest_sessionstart(session):
-    session.config.pluginmanager.getplugin("elastic-reporter").set(
+    session.config.pluginmanager.getplugin("elastic-reporter").set_global(
         vc="fw-from-conftest", owner="lab-team", cycle_id=99,
     )
 """,
@@ -606,7 +612,7 @@ def test_without_the_plugin_loaded_nothing_reports_and_set_still_works(pytester)
         import elastic_reporter as er
 
         def test_a():
-            er.reporter().set(vc="fw-1")  # no session, no config, no plugin
+            er.reporter().set_test(vc="fw-1")  # no session, no config, no plugin
         """,
     )
     result = pytester.runpytest_subprocess()
@@ -864,3 +870,119 @@ def test_a_fault_is_recorded_even_when_the_exception_cannot_say_why(stream):
 
     stream.fault("somewhere", UnspeakableError())
     assert stream.faults == ["somewhere: UnspeakableError: (no message)"]
+
+
+# ---------------------------------------------------------------------------
+# two scopes: what is true of the run, and what is true of one test
+# ---------------------------------------------------------------------------
+
+
+def test_the_test_scope_wins_over_the_run_scope():
+    attributes = er.CaseAttributes()
+    attributes.set_global(vc="fw-run", owner="lab-team")
+    attributes.set_test(vc="fw-this-one")
+    assert attributes.snapshot() == {"vc": "fw-this-one", "owner": "lab-team"}
+
+
+def test_clearing_the_test_scope_leaves_the_run_scope():
+    attributes = er.CaseAttributes()
+    attributes.set_global(owner="lab-team")
+    attributes.set_test(machine="rack1", owner="someone-else")
+    attributes.clear_test()
+    assert attributes.snapshot() == {"owner": "lab-team"}
+
+
+def test_what_a_test_sets_does_not_reach_the_next_test(run):
+    """The whole point: no reset fixture, no leak, whatever the test did."""
+    _, documents = run(
+        """
+        import elastic_reporter as er
+        import pytest
+
+        def test_sets_and_passes():
+            er.reporter().set_test(machine="rack1-dut7")
+
+        def test_sets_and_fails():
+            er.reporter().set_test(machine="rack2-dut3")
+            raise AssertionError("no")
+
+        def test_sets_and_skips():
+            er.reporter().set_test(machine="rack3-dut9")
+            pytest.skip("not today")
+
+        def test_sets_nothing():
+            pass
+        """,
+    )
+    assert_one_verdict_per_case(documents)
+    cases = by_case(documents)
+    assert {r["machine"] for r in cases["test_sets_nothing"]} == {None}
+    # each test kept its own, from the step that set it onwards
+    assert cases["test_sets_and_passes"][-1]["machine"] == "rack1-dut7"
+    assert cases["test_sets_and_fails"][-1]["machine"] == "rack2-dut3"
+    assert cases["test_sets_and_skips"][-1]["machine"] == "rack3-dut9"
+
+
+def test_the_run_scope_reaches_every_test_and_the_test_scope_does_not(run):
+    pytest.importorskip("xdist")
+    _, documents = run(
+        """
+        import elastic_reporter as er
+        import pytest
+
+        @pytest.mark.parametrize("n", range(6))
+        def test_spread(n):
+            if n == 0:
+                er.reporter().set_test(machine="only-mine")
+        """,
+        "-n",
+        "2",
+        conftest=RECORD
+        + """
+
+def pytest_sessionstart(session):
+    session.config.pluginmanager.getplugin("elastic-reporter").set_global(vc="fw-everywhere")
+""",
+    )
+    assert len(documents) == 18
+    assert {d["vc"] for d in documents} == {"fw-everywhere"}  # the run scope, everywhere
+    machines = collections.Counter(d["machine"] for d in documents)
+    # Fifteen from the five tests that set nothing, and one more: the setup
+    # report of the test that set it in its body, which ended before it did.
+    assert machines[None] == 16
+    assert machines["only-mine"] == 2
+
+
+def test_a_worker_that_runs_many_tests_starts_each_one_clean(run):
+    """The store is the worker's, and the worker is reused test after test."""
+    pytest.importorskip("xdist")
+    _, documents = run(
+        """
+        import elastic_reporter as er
+        import pytest
+
+        @pytest.fixture
+        def allocated(request):
+            er.reporter().set_test(machine=f"box-{request.node.callspec.params['n']}")
+
+        @pytest.mark.parametrize("n", range(10))
+        def test_alternate(n, request):
+            if n % 2 == 0:
+                request.getfixturevalue("allocated")
+        """,
+        "-n",
+        "1",  # one worker, so every test follows the one before it
+    )
+    cases = by_case(documents)
+    for n in range(10):
+        machines = {r["machine"] for r in cases[f"test_alternate[{n}]"]}
+        # Set in the body, so the setup report of that test ended before it
+        # did; every report after it has it, and no report of the next test.
+        expected = {None, f"box-{n}"} if n % 2 == 0 else {None}
+        assert machines == expected, n
+
+
+def test_a_new_attribute_is_one_line_on_the_model():
+    """`SETTABLE` is derived, so a new field needs naming nowhere else."""
+    assert frozenset(er.CaseReport.model_fields) - er.PLUGIN_FIELDS == er.SETTABLE
+    assert set(er.FIELD_TYPES) == er.SETTABLE
