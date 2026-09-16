@@ -627,3 +627,240 @@ def test_nothing_is_held_once_a_test_is_done(run):
     )
     assert_one_verdict_per_case(documents)
     assert len(documents) == 75
+
+
+# ---------------------------------------------------------------------------
+# robustness: a reporting bug is never a test failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stream(monkeypatch):
+    """Make a reporter with a recording hook, and put `current` back afterwards."""
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)
+    return er.ElasticCaseReporter(FakeHook(), er.CaseAttributes())
+
+
+def a_step(nodeid="t.py::test_a", when="call", outcome="passed", longrepr=None):
+    """Build a real pytest report, the way the runner would hand us one."""
+    return pytest.TestReport(
+        nodeid=nodeid,
+        location=("t.py", 1, nodeid),
+        keywords={},
+        outcome=outcome,
+        longrepr=longrepr,
+        when=when,
+    )
+
+
+def test_a_foreign_object_in_logreport_is_a_fault_not_a_crash(stream):
+    """Anything at all can call this hook. None of it may end the session."""
+    stream.pytest_runtest_logreport(object())  # no nodeid, no when, no outcome
+    assert stream.faults
+    assert "pytest_runtest_logreport" in stream.faults[0]
+    # and the next test still reports
+    stream.pytest_runtest_logstart("t.py::test_a")
+    stream.pytest_runtest_logreport(a_step())
+    assert stream.built == 1
+
+
+def test_a_corrupt_meta_is_ignored(stream):
+    """Another plugin's attribute of the same name, or an older worker's."""
+    report = a_step()
+    setattr(report, er.META_ATTR, "not a dict at all")
+    stream.pytest_runtest_logstart(report.nodeid)
+    stream.pytest_runtest_logreport(report)
+    assert stream.built == 1
+    assert not stream.faults  # not even worth mentioning: it was simply not ours
+
+
+def test_meta_that_is_not_what_it_claims_still_builds_a_report(stream):
+    """A string field is given something that is not a string."""
+    report = a_step()
+    setattr(report, er.META_ATTR, {"attributes": ["not", "a", "dict"], "exception": 17})
+    stream.pytest_runtest_logstart(report.nodeid)
+    stream.pytest_runtest_logreport(report)
+    assert stream.built == 1
+    assert not stream.faults
+    [batch] = [stream.queue._filling]
+    assert batch[0].exception == "17"
+
+
+def test_a_failed_logfinish_does_not_let_a_test_report_twice(stream, monkeypatch):
+    def broken(*_args, **_kwargs):
+        message = "the bug is in here"
+        raise RuntimeError(message)
+
+    stream.pytest_runtest_logstart("t.py::test_a")
+    stream.pytest_runtest_logreport(a_step(when="teardown"))
+    monkeypatch.setattr(er.ElasticCaseReporter, "_finish", broken)
+    stream.pytest_runtest_logfinish("t.py::test_a")
+    assert stream.faults
+    assert "the bug is in here" in stream.faults[0]
+    assert stream._cases == {}  # dropped, so the end of the run cannot close it again
+
+
+def test_faults_are_said_once_and_bounded(stream):
+    for _ in range(200):
+        stream.fault("somewhere", RuntimeError("the same thing again"))
+    assert len(stream.faults) == 1
+    for n in range(200):
+        stream.fault("somewhere", RuntimeError(f"number {n}"))
+    assert len(stream.faults) == er.MAX_ERRORS
+
+
+def test_a_nested_session_gives_the_outer_plugin_back(monkeypatch):
+    """A process that runs pytest twice must not strand the first one."""
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)
+    outer = er.ElasticPlugin(er.CaseAttributes())
+    inner = er.ElasticPlugin(er.CaseAttributes())
+    assert er.ElasticPlugin.current is inner
+    inner.detach()
+    assert er.ElasticPlugin.current is outer
+    outer.detach()
+    assert er.ElasticPlugin.current is None
+
+
+def test_a_vocabulary_missing_a_word_is_caught_before_the_run():
+    with pytest.raises(KeyError, match="passed"):
+        er.check_vocabulary(("OUTCOMES", {"failed": "FAIL"}))
+    with pytest.raises(TypeError, match="strings"):
+        er.check_vocabulary(("PHASE_STEPS", {"setup": 1, "call": "call", "teardown": "t"}))
+
+
+def test_a_vocabulary_broken_after_configure_degrades_instead_of_raising(monkeypatch):
+    """The check passed, then a conftest mutated the table anyway."""
+    monkeypatch.setitem(er.OUTCOMES, "passed", "PASS")
+    assert er.outcome_of("passed") == "PASS"
+    monkeypatch.delitem(er.OUTCOMES, "passed")
+    assert er.outcome_of("passed") == "passed"  # the plain word, not a KeyError
+    monkeypatch.setitem(er.OUTCOMES, "passed", 7)
+    assert er.outcome_of("passed") == "passed"  # nor a number on a string field
+
+
+def test_an_exception_whose_str_raises_still_reports(run):
+    result, documents = run(
+        """
+        class Nasty(Exception):
+            def __str__(self):
+                raise RuntimeError("even my message is broken")
+
+        def test_nasty():
+            raise Nasty()
+        """,
+    )
+    assert result.ret == 1  # the test failed, which is the test's business
+    assert_one_verdict_per_case(documents)
+    call = next(d for d in documents if d["step_name"] == "call")
+    assert call["exception"] == "Nasty"
+    assert call["exception_message"] == "<exception message unavailable>"
+
+
+def test_a_bug_in_the_reporting_does_not_fail_the_run(run):
+    """Break the plugin for one test, on purpose. Every other test still reports."""
+    conftest = (
+        RECORD
+        + """
+import elastic_reporter as er
+
+_build = er.ElasticCaseReporter._build
+
+
+def broken(self, step_name, status, case, failure=er.NO_FAILURE):
+    if case.identity[1] == "test_b":
+        raise RuntimeError("the reporting is broken")
+    return _build(self, step_name, status, case, failure)
+
+
+er.ElasticCaseReporter._build = broken
+"""
+    )
+    result, documents = run(
+        """
+        def test_a(): pass
+        def test_b(): pass
+        def test_c(): pass
+        """,
+        conftest=conftest,
+    )
+    result.assert_outcomes(passed=3)  # the run is untouched by the reporting
+    cases = by_case(documents)
+    assert len(cases["test_a"]) == 3
+    assert len(cases["test_c"]) == 3
+    assert cases["test_a"][-1]["outcome"] == "passed"
+    assert cases["test_c"][-1]["outcome"] == "passed"
+    result.stdout.fnmatch_lines(["*the reporting is broken*"])
+
+
+def test_warnings_as_errors_does_not_fail_the_run(run):
+    """A suite that turns warnings into errors must not turn a fault into one."""
+    conftest = (
+        RECORD
+        + """
+import elastic_reporter as er
+
+_build = er.ElasticCaseReporter._build
+
+
+def broken(self, step_name, status, case, failure=er.NO_FAILURE):
+    raise RuntimeError("everything is broken")
+
+
+er.ElasticCaseReporter._build = broken
+"""
+    )
+    result, _ = run(
+        """
+        def test_a(): pass
+        """,
+        "-W",
+        "error",
+        conftest=conftest,
+    )
+    result.assert_outcomes(passed=1)
+
+
+@pytest.mark.parametrize("order", ["reporter first", "annotator first"])
+def test_both_halves_hand_the_session_back_in_any_order(monkeypatch, order):
+    """The unconfigure order is pytest's to choose, not ours."""
+    monkeypatch.setattr(er.ElasticPlugin, "current", None)
+    before = er.ElasticPlugin(er.CaseAttributes())
+    attributes = er.CaseAttributes()
+    annotator = er.ReportAnnotator(attributes)
+    reporter = er.ElasticCaseReporter(FakeHook(), attributes)
+    halves = [reporter, annotator] if order == "reporter first" else [annotator, reporter]
+    for half in halves:
+        half.detach()
+    assert er.ElasticPlugin.current is before
+
+
+def test_a_report_after_the_run_is_counted_not_lost():
+    reports = er.ReportQueue(FakeHook())
+    reports.start()
+    reports.close(timeout=5)
+    reports.submit(a_report("test_too_late"))
+    assert reports.dropped == 1
+
+
+def test_a_hook_that_empties_the_batch_is_still_counted(monkeypatch):
+    monkeypatch.setattr(er, "BATCH_SIZE", 2)
+
+    class Greedy:
+        def pytest_case_reports(self, reports):
+            reports.clear()  # took them, and took the list with them
+
+    reports = er.ReportQueue(Greedy())
+    reports.start()
+    for n in range(4):
+        reports.submit(a_report(f"test_{n}"))
+    reports.close(timeout=5)
+    assert reports.sent == 4
+
+
+def test_a_fault_is_recorded_even_when_the_exception_cannot_say_why(stream):
+    class UnspeakableError(Exception):
+        def __str__(self):
+            raise RuntimeError  # not even the message works
+
+    stream.fault("somewhere", UnspeakableError())
+    assert stream.faults == ["somewhere: UnspeakableError: (no message)"]
