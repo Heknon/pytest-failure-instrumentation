@@ -261,3 +261,17 @@ def test_s(env, step):
 - Expected after this work: all three modes blame `test_s[envA-0]` at line 6, with no other stall incidents.
 
 **Death (hybrid).** Three environments × 2 steps. `envB` step 0 calls `os._exit(1)` once, using a flag file under `tmp_path_factory.getbasetemp().parent`. Run with `-n 1 --lanes 3`. Expected: the death incident lists the three lanes in flight (§6.1 C5), and xdist replaces the worker.
+
+## Appendix C: cross-check with `--lanes-detect`
+
+pytest-lanes' shared-state detector (`pytest --lanes-detect`, added after this doc was first written) was run on a small suite with `--failure-instrumentation` active. With no hints, it reported this per-test state in the plugin's objects. Every item is already covered by §6.1:
+
+| Reported path | What it is | Covered by |
+|---|---|---|
+| `plugin:failure-instrumentation-recorder._counted`, `._attempt` | per-test bookkeeping in `WorkerRecorder` | C1 (lane slot) |
+| `…-recorder._open_resources[0].nodeid` / `.phase_started` / `.attempt` / `.tests_started` / `.tests_finished` / `.test_started` / `.sequence` / `.last_nodeid*` / `._hashed` | the process's `WorkerState` record (reached through `_open_resources`) | C1 (a `WorkerState` per lane) |
+| `…-recorder.heartbeat._identity` | the heartbeat's single nodeid/phase | C6 (no nodeid on the process beat) and C3 |
+| `…-recorder.heartbeat.tickers[0]._started_at` | `SlowTestWatchdog`, one clock per process | C6 (per-lane clock, or disabled) |
+| `plugin:failure-instrumentation-controller.activity['main']` | stall detection keyed by `SOLE_WORKER` | C4 (key by `report.lane_id`) |
+
+**How to use the detector here:** after C1–C6, a sequential run still reports the process-level state (without lanes the plugin writes the process's own slot, exactly as today), so the detector is not the acceptance test for this work; the three-mode end-to-end scenarios in Appendix B are. It is useful as a regression check: any *new* per-test state in the plugin shows up in its report. Run it as `pytest --lanes-detect --lanes-detect-report=shared.json --failure-instrumentation`, and compare `findings` with this table.
