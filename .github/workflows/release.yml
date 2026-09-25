@@ -1,14 +1,20 @@
 name: Release
 
-# Tag the commit and the release runs itself:
+# Merge a version bump to master and the release runs itself: a push to master
+# whose pyproject.toml version has no vX.Y.Z tag yet builds, verifies the wheel
+# on every platform, publishes to PyPI, then tags that commit vX.Y.Z and makes
+# the GitHub release. A merge that does not change the version stops at the
+# first job. Tagging by hand still works as it always did:
 #
 #     git tag v0.2.0 && git push origin v0.2.0
 #
-# The tag is the only input. Everything else - the version, the release notes,
-# whether it is a prerelease - is derived from it or from the repository, so
-# there is nothing to remember on the day.
+# The version is the only input. Everything else - the release notes, whether
+# it is a prerelease - is derived from it or from the repository, so there is
+# nothing to remember on the day. The tag this workflow pushes does not start
+# it again: a push made with the run's own token triggers no workflow.
 on:
   push:
+    branches: [master]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -21,9 +27,50 @@ on:
 permissions:
   contents: read
 
+# Two merges in quick succession release one after the other, never at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    # Only a push to master is ever a no-op: most merges do not bump the
+    # version, and the version they carry is already on PyPI and tagged. A tag
+    # push and a manual run are releases by definition, as before.
+    name: Anything to release?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.gate.outputs.release }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is pyproject.toml's version tagged yet?
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != push ] || [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(python3 -c "
+          import pathlib, tomllib
+          print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])
+          ")
+          if git ls-remote --exit-code origin "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already released, and this merge does not change the version: nothing to publish."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is not tagged yet: releasing it."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:

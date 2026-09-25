@@ -39,8 +39,17 @@ class Heartbeat:
         interval: float = DEFAULT_INTERVAL,
         observers: list[Any] | None = None,
         tickers: list[Any] | None = None,
+        lane_cpu: Callable[[], None] | None = None,
     ) -> None:
         self.record = record
+        #: Called after every beat in a process running pytest-threadlanes, to
+        #: write down each lane's own CPU; None in every other process. The
+        #: process's CPU is every lane's summed, so one busy lane made every
+        #: sibling read as working, and a hung lane in a busy process was never
+        #: blocked. The figures go on each lane's own record rather than on
+        #: this beat, whose line then stays the size it always was however
+        #: many lanes there are - see WorkerState.record_cpu.
+        self.lane_cpu = lane_cpu
         self.interval = max(1.0, interval)
         #: Called on every beat, with what the beat measured.
         self.observers = observers or []
@@ -115,6 +124,11 @@ class Heartbeat:
             nodeid_hash=nodeid_hash,
             phase=self.phase,
         )
+        if self.lane_cpu is not None:
+            try:
+                self.lane_cpu()
+            except Exception:  # noqa: BLE001 - a missing figure beats a missing beat
+                pass
         if notify_observers:
             for observer in self.observers:
                 observer.observe(resident, nodeid, nodeid_hash)

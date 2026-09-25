@@ -47,6 +47,27 @@ def same_process(pid: int, created: Any = None) -> bool:
                 and abs(observed - created) > 0.001)
 
 
+def thread_cpu_seconds() -> dict[int, float]:
+    """CPU seconds, user and system, used by each thread of this process.
+
+    Keyed by psutil's id for each thread. On Linux and Windows that is the
+    native thread id - the number ``threading.get_native_id()`` returns - and
+    a lane finds its own thread by it. On macOS it is not: psutil numbers the
+    threads 1, 2, 3... in the order the kernel lists them, so no lane can be
+    found there, and the recorder does not ask - see
+    ``WorkerRecorder._lane_cpu_readable``. Empty where they cannot be read: a
+    lane then reads its process's figure, the reading it had before
+    per-thread ones.
+    """
+    try:
+        return {
+            int(thread.id): float(thread.user_time) + float(thread.system_time)
+            for thread in psutil.Process().threads()
+        }
+    except (psutil.Error, OSError, AttributeError, ValueError):
+        return {}
+
+
 def is_running(pid: int) -> bool:
     """Whether a process still exists. Never touches it.
 

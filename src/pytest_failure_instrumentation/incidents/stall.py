@@ -18,15 +18,17 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import ClassVar, Literal, Optional
+from typing import Any, ClassVar, Literal, Optional
 
 from pydantic import ConfigDict, Field
 
+from .. import lanes as thread_lanes
 from .. import probes
 from ..analysis import stall as assessment
 from ..capture import crash_stack
 from ..capture import events as event_log
 from ..capture.state import read_state
+from ..lanes import ThreadKey
 from .base import Incident
 
 #: How long to wait for a signalled worker to write its stack.
@@ -177,6 +179,7 @@ def build(
     run_id: Optional[str] = None,
     live_pid: Optional[int] = None,
     cancel: Optional[threading.Event] = None,
+    known_lane: bool = False,
 ) -> Optional[WorkerStallIncident]:
     """Assess a silent worker. Returns None when it is merely slow.
 
@@ -195,21 +198,55 @@ def build(
     same evidence, written to the same files by the same recorder, and the
     only thing that differs is that the process holding it is this one - which
     :func:`_stack` notices for itself.
+
+    **A lane of pytest-threadlanes** is a worker that shares its process - see
+    :mod:`..lanes`. Its state is its own and names the process, whose files
+    hold everything else: the beats, read with the lane's own thread's CPU
+    where they carry it, and the dumps, read for the lane's own thread. A lane
+    with no test in flight is idle - out of work at the end of an uneven run,
+    or waiting to be given some - and is never a stall: its process is
+    answering for it, and a sibling lane that is stuck says so for itself.
+
+    And the process such a lane runs in is their container, whose silence is
+    theirs: while any of them has a test in flight, that lane is watched and
+    judged on its own, and the process says nothing. Only once none has is its
+    silence its own, and it is judged as any worker with no test running is.
+
+    ``known_lane`` is the engine saying this name is a lane. A lane that has
+    never started a test has no record yet - more lanes than there is work
+    for, say - and is idle like any other.
     """
-    path = directory / f"{worker}.events"
+    record = read_state(directory / f"{worker}.state", run_id)
+    files, thread, lane = worker, None, _lane(directory, worker, record)
+    lanes: Optional[list[tuple[str, dict[str, Any]]]] = None
+    if lane is None and known_lane:
+        return None  # a lane with no record has never had a test: idle
+    if lane is not None:
+        if not lane.get("nodeid"):
+            return None  # idle; the engine re-arms it, and nothing is said
+        files = lane[thread_lanes.PROCESS_KEY]
+        thread = (lane.get("thread_ident"), lane.get("thread_name"))
+    elif thread_lanes.is_container(record):
+        lanes = thread_lanes.lane_records(directory, worker, run_id)
+        if thread_lanes.in_flight(lanes):
+            return None  # its lanes are watched, and judged, one by one
+    path = directory / f"{files}.events"
     # Only this run's. An earlier run's beats - left where the directory could
     # not be cleared, which on Windows is any file somebody still had open -
     # are old by definition, and old beats are exactly what FROZEN is read off.
     events = event_log.this_run(event_log.read_events(path), run_id)
-    beats = event_log.heartbeats(events)
+    beats = _measured(event_log.heartbeats(events), lane)
     verdict = assessment.assess(beats, time.time(), silent_for, interval)
 
     if verdict.needs_confirmation:
         previous = assessment.last_beat_time(beats)
         if _wait(cancel, interval * 1.2):
             return None  # the run is ending; nobody is left to tell
-        beats = event_log.heartbeats(
-            event_log.this_run(event_log.read_events(path), run_id)
+        if lane is not None:
+            lane = read_state(directory / f"{worker}.state", run_id) or lane
+        beats = _measured(
+            event_log.heartbeats(event_log.this_run(event_log.read_events(path), run_id)),
+            lane,
         )
         verdict = assessment.confirm(beats, previous, time.time(), silent_for)
 
@@ -219,8 +256,10 @@ def build(
     state = read_state(directory / f"{worker}.state", run_id)
     pid = state.get("pid") or event_log.worker_pid(events)
     in_flight = state.get("nodeid")
+    if lane is not None and not in_flight:
+        return None  # the lane's test ended while it was being assessed
     stack, probed, why, written, source = _stack(
-        directory, worker, pid, stack_probe, live_pid, cancel
+        directory, files, pid, stack_probe, live_pid, cancel, thread
     )
 
     evidence = [verdict.reason]
@@ -235,10 +274,25 @@ def build(
             "No test was running. A worker between tests, still collecting, or "
             "waiting to be given work looks the same from outside."
         )
+        if lanes is not None:
+            evidence.append(
+                f"None of this process's {len(lanes)} lanes had a test in flight."
+            )
         confidence = "low"
-    evidence.append(
-        "The run cannot finish while xdist waits for work this worker was handed."
-    )
+    if lane is not None:
+        evidence.append(
+            f"Lane {worker} is the thread {lane.get('thread_name') or 'named for it'} "
+            f"in worker process {files}, whose other lanes go on running. The CPU "
+            "figure is that thread's own where it was measured, and the stack is "
+            "that thread's."
+        )
+        evidence.append(
+            "The run cannot finish while xdist waits for the test this lane was handed."
+        )
+    else:
+        evidence.append(
+            "The run cannot finish while xdist waits for work this worker was handed."
+        )
     age = round(max(0.0, time.time() - written), 1) if written is not None else None
     if in_flight:
         evidence.append(f"Look at: {in_flight}.")
@@ -277,6 +331,25 @@ def build(
     )
 
 
+def _lane(
+    directory: Path, worker: str, record: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """The worker's state, if it is a lane's whose process can be named."""
+    if not thread_lanes.is_lane(record):
+        return None
+    process = record.get(thread_lanes.PROCESS_KEY)
+    if thread_lanes.sibling(directory / f"{worker}.state", process, ".events") is None:
+        return None
+    return record
+
+
+def _measured(
+    beats: list[dict[str, Any]], lane: Optional[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The beats as a lane's own CPU, for a lane; as they are otherwise."""
+    return assessment.lane_beats(beats, lane.get("cpu")) if lane is not None else beats
+
+
 def _wait(cancel: Optional[threading.Event], seconds: float) -> bool:
     """Sleep, unless and until the run ends. True when it did."""
     if cancel is None:
@@ -292,6 +365,7 @@ def _stack(
     allowed: bool,
     live_pid: Optional[int] = None,
     cancel: Optional[threading.Event] = None,
+    thread: Optional[ThreadKey] = None,
 ) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
     """Ask the worker for a stack, and read only what it added.
 
@@ -301,9 +375,12 @@ def _stack(
     unprompted into its own file, so a stack may be here without anything
     having been signalled - and that one describes whenever the watchdog last
     fired rather than now.
+
+    ``worker`` names the files, which for a lane are its process's; ``thread``
+    is then the lane's thread, which every read below picks out of the dump.
     """
     if pid == os.getpid():
-        return _own_stack(directory, worker)
+        return _own_stack(directory, worker, thread)
 
     crash_file = directory / f"{worker}.crash"
     try:
@@ -314,10 +391,10 @@ def _stack(
     why = _cannot_probe(pid, allowed, live_pid)
     if why is not None or pid is None:
         # Whatever the worker wrote on its own is still evidence.
-        stack, written, source = _passive_stack(directory, worker)
+        stack, written, source = _passive_stack(directory, worker, thread)
         return stack, False, why, written, source
     if not probes.request_stack(pid):
-        stack, written, source = _passive_stack(directory, worker)
+        stack, written, source = _passive_stack(directory, worker, thread)
         return (
             stack,
             False,
@@ -333,7 +410,9 @@ def _stack(
         try:
             if crash_file.stat().st_size > before:
                 return (
-                    crash_stack.read(crash_file, limit=STACK_LINES, offset=before),
+                    crash_stack.read(
+                        crash_file, limit=STACK_LINES, offset=before, thread=thread
+                    ),
                     True,
                     None,
                     time.time(),  # it was written in answer to the signal
@@ -341,10 +420,10 @@ def _stack(
                 )
         except OSError:
             break
-    fresh = crash_stack.read(crash_file, limit=STACK_LINES)
+    fresh = crash_stack.read(crash_file, limit=STACK_LINES, thread=thread)
     if fresh:
         return fresh, True, None, crash_stack.written_at(crash_file), "probe"
-    stack, written, source = _passive_stack(directory, worker)
+    stack, written, source = _passive_stack(directory, worker, thread)
     return (
         stack,
         True,
@@ -355,7 +434,9 @@ def _stack(
 
 
 def _own_stack(
-    directory: Path, worker: str
+    directory: Path,
+    worker: str,
+    thread: Optional[ThreadKey] = None,
 ) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
     """The stack of a run with no workers, which is this process.
 
@@ -384,13 +465,13 @@ def _own_stack(
     being made here - see :func:`..probes.stacks.live_stack`.
     """
     threads, error = probes.live_stack(os.getpid())
-    stack = crash_stack.from_threads(threads or [], limit=STACK_LINES)
+    stack = crash_stack.from_threads(threads or [], limit=STACK_LINES, thread=thread)
     if stack:
         return stack, True, None, time.time(), "py-spy"
     # Whatever this process wrote for itself unprompted is still evidence, and
     # is what a run without py-spy is left with. The watchdog's dump names the
     # same blocked test; it is only older, and the incident says by how much.
-    passive, written, source = _passive_stack(directory, worker)
+    passive, written, source = _passive_stack(directory, worker, thread)
     return passive, True, error or "py-spy returned no frames", written, source
 
 
@@ -429,7 +510,9 @@ def _cannot_probe(
 
 
 def _passive_stack(
-    directory: Path, worker: str
+    directory: Path,
+    worker: str,
+    thread: Optional[ThreadKey] = None,
 ) -> tuple[list[str], Optional[float], Optional[str]]:
     """Whatever the worker dumped on its own, without being asked, and when.
 
@@ -441,7 +524,7 @@ def _passive_stack(
     """
     for suffix, source in PASSIVE_SOURCES:
         path = directory / f"{worker}{suffix}"
-        lines = crash_stack.read(path, limit=STACK_LINES)
+        lines = crash_stack.read(path, limit=STACK_LINES, thread=thread)
         if lines:
             return lines, crash_stack.written_at(path), source
     return [], None, None

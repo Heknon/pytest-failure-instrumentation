@@ -2519,6 +2519,120 @@ was repaired. The live-heap reading that tells freed-but-mapped memory
 from kept memory is glibc only; elsewhere what a test kept is its resident
 step alone.
 
+## Running under pytest-threadlanes
+
+[pytest-threadlanes](https://github.com/Heknon/pytest-threadlanes) runs
+pytest-xdist's own schedulers on threads it calls lanes: `--lanes 3` is one
+process running three tests at once, and `-n 2 --lanes 3` is two xdist workers
+running three each. Everything above assumes one process is one worker with at
+most one test in flight, and a process of lanes breaks that — read as a
+process, `/workers` named whichever lane had written last, a hung lane was
+hidden by its busy siblings, and a stall or a death was blamed on the wrong
+test.
+
+So a lane is recorded as the worker it is: a worker that is a thread of a named
+process. Nothing needs configuring and nothing needs pytest-threadlanes
+installed: the plugin never imports it, and it treats a run as one of lanes
+only when that plugin is registered *and* `--lanes` asks for lanes. A run
+without lanes writes what it wrote before — the suite checks its files, slot
+bytes, captured stderr, rows, samples and payload schemas against 0.13.1's.
+
+**Each lane is a row.** A lane gets a state slot of its own, named after it —
+`ln3.state` in a run with no `-n`, `gw0.ln3.state` in one with — so `/workers`,
+`?worker=` and `/stack?worker=` see it as a worker, with its own test, phase and
+counts. What is per process stays on the process's files — the heartbeat, and
+with it the resident memory, liveness and finish — and a lane's row reports its
+process's. Three fields say which process and which of its threads a lane is:
+
+```json
+{"worker": "gw0.ln1", "pid": 21615, "nodeid": "test_env.py::test_s[envB-3]",
+ "phase": "call", "status": "blocked", "cpu_rate": 0.0, "rss_mb": 212,
+ "tests_finished": 3, "tests_running": 1, "tests_queued": 4, "tests_assigned": 8,
+ "process": "gw0", "thread_name": "lane-gw0.ln1", "thread_id": 21631}
+```
+
+`thread_id` is the operating system's number for the thread, which a stack of
+the pid reports as that thread's `os_thread_id` — the thread to open, since the
+process's main thread is pytest-threadlanes' scheduler. The three fields are
+only on a lane's row, and are on `client.Worker` and on a pushed sample's row
+the same way. Once a process's first lane has started a test, its own row
+leaves the list — its lanes are the rows. `?worker=gw0` asks for what that
+process is running, and lists its lanes; `/stack?worker=gw0` still reads the
+whole process.
+
+**Each lane's progress is its own**, in the fields every row has and with the
+meaning they always had, for that lane. Under `-n` xdist's scheduler hands work
+to lanes, so the controller's schedule has a row per lane — assigned, finished,
+running, queued, and whether a rerun is under way — and a lane's row reads its
+own. A run of lanes in one process has no xdist controller writing a schedule,
+so there, as in any run with no workers, `tests_assigned`, `tests_running` and
+`tests_queued` are null.
+
+**Each lane's CPU is its own.** A process's CPU is every lane's summed, so one
+busy lane would make every sibling read as `working`. With each beat the
+heartbeat also writes each lane's thread CPU onto the lane's own record, and a
+lane's row and its stall verdict are read from it — falling back to the
+process's figure for a lane's first reading, and where the platform cannot
+number threads: on macOS psutil numbers them by position rather than by native
+id, so there every lane reads its process's CPU, and the event log says so
+(`lanes_adjusted`, `per_lane_cpu`). The beat itself stays the line it always
+was, however many lanes there are.
+
+**A stall is a lane's.** Each lane is timed on its own — from its reports
+(`report.lane_id`), and from its own record, where it writes the start of each
+phase as it happens. The second is what catches a hang in a lane's very first
+setup, before it has reported anything, and what keeps an exclusive test —
+whose reports pytest-threadlanes holds until it ends — from reading as one
+silence the length of all its phases. A lane that hangs while its siblings keep
+going is named, with its own test and a stack of its own thread, and the
+incident says which thread of which process that is. A lane with no test in
+flight — never given one, out of work at the end of an uneven run, or waiting —
+is idle and never reported. The process holding the lanes is judged only once
+none of them has a test in flight, as any worker with no test running is.
+
+**A death names every lane it took.** A process that dies takes each of its
+lanes' tests with it, and its counts are all of theirs. With one lane in
+flight, that lane's test is `test_in_flight`, as a worker's always was. With
+several, a fatal dump written on one of their threads — a native fault is
+delivered to the thread that faulted — blames that lane's test; otherwise none
+is blamed, since nothing on disk says which caused it. Either way every lane in
+flight is listed in `lanes_in_flight`, `{lane, nodeid, nodeid_hash, phase}`
+each, which is absent from the payload of a death without lanes. An internal
+error is named the same way: after the lane whose test it interrupted, and
+listing them all where several were mid-test.
+
+**Resources say how many lanes are running.** The worker process of a run of
+lanes carries `lanes_running` in `/resources` — how many of its lanes had a test
+in flight when the sample was taken — since it names no test of its own. It is
+absent for every other process.
+
+**What is one per process is adjusted, and says so.** Each of these was built
+for one test at a time, and each adjustment is written to the process's event
+log as `lanes_adjusted`:
+
+| Mechanism | Under lanes |
+|---|---|
+| Profiler (`failure_profile`) | Off. It charges every sample to the one test in flight, and a process of lanes has one per lane |
+| Stderr tee (`failure_capture_output`) | fd 2 is taken once for the session rather than per phase — lanes' phases overlap, and pytest-threadlanes does not swap fd 2 per test either. What arrives is passed on to stderr within a second. The disk under what was passed on is given back as it goes: on Linux by punching holes in the file, which keeps the one file every writer of fd 2 shares — a test's child processes included — so no byte is lost; on a Linux filesystem that cannot punch holes, by rotating it, keeping the last tail as `<name>.output.prev`, where a child that outlives a rotation loses what it writes afterwards. On macOS and other platforms the file keeps the whole session's stderr: rotating means swapping fd 2 under the lanes writing it, and only Linux does that in one step (on macOS a lane's write to stderr can fail with EBADF mid-swap) |
+| Slow-test watchdog | One clock per lane. The dump is of every thread, so it holds whichever lane is overdue |
+| Heartbeat | No test on the process's beat; its memory is not attributed to a test. Each lane's CPU is on its own record |
+
+The files of a run with lanes, then:
+
+```
+.pytest-failures/
+  run-70a514cc7a93/
+    gw0.state          <- "lanes": true once a lane has started
+    gw0.events         <- the heartbeat, as it always was
+    gw0.ln0.state      <- "process": "gw0", "thread_name", "thread_id", and
+    gw0.ln1.state         "cpu": the lane's own CPU readings
+    gw0.ln2.state
+```
+
+Python 3.12 or later is pytest-threadlanes' own requirement; before 3.14 it
+runs with `-p no:warnings`. The design, and what was measured before and after
+it, is in [docs/pytest-lanes-support.md](docs/pytest-lanes-support.md).
+
 ## One directory per run
 
 ```
@@ -2855,6 +2969,15 @@ much as the operating system, so each gets its own job:
   job installs whatever is newest, so a hook signature or an ini type that
   arrived later would pass all of them and fail on a user's pinned pytest.
 
+- **with `pytest-threadlanes`**, where it is installed: `tests/test_lanes.py`
+  runs lanes for real in all three of its modes — a live `/workers`, a hung
+  lane, idle lanes beside a busy one, a hybrid worker's death — and skips that
+  half where it is not, since it needs Python 3.12. The other half needs
+  nothing: the readers are fed evidence laid out as lanes write it, and a run
+  without lanes is compared, file by file, with what 0.13.1 wrote for the same
+  suite (`tests/evidence_without_lanes.json`, recorded from 0.13.1 itself by
+  `tests/without_lanes.py`).
+
 - **the profiler's budget**, `benchmarks/profile_gate.py`, which is a job of
   its own because it is the one claim in this README a reader cannot check by
   reading. It times the same fixed-CPU workload under plain pytest, under
@@ -2875,17 +2998,25 @@ cost more than the failure it came to explain.
 
 ## Releasing
 
-Tag the commit and the rest runs itself:
+Bump `version` in `pyproject.toml` (and `__version__` in
+`src/pytest_failure_instrumentation/__init__.py`) in a pull request, and merge
+it. The merge releases itself: `.github/workflows/release.yml` runs on every
+push to `master`, and when that version has no `vX.Y.Z` tag yet it builds the
+sdist and wheel, installs the **built wheel** on Linux, macOS and Windows and
+runs the whole suite against it, publishes to PyPI, then tags the merge commit
+`vX.Y.Z` and creates the GitHub release with the artifacts attached. A merge
+that does not change the version finds its tag already there and stops at the
+first job, so nothing is published twice. Merging a version bump is releasing
+it: run the pre-merge gate in [AGENTS.md](AGENTS.md) first.
+
+Tagging by hand still works, for a commit that is not a merge:
 
 ```console
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-The tag is the only input. `.github/workflows/release.yml` builds the sdist and
-wheel, refuses to continue if the tag disagrees with the version in
-`pyproject.toml`, installs the **built wheel** on Linux, macOS and Windows and
-runs the whole suite against it, publishes to PyPI, and then creates the GitHub
-release with the artifacts attached.
+The run then refuses to continue if the tag disagrees with the version in
+`pyproject.toml`.
 
 The wheel is tested rather than the checkout because this plugin is one entry
 point. If packaging drops it the import still succeeds, the suite still passes,
@@ -2924,8 +3055,10 @@ publish, and waits. Nothing is uploaded until someone approves, and waiting does
 not consume the job's timeout.
 
 Worth setting at the same time, under *Deployment branches and tags*: restrict
-the environment to the tag pattern `v*`, so the only thing that can ever reach
-PyPI is a tagged commit.
+the environment to the branch `master` and the tag pattern `v*`, so the only
+things that can ever reach PyPI are a merged commit and a tagged one. The
+branch has to be in the list: a merge publishes from `master`, and an
+environment limited to `v*` alone refuses it.
 
 **TestPyPI** is a separate site with a separate account, so rehearsing needs its
 own pending publisher at test.pypi.org with the environment named `testpypi`.

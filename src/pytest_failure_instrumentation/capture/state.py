@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -98,8 +99,34 @@ def _elide(nodeid: str | None, keep: int) -> str | None:
 class WorkerState:
     """The current nodeid, phase and counters for one worker."""
 
-    def __init__(self, path: Path, pid: int, run_id: str | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        pid: int,
+        run_id: str | None = None,
+        *,
+        lane: dict[str, Any] | None = None,
+    ) -> None:
         self.path = path
+        #: Who a lane's record is, written after everything else: the process
+        #: it runs in, and the thread it runs on - by name, by native id, and
+        #: by the id faulthandler prints - see :mod:`..lanes`. None for a
+        #: worker that is a process, whose record is byte for byte what it
+        #: was before lanes existed.
+        self.lane = dict(lane) if lane else None
+        #: Set on a process's own record once its first lane has started a
+        #: test: from then on the process is a container, and its lanes are
+        #: its workers. Absent from the record until then, and forever in a
+        #: run without lanes.
+        self.lanes: bool | None = None
+        #: A lane's own CPU, as ``[time, seconds]`` pairs, newest last - see
+        #: :meth:`record_cpu`. Only ever set on a lane's record.
+        self.cpu: list[list[float]] | None = None
+        #: A lane's slot has two writers - its own thread at each phase, and
+        #: the heartbeat's with its CPU - and one pwrite of a record assembled
+        #: from both must not interleave with the other. A worker's slot has
+        #: one writer, and takes no lock.
+        self._lock = threading.Lock() if self.lane else None
         from ..probes.process import creation_time
 
         self.pid = pid
@@ -156,6 +183,29 @@ class WorkerState:
         self._hashed: tuple[str | None, str | None] = (None, None)
 
     def update(self, **fields: Any) -> None:
+        if self._lock is None:
+            self._update(fields)
+            return
+        with self._lock:
+            self._update(fields)
+
+    def record_cpu(self, stamp: float, seconds: float, keep: int) -> None:
+        """Add one reading of a lane's thread CPU, keeping the newest ``keep``.
+
+        On the lane's own record rather than on the process's beat: a beat
+        carrying every lane's figure grew with the lane count - fourteen
+        kilobytes a beat at a thousand lanes, which pushed all but a handful
+        of beats out of the tail a reader takes, and with them the window a
+        rate is measured over. Here each lane's figures cost its own slot a
+        few dozen bytes, and a reader of one lane reads one slot.
+        """
+        with self._lock or _NO_LOCK:
+            readings = list(self.cpu or [])
+            readings.append([round(stamp, 3), round(seconds, 3)])
+            self.cpu = readings[-keep:]
+            self._update({})
+
+    def _update(self, fields: dict[str, Any]) -> None:
         for name, value in fields.items():
             setattr(self, name, value)
         if self.nodeid:
@@ -244,6 +294,11 @@ class WorkerState:
                 "timeout_settings": self.timeout_settings,
                 "tests_started": self.tests_started,
                 "tests_finished": self.tests_finished,
+                # Only ever present under lanes, and last, so a record written
+                # without them is the record this file always wrote.
+                **({"lanes": True} if self.lanes else {}),
+                **(self.lane or {}),
+                **({"cpu": self.cpu} if self.cpu else {}),
             }
         )
         return payload.encode("utf-8") + b"\n"
@@ -253,6 +308,17 @@ class WorkerState:
             os.close(self._descriptor)
         except OSError:
             pass
+
+
+class _NoLock:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *failure: Any) -> None:
+        return None
+
+
+_NO_LOCK = _NoLock()
 
 
 def read_state(path: Path, run_id: str | None = None) -> dict[str, Any]:

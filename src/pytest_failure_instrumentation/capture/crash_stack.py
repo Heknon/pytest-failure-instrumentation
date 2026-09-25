@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import faulthandler
 import os
+import re
 import signal
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional, TextIO
 
+from ..lanes import ThreadKey
 from ..probes import stacks
 
 
@@ -136,6 +139,17 @@ class SlowTestWatchdog:
         #: Whether there is a dump to clean up. A suite of fast tests never
         #: writes one, and must not pay a failing unlink per test to find out.
         self._on_disk = False
+        #: The same clock, once per lane, in a process running
+        #: pytest-threadlanes: several tests are in flight at once there, and
+        #: the one attribute above can only time one of them. The dump itself
+        #: is unchanged - it is of every thread, so whichever lane is overdue,
+        #: its thread is in it. Empty, and never consulted, without lanes.
+        self._lanes: dict[str, float] = {}
+        self._lanes_dumped: dict[str, float] = {}
+        #: Lanes start and end tests on their own threads while the heartbeat
+        #: ticks on its own; a single process's clock needs no lock, and does
+        #: not take this one.
+        self._lanes_lock = threading.Lock()
 
     def start_test(self) -> None:
         if not self.enabled:
@@ -159,12 +173,41 @@ class SlowTestWatchdog:
         if self._on_disk:
             self._discard()
 
+    def start_lane(self, lane: str) -> None:
+        """:meth:`start_test`, for one lane of a process running several."""
+        if not self.enabled:
+            return
+        with self._lanes_lock:
+            self._lanes[lane] = time.monotonic()
+            self._lanes_dumped.pop(lane, None)
+
+    def end_lane(self, lane: str) -> None:
+        """:meth:`end_test`, for one lane.
+
+        The dump on disk is of every thread, so it is still the right one to
+        keep while any other lane's test is past the timeout - discarding it
+        because one lane finished would take the stack away from the lane
+        that is still stuck. It goes once nothing running is overdue.
+        """
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        with self._lanes_lock:
+            self._lanes.pop(lane, None)
+            self._lanes_dumped.pop(lane, None)
+            overdue = any(now - started >= self.timeout for started in self._lanes.values())
+            if self._on_disk and not overdue:
+                self._discard()
+
     def stop(self) -> None:
         """The heartbeat's ticker protocol. Nothing to wind down: what is on
         disk at the end of a run is the last test's, and the next run clears
         the directory before it reads anything."""
 
     def tick(self) -> None:
+        if self._lanes:
+            self._tick_lanes()
+            return
         started = self._started_at
         if not self.enabled or started is None:
             return
@@ -175,6 +218,26 @@ class SlowTestWatchdog:
             return
         self._dumped_at = now
         self._dump()
+
+    def _tick_lanes(self) -> None:
+        """One dump whenever any lane's test is due one, on each lane's own
+        cadence - measured within that lane's test, as the single clock's is."""
+        now = time.monotonic()
+        with self._lanes_lock:
+            due = [
+                lane
+                for lane, started in self._lanes.items()
+                if now - started >= self.timeout
+                and (
+                    lane not in self._lanes_dumped
+                    or now - self._lanes_dumped[lane] >= self.timeout
+                )
+            ]
+            if not due:
+                return
+            for lane in due:
+                self._lanes_dumped[lane] = now
+            self._dump()
 
     def _dump(self) -> None:
         """Write the whole dump beside the file, then move it into place.
@@ -374,7 +437,12 @@ RUNTEST_MARKERS = (
 OWN_PACKAGE = "/pytest_failure_instrumentation/"
 
 
-def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
+def read(
+    path: Path,
+    limit: int = 12,
+    offset: int = 0,
+    thread: Optional[ThreadKey] = None,
+) -> list[str]:
     """One thread's stack out of the *latest* dump - most recent call first.
 
     Two things have to be picked correctly here, and getting either wrong
@@ -395,6 +463,11 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
 
     ``offset`` reads only what was appended past a known point, so a stack
     written now is never confused with one written earlier.
+
+    ``thread`` names the thread wanted, as ``(ident, name)``, when the caller
+    knows which it is: a lane of pytest-threadlanes, which shares its process
+    and therefore its dump with every sibling lane - each of them carrying
+    the runtest protocol - and with a main thread that is the scheduler.
     """
     lines = _lines(path, offset)
     if not lines:
@@ -406,11 +479,37 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
     if not sections:
         return _capped(lines, limit)
 
-    section = _capped(_most_relevant(sections), limit)
+    section = _capped(_most_relevant(sections, thread), limit)
     return ([banner] + section) if banner else section
 
 
-def from_threads(threads: list[dict[str, Any]], limit: int = 12) -> list[str]:
+def current_thread(path: Path) -> Optional[int]:
+    """The ident of the thread a *fatal* dump in ``path`` was written on.
+
+    faulthandler labels the thread the fatal signal reached "Current thread",
+    and a fault in native code is delivered to the thread that faulted. For a
+    process running pytest-threadlanes that is which lane's test took it
+    down. None for anything else: no dump, a dump of a process that went on
+    living, or one with no current thread.
+    """
+    lines = _lines(path)
+    if not lines:
+        return None
+    lines = _latest_dump(lines)
+    if not is_fatal(lines):
+        return None
+    for line in lines:
+        if line.startswith("Current thread"):
+            found = _THREAD_HEADER.match(line)
+            return int(found.group(1), 16) if found else None
+    return None
+
+
+def from_threads(
+    threads: list[dict[str, Any]],
+    limit: int = 12,
+    thread: Optional[ThreadKey] = None,
+) -> list[str]:
     """A live reader's threads, as a dump read off disk would have looked.
 
     :func:`.probes.stacks.live_stack` answers in a structured shape, and
@@ -427,17 +526,17 @@ def from_threads(threads: list[dict[str, Any]], limit: int = 12) -> list[str]:
     thread carrying the runtest protocol, which is the one running the test.
     """
     lines: list[str] = []
-    for thread in threads:
-        name = thread.get("thread_name") or ""
-        title = f"Thread 0x{int(thread.get('thread_id') or 0):016x}"
+    for reading in threads:
+        name = reading.get("thread_name") or ""
+        title = f"Thread 0x{int(reading.get('thread_id') or 0):016x}"
         lines.append(f"{title} ({name}, most recent call first):" if name
                      else f"{title} (most recent call first):")
         lines.extend(
             f'  File "{frame.get("file")}", line {frame.get("line")} in {frame.get("function")}'
-            for frame in thread.get("frames") or []
+            for frame in reading.get("frames") or []
         )
     sections = _thread_sections(lines)
-    return _capped(_most_relevant(sections), limit) if sections else []
+    return _capped(_most_relevant(sections, thread), limit) if sections else []
 
 
 def _capped(lines: list[str], limit: int) -> list[str]:
@@ -497,8 +596,36 @@ def _thread_sections(lines: list[str]) -> list[list[str]]:
     return sections
 
 
-def _most_relevant(sections: list[list[str]]) -> list[str]:
+#: The thread id in a section's first line, as faulthandler prints it.
+_THREAD_HEADER = re.compile(r"(?:Current thread|Thread) 0x([0-9a-fA-F]+)")
+
+
+def _is_thread(
+    header: str, thread: ThreadKey
+) -> bool:
+    """Whether a section's first line is the named thread's.
+
+    faulthandler prints the thread's ident - ``threading.get_ident()`` - and
+    no name; a live read prints both. So the ident is compared as a number,
+    whatever width it was padded to, and the name only where one is printed.
+    """
+    ident, name = thread
+    found = _THREAD_HEADER.match(header)
+    if ident is not None and found is not None and int(found.group(1), 16) == ident:
+        return True
+    return bool(name) and f"({name}," in header
+
+
+def _most_relevant(
+    sections: list[list[str]],
+    thread: Optional[ThreadKey] = None,
+) -> list[str]:
     """The thread worth reporting, in descending order of certainty.
+
+    A caller that knows which thread it is asking about - a lane of
+    pytest-threadlanes - is answered with that one, whenever the dump holds
+    it. Nothing below can pick it out: its siblings carry the same runtest
+    protocol, and the thread a signal lands on is the scheduler's.
 
     A fatal signal and an on-demand SIGUSR1 both label the thread they reached
     as "Current thread", and that is the answer.
@@ -509,6 +636,10 @@ def _most_relevant(sections: list[list[str]]) -> list[str]:
     down to a psutil frame as the blamed function. A slow test has to be found
     by what is on its stack instead.
     """
+    if thread is not None:
+        for section in sections:
+            if _is_thread(section[0], thread):
+                return section
     for section in sections:
         if section[0].startswith("Current thread") and not _mentions_us(section):
             return section

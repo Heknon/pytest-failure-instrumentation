@@ -27,8 +27,15 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
+from .lanes import without_unset
 from .live_view import LiveStackServer
 from .stack_server import AUTH_HEADER, AUTH_SCHEME
 
@@ -214,6 +221,18 @@ class Worker(_Wire):
     heartbeat_age_s: Optional[float] = None
     #: None is not zero: "burned nothing" and "could not measure" differ.
     cpu_rate: Optional[float] = None
+    #: Set only on a lane of pytest-threadlanes, which is a worker sharing its
+    #: process with its sibling lanes: the xdist worker it runs in (``gw0``,
+    #: or ``main`` in a run with no ``-n``), whose pid, memory and heartbeat
+    #: this row reports. None on every worker that is a process of its own.
+    process: Optional[str] = None
+    #: The lane's thread in that process, by name (``lane-gw0.ln3``) and by
+    #: native id - the operating system's number for it, which a stack read
+    #: of the process reports as each thread's ``os_thread_id``. That is the
+    #: thread to open in a stack of the pid above; the process's main thread
+    #: is the lanes' scheduler. None where the row is not a lane.
+    thread_name: Optional[str] = None
+    thread_id: Optional[int] = None
 
 
 class Run(_Wire):
@@ -277,6 +296,17 @@ class ResourceProcess(ResourceMeasurements):
     nodeid_hash: Optional[str] = None
     phase: Optional[str] = None
     observed_at: Optional[float] = None
+    #: Set only on the worker process of a run of pytest-threadlanes whose
+    #: lanes have started: how many of them had a test in flight when this
+    #: sample was taken, zero included. Such a process names no test of its
+    #: own - ``nodeid`` is None - because it runs one per lane. Absent from
+    #: the payload for every other process, and from this model's dump too,
+    #: so a consumer re-serving it serves what it did before lanes existed.
+    lanes_running: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        return without_unset(handler(self), self, ("lanes_running",))
 
 
 class ResourceBatch(_Wire):

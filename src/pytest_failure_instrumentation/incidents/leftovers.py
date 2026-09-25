@@ -129,12 +129,17 @@ def worker_records(directory: Path) -> list[dict[str, Any]]:
     """Recorded worker identities, with event-log fallback for torn/missing slots."""
     from ..capture import events as event_log
     from ..capture.state import read_state
+    from ..lanes import is_lane
 
     names = {path.stem for path in directory.glob("*.state")}
     names.update(path.stem for path in directory.glob("*.events"))
     records = []
     for name in sorted(names):
         state = read_state(directory / f"{name}.state")
+        if is_lane(state):
+            # A lane of pytest-threadlanes is a thread of a process listed
+            # here under its own name, with the same pid - see ..lanes.
+            continue
         if not isinstance(state.get("pid"), int):
             events = event_log.read_events(directory / f"{name}.events")
             pid = event_log.worker_pid(events)

@@ -37,9 +37,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, model_serializer
 
 from . import topology
+from .lanes import without_unset
 
 
 class SampledWorker(BaseModel):
@@ -95,6 +96,20 @@ class SampledWorker(BaseModel):
     tests_finished: Optional[int] = None
     tests_running: Optional[int] = None
     tests_queued: Optional[int] = None
+
+    #: A lane of pytest-threadlanes is a worker sharing its process with its
+    #: sibling lanes; these say which process and which of its threads - see
+    #: ``/workers`` and :class:`..client.Worker`, which carry the same three.
+    #: Only in a lane's row: a row without lanes dumps exactly as it did
+    #: before they existed, so a consumer holding this schema as a strict one
+    #: of its own is not handed three columns it has never heard of.
+    process: Optional[str] = None
+    thread_name: Optional[str] = None
+    thread_id: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        return without_unset(handler(self), self, ("process", "thread_name", "thread_id"))
 
 
 class WorkerSample(BaseModel):
@@ -174,6 +189,9 @@ class WorkerSampler:
                     tests_finished=record.get("tests_finished"),
                     tests_running=record.get("tests_running"),
                     tests_queued=record.get("tests_queued"),
+                    process=record.get("process"),
+                    thread_name=record.get("thread_name"),
+                    thread_id=record.get("thread_id"),
                 )
                 for record in described.get("workers", [])
             ],
