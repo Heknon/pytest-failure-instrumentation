@@ -298,8 +298,10 @@ class WorkerRecorder:
                 "one lane's phase end would take it from the others; pytest does "
                 "not swap fd 2 per test under lanes either. What reaches it is "
                 "passed on to stderr as it arrives, and the disk under what was "
-                "passed on is given back as it goes - holes punched in the file "
-                "on Linux, the file rotated to .prev elsewhere",
+                "passed on is given back as it goes on Linux - holes punched in "
+                "the file, or the file rotated to .prev where holes cannot be "
+                "punched. Elsewhere the file keeps the session's stderr: fd 2 "
+                "cannot be swapped safely under writing threads there",
             )
         if self.slow_test.enabled:
             self.events.record(

@@ -60,6 +60,14 @@ PREVIOUS_SUFFIX = ".prev"
 #: How much :meth:`StderrTee._copy` reads at a time.
 COPY_BYTES = 64 * 1024
 
+#: Whether a session's capture file may be rotated - fd 2 swapped with
+#: ``dup2`` while lane threads write it. Linux swaps a descriptor in one step.
+#: macOS does not: another thread's write can find fd 2 closed for an instant
+#: and fail with EBADF - in a lane's own code, from a plain write to stderr -
+#: and CI's macOS suite lost everything one writer thread wrote after a
+#: rotation. Where this is False the file is left to grow instead.
+ROTATES = sys.platform.startswith("linux")
+
 
 class StderrTee:
     """Points fd 2 at a real file for the length of each phase.
@@ -216,14 +224,21 @@ class StderrTee:
         writes go anywhere else; the file's length still counts every byte
         ever written, and its blocks hold the tail.
 
-        Where holes cannot be punched - not Linux, or a filesystem without
-        them - the file is rotated instead (:meth:`_rotate`), which is exact
-        for this process's own writes and loses what a child that outlives
-        the rotation writes afterwards.
+        Where holes cannot be punched on Linux - a filesystem without them -
+        the file is rotated instead (:meth:`_rotate`), which is exact for this
+        process's own writes and loses what a child that outlives the
+        rotation writes afterwards. Elsewhere nothing is given back: rotating
+        swaps fd 2 under writing threads, which only Linux does safely - see
+        :data:`ROTATES`.
         """
         upto = max(0, self._phase_offset - self.limit) // HOLE_ALIGNMENT * HOLE_ALIGNMENT
         if upto > self._released and self._file is not None and _punch_hole(self._file, upto):
             self._released = upto
+            return
+        if not ROTATES:
+            # Nothing is given back: the file keeps the session's stderr. Only
+            # asked again after as much more, not on every drain.
+            self._released = self._phase_offset
             return
         self._rotate()
 

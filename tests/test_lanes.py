@@ -640,8 +640,10 @@ import os, subprocess, sys, threading
 from pathlib import Path
 from pytest_failure_instrumentation.capture import output
 
-if sys.argv[2] == "rotate":
+if sys.argv[2] in ("rotate", "grow"):
     output._punch_hole = lambda descriptor, length: False
+if sys.argv[2] == "grow":
+    output.ROTATES = False  # what macOS does: never swap fd 2 under writers
 path = Path(sys.argv[1])
 tee = output.StderrTee(path, limit=4096, append=True)
 tee.start()
@@ -682,16 +684,17 @@ print(output.read_tail(path)[-1])
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX only")
-@pytest.mark.parametrize("how", ["punch", "rotate"])
+@pytest.mark.parametrize("how", ["punch", "rotate", "grow"])
 def test_a_session_long_tee_passes_every_byte_on_once_and_stays_bounded(tmp_path, how):
     """Taken once for a session of lanes, the tee is never between phases,
     where it would otherwise be trimmed. It gives the disk back instead - by
-    punching holes where it can, by rotating where it cannot - and neither may
+    punching holes where it can, by rotating where it cannot, and where fd 2
+    cannot be swapped safely under writing threads it grows - and none may
     lose a byte on its way to the terminal, or pass one on twice."""
     import subprocess
 
-    if how == "punch" and not sys.platform.startswith("linux"):
-        pytest.skip("holes are punched on Linux")
+    if how in ("punch", "rotate") and not sys.platform.startswith("linux"):
+        pytest.skip("holes are punched, and a file rotated, on Linux only")
     capture = tmp_path / "main.output"
     finished = subprocess.run(
         [sys.executable, "-c", TEE_SCRIPT, str(capture), how],
@@ -704,12 +707,16 @@ def test_a_session_long_tee_passes_every_byte_on_once_and_stays_bounded(tmp_path
             f"w{key}-{index:05d}" for index in range(2000)
         ]
     child = [line for line in lines if line.startswith("c-")]
-    if how == "punch":
+    if how in ("punch", "grow"):
         # The child's fd 2 is the same open file: none of its bytes is lost.
         assert child == [f"c-{index:05d}" for index in range(2000)]
     else:
         assert len(child) == len(set(child))
     on_disk, length = (int(value) for value in finished.stdout.split()[:2])
+    if how == "grow":
+        assert length >= 3 * 2000 * 9 + 2000 * 8
+        assert not (tmp_path / "main.output.prev").exists()
+        return
     assert on_disk < 64 * 1024
     if how == "rotate":
         assert length < 3 * 4096 + 1024
@@ -722,6 +729,7 @@ from pathlib import Path
 from pytest_failure_instrumentation.capture import output
 
 output._punch_hole = lambda descriptor, length: False
+output.ROTATES = True  # no thread writes fd 2 while it is swapped here
 tee = output.StderrTee(Path(sys.argv[1]), limit=4096, append=True)
 tee.start()
 tee.take()
@@ -1335,6 +1343,7 @@ session = output.StderrTee(directory / "main.output", limit=4096, append=True)
 session.start()
 flags = [appends(per_phase._file), appends(session._file)]
 output._punch_hole = lambda descriptor, length: False
+output.ROTATES = True  # no thread writes fd 2 while it is swapped here
 session.take()
 os.write(2, b"x" * 4096 * 3 + b"\n")
 session.drain()                  # rotates
@@ -1368,6 +1377,7 @@ from pathlib import Path
 from pytest_failure_instrumentation.capture import output
 
 output._punch_hole = lambda descriptor, length: False
+output.ROTATES = True  # no thread writes fd 2 while it is swapped here
 tee = output.StderrTee(Path(sys.argv[1]), limit=4096, append=True)
 tee.start()
 tee.take()
@@ -1409,6 +1419,7 @@ from pathlib import Path
 from pytest_failure_instrumentation.capture import output
 
 output._punch_hole = lambda descriptor, length: False
+output.ROTATES = True  # no thread writes fd 2 while it is swapped here
 tee = output.StderrTee(Path(sys.argv[1]), limit=4096, append=True)
 tee.start()
 tee.take()
