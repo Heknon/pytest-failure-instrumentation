@@ -17,6 +17,7 @@ import psutil
 from .capture.resource_history import ResourceHistory
 from .capture.state import read_state
 from .config import Settings
+from .lanes import is_lane
 from .probes.resource_metrics import PlatformMetrics, cgroup_metrics, reason
 
 MAX_PROCESSES = 512
@@ -111,6 +112,11 @@ class ResourceSampler:
         for path in self.directory.glob("*.state"):
             state = read_state(path)
             pid = state.get("pid")
+            if is_lane(state):
+                # A lane of pytest-threadlanes is a thread of a process whose
+                # own state is here too, with this pid; the process is what is
+                # measured, and it is known by its own name - see .lanes.
+                continue
             if isinstance(pid, int) and len(workers) < MAX_PROCESSES:
                 visible = self.pid_map.get(pid) if self.foreign_procfs else pid
                 if visible is None:

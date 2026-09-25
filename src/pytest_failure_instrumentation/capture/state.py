@@ -98,8 +98,26 @@ def _elide(nodeid: str | None, keep: int) -> str | None:
 class WorkerState:
     """The current nodeid, phase and counters for one worker."""
 
-    def __init__(self, path: Path, pid: int, run_id: str | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        pid: int,
+        run_id: str | None = None,
+        *,
+        lane: dict[str, Any] | None = None,
+    ) -> None:
         self.path = path
+        #: Who a lane's record is, written after everything else: the process
+        #: it runs in, and the thread it runs on - by name, by native id, and
+        #: by the id faulthandler prints - see :mod:`..lanes`. None for a
+        #: worker that is a process, whose record is byte for byte what it
+        #: was before lanes existed.
+        self.lane = dict(lane) if lane else None
+        #: Set on a process's own record once its first lane has started a
+        #: test: from then on the process is a container, and its lanes are
+        #: its workers. Absent from the record until then, and forever in a
+        #: run without lanes.
+        self.lanes: bool | None = None
         from ..probes.process import creation_time
 
         self.pid = pid
@@ -244,6 +262,10 @@ class WorkerState:
                 "timeout_settings": self.timeout_settings,
                 "tests_started": self.tests_started,
                 "tests_finished": self.tests_finished,
+                # Only ever present under lanes, and last, so a record written
+                # without them is the record this file always wrote.
+                **({"lanes": True} if self.lanes else {}),
+                **(self.lane or {}),
             }
         )
         return payload.encode("utf-8") + b"\n"

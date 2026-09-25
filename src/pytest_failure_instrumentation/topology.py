@@ -65,6 +65,7 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Optional
 
+from . import lanes as thread_lanes
 from .analysis import stall as stall_analysis
 from .capture.events import head_events, tail_events, this_run
 from .capture.heartbeat import DEFAULT_INTERVAL
@@ -179,11 +180,18 @@ def run(
     # would report a run whose rows came from different instants.
     schedule = read_schedule(directory)
     rows = worker_rows(schedule)
-    workers = [
-        worker(state, moment, rows.get(state.stem))
-        for state in sorted(directory.glob("*.state"))
-        if wanted is None or state.stem in wanted
-    ]
+    workers = []
+    for state in sorted(directory.glob("*.state")):
+        if wanted is not None and state.stem not in wanted:
+            continue
+        row, record = _row(state, moment, rows.get(state.stem))
+        # A process running pytest-threadlanes is the container of its lanes
+        # once one has started, and its lanes are the rows: each a worker with
+        # its own test. Listing the process too would add a row that is
+        # running all of their tests and names none of them.
+        if thread_lanes.is_container(record):
+            continue
+        workers.append(row)
     controller_pid = owner.get("pid")
     return {
         "session": directory.name,
@@ -254,8 +262,39 @@ def worker(
     ``schedule`` is this worker's row out of the controller's record, or None
     where there is not one. It is passed in rather than read here because it
     lives in one file for the whole run - see :func:`run`.
+
+    **A lane of pytest-threadlanes** is a worker whose process is shared with
+    its siblings - see :mod:`.lanes`. Its record names that process, and what
+    is per process is read from the process's files: the heartbeat, and with
+    it the resident memory, the liveness and the finish. Its CPU is its own
+    thread's, where the beats carry a figure per lane, because the process's
+    is every lane's summed and one busy sibling would make a hung lane read as
+    working. It is not in the controller's schedule, which counts per xdist
+    worker, so what it was assigned is left unsaid rather than guessed.
     """
-    events = tail_events(state_path.with_name(f"{state_path.stem}.events"))
+    return _row(state_path, now, schedule)[0]
+
+
+def _row(
+    state_path: Path, now: float, schedule: Optional[dict[str, Any]] = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """:func:`worker`'s row, and the record it was read from."""
+    events_path = state_path.with_name(f"{state_path.stem}.events")
+    lane: Optional[str] = None
+    process: Any = None
+    events = tail_events(events_path)
+    if not events:
+        # A lane keeps no event log: its beats are its process's. Asked only
+        # where there is nothing to read, so a worker that is a process - with
+        # a log from its first moment - pays nothing for the question.
+        hint = read_state(state_path)
+        if thread_lanes.is_lane(hint):
+            process = hint.get(thread_lanes.PROCESS_KEY)
+            shared = thread_lanes.sibling(state_path, process, ".events")
+            if shared is not None:
+                lane, events_path = state_path.stem, shared
+                schedule = None
+                events = tail_events(events_path)
     run_id = _worker_run_id(events)
     events = this_run(events, run_id)
     record = read_state(state_path, run_id)
@@ -266,14 +305,17 @@ def worker(
     pid = record.get("pid")
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
-    rate = stall_analysis.cpu_rate(beats[-RATE_WINDOW:]) if len(beats) >= 2 else None
+    measured = stall_analysis.lane_beats(beats, lane) if lane is not None else beats
+    rate = (
+        stall_analysis.cpu_rate(measured[-RATE_WINDOW:]) if len(measured) >= 2 else None
+    )
     status, why = _status(
-        exists, beats, beat_age, rate, _interval(events, state_path), record,
+        exists, beats, beat_age, rate, _interval(events, events_path), record,
         finished=finished, now=now,
     )
 
     nodeid = record.get("nodeid")
-    return {
+    row = {
         "worker": state_path.stem,
         "pid": pid,
         "nodeid": nodeid,
@@ -325,6 +367,15 @@ def worker(
         # produces exactly the second one.
         "cpu_rate": None if rate is None else round(rate, 3),
     }
+    if lane is not None:
+        # Which process the lane runs in and which of its threads it is, so a
+        # reader holding the process's stack can open the lane's thread in it
+        # rather than the main thread, which is the lanes' scheduler. Only on
+        # a lane's row: a row without them is the row this always returned.
+        row["process"] = process
+        row["thread_name"] = record.get("thread_name")
+        row["thread_id"] = record.get("thread_id")
+    return row, record
 
 
 def _progress(
@@ -497,7 +548,7 @@ def _finish(events: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     return None
 
 
-def _interval(events: list[dict[str, Any]], state_path: Optional[Path] = None) -> float:
+def _interval(events: list[dict[str, Any]], events_path: Optional[Path] = None) -> float:
     """The heartbeat cadence this worker was actually started with.
 
     Read rather than assumed: it is what "stale" is measured in, and a run
@@ -520,8 +571,8 @@ def _interval(events: list[dict[str, Any]], state_path: Optional[Path] = None) -
     for event in reversed(events):
         if event.get("event") == "watchdog_started" and event.get("interval"):
             return float(event["interval"])
-    if state_path is not None:
-        head = head_events(state_path.with_name(f"{state_path.stem}.events"))
+    if events_path is not None:
+        head = head_events(events_path)
         for event in head:
             if event.get("event") == "watchdog_started" and event.get("interval"):
                 return float(event["interval"])

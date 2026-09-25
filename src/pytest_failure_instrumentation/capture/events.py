@@ -16,6 +16,7 @@ this one, with full confidence and the wrong worker's name on it.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,14 +29,21 @@ class EventLog:
         self.path = path
         self.run_id = run_id
         self._stream = path.open("w", buffering=1, encoding="utf-8")
+        #: One line at a time. The heartbeat's thread and the main thread have
+        #: always both written here, and a process running pytest-threadlanes
+        #: adds its lanes; a text stream is not promised to keep two writers'
+        #: lines whole, least of all on a free-threaded build.
+        self._lock = threading.Lock()
 
     def record(self, event: str, **fields: Any) -> None:
         fields["event"] = event
         fields.setdefault("time", round(time.time(), 3))
         fields.setdefault("run_id", self.run_id)
         try:
-            self._stream.write(json.dumps(fields) + "\n")
-            self._stream.flush()
+            line = json.dumps(fields) + "\n"
+            with self._lock:
+                self._stream.write(line)
+                self._stream.flush()
         except (ValueError, OSError, TypeError):
             pass  # bookkeeping must never break a run
 

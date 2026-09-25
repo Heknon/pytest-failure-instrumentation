@@ -47,6 +47,23 @@ def same_process(pid: int, created: Any = None) -> bool:
                 and abs(observed - created) > 0.001)
 
 
+def thread_cpu_seconds() -> dict[int, float]:
+    """CPU seconds, user and system, used by each thread of this process.
+
+    Keyed by the native thread id - the number ``threading.get_native_id()``
+    returns for a thread - which is how psutil numbers them on Linux, macOS
+    and Windows. Empty where they cannot be read: a lane then falls back to
+    its process's figure, which is the reading it had before per-thread ones.
+    """
+    try:
+        return {
+            int(thread.id): float(thread.user_time) + float(thread.system_time)
+            for thread in psutil.Process().threads()
+        }
+    except (psutil.Error, OSError, AttributeError, ValueError):
+        return {}
+
+
 def is_running(pid: int) -> bool:
     """Whether a process still exists. Never touches it.
 

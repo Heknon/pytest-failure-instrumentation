@@ -302,9 +302,14 @@ def roles_in(directory: Path) -> dict[int, str]:
             roles[int(record["pid"])] = CONTROLLER
     except (OSError, ValueError):
         pass
+    from ..lanes import is_lane
+
     for state in sorted(directory.glob("*.state")):
-        pid = read_state(state, None).get("pid")
-        if isinstance(pid, int):
+        record = read_state(state, None)
+        pid = record.get("pid")
+        # A lane shares its process's pid, and the process is what a signal
+        # is sent to; its name is the one the role is known by.
+        if isinstance(pid, int) and not is_lane(record):
             roles[pid] = state.stem
     return roles
 

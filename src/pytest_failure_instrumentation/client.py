@@ -214,6 +214,18 @@ class Worker(_Wire):
     heartbeat_age_s: Optional[float] = None
     #: None is not zero: "burned nothing" and "could not measure" differ.
     cpu_rate: Optional[float] = None
+    #: Set only on a lane of pytest-threadlanes, which is a worker sharing its
+    #: process with its sibling lanes: the xdist worker it runs in (``gw0``,
+    #: or ``main`` in a run with no ``-n``), whose pid, memory and heartbeat
+    #: this row reports. None on every worker that is a process of its own.
+    process: Optional[str] = None
+    #: The lane's thread in that process, by name (``lane-gw0.ln3``) and by
+    #: native id - the operating system's number for it, which a stack read
+    #: of the process reports as each thread's ``os_thread_id``. That is the
+    #: thread to open in a stack of the pid above; the process's main thread
+    #: is the lanes' scheduler. None where the row is not a lane.
+    thread_name: Optional[str] = None
+    thread_id: Optional[int] = None
 
 
 class Run(_Wire):

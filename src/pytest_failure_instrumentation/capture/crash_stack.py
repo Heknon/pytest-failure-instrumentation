@@ -26,6 +26,7 @@ from __future__ import annotations
 import faulthandler
 import os
 import signal
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -136,6 +137,17 @@ class SlowTestWatchdog:
         #: Whether there is a dump to clean up. A suite of fast tests never
         #: writes one, and must not pay a failing unlink per test to find out.
         self._on_disk = False
+        #: The same clock, once per lane, in a process running
+        #: pytest-threadlanes: several tests are in flight at once there, and
+        #: the one attribute above can only time one of them. The dump itself
+        #: is unchanged - it is of every thread, so whichever lane is overdue,
+        #: its thread is in it. Empty, and never consulted, without lanes.
+        self._lanes: dict[str, float] = {}
+        self._lanes_dumped: dict[str, float] = {}
+        #: Lanes start and end tests on their own threads while the heartbeat
+        #: ticks on its own; a single process's clock needs no lock, and does
+        #: not take this one.
+        self._lanes_lock = threading.Lock()
 
     def start_test(self) -> None:
         if not self.enabled:
@@ -159,12 +171,41 @@ class SlowTestWatchdog:
         if self._on_disk:
             self._discard()
 
+    def start_lane(self, lane: str) -> None:
+        """:meth:`start_test`, for one lane of a process running several."""
+        if not self.enabled:
+            return
+        with self._lanes_lock:
+            self._lanes[lane] = time.monotonic()
+            self._lanes_dumped.pop(lane, None)
+
+    def end_lane(self, lane: str) -> None:
+        """:meth:`end_test`, for one lane.
+
+        The dump on disk is of every thread, so it is still the right one to
+        keep while any other lane's test is past the timeout - discarding it
+        because one lane finished would take the stack away from the lane
+        that is still stuck. It goes once nothing running is overdue.
+        """
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        with self._lanes_lock:
+            self._lanes.pop(lane, None)
+            self._lanes_dumped.pop(lane, None)
+            overdue = any(now - started >= self.timeout for started in self._lanes.values())
+            if self._on_disk and not overdue:
+                self._discard()
+
     def stop(self) -> None:
         """The heartbeat's ticker protocol. Nothing to wind down: what is on
         disk at the end of a run is the last test's, and the next run clears
         the directory before it reads anything."""
 
     def tick(self) -> None:
+        if self._lanes:
+            self._tick_lanes()
+            return
         started = self._started_at
         if not self.enabled or started is None:
             return
@@ -175,6 +216,26 @@ class SlowTestWatchdog:
             return
         self._dumped_at = now
         self._dump()
+
+    def _tick_lanes(self) -> None:
+        """One dump whenever any lane's test is due one, on each lane's own
+        cadence - measured within that lane's test, as the single clock's is."""
+        now = time.monotonic()
+        with self._lanes_lock:
+            due = [
+                lane
+                for lane, started in self._lanes.items()
+                if now - started >= self.timeout
+                and (
+                    lane not in self._lanes_dumped
+                    or now - self._lanes_dumped[lane] >= self.timeout
+                )
+            ]
+            if not due:
+                return
+            for lane in due:
+                self._lanes_dumped[lane] = now
+            self._dump()
 
     def _dump(self) -> None:
         """Write the whole dump beside the file, then move it into place.

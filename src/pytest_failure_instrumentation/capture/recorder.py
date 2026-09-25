@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -31,6 +32,45 @@ from .heartbeat import Heartbeat
 from .state import WorkerState
 
 
+class _LaneSlot:
+    """One lane's share of a recorder: its own state slot and its own count.
+
+    A lane of pytest-threadlanes is a worker that shares its process with its
+    siblings, and everything per test in :class:`WorkerRecorder` was written
+    for a process with one test in flight. So each lane gets the per-test half
+    of the recorder to itself - the three attributes :meth:`WorkerRecorder._phase`
+    reads, spelt the same, so that one code path serves both - and the
+    per-process half (heartbeat, event log, dumps) stays shared.
+
+    Only ever touched from the lane's own thread, which is what makes it safe
+    without a lock: a lane is one thread for the whole session.
+    """
+
+    def __init__(self, name: str, state: WorkerState, native_id: int, ident: int) -> None:
+        self.name = name
+        self.state = state
+        self._counted: Optional[str] = None
+        self._attempt = 0
+        self.native_id = native_id
+        self.ident = ident
+
+
+class _SessionTeeDrain:
+    """A heartbeat ticker that passes a session-long tee's bytes on to the
+    terminal, so fd 2 under lanes reaches it within a tick rather than at the
+    end of whichever phase some lane finishes next - a phase of these suites
+    can be two hours long."""
+
+    def __init__(self, recorder: WorkerRecorder) -> None:
+        self.recorder = recorder
+
+    def tick(self) -> None:
+        self.recorder._tee_drain()
+
+    def stop(self) -> None:
+        pass
+
+
 class WorkerRecorder:
     def __init__(
         self,
@@ -40,9 +80,28 @@ class WorkerRecorder:
         *,
         faulthandler_timeout: float = 0.0,
         claims_fatal_dumps: bool = True,
+        lanes: bool = False,
     ) -> None:
         self.worker_id = worker_id
         self.directory = directory
+        #: Whether this process runs its tests on pytest-threadlanes' lanes,
+        #: several at once. Decided at registration from the option alone -
+        #: see :mod:`..lanes` - so that everything that has to be settled
+        #: before the first test (the tee, the profiler, the heartbeat's
+        #: per-lane figures) is. False everywhere else, and then nothing below
+        #: takes a branch it did not take before lanes existed.
+        self.lanes = lanes
+        #: This process's lanes, by name, each created on its first test.
+        #: Inserted into under the lock, from the lanes' own threads; read
+        #: without it by each lane for its own entry.
+        self._lanes: dict[str, _LaneSlot] = {}
+        #: Lanes whose slot could not be opened, so that it is tried - and the
+        #: failure recorded - once, rather than on every phase of every test.
+        self._lanes_failed: set[str] = set()
+        self._lanes_lock = threading.Lock()
+        #: Serializes the session-long tee's copies, which lanes' phase ends
+        #: and the heartbeat's ticks make concurrently. Untouched without lanes.
+        self._tee_lock = threading.Lock()
         #: Whether to point fatal-signal dumps at this process's own crash
         #: file, which means taking them off the stderr pytest aimed them at.
         #: True for a worker, where that stderr is shared with fifteen others
@@ -151,6 +210,8 @@ class WorkerRecorder:
         #: _tee_take. Read by _tee_hand_back, so it never restores a
         #: descriptor it did not take.
         self._tee_stood_down = False
+        if self.lanes:
+            self._record_lane_adjustments(settings)
 
         self._apply_memory_limit(settings)
         if settings.profile_allocations:
@@ -207,6 +268,44 @@ class WorkerRecorder:
         self._open_resources.append(resource)
         return resource
 
+    def _record_lane_adjustments(self, settings: Settings) -> None:
+        """Say which process-wide machinery runs differently under lanes.
+
+        Each of these was written for a process with one test in flight, and
+        a reader looking at this process's evidence - a stderr tail with no
+        phase boundaries, a watchdog dump holding every lane, no nodeid on a
+        beat - is owed the reason, in the file it is reading. The profiler
+        says so where it is skipped.
+        """
+        if self.stderr_tee is not None:
+            self.events.record(
+                "lanes_adjusted",
+                mechanism="stderr_tee",
+                action="taken once for the session",
+                reason="lanes run their phases at once, so handing fd 2 back at "
+                "one lane's phase end would take it from the others; pytest does "
+                "not swap fd 2 per test under lanes either. What reaches it is "
+                "passed on to stderr as it arrives, and is not trimmed until "
+                "the session ends",
+            )
+        if self.slow_test.enabled:
+            self.events.record(
+                "lanes_adjusted",
+                mechanism="slow_test_watchdog",
+                action="one clock per lane",
+                reason="several tests are in flight at once; the dump is of "
+                "every thread, so it holds whichever lane is overdue",
+            )
+        if settings.watchdog:
+            self.events.record(
+                "lanes_adjusted",
+                mechanism="heartbeat",
+                action="no test on the process's beat; per-lane CPU in threads",
+                reason="the process is running one test per lane, and its beat "
+                "cannot name one of them. Memory is per process and is not "
+                "attributed to any test",
+            )
+
     # -- setup -----------------------------------------------------------
 
     def _apply_memory_limit(self, settings: Settings) -> None:
@@ -241,6 +340,18 @@ class WorkerRecorder:
         see a two-second spike as anything but one sample.
         """
         if not settings.profile:
+            return
+        if self.lanes:
+            # Every sample is attributed to the one test in flight, and a
+            # process of lanes has as many in flight as it has lanes: each of
+            # them would be charged for all the others' CPU and memory.
+            self.events.record(
+                "lanes_adjusted",
+                mechanism="profiler",
+                action="disabled",
+                reason="it attributes samples to one test at a time, and this "
+                "process runs one test per lane at once",
+            )
             return
         from .. import probes
         from ..profile.sampler import ProfileLog, Sampler
@@ -293,6 +404,9 @@ class WorkerRecorder:
             capabilities=probes.capabilities(),
             **self.monitor.describe(),
         )
+        tickers: list[Any] = [self.slow_test, self.frozen]
+        if self.lanes and self.stderr_tee is not None:
+            tickers.append(_SessionTeeDrain(self))
         self.heartbeat = Heartbeat(
             self.events.record,
             interval=settings.heartbeat_interval,
@@ -300,7 +414,8 @@ class WorkerRecorder:
             # Every wake rather than every beat: one is watching a deadline
             # and the other is pushing one out, and both are wrong if they
             # only happen every fifth second.
-            tickers=[self.slow_test, self.frozen],
+            tickers=tickers,
+            threads=self._lane_threads if self.lanes else None,
         )
         self.heartbeat.start()
 
@@ -328,6 +443,8 @@ class WorkerRecorder:
             on_demand_stack=on_demand,
             slow_test_seconds=self.slow_test.timeout if self.slow_test.enabled else None,
         )
+        if self.lanes:
+            self._tee_session()
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(self, item: pytest.Item, nextitem: Any) -> Any:
@@ -365,11 +482,14 @@ class WorkerRecorder:
         the profile summary reported a run of two tests as four. Here is
         after the last attempt, whichever attempt that turns out to be.
         """
-        self._counted = None
-        self._attempt = 0
+        slot = self._slot(item)
+        if slot is not None:
+            slot._counted = None
+            slot._attempt = 0
         yield
-        self._counted = None
-        self._attempt = 0
+        if slot is not None:
+            slot._counted = None
+            slot._attempt = 0
         self._profile("end_test", item.nodeid)
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
@@ -398,7 +518,8 @@ class WorkerRecorder:
         the start of every phase; this takes it just after, and _tee_hand_back
         gives it back at the phase's end with the phase's bytes copied into
         pytest's file, so both keep the output."""
-        if self.stderr_tee is None:
+        if self.stderr_tee is None or self.lanes:
+            # Under lanes fd 2 is taken once, for the session - _tee_session.
             return
         if item is not None and self._FD_CAPTURE_FIXTURES.intersection(
             getattr(item, "fixturenames", ())
@@ -412,8 +533,35 @@ class WorkerRecorder:
         # Only hand back what was taken: a phase the tee stood down for never
         # touched fd 2, and calling hand_back then would restore a descriptor
         # it does not own.
+        if self.lanes:
+            self._tee_drain()
+            return
         if self.stderr_tee is not None and not self._tee_stood_down:
             self.stderr_tee.hand_back()
+
+    def _tee_session(self) -> None:
+        """Take fd 2 once, for a process running lanes.
+
+        Per phase is what the tee does everywhere else, and it cannot here:
+        lanes run their phases at the same time, and a lane handing fd 2 back
+        at the end of its phase would take it away from every sibling still
+        inside one - the next C-level write of theirs lost from the ring, or
+        fd 2 left pointing at whichever file was restored last. pytest does
+        not take fd 2 per test under lanes either (pytest-threadlanes runs it
+        with ``--capture=no`` and captures per lane itself), so there is
+        nothing to coexist with. What arrives is passed on as it arrives -
+        _tee_drain - and fd 2 is given back at session finish.
+        """
+        if self.stderr_tee is None:
+            return
+        with self._tee_lock:
+            self.stderr_tee.take()
+
+    def _tee_drain(self) -> None:
+        if self.stderr_tee is None:
+            return
+        with self._tee_lock:
+            self.stderr_tee.drain()
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_collection(self, session: Any) -> Any:
@@ -444,21 +592,31 @@ class WorkerRecorder:
         "died mid-call": pytest's own logfinish fires only after the whole
         protocol, so it cannot tell them apart."""
         self._tee_take(item)
+        slot = self._slot(item)
+        if slot is None:
+            # A lane whose slot could not be opened: recorded once, and the
+            # test runs unrecorded rather than written into another's slot.
+            try:
+                yield
+            finally:
+                self._tee_hand_back()
+            return
+        own = slot is self
         now = time.time()
         if phase == "setup":
-            if self._counted != nodeid:
+            if slot._counted != nodeid:
                 # The first setup of the protocol is the test starting.
-                self._counted = nodeid
-                self.state.tests_started += 1
-                self._attempt = 1
+                slot._counted = nodeid
+                slot.state.tests_started += 1
+                slot._attempt = 1
             else:
                 # A second one is a rerun of the same test, which is not a
                 # test starting - see pytest_runtest_protocol. The attempt is
                 # counted whatever the counters are doing, because it is the
                 # only field that says a rerun is happening at all; everything
                 # else here is about tests, of which this is still the one.
-                self._attempt += 1
-                if self.state.tests_finished > 0:
+                slot._attempt += 1
+                if slot.state.tests_finished > 0:
                     # And the finish counted at the end of the last attempt
                     # was not a finish either. It is taken back rather than
                     # never counted, because at the end of a teardown nobody
@@ -466,21 +624,24 @@ class WorkerRecorder:
                     # back rather than left, because the row is read as
                     # ``started - finished`` running, and that read zero
                     # beside a call phase in the slot.
-                    self.state.tests_finished -= 1
+                    slot.state.tests_finished -= 1
             # The whole test's clock, not the phase's: pytest-timeout and
             # faulthandler_timeout both time the item from its setup, so a
             # death is matched against a timeout by how long the *test* ran.
             # Set on every attempt, rerun or not: an enforcer gives each
             # attempt its own deadline, measured from that attempt's setup.
-            self.state.attempt = self._attempt
-            self.state.test_started = now
+            slot.state.attempt = slot._attempt
+            slot.state.test_started = now
             from .timeouts import effective
 
-            self.state.timeout_settings = effective(item) if item is not None else []
-        if self.heartbeat is not None:
+            slot.state.timeout_settings = effective(item) if item is not None else []
+        # The process's beat names the test it is running, which a process of
+        # lanes cannot: it runs one per lane. Their CPU is on the beat per
+        # lane instead - see Heartbeat.threads.
+        if own and self.heartbeat is not None:
             self.heartbeat.nodeid = nodeid
             self.heartbeat.phase = phase
-        self.state.update(nodeid=nodeid, phase=phase, phase_started=now)
+        slot.state.update(nodeid=nodeid, phase=phase, phase_started=now)
         # Started once for the whole test rather than per phase, and from
         # setup rather than from the call.
         #
@@ -495,7 +656,10 @@ class WorkerRecorder:
         # spent most of the interval in setup and the rest in the call never
         # reached it.
         if phase == "setup":
-            self.slow_test.start_test()
+            if own:
+                self.slow_test.start_test()
+            else:
+                self.slow_test.start_lane(slot.name)
         self._profile("begin_phase", nodeid, phase)
         try:
             yield
@@ -504,18 +668,21 @@ class WorkerRecorder:
             # pytest's own capture, whatever the phase did.
             self._tee_hand_back()
         self._profile("end_phase", phase)
-        if self.heartbeat is not None:
+        if own and self.heartbeat is not None:
             self.heartbeat.phase = None
         if phase != "teardown":
-            self.state.update(phase=None)
+            slot.state.update(phase=None)
             return
-        self.slow_test.end_test()
-        self.state.tests_finished += 1
+        if own:
+            self.slow_test.end_test()
+        else:
+            self.slow_test.end_lane(slot.name)
+        slot.state.tests_finished += 1
         # Cleared with the test rather than with the phase, exactly as the
         # node id below is and for the same reason: between two tests there is
         # no attempt in flight, and a row saying there is names one that is
         # over. A rerun sets it again at its next setup, above.
-        self.state.attempt = None
+        slot.state.attempt = None
         # The node id is cleared with the *test*, not with each phase. A worker
         # that dies or wedges in the gap between two tests has no test in
         # flight, and saying it had one names a test that already passed - to
@@ -529,20 +696,117 @@ class WorkerRecorder:
         # left running between tests makes an idle worker's `os._exit(1)`
         # reach any timeout you like, and the death is reported as TIMED_OUT
         # against a test that had already passed.
-        if self.heartbeat is not None:
+        if own and self.heartbeat is not None:
             self.heartbeat.nodeid = None
-        self.state.update(phase=None, nodeid=None, phase_started=None, test_started=None)
+        slot.state.update(phase=None, nodeid=None, phase_started=None, test_started=None)
+
+    # -- lanes -----------------------------------------------------------
+
+    def _slot(self, item: Any) -> Any:
+        """Where this test's bookkeeping goes: this recorder, or its lane's slot.
+
+        This recorder itself everywhere but a lane - it carries the same three
+        attributes a slot does - so a run without lanes takes exactly the path
+        it always took. None only for a lane whose slot could not be opened.
+        """
+        if not self.lanes or item is None:
+            return self
+        lane = self._lane_of(item)
+        if lane is None:
+            return self
+        slot = self._lanes.get(lane)
+        if slot is None and lane not in self._lanes_failed:
+            slot = self._open_lane(lane)
+        return slot
+
+    def _lane_of(self, item: Any) -> Optional[str]:
+        """The lane running ``item``, or None when it is this process itself.
+
+        pytest-threadlanes makes ``config.workerinput`` name the lane on the
+        lane's own thread, exactly as xdist makes it name the worker in the
+        worker's process: ``ln3`` in a run with no ``-n``, ``gw0.ln3`` in one
+        with. Off a lane it is what it always was - absent in a run with no
+        workers, and this worker's own id in an xdist worker - and either of
+        those is this process, not a lane.
+        """
+        workerinput = getattr(getattr(item, "config", None), "workerinput", None)
+        if not isinstance(workerinput, dict):
+            return None
+        lane = workerinput.get("workerid")
+        if not lane or lane == self.worker_id:
+            return None
+        return str(lane)
+
+    def _open_lane(self, lane: str) -> Optional[_LaneSlot]:
+        """A lane's slot, made on its first test, on its own thread.
+
+        On its own thread because the slot records which thread that is - by
+        name for a person, by native id for the per-thread CPU figures and a
+        UI matching a stack to it, and by the id faulthandler prints for the
+        stall and death readers picking its section out of a dump.
+
+        The first one also marks this process's own record as the container of
+        its lanes, and leaves its node id alone from then on: a reader then
+        lists the lanes rather than a process that is running all of them.
+        """
+        current = threading.current_thread()
+        with self._lanes_lock:
+            existing = self._lanes.get(lane)
+            if existing is not None:
+                return existing
+            try:
+                state = WorkerState(
+                    self.directory / f"{lane}.state",
+                    os.getpid(),
+                    self.state.run_id,
+                    lane={
+                        "process": self.worker_id,
+                        "thread_name": current.name,
+                        "thread_id": threading.get_native_id(),
+                        "thread_ident": threading.get_ident(),
+                        "lane": True,
+                    },
+                )
+            except OSError as failure:
+                self._lanes_failed.add(lane)
+                self.events.record("lane_state_failed", lane=lane, detail=repr(failure))
+                return None
+            self._track(state)
+            slot = _LaneSlot(lane, state, threading.get_native_id(), threading.get_ident())
+            first = not self._lanes
+            self._lanes[lane] = slot
+            state.update()
+            if first:
+                self.state.update(lanes=True)
+        return slot
+
+    def _lane_threads(self) -> dict[str, int]:
+        """Each lane's native thread id, for the heartbeat's per-lane CPU."""
+        with self._lanes_lock:
+            return {name: slot.native_id for name, slot in self._lanes.items()}
+
+    def _current_lane(self) -> Optional[_LaneSlot]:
+        """The lane whose thread this is, if it is one."""
+        ident = threading.get_ident()
+        with self._lanes_lock:
+            slots = list(self._lanes.values())
+        return next((slot for slot in slots if slot.ident == ident), None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_internalerror(self, excrepr: object) -> None:
         # xdist relays this to the controller as a flat string and re-raises it
         # there, so the INTERNALERROR block shows xdist's frame rather than
-        # this failure. Record the real one, attributed to this worker.
+        # this failure. Record the real one, attributed to this worker - or,
+        # under lanes, to the lane whose thread raised it, since the process's
+        # own slot names no test there.
+        lane = self._current_lane() if self.lanes else None
+        state = lane.state if lane is not None else self.state
         self.events.record(
             "internal_error",
             detail=str(excrepr),
-            nodeid=self.state.nodeid,
-            nodeid_hash=self.state.nodeid_hash,
+            nodeid=state.nodeid,
+            nodeid_hash=state.nodeid_hash,
+            **({"lane": lane.name} if lane is not None else {}),
         )
 
     def close(self) -> None:
@@ -568,5 +832,18 @@ class WorkerRecorder:
         # and an attempt beside a null node id names a test the same record
         # says is not running.
         self.state.update(phase=None, nodeid=None, attempt=None)
+        if self.lanes:
+            # Every lane, for the same reason: a session torn down inside a
+            # test leaves its lane's slot naming it. The lanes' threads have
+            # all returned by now, so nothing else is writing these.
+            with self._lanes_lock:
+                slots = list(self._lanes.values())
+            for slot in slots:
+                slot.state.update(phase=None, nodeid=None, attempt=None)
+            # And fd 2 back where it was, with what is left of the session's
+            # stderr passed on - see _tee_session.
+            if self.stderr_tee is not None:
+                with self._tee_lock:
+                    self.stderr_tee.hand_back()
         if self._allocation_tracer is not None:
             self._allocation_tracer.close()

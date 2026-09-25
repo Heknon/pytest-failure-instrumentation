@@ -64,6 +64,37 @@ def cpu_rate(beats: list[dict[str, Any]]) -> Optional[float]:
     return used / elapsed
 
 
+def lane_beats(beats: list[dict[str, Any]], lane: str) -> list[dict[str, Any]]:
+    """The beats as one lane's, where they measured it: its own thread's CPU.
+
+    A lane of pytest-threadlanes shares its process, and a process's CPU is
+    every lane's summed - so one busy sibling makes a lane that is waiting on
+    a socket read as working, and the verdict this module exists for, "burning
+    CPU: slow, not stuck", hides exactly the lane that is stuck. The heartbeat
+    of a process with lanes carries each lane's thread figure under
+    ``threads``, and this puts it where every rule here reads CPU.
+
+    Only while the latest beat measures the lane, and only from beats that
+    did: a figure missing from the latest - the thread has ended, or this
+    platform could not number it - leaves the process's reading in force. So
+    does a lane measured only once so far, which has no rate of its own yet:
+    the process's is the reading it had before per-thread figures existed, and
+    reading "could not tell" instead raised a stall, at low confidence, on a
+    lane that had started burning a core a second earlier. The next reading
+    has the lane's own. Timing is untouched: the latest beat is kept either
+    way, so a frozen process is exactly as frozen read either way.
+    """
+    latest = beats[-1].get("threads") if beats else None
+    if not isinstance(latest, dict) or lane not in latest:
+        return beats
+    measured = [
+        {**beat, "cpu_seconds": beat["threads"][lane]}
+        for beat in beats
+        if isinstance(beat.get("threads"), dict) and lane in beat["threads"]
+    ]
+    return measured if len(measured) >= 2 else beats
+
+
 def assess(
     beats: list[dict[str, Any]], now: float, silent_for: float, interval: float
 ) -> Assessment:

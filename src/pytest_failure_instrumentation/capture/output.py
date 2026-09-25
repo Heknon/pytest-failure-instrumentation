@@ -137,6 +137,43 @@ class StderrTee:
         finally:
             os.close(passthrough)
 
+    def drain(self) -> None:
+        """Copy what reached the capture file since the last copy on to the
+        stderr it was taken from, and keep fd 2.
+
+        For a process running pytest-threadlanes, which takes fd 2 once for the
+        whole session rather than per phase: its lanes run their phases at the
+        same time, so handing fd 2 back at the end of one lane's phase would
+        take it away from every sibling still inside theirs - see
+        :meth:`..recorder.WorkerRecorder._tee_session`. Without this the
+        terminal would see nothing written to fd 2 until the session ended.
+
+        Not thread-safe on its own; the one caller serializes it.
+        """
+        if not self.active or self._file is None or self._passthrough is None:
+            return
+        try:
+            end = os.lseek(self._file, 0, os.SEEK_END)
+            if end <= self._phase_offset:
+                return
+            with self.path.open("rb") as source:
+                source.seek(self._phase_offset)
+                remaining = end - self._phase_offset
+                while remaining:
+                    chunk = source.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    self._phase_offset += len(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(self._passthrough, view)
+                        if written <= 0:
+                            raise OSError("stderr copy made no progress")
+                        view = view[written:]
+        except OSError:
+            self.reason = "degraded: stderr copy failed"
+
     def _trim(self) -> None:
         """Keep the file to its last ``limit`` bytes. Only between phases, so a
         phase's own output is never trimmed while it is still being written."""

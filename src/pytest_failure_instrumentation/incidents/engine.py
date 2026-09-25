@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from .. import lanes as thread_lanes
 from .. import probes
 from ..analysis.attribution import Attributor
 from ..analysis.collection import CollectionTracker
@@ -198,6 +199,10 @@ class IncidentEngine:
         self.distributed = bool(
             config.pluginmanager.hasplugin("xdist")
             and config.getoption("dist", "no") != "no"
+            # Lanes in this one process are xdist's controller and workers
+            # both, whatever --dist chose for their scheduler: nothing else
+            # will record them, so this process does - see :mod:`..lanes`.
+            and not thread_lanes.in_one_process(config)
         )
 
         # xdist's own id for the run is the one a reader can line up against

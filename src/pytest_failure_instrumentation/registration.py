@@ -198,6 +198,14 @@ def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
     # process-wide timer the two plugins share.
     timeout = pytest_faulthandler_timeout(config)
 
+    # Whether this process runs its tests on pytest-threadlanes' lanes, asked
+    # of the option alone, since that plugin may not be installed at all - see
+    # :mod:`.lanes`. Only a recorder is told: it is where a process running
+    # several tests at once has to be recorded differently.
+    from . import lanes as thread_lanes
+
+    lanes = thread_lanes.requested(config)
+
     if hasattr(config, "workerinput"):
         worker_id = config.workerinput["workerid"]
 
@@ -205,7 +213,11 @@ def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
             from .capture.recorder import WorkerRecorder
 
             return WorkerRecorder(
-                settings.directory, worker_id, settings, faulthandler_timeout=timeout
+                settings.directory,
+                worker_id,
+                settings,
+                faulthandler_timeout=timeout,
+                lanes=lanes,
             )
 
         built = _built(worker, "worker")
@@ -248,6 +260,7 @@ def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
             # destination for a fatal dump and pytest has already pointed it
             # at a terminal somebody is watching. See failure_crash_stack.
             claims_fatal_dumps=settings.crash_stack,
+            lanes=lanes,
         )
 
     # A recorder that cannot be built leaves the engine registered rather than
