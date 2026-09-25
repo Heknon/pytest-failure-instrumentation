@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import faulthandler
 import os
+import re
 import signal
 import threading
 import time
@@ -435,7 +436,12 @@ RUNTEST_MARKERS = (
 OWN_PACKAGE = "/pytest_failure_instrumentation/"
 
 
-def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
+def read(
+    path: Path,
+    limit: int = 12,
+    offset: int = 0,
+    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+) -> list[str]:
     """One thread's stack out of the *latest* dump - most recent call first.
 
     Two things have to be picked correctly here, and getting either wrong
@@ -456,6 +462,11 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
 
     ``offset`` reads only what was appended past a known point, so a stack
     written now is never confused with one written earlier.
+
+    ``thread`` names the thread wanted, as ``(ident, name)``, when the caller
+    knows which it is: a lane of pytest-threadlanes, which shares its process
+    and therefore its dump with every sibling lane - each of them carrying
+    the runtest protocol - and with a main thread that is the scheduler.
     """
     lines = _lines(path, offset)
     if not lines:
@@ -467,11 +478,15 @@ def read(path: Path, limit: int = 12, offset: int = 0) -> list[str]:
     if not sections:
         return _capped(lines, limit)
 
-    section = _capped(_most_relevant(sections), limit)
+    section = _capped(_most_relevant(sections, thread), limit)
     return ([banner] + section) if banner else section
 
 
-def from_threads(threads: list[dict[str, Any]], limit: int = 12) -> list[str]:
+def from_threads(
+    threads: list[dict[str, Any]],
+    limit: int = 12,
+    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+) -> list[str]:
     """A live reader's threads, as a dump read off disk would have looked.
 
     :func:`.probes.stacks.live_stack` answers in a structured shape, and
@@ -488,17 +503,17 @@ def from_threads(threads: list[dict[str, Any]], limit: int = 12) -> list[str]:
     thread carrying the runtest protocol, which is the one running the test.
     """
     lines: list[str] = []
-    for thread in threads:
-        name = thread.get("thread_name") or ""
-        title = f"Thread 0x{int(thread.get('thread_id') or 0):016x}"
+    for reading in threads:
+        name = reading.get("thread_name") or ""
+        title = f"Thread 0x{int(reading.get('thread_id') or 0):016x}"
         lines.append(f"{title} ({name}, most recent call first):" if name
                      else f"{title} (most recent call first):")
         lines.extend(
             f'  File "{frame.get("file")}", line {frame.get("line")} in {frame.get("function")}'
-            for frame in thread.get("frames") or []
+            for frame in reading.get("frames") or []
         )
     sections = _thread_sections(lines)
-    return _capped(_most_relevant(sections), limit) if sections else []
+    return _capped(_most_relevant(sections, thread), limit) if sections else []
 
 
 def _capped(lines: list[str], limit: int) -> list[str]:
@@ -558,8 +573,36 @@ def _thread_sections(lines: list[str]) -> list[list[str]]:
     return sections
 
 
-def _most_relevant(sections: list[list[str]]) -> list[str]:
+#: The thread id in a section's first line, as faulthandler prints it.
+_THREAD_HEADER = re.compile(r"(?:Current thread|Thread) 0x([0-9a-fA-F]+)")
+
+
+def _is_thread(
+    header: str, thread: tuple[Optional[int], Optional[str]]
+) -> bool:
+    """Whether a section's first line is the named thread's.
+
+    faulthandler prints the thread's ident - ``threading.get_ident()`` - and
+    no name; a live read prints both. So the ident is compared as a number,
+    whatever width it was padded to, and the name only where one is printed.
+    """
+    ident, name = thread
+    found = _THREAD_HEADER.match(header)
+    if ident is not None and found is not None and int(found.group(1), 16) == ident:
+        return True
+    return bool(name) and f"({name}," in header
+
+
+def _most_relevant(
+    sections: list[list[str]],
+    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+) -> list[str]:
     """The thread worth reporting, in descending order of certainty.
+
+    A caller that knows which thread it is asking about - a lane of
+    pytest-threadlanes - is answered with that one, whenever the dump holds
+    it. Nothing below can pick it out: its siblings carry the same runtest
+    protocol, and the thread a signal lands on is the scheduler's.
 
     A fatal signal and an on-demand SIGUSR1 both label the thread they reached
     as "Current thread", and that is the answer.
@@ -570,6 +613,10 @@ def _most_relevant(sections: list[list[str]]) -> list[str]:
     down to a psutil frame as the blamed function. A slow test has to be found
     by what is on its stack instead.
     """
+    if thread is not None:
+        for section in sections:
+            if _is_thread(section[0], thread):
+                return section
     for section in sections:
         if section[0].startswith("Current thread") and not _mentions_us(section):
             return section

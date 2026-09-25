@@ -34,6 +34,7 @@ from pytest_failure_instrumentation.analysis import stall as stall_analysis
 from pytest_failure_instrumentation.capture import crash_stack
 from pytest_failure_instrumentation.capture.heartbeat import Heartbeat
 from pytest_failure_instrumentation.capture.state import WorkerState, read_state
+from pytest_failure_instrumentation.incidents import death, stall
 from pytest_failure_instrumentation.nodeid import hash_of
 from pytest_failure_instrumentation.sampling import SampledWorker, WorkerSampler
 
@@ -289,7 +290,73 @@ def test_a_heartbeat_measures_each_lanes_thread_only_when_asked():
     assert list(without) == ["cpu_seconds", "rss_mb", "nodeid", "nodeid_hash", "phase"]
 
 
-# --- the watchdog ---------------------------------------------------------
+# --- stalls -----------------------------------------------------------------
+
+
+def _stall(lanes: Lanes, worker: str):
+    return stall.build(worker, lanes.run, 10.0, 1.0, stack_probe=False, run_id=RUN_ID)
+
+
+def test_a_hung_lane_in_a_busy_process_is_blamed_for_its_own_test(lanes):
+    _hybrid(lanes)
+    incident = _stall(lanes, "gw0.ln1")
+
+    assert incident is not None
+    assert incident.worker == "gw0.ln1"
+    assert incident.state == "BLOCKED"
+    assert incident.cpu_rate == 0.0
+    assert incident.test_in_flight == "t.py::test_hung"
+    assert incident.test_in_flight_hash == hash_of("t.py::test_hung")
+    assert any("lane-gw0.ln1" in line and "gw0" in line for line in incident.evidence)
+
+
+def test_a_busy_lane_is_slow_not_stuck_and_an_idle_one_is_neither(lanes):
+    _hybrid(lanes)
+    assert _stall(lanes, "gw0.ln0") is None
+    assert _stall(lanes, "gw0.ln2") is None
+
+
+def test_a_process_of_lanes_is_silent_for_its_lanes_while_any_has_a_test(lanes):
+    """Its lanes are watched one by one. Its silence is its own only once none
+    of them is running anything, and then it is judged as any worker with no
+    test running: at low confidence, and saying its lanes were idle."""
+    _hybrid(lanes)
+    assert _stall(lanes, "gw0") is None
+
+    lanes.lane("gw0.ln0", "gw0")
+    lanes.lane("gw0.ln1", "gw0")
+    lanes.beats("gw0", {"gw0.ln0": 0.0, "gw0.ln1": 0.0}, process_step=0.0)
+    incident = _stall(lanes, "gw0")
+    assert incident is not None
+    assert incident.test_in_flight is None
+    assert incident.confidence == "low"
+    assert "None of this process's 3 lanes had a test in flight." in incident.evidence
+
+
+def test_a_stack_is_the_lanes_thread_out_of_a_dump_of_all_of_them(tmp_path):
+    lane, sibling = 0x7F00000000A1, 0x7F00000000B2
+    dump = tmp_path / "gw0.crash"
+    dump.write_text(
+        "Current thread 0x00007f00000000c3 (most recent call first):\n"
+        '  File "runner.py", line 318 in _pump_events\n'
+        f"Thread 0x{sibling:016x} (most recent call first):\n"
+        '  File "t.py", line 9 in test_busy\n'
+        '  File "_pytest/runner.py", line 1 in pytest_runtest_call\n'
+        f"Thread 0x{lane:016x} (most recent call first):\n"
+        '  File "t.py", line 6 in test_hung\n'
+        '  File "_pytest/runner.py", line 1 in pytest_runtest_call\n'
+    )
+    assert "_pump_events" in crash_stack.read(dump)[1]
+    assert "test_hung" in crash_stack.read(dump, thread=(lane, None))[1]
+    live = [
+        {"thread_id": sibling, "thread_name": "lane-gw0.ln0",
+         "frames": [{"file": "t.py", "line": 9, "function": "test_busy"},
+                    {"file": "_pytest/runner.py", "line": 1, "function": "pytest_runtest_call"}]},
+        {"thread_id": lane, "thread_name": "lane-gw0.ln1",
+         "frames": [{"file": "t.py", "line": 6, "function": "test_hung"}]},
+    ]
+    assert "test_hung" in crash_stack.from_threads(live, thread=(None, "lane-gw0.ln1"))[1]
+    assert "test_busy" in crash_stack.from_threads(live)[1]
 
 
 def test_the_watchdog_keeps_a_clock_per_lane(tmp_path):
@@ -304,6 +371,61 @@ def test_the_watchdog_keeps_a_clock_per_lane(tmp_path):
     assert (tmp_path / "main.slow").exists()
     watchdog.end_lane("ln1")
     assert not (tmp_path / "main.slow").exists()
+
+
+# --- deaths -----------------------------------------------------------------
+
+
+def _died(lanes: Lanes):
+    """A process of lanes that ended without reaching session finish, as a
+    later run finds it."""
+    return death.recover(lanes.run / "gw0.events", session="run-lanes")
+
+
+def test_a_death_with_one_lane_in_flight_names_that_lanes_test(lanes):
+    lanes.process("gw0", tests_started=0)
+    lanes.lane("gw0.ln0", "gw0")
+    lanes.lane("gw0.ln1", "gw0", "t.py::test_crash", "call", tests_started=3, tests_finished=2)
+    lanes.beats("gw0", {}, process_step=0.0)
+    incident = _died(lanes)
+
+    assert incident.test_in_flight == "t.py::test_crash"
+    assert incident.phase == "call"
+    assert incident.tests_started == 3
+    assert incident.lanes_in_flight == [{
+        "lane": "gw0.ln1", "nodeid": "t.py::test_crash",
+        "nodeid_hash": hash_of("t.py::test_crash"), "phase": "call",
+    }]
+    assert incident.suspect_nodeid() == "t.py::test_crash"
+    assert "on lane gw0.ln1" in incident.summary()
+
+
+def test_a_death_with_several_lanes_in_flight_lists_them_and_blames_none(lanes):
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "t.py::test_a", "call")
+    lanes.lane("gw0.ln1", "gw0", "t.py::test_b", "setup")
+    lanes.lane("gw0.ln2", "gw0")
+    lanes.beats("gw0", {}, process_step=0.0)
+    incident = _died(lanes)
+
+    assert incident.test_in_flight is None
+    assert incident.last_test is None
+    assert [lane["lane"] for lane in incident.lanes_in_flight] == ["gw0.ln0", "gw0.ln1"]
+    assert incident.suspect_nodeid() is None
+    assert incident.tests_started == 6
+    assert "2 tests at once, on lanes gw0.ln0, gw0.ln1" in incident.summary()
+    assert any("t.py::test_b (setup)" in line for line in incident.evidence)
+
+
+def test_a_death_between_tests_counts_every_lanes_tests(lanes):
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0")
+    lanes.lane("gw0.ln1", "gw0")
+    lanes.beats("gw0", {}, process_step=0.0)
+    incident = _died(lanes)
+    assert incident.test_in_flight is None
+    assert incident.tests_finished == 4
+    assert "lanes_in_flight" not in incident.model_dump()
 
 
 def test_lanes_are_not_processes_to_anything_that_counts_processes(lanes):
@@ -471,6 +593,117 @@ def test_every_lane_is_live_as_a_worker_of_its_own(pytester, monkeypatch, mode, 
         assert workers == {f"gw{p}.ln{n}" for p in range(2) for n in range(3)}
     else:
         assert workers == {"ln0", "ln1", "ln2"}
+
+
+#: A hung test on one lane while the others go on, then finish and sit idle -
+#: out of work at the end of an uneven run - for longer than the stall limit.
+STALL_SUITE = '''
+import time
+import pytest
+
+
+@pytest.mark.parametrize("step", range(4))
+@pytest.mark.parametrize("env", ["envA", "envB", "envC", "envD"])
+def test_s(env, step):
+    if env == "envA" and step == 0:
+        time.sleep(7)          # hung: blocked, no CPU
+    elif env != "envA":
+        time.sleep(0.3)
+'''
+
+
+@pytest.mark.parametrize("mode", list(MODES))
+def test_a_hung_lane_is_blamed_for_its_own_test_and_nothing_else_is(pytester, mode):
+    """Appendix B of the design: in every mode, one stall, of the hung test,
+    at the line it hangs on. Not a sibling's test, not the process, and not
+    the lanes that ran out of work and waited for the hung one to finish."""
+    pytester.makepyfile(test_stall=STALL_SUITE)
+    _lanes_run(pytester, MODES[mode], ini="failure_stall_seconds = 2\n")
+
+    stalls = [incident for incident in _incidents(pytester) if incident["kind"] == "worker_stall"]
+    assert len(stalls) == 1, [(i["worker"], i.get("test_in_flight")) for i in stalls]
+    (incident,) = stalls
+    assert incident["test_in_flight"] == "test_stall.py::test_s[envA-0]"
+    assert incident["state"] == "BLOCKED"
+    assert incident["blamed_frame"]["function"] == "test_s"
+    assert incident["blamed_frame"]["line"] == 9
+    if mode != "xdist":
+        assert "ln" in incident["worker"]
+
+
+BUSY_SUITE = '''
+import time
+import pytest
+
+
+@pytest.mark.parametrize("step", range(3))
+@pytest.mark.parametrize("env", ["envA", "envB", "envC"])
+def test_b(env, step):
+    if env == "envA" and step == 0:
+        end = time.time() + 6   # slow, not stuck: burning a core
+        while time.time() < end:
+            sum(range(1000))
+    else:
+        time.sleep(0.2)
+'''
+
+
+@pytest.mark.parametrize("mode", ["lanes", "hybrid"])
+def test_lanes_idle_beside_a_slow_one_raise_nothing(pytester, mode):
+    """The end of an uneven run: one lane still working, its siblings out of
+    work for longer than the stall limit. Nothing is stuck, so nothing is
+    raised - the working lane reads its own CPU, the idle ones have no test,
+    and the process holding them all has a lane in flight."""
+    pytester.makepyfile(test_busy=BUSY_SUITE)
+    result = _lanes_run(pytester, MODES[mode], ini="failure_stall_seconds = 2\n")
+    assert result.ret == 0, result.stdout.str()
+    stalls = [incident for incident in _incidents(pytester) if incident["kind"] == "worker_stall"]
+    assert stalls == []
+
+
+DEATH_SUITE = '''
+import os, time
+import pytest
+
+
+@pytest.mark.parametrize("step", range(2))
+@pytest.mark.parametrize("env", ["envA", "envB", "envC"])
+def test_d(env, step, tmp_path_factory):
+    flag = tmp_path_factory.getbasetemp().parent / "died-once"
+    if env == "envB" and step == 0 and not flag.exists():
+        time.sleep(float(os.environ["DEATH_AFTER"]))
+        flag.write_text("x")
+        os._exit(1)
+    time.sleep(float(os.environ["SIBLINGS_TAKE"]))
+'''
+
+
+@pytest.mark.parametrize(
+    ("siblings_take", "death_after", "in_flight"),
+    [(2.0, 0.5, 3), (0.1, 2.0, 1)],
+    ids=["siblings-in-flight", "culprit-alone"],
+)
+def test_a_death_names_the_lanes_it_took(pytester, monkeypatch, siblings_take, death_after, in_flight):
+    monkeypatch.setenv("SIBLINGS_TAKE", str(siblings_take))
+    monkeypatch.setenv("DEATH_AFTER", str(death_after))
+    pytester.makepyfile(test_death=DEATH_SUITE)
+    result = _lanes_run(pytester, ["-n", "1", "--lanes", "3"])
+
+    deaths = [incident for incident in _incidents(pytester) if incident["kind"] == "worker_death"]
+    assert len(deaths) == 1, deaths
+    (incident,) = deaths
+    assert incident["worker"] == "gw0"
+    assert incident["verdict"] == "SELF_EXIT"
+    assert len(incident["lanes_in_flight"]) == in_flight
+    culprit = "test_death.py::test_d[envB-0]"
+    if in_flight == 1:
+        assert incident["test_in_flight"] == culprit
+        assert incident["lanes_in_flight"][0]["nodeid"] == culprit
+    else:
+        assert incident["test_in_flight"] is None
+        assert culprit in {lane["nodeid"] for lane in incident["lanes_in_flight"]}
+    # xdist replaced the worker and the run went on to the end.
+    assert "passed" in result.stdout.str()
 
 
 ADJUSTED_SUITE = '''

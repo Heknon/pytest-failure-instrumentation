@@ -243,6 +243,11 @@ class IncidentEngine:
         #: them (see ``confirm``, which asks whether the beat *advanced*).
         self.activity: dict[str, float] = {}
         self.stalled: set[str] = set()
+        #: The worker process each lane of pytest-threadlanes runs in, from its
+        #: reports: ``gw0.ln3`` is in ``gw0``, and a lane of a run with no
+        #: workers is in this process, ``main``. A lane is watched as a worker
+        #: of its own - see _touch_lane - and goes down with its process.
+        self.lane_process: dict[str, str] = {}
         #: The live node behind each worker id, so a pid read out of a file can
         #: be checked against the process the gateway is actually running
         #: before anybody signals it. See _live_pid.
@@ -563,7 +568,10 @@ class IncidentEngine:
         with self.lock:
             if self.closed:
                 return False
-            if incident.kind == "worker_stall" and incident.worker in self.workers_failed:
+            if incident.kind == "worker_stall" and (
+                incident.worker in self.workers_failed
+                or self.lane_process.get(incident.worker) in self.workers_failed
+            ):
                 return False  # A failed node already has a death report.
             count = self.seen.get(incident.fingerprint, 0) + 1
             self.seen[incident.fingerprint] = count
@@ -626,6 +634,29 @@ class IncidentEngine:
             # in the set, a worker reported once could never be reported again
             # however badly it went on to hang.
             self.stalled.discard(worker)
+
+    def _touch_lane(self, lane: str, process: str | None) -> None:
+        """A lane reported, so it is alive - and so is the process it runs in.
+
+        A lane of pytest-threadlanes is watched as a worker of its own, keyed
+        by the id its reports carry (``report.lane_id``), because that is the
+        only way a stall names the test that stalled: its process runs one
+        test per lane, and a hung lane's silence is hidden by its siblings'
+        chatter if only the process is timed. Before this, a run with lanes
+        blamed whichever lane had written last, and in a run with no workers
+        raised a false alarm for a lane nobody had timed at all.
+
+        The process is still touched. It is the container of its lanes, and it
+        is judged only when none of them has a test in flight - see
+        :func:`.stall.build` - which is the one case its silence is its own.
+        """
+        with self.lock:
+            if process:
+                self.lane_process[lane] = process
+            if lane in self.workers_down or (process and process in self.workers_down):
+                return  # the lane's process is gone; see _touch
+        self._touch(lane)
+        self._touch(process)
 
     def _watch_for_stalls(self) -> None:
         """Poll, because a wedged worker fires no hook at all.
@@ -692,7 +723,10 @@ class IncidentEngine:
         caller falls back to asking the machine instead.
         """
         with self.lock:
-            node = self.nodes.get(worker)
+            # A lane has no gateway of its own; the process it runs in does.
+            node = self.nodes.get(worker) or self.nodes.get(
+                self.lane_process.get(worker, "")
+            )
         popen = getattr(getattr(getattr(node, "gateway", None), "_io", None), "popen", None)
         if popen is None:
             return None
@@ -1213,7 +1247,16 @@ class IncidentEngine:
             return
         self.tests_seen += 1
         worker = worker_of(node)
-        self._touch(worker)
+        lane = getattr(report, "lane_id", None)
+        if lane:
+            # A lane of pytest-threadlanes, which xdist knows as the process
+            # it runs in (``gw0``) or, in a run with no workers, as itself -
+            # the lane is what is timed, and the process with it.
+            self._touch_lane(
+                str(lane), SOLE_WORKER if self.records_here else worker
+            )
+        else:
+            self._touch(worker)
         # Teardown is once per test whatever happened in it - a test whose
         # setup failed still has one, and a test that passed has no other
         # phase that is guaranteed. This is the whole per-test cost of the
@@ -1366,6 +1409,10 @@ class IncidentEngine:
             # Final, and it has to be: the report xdist writes for the test
             # this worker abandoned is still to come, and it names this node.
             self.workers_down.add(worker)
+            # Its lanes with it: they are threads of the process that is gone.
+            for lane in [lane for lane, owner in self.lane_process.items() if owner == worker]:
+                self.activity.pop(lane, None)
+                self.workers_down.add(lane)
             if error:
                 self.workers_failed.add(worker)
             if worker not in self.collections.digest_by_worker:
