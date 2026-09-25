@@ -360,6 +360,10 @@ def test_a_lanes_cpu_is_on_its_own_record_and_the_beat_is_unchanged(tmp_path):
     assert list(read_state(tmp_path / "ln0.state"))[-1] == "cpu"
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="psutil numbers macOS threads by position, so no lane CPU is read there",
+)
 def test_every_lanes_cpu_is_recorded_after_a_beat(tmp_path):
     """The recorder of a process of lanes measures each lane's own thread."""
     from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
@@ -639,7 +643,7 @@ from pytest_failure_instrumentation.capture import output
 if sys.argv[2] == "rotate":
     output._punch_hole = lambda descriptor, length: False
 path = Path(sys.argv[1])
-tee = output.StderrTee(path, limit=4096)
+tee = output.StderrTee(path, limit=4096, append=True)
 tee.start()
 tee.take()
 lock, stop = threading.Lock(), threading.Event()
@@ -714,7 +718,7 @@ from pathlib import Path
 from pytest_failure_instrumentation.capture import output
 
 output._punch_hole = lambda descriptor, length: False
-tee = output.StderrTee(Path(sys.argv[1]), limit=4096)
+tee = output.StderrTee(Path(sys.argv[1]), limit=4096, append=True)
 tee.start()
 tee.take()
 # A write already under way when the file is rotated resolved fd 2 to the old
@@ -1309,3 +1313,87 @@ def test_a_native_crash_on_one_lane_blames_that_lanes_test(pytester):
     assert incident["verdict"] == "NATIVE_CRASH"
     assert incident["test_in_flight"] == "test_seg.py::test_d[envB-0]"
     assert len(incident["lanes_in_flight"]) == 3
+
+
+
+APPEND_SCRIPT = r"""
+import fcntl, os, sys
+from pathlib import Path
+from pytest_failure_instrumentation.capture import output
+
+def appends(descriptor):
+    return bool(fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_APPEND)
+
+directory = Path(sys.argv[1])
+per_phase = output.StderrTee(directory / "gw0.output", limit=4096)
+per_phase.start()
+session = output.StderrTee(directory / "main.output", limit=4096, append=True)
+session.start()
+flags = [appends(per_phase._file), appends(session._file)]
+output._punch_hole = lambda descriptor, length: False
+session.take()
+os.write(2, b"x" * 4096 * 3 + b"\n")
+session.drain()                  # rotates
+flags += [appends(session._file), appends(2)]
+session.hand_back()
+print(flags)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX only")
+def test_a_session_long_tee_appends_so_concurrent_writers_never_share_an_offset(tmp_path):
+    """Under lanes many writers share fd 2 - lane threads, and the children
+    their tests start, which inherit it. Without ``O_APPEND`` each write lands
+    at the description's shared offset, which Linux serializes and macOS does
+    not: there a child's writes overwrote a lane's (CI lost the last 233 lines
+    of one writer). The session's file, and every file a rotation starts, is
+    opened to append; the per-phase tee without lanes is left as it was."""
+    import subprocess
+
+    finished = subprocess.run(
+        [sys.executable, "-c", APPEND_SCRIPT, str(tmp_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    assert finished.stdout.split("\n")[0] == "[False, True, True, True]"
+
+
+TORN_READ_SCRIPT = r"""
+import os, sys
+from pathlib import Path
+from pytest_failure_instrumentation.capture import output
+
+output._punch_hole = lambda descriptor, length: False
+tee = output.StderrTee(Path(sys.argv[1]), limit=4096, append=True)
+tee.start()
+tee.take()
+retired = os.dup(2)              # the old file, as a child that inherited it holds it
+os.write(2, b"x" * 4096 * 3 + b"\n")
+tee.drain()                      # rotates: fd 2 is a fresh file now
+os.write(2, b"w")                # a drain reads a line the kernel is still copying in
+tee.drain()
+os.write(retired, b"child\n")    # the old file gains a line meanwhile
+os.write(2, b"1-00420\n")        # and the torn line is completed
+tee.drain()
+os.close(retired)
+tee.hand_back()
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX only")
+def test_a_drain_passes_on_only_whole_lines_so_two_files_never_splice_one(tmp_path):
+    """A drain can read a line the kernel is still copying in - its first part
+    is in the file before its last. Passed on as it stood, the next drain put
+    the rotated file's new line between its halves: stress runs showed
+    ``w`` + ``c-00000`` + ``1-00420``. Only whole lines are passed on until
+    fd 2 is handed back, which passes on whatever is left."""
+    import subprocess
+
+    finished = subprocess.run(
+        [sys.executable, "-c", TORN_READ_SCRIPT, str(tmp_path / "main.output")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    lines = finished.stderr.splitlines()
+    assert "w1-00420" in lines
+    assert "child" in lines

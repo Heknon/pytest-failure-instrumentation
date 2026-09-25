@@ -212,7 +212,7 @@ class WorkerRecorder:
         # that cannot be built is a recorded reason, never a failed worker.
         self.stderr_tee: output_capture.StderrTee | None = None
         if settings.capture_output:
-            tee = output_capture.StderrTee(directory / f"{worker_id}.output")
+            tee = output_capture.StderrTee(directory / f"{worker_id}.output", append=self.lanes)
             tee.start()
             if tee.active:
                 self._track(tee)

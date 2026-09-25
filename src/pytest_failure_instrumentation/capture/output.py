@@ -57,6 +57,9 @@ HOLE_ALIGNMENT = 4096
 #: Where the tail of a rotated capture file is kept.
 PREVIOUS_SUFFIX = ".prev"
 
+#: How much :meth:`StderrTee._copy` reads at a time.
+COPY_BYTES = 64 * 1024
+
 
 class StderrTee:
     """Points fd 2 at a real file for the length of each phase.
@@ -67,9 +70,17 @@ class StderrTee:
     phase, ``hand_back`` at the end of each, ``close`` at the end of the run.
     """
 
-    def __init__(self, path: Path, limit: int = RING_BYTES) -> None:
+    def __init__(self, path: Path, limit: int = RING_BYTES, append: bool = False) -> None:
         self.path = path
         self.limit = limit
+        #: Open the capture file to append: for a process running
+        #: pytest-threadlanes, whose lanes - and the children their tests
+        #: start, which inherit fd 2 - write it at the same time. Without it
+        #: every write lands at the description's shared offset, which Linux
+        #: serializes and macOS does not: there a child's writes overwrote a
+        #: lane's. The per-phase tee keeps its flags; its :meth:`_trim` writes
+        #: at the start of the file, which appending would not allow.
+        self._flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | (os.O_APPEND if append else 0)
         self.active = False
         self.reason = "off"
         self._file: Optional[int] = None
@@ -87,7 +98,7 @@ class StderrTee:
             self.reason = "off: capturing stderr is a POSIX facility for now"
             return False
         try:
-            self._file = os.open(str(self.path), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+            self._file = os.open(str(self.path), self._flags, 0o644)
         except OSError as failure:
             self.reason = f"off: the capture file could not be opened ({failure!r})"
             return False
@@ -178,7 +189,7 @@ class StderrTee:
             return
         try:
             self._follow_retired()
-            self._phase_offset = self._copy(self._file, self._phase_offset)
+            self._phase_offset = self._copy(self._file, self._phase_offset, whole_lines=True)
             if self._phase_offset - self._released >= RELEASE_FACTOR * self.limit:
                 self._release()
         except OSError:
@@ -209,11 +220,26 @@ class StderrTee:
             return
         self._rotate()
 
-    def _copy(self, source: int, offset: int) -> int:
-        """Pass ``source`` on from ``offset`` to its end; the new offset."""
+    def _copy(self, source: int, offset: int, whole_lines: bool = False) -> int:
+        """Pass ``source`` on from ``offset`` to its end; the new offset.
+
+        With ``whole_lines``, for a file still being written, stop at its last
+        newline. A read can catch a write the kernel is still copying in - its
+        first part is in the file before its last - and a drain that passed
+        that part on would let the next one put another file's line between
+        its halves. The rest follows with its newline, or when fd 2 is handed
+        back, which passes on everything. A line longer than a whole read is
+        passed on as it stands, so the copy always moves.
+        """
         assert self._passthrough is not None
         while True:
-            chunk = os.pread(source, 64 * 1024, offset)
+            chunk = os.pread(source, COPY_BYTES, offset)
+            if whole_lines:
+                end = chunk.rfind(b"\n") + 1
+                if end:
+                    chunk = chunk[:end]
+                elif len(chunk) < COPY_BYTES:
+                    return offset
             if not chunk:
                 return offset
             offset += len(chunk)
@@ -242,7 +268,7 @@ class StderrTee:
         """
         assert self._file is not None
         fresh_path = self.path.with_name(self.path.name + ".next")
-        fresh = os.open(str(fresh_path), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        fresh = os.open(str(fresh_path), self._flags, 0o644)
         try:
             os.dup2(fresh, STDERR_FD)
         except OSError:
@@ -250,7 +276,7 @@ class StderrTee:
             raise
         old, offset = self._file, self._phase_offset
         self._file, self._phase_offset, self._released = fresh, 0, 0
-        offset = self._copy(old, offset)
+        offset = self._copy(old, offset, whole_lines=True)
         self._drain_retired()
         self._retired = (old, offset)
         tail = os.pread(old, self.limit, max(0, offset - self.limit))
@@ -266,7 +292,7 @@ class StderrTee:
         if self._retired is None:
             return
         old, offset = self._retired
-        self._retired = (old, self._copy(old, offset))
+        self._retired = (old, self._copy(old, offset, whole_lines=True))
 
     def _drain_retired(self) -> None:
         """The last of the file :meth:`_rotate` replaced, then close it."""
@@ -282,7 +308,9 @@ class StderrTee:
     def _trim(self) -> None:
         """Keep the file to its last ``limit`` bytes. Only between phases, so a
         phase's own output is never trimmed while it is still being written."""
-        if self._file is None:
+        if self._file is None or self._flags & os.O_APPEND:
+            # A file opened to append is a session's (see __init__): it is
+            # never between phases, and :meth:`_release` bounds it instead.
             return
         try:
             size = os.lseek(self._file, 0, os.SEEK_END)
