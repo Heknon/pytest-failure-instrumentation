@@ -708,6 +708,51 @@ def test_a_session_long_tee_passes_every_byte_on_once_and_stays_bounded(tmp_path
         assert (tmp_path / "main.output.prev").exists()
 
 
+LATE_WRITE_SCRIPT = r"""
+import os, sys
+from pathlib import Path
+from pytest_failure_instrumentation.capture import output
+
+output._punch_hole = lambda descriptor, length: False
+tee = output.StderrTee(Path(sys.argv[1]), limit=4096)
+tee.start()
+tee.take()
+# A write already under way when the file is rotated resolved fd 2 to the old
+# file before the switch; a duplicate taken now stands for it.
+late = os.dup(2)
+for index in range(1000):
+    os.write(2, f"early-{index:05d}\n".encode())
+tee.drain()                      # rotates
+os.write(2, b"after-rotation\n")
+tee.drain()                      # the drain that used to close the old file
+os.write(late, b"late-write\n")  # the stalled write lands only now
+os.close(late)
+tee.drain()
+tee.hand_back()
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX only")
+def test_a_write_that_lands_in_a_rotated_file_after_the_next_drain_is_still_passed_on(tmp_path):
+    """A thread's write to fd 2 that began before a rotation lands in the old
+    file whenever the scheduler lets it finish - on a loaded machine, after
+    the next drain. The old file is followed until the next rotation, and
+    drained once more when fd 2 is handed back, so that write is not lost."""
+    import subprocess
+
+    finished = subprocess.run(
+        [sys.executable, "-c", LATE_WRITE_SCRIPT, str(tmp_path / "main.output")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    lines = finished.stderr.splitlines()
+    assert lines.count("late-write") == 1
+    assert lines.count("after-rotation") == 1
+    assert [line for line in lines if line.startswith("early-")] == [
+        f"early-{index:05d}" for index in range(1000)
+    ]
+
+
 def test_a_process_of_lanes_says_how_many_are_running_in_its_resources(tmp_path):
     from pytest_failure_instrumentation.config import Settings
     from pytest_failure_instrumentation.resource_sampling import ResourceSampler

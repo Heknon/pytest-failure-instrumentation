@@ -77,7 +77,7 @@ class StderrTee:
         self._phase_offset = 0
         self._closed = False
         #: The file :meth:`_rotate` replaced, and how far it was passed on:
-        #: kept for one more drain. Never set without lanes.
+        #: followed by every drain until the next rotation. Never set without lanes.
         self._retired: Optional[tuple[int, int]] = None
         #: How much of the file's start :meth:`_release` has given back.
         self._released = 0
@@ -177,7 +177,7 @@ class StderrTee:
         if not self.active or self._file is None or self._passthrough is None:
             return
         try:
-            self._drain_retired()
+            self._follow_retired()
             self._phase_offset = self._copy(self._file, self._phase_offset)
             if self._phase_offset - self._released >= RELEASE_FACTOR * self.limit:
                 self._release()
@@ -233,9 +233,12 @@ class StderrTee:
         lands there - and only then is the old file read to its end and
         passed on. Its last ``limit`` bytes are kept as ``<name>.prev``, which
         :func:`read_tail` reads ahead of the current file, so the ring still
-        holds the lines before the switch. The old descriptor is kept for one
-        more drain, which passes on a write that was already under way in
-        another thread when the switch happened, and is closed after it.
+        holds the lines before the switch. The old descriptor is kept and
+        followed by every drain until the next rotation, and drained once more
+        when fd 2 is handed back: a write another thread had already begun
+        when the switch happened lands in the old file whenever the scheduler
+        lets it finish, which on a loaded machine is after the next drain -
+        closing the old file after one more drain lost such a line in CI.
         """
         assert self._file is not None
         fresh_path = self.path.with_name(self.path.name + ".next")
@@ -256,6 +259,14 @@ class StderrTee:
         staging.write_bytes(tail)
         os.replace(staging, previous)
         os.replace(fresh_path, self.path)
+
+    def _follow_retired(self) -> None:
+        """Pass on whatever has reached the file :meth:`_rotate` replaced
+        since it was last read, and keep it open."""
+        if self._retired is None:
+            return
+        old, offset = self._retired
+        self._retired = (old, self._copy(old, offset))
 
     def _drain_retired(self) -> None:
         """The last of the file :meth:`_rotate` replaced, then close it."""
