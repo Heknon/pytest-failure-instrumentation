@@ -671,6 +671,10 @@ for thread in threads:
 stop.set()
 draining.join()
 with lock:
+    # The file is given back to at each drain, which the heartbeat runs every
+    # tick; the size is measured after one, not after however much a loaded
+    # machine let the writers add since the drainer last ran.
+    tee.drain()
     tee.hand_back()
 print(os.stat(path).st_blocks * 512, os.path.getsize(path))
 print(output.read_tail(path)[-1])
