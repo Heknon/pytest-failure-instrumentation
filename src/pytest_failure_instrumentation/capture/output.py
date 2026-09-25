@@ -333,13 +333,22 @@ class StderrTee:
         self._retired = (old, self._copy(old, offset, whole_lines=True))
 
     def _drain_retired(self) -> None:
-        """The last of the file :meth:`_rotate` replaced, then close it."""
+        """The last of the file :meth:`_rotate` replaced, then close it.
+
+        A child that outlives the rotation can be part way through a line
+        here, and what it writes after this is lost - the cost of rotating.
+        What it had written is passed on ended with a newline, so it is never
+        joined to the line that follows it from another file.
+        """
         if self._retired is None:
             return
         old, offset = self._retired
         self._retired = None
         try:
-            self._copy(old, offset)
+            end = self._copy(old, offset)
+            if end > offset and os.pread(old, 1, end - 1) != b"\n":
+                assert self._passthrough is not None
+                os.write(self._passthrough, b"\n")
         finally:
             os.close(old)
 

@@ -1460,3 +1460,45 @@ def test_a_writers_lines_keep_their_order_across_a_rotation(tmp_path):
     assert finished.returncode == 0, finished.stderr[-2000:]
     ours = [line for line in finished.stderr.splitlines() if line.startswith("k-")]
     assert ours == ["k-00001", "k-00002"]
+
+
+CUT_LINE_SCRIPT = r"""
+import os, sys
+from pathlib import Path
+from pytest_failure_instrumentation.capture import output
+
+output._punch_hole = lambda descriptor, length: False
+output.ROTATES = True  # no thread writes fd 2 while it is swapped here
+tee = output.StderrTee(Path(sys.argv[1]), limit=4096, append=True)
+tee.start()
+tee.take()
+child = os.dup(2)                # a child's inherited fd 2, kept past rotations
+os.write(2, b"x" * 4096 * 3 + b"\n")
+tee.drain()                      # rotates: the child's file is followed now
+os.write(child, b"c-01")         # the child is part way through a line
+tee.drain()
+os.write(2, b"y" * 4096 * 3 + b"\n")
+tee.drain()                      # rotates again: the child's file is closed
+os.write(2, b"w1-00500\n")
+tee.drain()
+os.close(child)
+tee.hand_back()
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX only")
+def test_a_line_cut_off_when_a_rotated_file_is_closed_is_not_joined_to_the_next(tmp_path):
+    """A child that outlives two rotations writes into a file this process has
+    stopped reading, and loses what it writes after that - the documented cost
+    of rotating. What it had written of a line by then is passed on, ended
+    with a newline, so the line that follows it is still a line of its own."""
+    import subprocess
+
+    finished = subprocess.run(
+        [sys.executable, "-c", CUT_LINE_SCRIPT, str(tmp_path / "main.output")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    lines = finished.stderr.splitlines()
+    assert "w1-00500" in lines
+    assert "c-01" in lines
