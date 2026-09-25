@@ -47,6 +47,16 @@ RUN_ID = "the-run"
 # --- evidence laid out as a process of lanes writes it ---------------------
 
 
+def _native(name: str) -> int:
+    """The native thread id a fake lane records: distinct per name."""
+    return 4000 + sum(ord(character) for character in name)
+
+
+def _ident(name: str) -> int:
+    """And the ident faulthandler would print for it."""
+    return 0x7F0000000000 + sum(ord(character) for character in name)
+
+
 class Lanes:
     """One run directory holding processes, their lanes, and their beats."""
 
@@ -76,8 +86,8 @@ class Lanes:
                 **fields,
                 "process": process,
                 "thread_name": f"lane-{name}",
-                "thread_id": 4000 + len(name),
-                "thread_ident": 0x7F0000000000 + len(name),
+                "thread_id": _native(name),
+                "thread_ident": _ident(name),
                 "lane": True,
             },
         )
@@ -97,7 +107,8 @@ class Lanes:
     def beats(self, process: str, lanes: dict, *, process_step: float, count: int = 4,
               interval: float = 1.0, finish: bool = False) -> None:
         """``count`` beats a second apart, the process's CPU rising by
-        ``process_step`` a beat and each lane's by its own step."""
+        ``process_step`` a beat, and on each lane's record a reading taken with
+        each beat, rising by the lane's own step."""
         now = time.time()
         lines = [
             {"event": "worker_start", "pid": LIVE, "time": now - 60, "run_id": RUN_ID},
@@ -111,7 +122,6 @@ class Lanes:
                 "rss_mb": 120,
                 "nodeid": None,
                 "phase": None,
-                "threads": {lane: index * step for lane, step in lanes.items()},
                 "run_id": RUN_ID,
             })
         if finish:
@@ -119,6 +129,14 @@ class Lanes:
         (self.run / f"{process}.events").write_text(
             "".join(json.dumps(line) + "\n" for line in lines)
         )
+        for lane, step in lanes.items():
+            path = self.run / f"{lane}.state"
+            record = json.loads(path.read_text())
+            record["cpu"] = [
+                [now - (count - 1 - index) * interval + 0.001, index * step]
+                for index in range(count)
+            ]
+            path.write_text(json.dumps(record) + "\n")
 
 
 @pytest.fixture
@@ -149,7 +167,7 @@ def test_every_lane_is_a_row_and_the_process_is_not(lanes):
     for name, row in rows.items():
         assert row["process"] == "gw0"
         assert row["thread_name"] == f"lane-{name}"
-        assert row["thread_id"] == 4000 + len(name)
+        assert row["thread_id"] == _native(name)
         # What is per process is the process's: its pid, memory and beat.
         assert row["pid"] == LIVE
         assert row["rss_mb"] == 120
@@ -190,12 +208,58 @@ def test_a_process_that_has_not_started_a_lane_is_still_a_row(lanes):
 
 def test_lanes_are_filtered_by_name_like_any_worker(lanes):
     _hybrid(lanes)
-    described = topology.snapshot(lanes.base, only=["gw0.ln1", "gw0"])
+    described = topology.snapshot(lanes.base, only=["gw0.ln1"])
     rows = described["runs"][0]["workers"]
     assert [row["worker"] for row in rows] == ["gw0.ln1"]
-    # The process is a container rather than a row, and asking for it by name
-    # finds nothing to list.
-    assert described["filter"]["unmatched"] == ["gw0"]
+
+
+def test_asking_for_a_process_of_lanes_by_name_lists_its_lanes(lanes):
+    _hybrid(lanes)
+    lanes.process("gw1")
+    lanes.lane("gw1.ln0", "gw1", "t.py::test_other", "call")
+    lanes.beats("gw1", {"gw1.ln0": 0.0}, process_step=0.0)
+    described = topology.snapshot(lanes.base, only=["gw0", "gw9"])
+    rows = described["runs"][0]["workers"]
+    assert [row["worker"] for row in rows] == ["gw0.ln0", "gw0.ln1", "gw0.ln2"]
+    assert described["filter"]["unmatched"] == ["gw9"]
+
+
+def test_a_lane_carries_its_own_progress_where_the_schedule_counts_lanes(lanes):
+    """xdist's scheduler hands work to lanes in a run with -n, so the
+    controller's record has a row per lane, meaning what a worker's row means."""
+    _hybrid(lanes)
+    (lanes.run / "schedule.json").write_text(json.dumps({
+        "run_id": RUN_ID, "dist": "loadscope", "collected": 9, "unassigned": 0,
+        "settled": True, "rerunning": 0,
+        "workers": {"gw0.ln1": {"assigned": 3, "completed": 1, "pending": 2, "rerunning": False}},
+    }))
+    rows = {row["worker"]: row for row in topology.run(lanes.run)["workers"]}
+    hung = rows["gw0.ln1"]
+    assert (hung["tests_assigned"], hung["tests_running"], hung["tests_queued"]) == (3, 1, 1)
+    assert hung["rerunning"] is False
+    # A lane the record has no row for says nothing, as a worker would.
+    assert rows["gw0.ln0"]["tests_assigned"] is None
+
+
+def test_a_thousand_lanes_read_their_process_once(lanes, monkeypatch):
+    """Each lane's beats are its process's: one read of them per request, and
+    each lane's CPU from its own slot, whatever the lane count."""
+    lanes.process("main")
+    names = {f"ln{index}": 0.0 for index in range(1000)}
+    for name in names:
+        lanes.lane(name, "main", f"t.py::test_x[e{name}]", "call")
+    lanes.beats("main", names, process_step=0.0)
+    reads = []
+    real = topology.tail_events
+    monkeypatch.setattr(topology, "tail_events", lambda path: reads.append(path) or real(path))
+    started = time.perf_counter()
+    rows = topology.run(lanes.run)["workers"]
+    assert len(rows) == 1000
+    assert {row["status"] for row in rows} == {"blocked"}
+    assert all(row["cpu_rate"] == 0.0 for row in rows)
+    assert len(reads) <= 2 + 1000  # its own, and one empty look per lane
+    assert sum(1 for path in reads if path.name == "main.events") == 1
+    assert time.perf_counter() - started < 20
 
 
 def test_a_lane_and_its_process_are_both_addressable_for_a_stack(lanes):
@@ -261,33 +325,112 @@ def test_the_state_record_gains_keys_only_under_lanes(tmp_path):
 
 
 def test_lane_beats_fall_back_to_the_process_where_a_lane_is_not_measured():
-    beats = [
-        {"time": 1.0, "cpu_seconds": 1.0, "threads": {"ln0": 0.0}},
-        {"time": 2.0, "cpu_seconds": 2.0, "threads": {"ln0": 0.0}},
-        {"time": 3.0, "cpu_seconds": 3.0},
-    ]
-    # The latest beat does not measure the lane: the process's figure stands.
-    assert stall_analysis.lane_beats(beats, "ln0") is beats
-    # It does: the lane's own, from the beats that measured it.
-    measured = stall_analysis.lane_beats(beats[:2], "ln0")
+    beats = [{"time": 1.0, "cpu_seconds": 1.0}, {"time": 2.0, "cpu_seconds": 2.0},
+             {"time": 3.0, "cpu_seconds": 3.0}]
+    # Current readings: the lane's own.
+    measured = stall_analysis.lane_beats(beats, [[2.001, 0.5], [3.001, 0.5]])
     assert stall_analysis.cpu_rate(measured) == 0.0
+    # Readings that stopped while the beats went on: the process's stand.
+    assert stall_analysis.lane_beats(beats, [[1.001, 0.5], [2.001, 0.5]]) is beats
     # Measured once: no rate of its own yet, so the process's reading stands.
-    early = [{"time": 1.0, "cpu_seconds": 5.0},
-             {"time": 2.0, "cpu_seconds": 9.0, "threads": {"ln0": 1.0}}]
-    assert stall_analysis.lane_beats(early, "ln0") is early
+    assert stall_analysis.lane_beats(beats, [[3.001, 0.5]]) is beats
+    # Nothing, or nonsense: the process's.
+    assert stall_analysis.lane_beats(beats, None) is beats
+    assert stall_analysis.lane_beats(beats, [["x", 1], [3.0]]) is beats
 
 
-def test_a_heartbeat_measures_each_lanes_thread_only_when_asked():
+def test_a_lanes_cpu_is_on_its_own_record_and_the_beat_is_unchanged(tmp_path):
+    """The beat of a process of lanes is the line it always was, however many
+    lanes it has; each lane's figures go on its own slot, newest kept."""
     written = []
-    native = threading.get_native_id()
+    calls = []
     Heartbeat(lambda event, **fields: written.append(fields),
-              threads=lambda: {"ln0": native})._beat()
+              lane_cpu=lambda: calls.append(1))._beat()
     Heartbeat(lambda event, **fields: written.append(fields))._beat()
-    with_lanes, without = written
-    assert set(with_lanes["threads"]) == {"ln0"}
-    assert with_lanes["threads"]["ln0"] >= 0.0
-    assert "threads" not in without
-    assert list(without) == ["cpu_seconds", "rss_mb", "nodeid", "nodeid_hash", "phase"]
+    assert calls == [1]
+    assert list(written[0]) == list(written[1]) == [
+        "cpu_seconds", "rss_mb", "nodeid", "nodeid_hash", "phase"]
+
+    lane = WorkerState(tmp_path / "ln0.state", LIVE, RUN_ID,
+                       lane={"process": "main", "lane": True})
+    for index in range(8):
+        lane.record_cpu(100.0 + index, index * 0.5, keep=6)
+    readings = read_state(tmp_path / "ln0.state")["cpu"]
+    assert readings == [[100.0 + index, index * 0.5] for index in range(2, 8)]
+    assert list(read_state(tmp_path / "ln0.state"))[-1] == "cpu"
+
+
+def test_every_lanes_cpu_is_recorded_after_a_beat(tmp_path):
+    """The recorder of a process of lanes measures each lane's own thread."""
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(tmp_path, "main", Settings(watchdog=False), lanes=True)
+    try:
+        done = threading.Event()
+        opened = []
+
+        def lane() -> None:
+            opened.append(recorder._open_lane("ln0"))
+            sum(range(2_000_000))
+            done.wait(5)
+
+        thread = threading.Thread(target=lane, name="lane-ln0")
+        thread.start()
+        while not opened:
+            time.sleep(0.01)
+        recorder._record_lane_cpu()
+        recorder._record_lane_cpu()
+        done.set()
+        thread.join()
+        record = read_state(tmp_path / "ln0.state")
+        assert record["thread_name"] == "lane-ln0"
+        assert record["thread_id"] == thread.native_id
+        assert len(record["cpu"]) == 2
+        assert read_state(tmp_path / "main.state")["lanes"] is True
+    finally:
+        recorder.close()
+
+
+def test_macos_reads_no_lanes_cpu_and_says_so(tmp_path, monkeypatch):
+    """psutil numbers macOS threads by position, not by native id."""
+    from pytest_failure_instrumentation.capture import recorder as recorder_module
+    from pytest_failure_instrumentation.config import Settings
+
+    monkeypatch.setattr(recorder_module.sys, "platform", "darwin")
+    recorder = recorder_module.WorkerRecorder(
+        tmp_path, "main", Settings(watchdog=False), lanes=True
+    )
+    try:
+        assert recorder._lane_cpu_readable() is False
+        events = (tmp_path / "main.events").read_text()
+        assert '"mechanism": "per_lane_cpu"' in events
+    finally:
+        recorder.close()
+
+
+def test_lanes_are_asked_for_only_with_pytest_threadlanes_registered():
+    """An option whose dest is ``lanes`` can be anybody's."""
+
+    class Plugins:
+        def __init__(self, names):
+            self.names = names
+
+        def hasplugin(self, name):
+            return name in self.names
+
+    class Config:
+        def __init__(self, names, lanes):
+            self.pluginmanager = Plugins(names)
+            self.lanes = lanes
+
+        def getoption(self, name, default=None):
+            return self.lanes if name == "lanes" else default
+
+    assert thread_lanes.requested(Config({"threadlanes"}, 3))
+    assert not thread_lanes.requested(Config(set(), 3))
+    assert not thread_lanes.requested(Config({"threadlanes"}, 0))
+    assert not thread_lanes.requested(Config({"threadlanes"}, None))
 
 
 # --- stalls -----------------------------------------------------------------
@@ -314,6 +457,15 @@ def test_a_busy_lane_is_slow_not_stuck_and_an_idle_one_is_neither(lanes):
     _hybrid(lanes)
     assert _stall(lanes, "gw0.ln0") is None
     assert _stall(lanes, "gw0.ln2") is None
+
+
+def test_a_lane_that_never_had_a_test_is_idle_not_silent(lanes):
+    """More lanes than work: a lane the engine knows of, with no record."""
+    _hybrid(lanes)
+    assert stall.build("ln9", lanes.run, 10.0, 1.0, False, run_id=RUN_ID,
+                       known_lane=True) is None
+    # A worker that is not a lane, with nothing on disk, is what it was.
+    assert stall.build("gw9", lanes.run, 10.0, 1.0, False, run_id=RUN_ID).state == "SILENT"
 
 
 def test_a_process_of_lanes_is_silent_for_its_lanes_while_any_has_a_test(lanes):
@@ -391,7 +543,10 @@ def test_a_death_with_one_lane_in_flight_names_that_lanes_test(lanes):
 
     assert incident.test_in_flight == "t.py::test_crash"
     assert incident.phase == "call"
-    assert incident.tests_started == 3
+    # The process's counts, which are every lane's: the worker that died is
+    # the process.
+    assert incident.tests_started == 5
+    assert incident.tests_finished == 4
     assert incident.lanes_in_flight == [{
         "lane": "gw0.ln1", "nodeid": "t.py::test_crash",
         "nodeid_hash": hash_of("t.py::test_crash"), "phase": "call",
@@ -417,6 +572,44 @@ def test_a_death_with_several_lanes_in_flight_lists_them_and_blames_none(lanes):
     assert any("t.py::test_b (setup)" in line for line in incident.evidence)
 
 
+def test_a_fatal_dump_on_one_lanes_thread_blames_that_lanes_test(lanes):
+    """A native fault is delivered to the thread that faulted, and
+    faulthandler calls it current: that is which lane took the process down.
+    The others went down with it, and are still listed."""
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "t.py::test_a", "call")
+    lanes.lane("gw0.ln1", "gw0", "t.py::test_b", "call")
+    lanes.beats("gw0", {}, process_step=0.0)
+    culprit = _ident("gw0.ln1")
+    (lanes.run / "gw0.crash").write_text(
+        "Fatal Python error: Segmentation fault\n\n"
+        f"Current thread 0x{culprit:016x} (most recent call first):\n"
+        '  File "/src/t.py", line 9 in test_b\n'
+        "Thread 0x00007f00000000ff (most recent call first):\n"
+        '  File "/src/t.py", line 4 in test_a\n'
+    )
+    incident = _died(lanes)
+
+    assert incident.test_in_flight == "t.py::test_b"
+    assert incident.suspect_nodeid() == "t.py::test_b"
+    assert [lane["lane"] for lane in incident.lanes_in_flight] == ["gw0.ln0", "gw0.ln1"]
+    assert "on lane gw0.ln1" in incident.summary()
+    assert any("written on lane gw0.ln1's thread" in line for line in incident.evidence)
+
+
+def test_a_dump_that_is_not_fatal_blames_no_lane(lanes):
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "t.py::test_a", "call")
+    lanes.lane("gw0.ln1", "gw0", "t.py::test_b", "call")
+    lanes.beats("gw0", {}, process_step=0.0)
+    culprit = _ident("gw0.ln1")
+    (lanes.run / "gw0.crash").write_text(
+        f"Current thread 0x{culprit:016x} (most recent call first):\n"
+        '  File "/src/t.py", line 9 in test_b\n'
+    )
+    assert _died(lanes).test_in_flight is None
+
+
 def test_a_death_between_tests_counts_every_lanes_tests(lanes):
     lanes.process("gw0")
     lanes.lane("gw0.ln0", "gw0")
@@ -434,6 +627,133 @@ def test_lanes_are_not_processes_to_anything_that_counts_processes(lanes):
     _hybrid(lanes)
     assert killer.roles_in(lanes.run)[LIVE] == "gw0"
     assert [record["worker"] for record in leftovers.worker_records(lanes.run)] == ["gw0"]
+
+
+# --- the tee, the resources, an internal error ------------------------------
+
+TEE_SCRIPT = r"""
+import os, subprocess, sys, threading
+from pathlib import Path
+from pytest_failure_instrumentation.capture import output
+
+if sys.argv[2] == "rotate":
+    output._punch_hole = lambda descriptor, length: False
+path = Path(sys.argv[1])
+tee = output.StderrTee(path, limit=4096)
+tee.start()
+tee.take()
+lock, stop = threading.Lock(), threading.Event()
+
+def writer(key):
+    for index in range(2000):
+        os.write(2, f"w{key}-{index:05d}\n".encode())
+
+def drainer():
+    while not stop.is_set():
+        with lock:
+            tee.drain()
+
+threads = [threading.Thread(target=writer, args=(key,)) for key in range(3)]
+draining = threading.Thread(target=drainer)
+draining.start()
+for thread in threads:
+    thread.start()
+# A child holding fd 2, as a test's own subprocess does.
+subprocess.run([sys.executable, "-c",
+                "import os\nfor i in range(2000): os.write(2, f'c-{i:05d}\\n'.encode())"],
+               check=True)
+for thread in threads:
+    thread.join()
+stop.set()
+draining.join()
+with lock:
+    tee.hand_back()
+print(os.stat(path).st_blocks * 512, os.path.getsize(path))
+print(output.read_tail(path)[-1])
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX only")
+@pytest.mark.parametrize("how", ["punch", "rotate"])
+def test_a_session_long_tee_passes_every_byte_on_once_and_stays_bounded(tmp_path, how):
+    """Taken once for a session of lanes, the tee is never between phases,
+    where it would otherwise be trimmed. It gives the disk back instead - by
+    punching holes where it can, by rotating where it cannot - and neither may
+    lose a byte on its way to the terminal, or pass one on twice."""
+    import subprocess
+
+    if how == "punch" and not sys.platform.startswith("linux"):
+        pytest.skip("holes are punched on Linux")
+    capture = tmp_path / "main.output"
+    finished = subprocess.run(
+        [sys.executable, "-c", TEE_SCRIPT, str(capture), how],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    lines = finished.stderr.splitlines()
+    for key in range(3):
+        assert [line for line in lines if line.startswith(f"w{key}-")] == [
+            f"w{key}-{index:05d}" for index in range(2000)
+        ]
+    child = [line for line in lines if line.startswith("c-")]
+    if how == "punch":
+        # The child's fd 2 is the same open file: none of its bytes is lost.
+        assert child == [f"c-{index:05d}" for index in range(2000)]
+    else:
+        assert len(child) == len(set(child))
+    on_disk, length = (int(value) for value in finished.stdout.split()[:2])
+    assert on_disk < 64 * 1024
+    if how == "rotate":
+        assert length < 3 * 4096 + 1024
+        assert (tmp_path / "main.output.prev").exists()
+
+
+def test_a_process_of_lanes_says_how_many_are_running_in_its_resources(tmp_path):
+    from pytest_failure_instrumentation.config import Settings
+    from pytest_failure_instrumentation.resource_sampling import ResourceSampler
+
+    lanes = Lanes(tmp_path)
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "t.py::test_a", "call")
+    lanes.lane("gw0.ln1", "gw0")
+    lanes._state("gw1", {"nodeid": "t.py::test_b", "phase": "call", "pid": 1})
+    sampler = ResourceSampler(lanes.run, "run", Settings(resources_seconds=1))
+    try:
+        workers = sampler._workers()
+    finally:
+        sampler.close()
+    assert workers[LIVE]["worker"] == "gw0"
+    assert workers[LIVE]["lanes_running"] == 1
+    assert "lanes_running" not in workers[1]
+
+
+def test_an_internal_error_off_the_lanes_names_the_one_lane_in_flight(tmp_path):
+    """pytest-threadlanes raises a lane's error on the main thread."""
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(tmp_path, "gw0", Settings(watchdog=False), lanes=True)
+    try:
+        slots = {}
+
+        def open_lane(name):
+            slots[name] = recorder._open_lane(name)
+
+        for name in ("gw0.ln0", "gw0.ln1"):
+            thread = threading.Thread(target=open_lane, args=(name,))
+            thread.start()
+            thread.join()
+        slots["gw0.ln1"].state.update(nodeid="t.py::test_b", phase="call")
+        recorder.pytest_internalerror("RuntimeError: boom")
+        slots["gw0.ln0"].state.update(nodeid="t.py::test_a", phase="setup")
+        recorder.pytest_internalerror("RuntimeError: again")
+        events = [json.loads(line) for line in (tmp_path / "gw0.events").read_text().splitlines()]
+        one, several = [event for event in events if event["event"] == "internal_error"]
+        assert (one["nodeid"], one["lane"]) == ("t.py::test_b", "gw0.ln1")
+        assert several["nodeid"] is None
+        assert {lane["lane"] for lane in several["lanes_in_flight"]} == {"gw0.ln0", "gw0.ln1"}
+    finally:
+        recorder.close()
 
 
 # --- without lanes, what 0.13.1 wrote --------------------------------------
@@ -464,6 +784,39 @@ def test_a_run_without_lanes_writes_what_it_always_wrote(pytester, mode):
 def test_incidents_without_lanes_dump_the_keys_they_always_did():
     expected = json.loads(BASELINE.read_text(encoding="utf-8"))["incidents"]
     assert without_lanes.incident_keys() == expected
+
+
+def test_the_clients_models_re_serve_a_payload_without_lanes_as_0_13_1_did():
+    """A consumer that parses a resource sample with the client and serves it
+    again - the Sahara API does - must not grow a ``lanes_running: null``."""
+    pytest.importorskip("httpx")
+    expected = json.loads(BASELINE.read_text(encoding="utf-8"))["client_dumps"]
+    assert without_lanes.client_dumps() == expected
+
+
+def test_the_schemas_are_0_13_1s_plus_only_the_declared_lane_fields():
+    """In both modes: a serializer that leaves a lane field out of a dump must
+    not leave the model's serialization schema as "anything", which is what
+    a wrap serializer annotated ``-> Any`` did."""
+    import pydantic
+
+    golden = json.loads(BASELINE.read_text(encoding="utf-8"))
+    if pydantic.VERSION != golden["pydantic"]:
+        pytest.skip(f"the schemas were recorded with pydantic {golden['pydantic']}")
+    found = without_lanes.schemas()
+    for name, schema in golden["schemas"].items():
+        if name.startswith("client_") and name not in found:
+            continue  # httpx is not installed
+        assert found[name] == schema, name
+    # And each declared property is really there, in both modes.
+    from pytest_failure_instrumentation.incidents import registry
+    from pytest_failure_instrumentation.sampling import WorkerSample
+
+    for mode in ("validation", "serialization"):
+        death = registry._adapter.json_schema(mode=mode)["$defs"]["WorkerDeathIncident"]
+        assert "lanes_in_flight" in death["properties"]
+        sampled = WorkerSample.model_json_schema(mode=mode)["$defs"]["SampledWorker"]
+        assert {"process", "thread_name", "thread_id"} <= set(sampled["properties"])
 
 
 # --- pytest-threadlanes, for real -------------------------------------------
@@ -514,9 +867,9 @@ MODES = {
 }
 
 
-def _lanes_run(pytester, mode_args, *extra, ini=""):
+def _lanes_run(pytester, mode_args, *extra, ini="", conftest=LANES_CONFTEST):
     _needs_lanes()
-    pytester.makeconftest(LANES_CONFTEST)
+    pytester.makeconftest(conftest)
     pytester.makeini("[pytest]\nfailure_heartbeat_interval = 1\n" + ini)
     return pytester.runpytest_subprocess(
         *_lanes_flags(), "--failure-instrumentation", *mode_args, *extra, timeout=180
@@ -591,8 +944,23 @@ def test_every_lane_is_live_as_a_worker_of_its_own(pytester, monkeypatch, mode, 
     workers = {row["worker"] for reading in seen for row in reading["rows"]}
     if mode == "hybrid":
         assert workers == {f"gw{p}.ln{n}" for p in range(2) for n in range(3)}
+        # xdist's scheduler hands work to lanes here, so each lane's row has
+        # a lane's progress, meaning what a worker's does...
+        for reading in seen:
+            for row in reading["rows"]:
+                assert row["tests_assigned"] == 1
+                assert row["tests_running"] + row["tests_queued"] + row["tests_finished"] == 1
+        # ...and the controller's record counted each finish on its lane.
+        (directory,) = [path for path in (pytester.path / ".pytest-failures").iterdir()
+                        if path.is_dir()]
+        schedule = json.loads((directory / "schedule.json").read_text().strip("\0 \n"))
+        assert set(schedule["workers"]) == workers
+        assert all(row["completed"] == row["assigned"] == 1
+                   for row in schedule["workers"].values())
     else:
         assert workers == {"ln0", "ln1", "ln2"}
+        # No xdist controller writes a schedule for lanes in one process.
+        assert all(row["tests_assigned"] is None for reading in seen for row in reading["rows"])
 
 
 #: A hung test on one lane while the others go on, then finish and sit idle -
@@ -746,3 +1114,153 @@ def test_what_is_one_per_process_is_adjusted_and_says_so(pytester):
     # was passed on to the terminal as well.
     assert "a line from native code" in (directory / "main.output").read_text()
     assert "a line from native code" in result.stderr.str()
+
+
+#: A hang in the setup of each lane's first test - provisioning, say - before
+#: any lane has reported anything.
+FIRST_SETUP_SUITE = '''
+import os, time
+import pytest
+
+
+@pytest.fixture
+def env_setup(env, step):
+    if step == 0 and env in os.environ["HANG_ENVS"].split(","):
+        time.sleep(6)
+    yield
+
+
+@pytest.mark.parametrize("step", range(3))
+@pytest.mark.parametrize("env", ["envA", "envB"])
+def test_f(env, step, env_setup):
+    time.sleep(0.2)
+'''
+
+
+@pytest.mark.parametrize("hang", ["envA", "envA,envB"], ids=["one-lane", "every-lane"])
+def test_a_hang_before_any_report_is_still_a_lanes_stall(pytester, monkeypatch, hang):
+    """With -n, the controller hears of a lane only from its reports; the
+    lane's own record is what times a test that never sent one."""
+    monkeypatch.setenv("HANG_ENVS", hang)
+    pytester.makepyfile(test_first=FIRST_SETUP_SUITE)
+    _lanes_run(pytester, ["-n", "1", "--lanes", "2"], ini="failure_stall_seconds = 2\n")
+    stalls = [i for i in _incidents(pytester) if i["kind"] == "worker_stall"]
+    assert stalls, _incidents(pytester)
+    assert {i["worker"] for i in stalls} <= {"gw0.ln0", "gw0.ln1"}
+    assert all(i["phase"] == "setup" and "[env" in i["test_in_flight"] for i in stalls)
+
+
+FEW_SUITE = '''
+import time
+import pytest
+
+
+@pytest.mark.parametrize("step", range(4))
+@pytest.mark.parametrize("env", ["envA", "envB"])
+def test_few(env, step):
+    for _ in range(12):
+        sum(range(20000))
+        time.sleep(0.1)
+'''
+
+
+def test_a_lane_given_no_work_is_idle_not_silent(pytester):
+    """Three lanes, two environments: one lane never gets a test."""
+    pytester.makepyfile(test_few=FEW_SUITE)
+    result = _lanes_run(pytester, ["--lanes", "3"], ini="failure_stall_seconds = 2\n")
+    assert result.ret == 0, result.stdout.str()
+    assert [i for i in _incidents(pytester) if i["kind"] == "worker_stall"] == []
+
+
+EXCLUSIVE_SUITE = '''
+import time
+import pytest
+
+
+@pytest.fixture
+def provision():
+    time.sleep(2.5)
+    yield
+
+
+@pytest.mark.lanes_exclusive
+@pytest.mark.parametrize("env", ["envX"])
+def test_exclusive(env, provision):
+    time.sleep(2.5)
+
+
+@pytest.mark.parametrize("step", range(2))
+@pytest.mark.parametrize("env", ["envA", "envB"])
+def test_plain(env, step):
+    time.sleep(0.2)
+'''
+
+
+@pytest.mark.parametrize("mode", ["lanes", "hybrid"])
+def test_an_exclusive_tests_held_reports_are_not_a_stall(pytester, mode):
+    """pytest-threadlanes holds an exclusive test's reports until it ends; its
+    phases, each under the limit, are timed by the lane's own record."""
+    pytester.makepyfile(test_ex=EXCLUSIVE_SUITE)
+    result = _lanes_run(
+        pytester, ["--lanes", "2"] if mode == "lanes" else ["-n", "1", "--lanes", "2"],
+        ini="failure_stall_seconds = 4\nmarkers = lanes_exclusive\n",
+    )
+    assert result.ret == 0, result.stdout.str()
+    assert [i for i in _incidents(pytester) if i["kind"] == "worker_stall"] == []
+
+
+INTERNAL_ERROR_CONFTEST = LANES_CONFTEST + '''
+import pytest
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    yield
+    if "envB-1" in item.nodeid and call.when == "call":
+        raise RuntimeError("plugin bug in makereport")
+'''
+
+
+@pytest.mark.parametrize("mode", ["lanes", "hybrid"])
+def test_an_internal_error_names_the_lane_and_its_test(pytester, mode):
+    _needs_lanes()
+    pytester.makepyfile(test_ie="""
+import time, pytest
+@pytest.mark.parametrize("step", range(3))
+@pytest.mark.parametrize("env", ["envA", "envB"])
+def test_i(env, step):
+    time.sleep(0.3)
+""")
+    _lanes_run(
+        pytester, ["--lanes", "2"] if mode == "lanes" else ["-n", "1", "--lanes", "2"],
+        conftest=INTERNAL_ERROR_CONFTEST,
+    )
+    (incident,) = [i for i in _incidents(pytester) if i["kind"] == "internal_error"]
+    assert incident["test_in_flight"] == "test_ie.py::test_i[envB-1]"
+    assert incident["worker"] in ("ln1", "gw0.ln1")
+
+
+SEGFAULT_SUITE = '''
+import ctypes, time, pytest
+
+
+@pytest.mark.parametrize("step", range(2))
+@pytest.mark.parametrize("env", ["envA", "envB", "envC"])
+def test_d(env, step, tmp_path_factory):
+    flag = tmp_path_factory.getbasetemp().parent / "died-once"
+    if env == "envB" and step == 0 and not flag.exists():
+        time.sleep(0.5)
+        flag.write_text("x")
+        ctypes.string_at(0)
+    time.sleep(2)
+'''
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a fault is an OSError there")
+def test_a_native_crash_on_one_lane_blames_that_lanes_test(pytester):
+    pytester.makepyfile(test_seg=SEGFAULT_SUITE)
+    _lanes_run(pytester, ["-n", "1", "--lanes", "3"])
+    (incident,) = [i for i in _incidents(pytester) if i["kind"] == "worker_death"]
+    assert incident["verdict"] == "NATIVE_CRASH"
+    assert incident["test_in_flight"] == "test_seg.py::test_d[envB-0]"
+    assert len(incident["lanes_in_flight"]) == 3

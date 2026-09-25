@@ -33,6 +33,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional, TextIO
 
+from ..lanes import ThreadKey
 from ..probes import stacks
 
 
@@ -440,7 +441,7 @@ def read(
     path: Path,
     limit: int = 12,
     offset: int = 0,
-    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+    thread: Optional[ThreadKey] = None,
 ) -> list[str]:
     """One thread's stack out of the *latest* dump - most recent call first.
 
@@ -482,10 +483,32 @@ def read(
     return ([banner] + section) if banner else section
 
 
+def current_thread(path: Path) -> Optional[int]:
+    """The ident of the thread a *fatal* dump in ``path`` was written on.
+
+    faulthandler labels the thread the fatal signal reached "Current thread",
+    and a fault in native code is delivered to the thread that faulted. For a
+    process running pytest-threadlanes that is which lane's test took it
+    down. None for anything else: no dump, a dump of a process that went on
+    living, or one with no current thread.
+    """
+    lines = _lines(path)
+    if not lines:
+        return None
+    lines = _latest_dump(lines)
+    if not is_fatal(lines):
+        return None
+    for line in lines:
+        if line.startswith("Current thread"):
+            found = _THREAD_HEADER.match(line)
+            return int(found.group(1), 16) if found else None
+    return None
+
+
 def from_threads(
     threads: list[dict[str, Any]],
     limit: int = 12,
-    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+    thread: Optional[ThreadKey] = None,
 ) -> list[str]:
     """A live reader's threads, as a dump read off disk would have looked.
 
@@ -578,7 +601,7 @@ _THREAD_HEADER = re.compile(r"(?:Current thread|Thread) 0x([0-9a-fA-F]+)")
 
 
 def _is_thread(
-    header: str, thread: tuple[Optional[int], Optional[str]]
+    header: str, thread: ThreadKey
 ) -> bool:
     """Whether a section's first line is the named thread's.
 
@@ -595,7 +618,7 @@ def _is_thread(
 
 def _most_relevant(
     sections: list[list[str]],
-    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+    thread: Optional[ThreadKey] = None,
 ) -> list[str]:
     """The thread worth reporting, in descending order of certainty.
 

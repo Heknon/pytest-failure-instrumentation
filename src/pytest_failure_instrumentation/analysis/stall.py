@@ -64,35 +64,47 @@ def cpu_rate(beats: list[dict[str, Any]]) -> Optional[float]:
     return used / elapsed
 
 
-def lane_beats(beats: list[dict[str, Any]], lane: str) -> list[dict[str, Any]]:
-    """The beats as one lane's, where they measured it: its own thread's CPU.
+def lane_beats(beats: list[dict[str, Any]], readings: Any) -> list[dict[str, Any]]:
+    """The beats as one lane's, where it was measured: its own thread's CPU.
 
     A lane of pytest-threadlanes shares its process, and a process's CPU is
     every lane's summed - so one busy sibling makes a lane that is waiting on
     a socket read as working, and the verdict this module exists for, "burning
     CPU: slow, not stuck", hides exactly the lane that is stuck. The heartbeat
-    of a process with lanes carries each lane's thread figure under
-    ``threads``, and this puts it where every rule here reads CPU.
+    of a process with lanes writes each lane's thread CPU onto the lane's own
+    record, as ``[time, seconds]`` readings taken with each beat, and this
+    turns them into beats every rule here reads.
 
-    Only while the latest beat measures the lane, and only from beats that
-    did: a figure missing from the latest - the thread has ended, or this
-    platform could not number it - leaves the process's reading in force. So
-    does a lane measured only once so far, which has no rate of its own yet:
-    the process's is the reading it had before per-thread figures existed, and
-    reading "could not tell" instead raised a stall, at low confidence, on a
-    lane that had started burning a core a second earlier. The next reading
-    has the lane's own. Timing is untouched: the latest beat is kept either
-    way, so a frozen process is exactly as frozen read either way.
+    Only while they are current: readings that stopped while the process's
+    beats went on - the thread has ended, or this platform cannot number it -
+    leave the process's beats in force. So does a lane measured only once so
+    far, which has no rate of its own yet: the process's is the reading it had
+    before per-thread figures existed, and "could not tell" instead raised a
+    stall, at low confidence, on a lane that had started burning a core a
+    second earlier. Timing is the heartbeat's either way, since the readings
+    are taken by the same thread: a frozen process is exactly as frozen.
     """
-    latest = beats[-1].get("threads") if beats else None
-    if not isinstance(latest, dict) or lane not in latest:
+    if not beats or not isinstance(readings, list):
         return beats
-    measured = [
-        {**beat, "cpu_seconds": beat["threads"][lane]}
-        for beat in beats
-        if isinstance(beat.get("threads"), dict) and lane in beat["threads"]
-    ]
-    return measured if len(measured) >= 2 else beats
+    measured = []
+    for reading in readings:
+        if (
+            isinstance(reading, list)
+            and len(reading) == 2
+            and all(isinstance(value, (int, float)) for value in reading)
+        ):
+            measured.append({"time": float(reading[0]), "cpu_seconds": float(reading[1])})
+    if len(measured) < 2:
+        return beats
+    if measured[-1]["time"] < last_beat_time(beats) - CURRENT_READING_SLACK:
+        return beats
+    return measured
+
+
+#: How far a lane's newest reading may trail the process's newest beat and
+#: still be current. The two are written by one thread, a moment apart, so a
+#: reader can land between them; a reading a whole beat behind has stopped.
+CURRENT_READING_SLACK = 0.5
 
 
 def assess(

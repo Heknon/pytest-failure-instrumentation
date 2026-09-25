@@ -28,6 +28,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
+#: A thread to pick out of a stack: its ident as faulthandler prints it, and
+#: its name as a live read prints it. Either may be unknown.
+ThreadKey = tuple[Optional[int], Optional[str]]
+
+#: pytest-threadlanes' plugin name, as its entry point registers it.
+PLUGIN = "threadlanes"
+
 #: The key a lane's record carries naming the worker process it runs in:
 #: ``main`` in a run with no ``-n``, ``gw0`` in one with.
 PROCESS_KEY = "process"
@@ -40,11 +47,16 @@ CONTAINER_KEY = "lanes"
 def requested(config: Any) -> bool:
     """Whether this run asked pytest-threadlanes for lanes.
 
-    ``getoption`` with a default, because the option exists only where that
-    plugin is installed - and ``--lanes 0`` is its spelling of "off".
+    Both halves, because either alone is somebody else's: an option whose
+    dest is ``lanes`` can be any plugin's or conftest's, and pytest-threadlanes
+    installed does nothing until asked. ``getoption`` with a default, because
+    the option exists only where the plugin is installed - and ``--lanes 0``
+    is its spelling of "off".
     """
     try:
-        return bool(config.getoption("lanes", None))
+        return bool(
+            config.pluginmanager.hasplugin(PLUGIN) and config.getoption("lanes", None)
+        )
     except (ValueError, AttributeError, TypeError):
         return False
 
@@ -68,6 +80,23 @@ def in_one_process(config: Any) -> bool:
         return False
 
 
+def without_unset(dumped: Any, model: Any, names: tuple[str, ...]) -> Any:
+    """A model's dump without the lane-only fields it left unset.
+
+    What a payload the plugin produces carries only where lanes ran: absent,
+    not null or empty, everywhere else, so a run without lanes serves exactly
+    what it did before lanes existed. For the wrap serializer of each model
+    that has such fields - which must not annotate its return, or pydantic
+    reads the model's serialization schema as "anything".
+    """
+    if isinstance(dumped, dict):
+        for name in names:
+            value = getattr(model, name, None)
+            if value is None or (isinstance(value, (list, dict)) and not value):
+                dumped.pop(name, None)
+    return dumped
+
+
 def is_lane(record: dict[str, Any]) -> bool:
     """Whether a state record was written by a lane."""
     return isinstance(record.get(PROCESS_KEY), str) and bool(record.get(PROCESS_KEY))
@@ -76,16 +105,6 @@ def is_lane(record: dict[str, Any]) -> bool:
 def is_container(record: dict[str, Any]) -> bool:
     """Whether a state record is a process whose lanes are its workers."""
     return record.get(CONTAINER_KEY) is True
-
-
-def process_of(worker: str) -> str:
-    """The process a lane id belongs to, by pytest-threadlanes' naming.
-
-    ``gw0.ln3`` is lane 3 of the xdist worker ``gw0``. A single-process lane
-    (``ln3``) has no prefix, and the caller that knows it is one says so rather
-    than asking here.
-    """
-    return worker.split(".", 1)[0]
 
 
 def sibling(path: Path, name: Any, suffix: str) -> Optional[Path]:

@@ -17,7 +17,7 @@ import psutil
 from .capture.resource_history import ResourceHistory
 from .capture.state import read_state
 from .config import Settings
-from .lanes import is_lane
+from .lanes import is_container, is_lane
 from .probes.resource_metrics import PlatformMetrics, cgroup_metrics, reason
 
 MAX_PROCESSES = 512
@@ -109,13 +109,21 @@ class ResourceSampler:
 
     def _workers(self) -> dict[int, dict[str, Any]]:
         workers: dict[int, dict[str, Any]] = {}
+        # Lanes with a test in flight, by the process they run in, and the
+        # processes that are containers of lanes - see .lanes.
+        running: dict[str, int] = {}
+        containers: dict[int, str] = {}
         for path in self.directory.glob("*.state"):
             state = read_state(path)
             pid = state.get("pid")
             if is_lane(state):
                 # A lane of pytest-threadlanes is a thread of a process whose
                 # own state is here too, with this pid; the process is what is
-                # measured, and it is known by its own name - see .lanes.
+                # measured, and it is known by its own name. What it adds is
+                # whether it is running a test, counted on its process.
+                if state.get("nodeid"):
+                    process = str(state.get("process"))
+                    running[process] = running.get(process, 0) + 1
                 continue
             if isinstance(pid, int) and len(workers) < MAX_PROCESSES:
                 visible = self.pid_map.get(pid) if self.foreign_procfs else pid
@@ -131,6 +139,10 @@ class ResourceSampler:
                 workers[visible] = {"worker": path.stem, "nodeid": (state.get("nodeid") or "")[:1024],
                                     "nodeid_hash": state.get("nodeid_hash"),
                                     "phase": state.get("phase"), "state_time": state.get("time", 0)}
+                if is_container(state):
+                    containers[visible] = path.stem
+        for visible, name in containers.items():
+            workers[visible]["lanes_running"] = running.get(name, 0)
         return workers
 
     def _discover(self, workers: dict[int, dict[str, Any]], now: float) -> None:
@@ -260,7 +272,10 @@ class ResourceSampler:
                 processes.append({**row, "metrics": values, "unavailable": missing,
                                   "observed_at": time.time(), "nodeid": worker.get("nodeid"),
                                   "nodeid_hash": worker.get("nodeid_hash"),
-                                  "phase": worker.get("phase")})
+                                  "phase": worker.get("phase"),
+                                  # Only for a process of lanes - see .lanes.
+                                  **({"lanes_running": worker["lanes_running"]}
+                                     if "lanes_running" in worker else {})})
             except psutil.NoSuchProcess:
                 self.event({"kind": "process_no_longer_observed", **row})
                 del self.tracked[key]

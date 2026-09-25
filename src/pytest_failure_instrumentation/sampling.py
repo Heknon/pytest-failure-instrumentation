@@ -35,11 +35,12 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, model_serializer
 
 from . import topology
+from .lanes import without_unset
 
 
 class SampledWorker(BaseModel):
@@ -107,17 +108,8 @@ class SampledWorker(BaseModel):
     thread_id: Optional[int] = None
 
     @model_serializer(mode="wrap")
-    def _without_absent_lanes(self, handler: Any) -> Any:
-        dumped = handler(self)
-        if isinstance(dumped, dict) and self.process is None:
-            for name in _LANE_FIELDS:
-                if dumped.get(name) is None:
-                    dumped.pop(name, None)
-        return dumped
-
-
-#: The fields only a lane's row carries.
-_LANE_FIELDS = ("process", "thread_name", "thread_id")
+    def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        return without_unset(handler(self), self, ("process", "thread_name", "thread_id"))
 
 
 class WorkerSample(BaseModel):

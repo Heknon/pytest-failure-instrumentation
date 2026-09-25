@@ -28,6 +28,7 @@ from ..analysis import stall as assessment
 from ..capture import crash_stack
 from ..capture import events as event_log
 from ..capture.state import read_state
+from ..lanes import ThreadKey
 from .base import Incident
 
 #: How long to wait for a signalled worker to write its stack.
@@ -178,6 +179,7 @@ def build(
     run_id: Optional[str] = None,
     live_pid: Optional[int] = None,
     cancel: Optional[threading.Event] = None,
+    known_lane: bool = False,
 ) -> Optional[WorkerStallIncident]:
     """Assess a silent worker. Returns None when it is merely slow.
 
@@ -209,10 +211,16 @@ def build(
     theirs: while any of them has a test in flight, that lane is watched and
     judged on its own, and the process says nothing. Only once none has is its
     silence its own, and it is judged as any worker with no test running is.
+
+    ``known_lane`` is the engine saying this name is a lane. A lane that has
+    never started a test has no record yet - more lanes than there is work
+    for, say - and is idle like any other.
     """
     record = read_state(directory / f"{worker}.state", run_id)
     files, thread, lane = worker, None, _lane(directory, worker, record)
     lanes: Optional[list[tuple[str, dict[str, Any]]]] = None
+    if lane is None and known_lane:
+        return None  # a lane with no record has never had a test: idle
     if lane is not None:
         if not lane.get("nodeid"):
             return None  # idle; the engine re-arms it, and nothing is said
@@ -227,16 +235,17 @@ def build(
     # not be cleared, which on Windows is any file somebody still had open -
     # are old by definition, and old beats are exactly what FROZEN is read off.
     events = event_log.this_run(event_log.read_events(path), run_id)
-    beats = _measured(event_log.heartbeats(events), worker, lane)
+    beats = _measured(event_log.heartbeats(events), lane)
     verdict = assessment.assess(beats, time.time(), silent_for, interval)
 
     if verdict.needs_confirmation:
         previous = assessment.last_beat_time(beats)
         if _wait(cancel, interval * 1.2):
             return None  # the run is ending; nobody is left to tell
+        if lane is not None:
+            lane = read_state(directory / f"{worker}.state", run_id) or lane
         beats = _measured(
             event_log.heartbeats(event_log.this_run(event_log.read_events(path), run_id)),
-            worker,
             lane,
         )
         verdict = assessment.confirm(beats, previous, time.time(), silent_for)
@@ -335,10 +344,10 @@ def _lane(
 
 
 def _measured(
-    beats: list[dict[str, Any]], worker: str, lane: Optional[dict[str, Any]]
+    beats: list[dict[str, Any]], lane: Optional[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """The beats with a lane's own CPU in them, for a lane; as they are otherwise."""
-    return assessment.lane_beats(beats, worker) if lane is not None else beats
+    """The beats as a lane's own CPU, for a lane; as they are otherwise."""
+    return assessment.lane_beats(beats, lane.get("cpu")) if lane is not None else beats
 
 
 def _wait(cancel: Optional[threading.Event], seconds: float) -> bool:
@@ -356,7 +365,7 @@ def _stack(
     allowed: bool,
     live_pid: Optional[int] = None,
     cancel: Optional[threading.Event] = None,
-    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+    thread: Optional[ThreadKey] = None,
 ) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
     """Ask the worker for a stack, and read only what it added.
 
@@ -427,7 +436,7 @@ def _stack(
 def _own_stack(
     directory: Path,
     worker: str,
-    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+    thread: Optional[ThreadKey] = None,
 ) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
     """The stack of a run with no workers, which is this process.
 
@@ -503,7 +512,7 @@ def _cannot_probe(
 def _passive_stack(
     directory: Path,
     worker: str,
-    thread: Optional[tuple[Optional[int], Optional[str]]] = None,
+    thread: Optional[ThreadKey] = None,
 ) -> tuple[list[str], Optional[float], Optional[str]]:
     """Whatever the worker dumped on its own, without being asked, and when.
 

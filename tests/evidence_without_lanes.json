@@ -13,7 +13,7 @@
     "main.state": [
      [
       "sequence",
-      20
+      26
      ],
      [
       "time",
@@ -57,11 +57,11 @@
      ],
      [
       "phase_started",
-      null
+      "<volatile>"
      ],
      [
       "test_started",
-      null
+      "<volatile>"
      ],
      [
       "timeout_settings",
@@ -69,13 +69,19 @@
      ],
      [
       "tests_started",
-      3
+      4
      ],
      [
       "tests_finished",
-      3
+      4
      ]
     ]
+   },
+   "slots": {
+    "main.state": {
+     "length": 5120,
+     "prefix": "{\"sequence\": 26, "
+    }
    },
    "events": {
     "controller.events": {
@@ -92,9 +98,39 @@
        ]
       ]
      },
-     "order": [
-      "kill_witnesses"
-     ]
+     "events": [
+      [
+       [
+        "controller_witness",
+        "<volatile>"
+       ],
+       [
+        "signal_trace",
+        "<volatile>"
+       ],
+       [
+        "reporter",
+        "off: failure_on_run_death is not set"
+       ],
+       [
+        "elevate",
+        false
+       ],
+       [
+        "event",
+        "kill_witnesses"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ]
+     ],
+     "beats_named": []
     },
     "main.events": {
      "shapes": {
@@ -158,14 +194,149 @@
        ]
       ]
      },
-     "order": [
-      "watchdog_started",
-      "worker_start",
-      "faulthandler_armed",
-      "worker_finish"
+     "events": [
+      [
+       [
+        "interval",
+        1.0
+       ],
+       [
+        "capabilities",
+        "<volatile>"
+       ],
+       [
+        "limit_mb",
+        "<volatile>"
+       ],
+       [
+        "limit_source",
+        "<volatile>"
+       ],
+       [
+        "share_mb",
+        "<volatile>"
+       ],
+       [
+        "threshold_mb",
+        "<volatile>"
+       ],
+       [
+        "threshold_source",
+        "<volatile>"
+       ],
+       [
+        "tracemalloc",
+        false
+       ],
+       [
+        "object_census",
+        false
+       ],
+       [
+        "event",
+        "watchdog_started"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "pid",
+        "<volatile>"
+       ],
+       [
+        "python",
+        "<volatile>"
+       ],
+       [
+        "platform",
+        "<volatile>"
+       ],
+       [
+        "executable",
+        "<volatile>"
+       ],
+       [
+        "traceable_by_parent",
+        "<volatile>"
+       ],
+       [
+        "tracer_policy",
+        "off"
+       ],
+       [
+        "event",
+        "worker_start"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "fatal_stack",
+        "stderr"
+       ],
+       [
+        "on_demand_stack",
+        true
+       ],
+       [
+        "slow_test_seconds",
+        20.0
+       ],
+       [
+        "event",
+        "faulthandler_armed"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "exitstatus",
+        1
+       ],
+       [
+        "event",
+        "worker_finish"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ]
+     ],
+     "beats_named": [
+      [
+       "test_first.py::test_outlasts_a_beat",
+       "call"
+      ]
      ]
     }
    },
+   "outputs": {},
    "run": [
     [
      "session",
@@ -258,11 +429,11 @@
      ],
      [
       "tests_started",
-      3
+      4
      ],
      [
       "tests_finished",
-      3
+      4
      ],
      [
       "tests_assigned",
@@ -400,7 +571,7 @@
      ],
      [
       "tests_finished",
-      3
+      4
      ],
      [
       "tests_running",
@@ -428,7 +599,7 @@
     "gw0.state": [
      [
       "sequence",
-      20
+      26
      ],
      [
       "time",
@@ -472,11 +643,11 @@
      ],
      [
       "phase_started",
-      null
+      "<volatile>"
      ],
      [
       "test_started",
-      null
+      "<volatile>"
      ],
      [
       "timeout_settings",
@@ -484,13 +655,19 @@
      ],
      [
       "tests_started",
-      3
+      4
      ],
      [
       "tests_finished",
-      3
+      4
      ]
     ]
+   },
+   "slots": {
+    "gw0.state": {
+     "length": 5120,
+     "prefix": "{\"sequence\": 26, "
+    }
    },
    "events": {
     "controller.events": {
@@ -507,9 +684,39 @@
        ]
       ]
      },
-     "order": [
-      "kill_witnesses"
-     ]
+     "events": [
+      [
+       [
+        "controller_witness",
+        "<volatile>"
+       ],
+       [
+        "signal_trace",
+        "<volatile>"
+       ],
+       [
+        "reporter",
+        "off: failure_on_run_death is not set"
+       ],
+       [
+        "elevate",
+        false
+       ],
+       [
+        "event",
+        "kill_witnesses"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ]
+     ],
+     "beats_named": []
     },
     "gw0.events": {
      "shapes": {
@@ -573,14 +780,149 @@
        ]
       ]
      },
-     "order": [
-      "watchdog_started",
-      "worker_start",
-      "faulthandler_armed",
-      "worker_finish"
+     "events": [
+      [
+       [
+        "interval",
+        1.0
+       ],
+       [
+        "capabilities",
+        "<volatile>"
+       ],
+       [
+        "limit_mb",
+        "<volatile>"
+       ],
+       [
+        "limit_source",
+        "<volatile>"
+       ],
+       [
+        "share_mb",
+        "<volatile>"
+       ],
+       [
+        "threshold_mb",
+        "<volatile>"
+       ],
+       [
+        "threshold_source",
+        "<volatile>"
+       ],
+       [
+        "tracemalloc",
+        false
+       ],
+       [
+        "object_census",
+        false
+       ],
+       [
+        "event",
+        "watchdog_started"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "pid",
+        "<volatile>"
+       ],
+       [
+        "python",
+        "<volatile>"
+       ],
+       [
+        "platform",
+        "<volatile>"
+       ],
+       [
+        "executable",
+        "<volatile>"
+       ],
+       [
+        "traceable_by_parent",
+        "<volatile>"
+       ],
+       [
+        "tracer_policy",
+        "off"
+       ],
+       [
+        "event",
+        "worker_start"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "fatal_stack",
+        "this file"
+       ],
+       [
+        "on_demand_stack",
+        true
+       ],
+       [
+        "slow_test_seconds",
+        20.0
+       ],
+       [
+        "event",
+        "faulthandler_armed"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "exitstatus",
+        1
+       ],
+       [
+        "event",
+        "worker_finish"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ]
+     ],
+     "beats_named": [
+      [
+       "test_first.py::test_outlasts_a_beat",
+       "call"
+      ]
      ]
     }
    },
+   "outputs": {},
    "run": [
     [
      "session",
@@ -620,7 +962,7 @@
       ],
       [
        "collected",
-       3
+       4
       ],
       [
        "unassigned",
@@ -673,15 +1015,15 @@
      ],
      [
       "tests_started",
-      3
+      4
      ],
      [
       "tests_finished",
-      3
+      4
      ],
      [
       "tests_assigned",
-      3
+      4
      ],
      [
       "tests_running",
@@ -740,7 +1082,7 @@
     ],
     [
      "collected",
-     3
+     4
     ],
     [
      "unassigned",
@@ -811,11 +1153,11 @@
      ],
      [
       "tests_assigned",
-      3
+      4
      ],
      [
       "tests_finished",
-      3
+      4
      ],
      [
       "tests_running",
@@ -846,7 +1188,7 @@
     ],
     [
      "collected",
-     3
+     4
     ],
     [
      "unassigned",
@@ -868,11 +1210,11 @@
        [
         [
          "assigned",
-         3
+         4
         ],
         [
          "completed",
-         3
+         4
         ],
         [
          "pending",
@@ -902,7 +1244,7 @@
     "main.state": [
      [
       "sequence",
-      20
+      26
      ],
      [
       "time",
@@ -946,11 +1288,11 @@
      ],
      [
       "phase_started",
-      null
+      "<volatile>"
      ],
      [
       "test_started",
-      null
+      "<volatile>"
      ],
      [
       "timeout_settings",
@@ -958,13 +1300,19 @@
      ],
      [
       "tests_started",
-      3
+      4
      ],
      [
       "tests_finished",
-      3
+      4
      ]
     ]
+   },
+   "slots": {
+    "main.state": {
+     "length": 5120,
+     "prefix": "{\"sequence\": 26, "
+    }
    },
    "events": {
     "controller.events": {
@@ -981,9 +1329,39 @@
        ]
       ]
      },
-     "order": [
-      "kill_witnesses"
-     ]
+     "events": [
+      [
+       [
+        "controller_witness",
+        "<volatile>"
+       ],
+       [
+        "signal_trace",
+        "<volatile>"
+       ],
+       [
+        "reporter",
+        "off: failure_on_run_death is not set"
+       ],
+       [
+        "elevate",
+        false
+       ],
+       [
+        "event",
+        "kill_witnesses"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ]
+     ],
+     "beats_named": []
     },
     "main.events": {
      "shapes": {
@@ -1055,14 +1433,168 @@
        ]
       ]
      },
-     "order": [
-      "output_capture",
-      "watchdog_started",
-      "worker_start",
-      "faulthandler_armed",
-      "worker_finish"
+     "events": [
+      [
+       [
+        "status",
+        "on"
+       ],
+       [
+        "event",
+        "output_capture"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "interval",
+        1.0
+       ],
+       [
+        "capabilities",
+        "<volatile>"
+       ],
+       [
+        "limit_mb",
+        "<volatile>"
+       ],
+       [
+        "limit_source",
+        "<volatile>"
+       ],
+       [
+        "share_mb",
+        "<volatile>"
+       ],
+       [
+        "threshold_mb",
+        "<volatile>"
+       ],
+       [
+        "threshold_source",
+        "<volatile>"
+       ],
+       [
+        "tracemalloc",
+        false
+       ],
+       [
+        "object_census",
+        false
+       ],
+       [
+        "event",
+        "watchdog_started"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "pid",
+        "<volatile>"
+       ],
+       [
+        "python",
+        "<volatile>"
+       ],
+       [
+        "platform",
+        "<volatile>"
+       ],
+       [
+        "executable",
+        "<volatile>"
+       ],
+       [
+        "traceable_by_parent",
+        "<volatile>"
+       ],
+       [
+        "tracer_policy",
+        "off"
+       ],
+       [
+        "event",
+        "worker_start"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "fatal_stack",
+        "stderr"
+       ],
+       [
+        "on_demand_stack",
+        true
+       ],
+       [
+        "slow_test_seconds",
+        20.0
+       ],
+       [
+        "event",
+        "faulthandler_armed"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ],
+      [
+       [
+        "exitstatus",
+        1
+       ],
+       [
+        "event",
+        "worker_finish"
+       ],
+       [
+        "time",
+        "<volatile>"
+       ],
+       [
+        "run_id",
+        "<volatile>"
+       ]
+      ]
+     ],
+     "beats_named": [
+      [
+       "test_first.py::test_outlasts_a_beat",
+       "call"
+      ]
      ]
     }
+   },
+   "outputs": {
+    "main.output": "written to fd 2 by test_passes\nwritten to fd 2 by test_fails\n"
    },
    "run": [
     [
@@ -1156,11 +1688,11 @@
      ],
      [
       "tests_started",
-      3
+      4
      ],
      [
       "tests_finished",
-      3
+      4
      ],
      [
       "tests_assigned",
@@ -1298,7 +1830,7 @@
      ],
      [
       "tests_finished",
-      3
+      4
      ],
      [
       "tests_running",
@@ -1401,5 +1933,8809 @@
    "stack_age_seconds",
    "stack_source"
   ]
+ },
+ "schemas": {
+  "incidents": {
+   "$defs": {
+    "Capabilities": {
+     "additionalProperties": true,
+     "description": "What the machine could measure, so a reader can tell \"nothing went\nwrong\" from \"unmeasurable here\".",
+     "properties": {
+      "platform": {
+       "default": "",
+       "title": "Platform",
+       "type": "string"
+      },
+      "system": {
+       "default": "",
+       "title": "System",
+       "type": "string"
+      },
+      "python": {
+       "default": "",
+       "title": "Python",
+       "type": "string"
+      },
+      "resident_memory": {
+       "default": "unavailable",
+       "title": "Resident Memory",
+       "type": "string"
+      },
+      "system_memory": {
+       "default": "unavailable",
+       "title": "System Memory",
+       "type": "string"
+      },
+      "cgroup_oom_counter": {
+       "default": false,
+       "title": "Cgroup Oom Counter",
+       "type": "boolean"
+      },
+      "exit_status": {
+       "default": "unavailable",
+       "title": "Exit Status",
+       "type": "string"
+      },
+      "live_stack": {
+       "default": false,
+       "title": "Live Stack",
+       "type": "boolean"
+      },
+      "external_stack": {
+       "default": "unavailable",
+       "title": "External Stack",
+       "type": "string"
+      },
+      "psutil": {
+       "default": false,
+       "title": "Psutil",
+       "type": "boolean"
+      }
+     },
+     "title": "Capabilities",
+     "type": "object"
+    },
+    "CgroupMemory": {
+     "additionalProperties": true,
+     "properties": {
+      "current_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Current Mb"
+      },
+      "peak_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Peak Mb"
+      },
+      "max_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Max Mb"
+      }
+     },
+     "title": "CgroupMemory",
+     "type": "object"
+    },
+    "CollectionMismatchIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "collection_mismatch",
+       "default": "collection_mismatch",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "variant_count": {
+       "default": 0,
+       "title": "Variant Count",
+       "type": "integer"
+      },
+      "worker_count": {
+       "default": 0,
+       "title": "Worker Count",
+       "type": "integer"
+      },
+      "complete": {
+       "default": true,
+       "title": "Complete",
+       "type": "boolean"
+      },
+      "baseline_digest": {
+       "default": "",
+       "title": "Baseline Digest",
+       "type": "string"
+      },
+      "variants": {
+       "items": {
+        "$ref": "#/$defs/CollectionVariant"
+       },
+       "title": "Variants",
+       "type": "array"
+      },
+      "variant_files": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Variant Files",
+       "type": "object"
+      },
+      "parameters_unstable": {
+       "default": false,
+       "title": "Parameters Unstable",
+       "type": "boolean"
+      },
+      "unstable_tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Unstable Tests",
+       "type": "array"
+      },
+      "unstable_test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Unstable Test Hashes",
+       "type": "array"
+      },
+      "parameter_samples": {
+       "items": {
+        "$ref": "#/$defs/UnstableParameters"
+       },
+       "title": "Parameter Samples",
+       "type": "array"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "CollectionMismatchIncident",
+     "type": "object"
+    },
+    "CollectionVariant": {
+     "additionalProperties": true,
+     "description": "One distinct collection, and how it differs from the majority.",
+     "properties": {
+      "digest": {
+       "title": "Digest",
+       "type": "string"
+      },
+      "workers": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Workers",
+       "type": "array"
+      },
+      "worker_count": {
+       "default": 0,
+       "title": "Worker Count",
+       "type": "integer"
+      },
+      "test_count": {
+       "default": 0,
+       "title": "Test Count",
+       "type": "integer"
+      },
+      "replacements": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Replacements",
+       "type": "array"
+      },
+      "role": {
+       "default": "differs",
+       "title": "Role",
+       "type": "string"
+      },
+      "kind": {
+       "default": "membership",
+       "title": "Kind",
+       "type": "string"
+      },
+      "compared": {
+       "default": true,
+       "title": "Compared",
+       "type": "boolean"
+      },
+      "missing_count": {
+       "default": 0,
+       "title": "Missing Count",
+       "type": "integer"
+      },
+      "extra_count": {
+       "default": 0,
+       "title": "Extra Count",
+       "type": "integer"
+      },
+      "missing": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Missing",
+       "type": "array"
+      },
+      "extra": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Extra",
+       "type": "array"
+      },
+      "missing_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Missing Hashes",
+       "type": "array"
+      },
+      "extra_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Extra Hashes",
+       "type": "array"
+      },
+      "modules": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Modules",
+       "type": "array"
+      },
+      "module_count": {
+       "default": 0,
+       "title": "Module Count",
+       "type": "integer"
+      },
+      "first_divergence_index": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "First Divergence Index"
+      },
+      "first_divergence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "First Divergence",
+       "type": "array"
+      },
+      "first_divergence_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "First Divergence Hashes",
+       "type": "array"
+      }
+     },
+     "required": [
+      "digest"
+     ],
+     "title": "CollectionVariant",
+     "type": "object"
+    },
+    "CpuBurstIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "cpu_burst",
+       "default": "cpu_burst",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "thread": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Thread"
+      },
+      "burst_seconds": {
+       "default": 0.0,
+       "title": "Burst Seconds",
+       "type": "number"
+      },
+      "cores": {
+       "default": 0.0,
+       "title": "Cores",
+       "type": "number"
+      },
+      "cpu_seconds": {
+       "default": 0.0,
+       "title": "Cpu Seconds",
+       "type": "number"
+      },
+      "started_s": {
+       "default": 0.0,
+       "title": "Started S",
+       "type": "number"
+      },
+      "machine_busy_percent": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Machine Busy Percent"
+      },
+      "cpus": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpus"
+      },
+      "workers": {
+       "default": 0,
+       "title": "Workers",
+       "type": "integer"
+      },
+      "test_count": {
+       "default": 0,
+       "title": "Test Count",
+       "type": "integer"
+      },
+      "tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Tests",
+       "type": "array"
+      },
+      "test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Test Hashes",
+       "type": "array"
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "CpuBurstIncident",
+     "type": "object"
+    },
+    "CpuHotspotIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "cpu_hotspot",
+       "default": "cpu_hotspot",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "cpu_seconds": {
+       "default": 0.0,
+       "title": "Cpu Seconds",
+       "type": "number"
+      },
+      "share_percent": {
+       "default": 0.0,
+       "title": "Share Percent",
+       "type": "number"
+      },
+      "self_share_percent": {
+       "default": 0.0,
+       "title": "Self Share Percent",
+       "type": "number"
+      },
+      "background_share_percent": {
+       "default": 0.0,
+       "title": "Background Share Percent",
+       "type": "number"
+      },
+      "thread": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Thread"
+      },
+      "test_count": {
+       "default": 0,
+       "title": "Test Count",
+       "type": "integer"
+      },
+      "tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Tests",
+       "type": "array"
+      },
+      "test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Test Hashes",
+       "type": "array"
+      },
+      "hottest_lines": {
+       "items": {
+        "$ref": "#/$defs/HotLine"
+       },
+       "title": "Hottest Lines",
+       "type": "array"
+      },
+      "below": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "CpuHotspotIncident",
+     "type": "object"
+    },
+    "Frame": {
+     "additionalProperties": true,
+     "description": "One line of a stack, with the answer to \"whose code is this\".",
+     "properties": {
+      "file": {
+       "title": "File",
+       "type": "string"
+      },
+      "line": {
+       "title": "Line",
+       "type": "integer"
+      },
+      "function": {
+       "title": "Function",
+       "type": "string"
+      },
+      "module": {
+       "title": "Module",
+       "type": "string"
+      },
+      "owner": {
+       "title": "Owner",
+       "type": "string"
+      }
+     },
+     "required": [
+      "file",
+      "line",
+      "function",
+      "module",
+      "owner"
+     ],
+     "title": "Frame",
+     "type": "object"
+    },
+    "HotLine": {
+     "additionalProperties": true,
+     "properties": {
+      "line": {
+       "title": "Line",
+       "type": "integer"
+      },
+      "percent": {
+       "title": "Percent",
+       "type": "number"
+      }
+     },
+     "required": [
+      "line",
+      "percent"
+     ],
+     "title": "HotLine",
+     "type": "object"
+    },
+    "InternalErrorIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "internal_error",
+       "default": "internal_error",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "exception": {
+       "default": "",
+       "title": "Exception",
+       "type": "string"
+      },
+      "detail": {
+       "default": "",
+       "title": "Detail",
+       "type": "string"
+      },
+      "test_in_flight": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight"
+      },
+      "test_in_flight_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight Hash"
+      },
+      "first_hand": {
+       "default": true,
+       "title": "First Hand",
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "InternalErrorIncident",
+     "type": "object"
+    },
+    "KillSources": {
+     "additionalProperties": true,
+     "description": "What each source said about itself, so an absence is never silent.",
+     "properties": {
+      "kernel_log": {
+       "default": "not consulted",
+       "title": "Kernel Log",
+       "type": "string"
+      },
+      "signal_trace": {
+       "default": "off",
+       "title": "Signal Trace",
+       "type": "string"
+      },
+      "controller_witness": {
+       "default": "off",
+       "title": "Controller Witness",
+       "type": "string"
+      }
+     },
+     "title": "KillSources",
+     "type": "object"
+    },
+    "MemoryGrowth": {
+     "additionalProperties": true,
+     "properties": {
+      "tests": {
+       "title": "Tests",
+       "type": "integer"
+      },
+      "per_test_mb": {
+       "title": "Per Test Mb",
+       "type": "number"
+      },
+      "objects_per_test": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Objects Per Test"
+      },
+      "recurring_mb": {
+       "default": 0,
+       "title": "Recurring Mb",
+       "type": "integer"
+      }
+     },
+     "required": [
+      "tests",
+      "per_test_mb"
+     ],
+     "title": "MemoryGrowth",
+     "type": "object"
+    },
+    "MemoryProfileIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "memory_profile",
+       "default": "memory_profile",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "before_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Before Mb"
+      },
+      "after_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "After Mb"
+      },
+      "peak_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Peak Mb"
+      },
+      "delta_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Delta Mb"
+      },
+      "growth": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/MemoryGrowth"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "worker_rss": {
+       "additionalProperties": {
+        "type": "integer"
+       },
+       "title": "Worker Rss",
+       "type": "object"
+      },
+      "workers": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Workers"
+      },
+      "median_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Median Mb"
+      },
+      "tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Tests",
+       "type": "array"
+      },
+      "test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Test Hashes",
+       "type": "array"
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      },
+      "climb_mb": {
+       "default": 0,
+       "title": "Climb Mb",
+       "type": "integer"
+      },
+      "climb_total_mb": {
+       "default": 0,
+       "title": "Climb Total Mb",
+       "type": "integer"
+      },
+      "ceiling_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Ceiling Mb"
+      },
+      "arenas": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Arenas"
+      },
+      "threads": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Threads"
+      },
+      "cpus": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpus"
+      },
+      "allocator_free_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Allocator Free Mb"
+      },
+      "trim_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Trim Mb"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "MemoryProfileIncident",
+     "type": "object"
+    },
+    "OomKillRecord": {
+     "additionalProperties": true,
+     "description": "What the kernel printed when it chose this process, and the fleet\naround it at that instant.",
+     "properties": {
+      "victim_pid": {
+       "title": "Victim Pid",
+       "type": "integer"
+      },
+      "victim_comm": {
+       "default": "",
+       "title": "Victim Comm",
+       "type": "string"
+      },
+      "at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "At"
+      },
+      "matched_by": {
+       "default": "pid",
+       "title": "Matched By",
+       "type": "string"
+      },
+      "constraint": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Constraint"
+      },
+      "memcg": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Memcg"
+      },
+      "task_memcg": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Task Memcg"
+      },
+      "anon_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Anon Rss Mb"
+      },
+      "file_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "File Rss Mb"
+      },
+      "shmem_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Shmem Rss Mb"
+      },
+      "total_vm_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Total Vm Mb"
+      },
+      "uid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Uid"
+      },
+      "oom_score_adj": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Oom Score Adj"
+      },
+      "source": {
+       "default": "",
+       "title": "Source",
+       "type": "string"
+      },
+      "triggered_by_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Triggered By Pid"
+      },
+      "triggered_by_comm": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Triggered By Comm"
+      },
+      "triggered_by_role": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Triggered By Role"
+      },
+      "tasks_considered": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tasks Considered"
+      },
+      "tasks_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tasks Rss Mb"
+      },
+      "run_tasks": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Tasks"
+      },
+      "run_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Rss Mb"
+      },
+      "run_median_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Median Rss Mb"
+      },
+      "victim_rank": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Victim Rank"
+      },
+      "largest": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Largest",
+       "type": "array"
+      },
+      "pressure": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pressure"
+      }
+     },
+     "required": [
+      "victim_pid"
+     ],
+     "title": "OomKillRecord",
+     "type": "object"
+    },
+    "RunSummaryIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "run_summary",
+       "default": "run_summary",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "exitstatus": {
+       "default": 0,
+       "title": "Exitstatus",
+       "type": "integer"
+      },
+      "incidents": {
+       "additionalProperties": {
+        "type": "integer"
+       },
+       "title": "Incidents",
+       "type": "object"
+      },
+      "raised": {
+       "default": 0,
+       "title": "Raised",
+       "type": "integer"
+      },
+      "duplicates_suppressed": {
+       "default": 0,
+       "title": "Duplicates Suppressed",
+       "type": "integer"
+      },
+      "distributed": {
+       "default": false,
+       "title": "Distributed",
+       "type": "boolean"
+      },
+      "run_ending_incidents": {
+       "default": 0,
+       "title": "Run Ending Incidents",
+       "type": "integer"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "RunSummaryIncident",
+     "type": "object"
+    },
+    "SignalRecord": {
+     "additionalProperties": true,
+     "description": "One signal somebody sent to a process of this run, and who.",
+     "properties": {
+      "signal": {
+       "title": "Signal",
+       "type": "integer"
+      },
+      "name": {
+       "default": "",
+       "title": "Name",
+       "type": "string"
+      },
+      "exit_code": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Code"
+      },
+      "api_status": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Api Status"
+      },
+      "at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "At"
+      },
+      "seconds_before_death": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Seconds Before Death"
+      },
+      "si_code": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Si Code"
+      },
+      "origin": {
+       "default": "unknown",
+       "title": "Origin",
+       "type": "string"
+      },
+      "sender_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Pid"
+      },
+      "sender_uid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Uid"
+      },
+      "sender_comm": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Comm"
+      },
+      "sender_cmdline": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Cmdline"
+      },
+      "sender_exe": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Exe"
+      },
+      "sender_role": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Role"
+      },
+      "target": {
+       "default": "",
+       "title": "Target",
+       "type": "string"
+      },
+      "source": {
+       "default": "",
+       "title": "Source",
+       "type": "string"
+      }
+     },
+     "required": [
+      "signal"
+     ],
+     "title": "SignalRecord",
+     "type": "object"
+    },
+    "StackServerIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "stack_server_unavailable",
+       "default": "stack_server_unavailable",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "requested_port": {
+       "default": 0,
+       "title": "Requested Port",
+       "type": "integer"
+      },
+      "host": {
+       "default": "",
+       "title": "Host",
+       "type": "string"
+      },
+      "drawn": {
+       "default": true,
+       "title": "Drawn",
+       "type": "boolean"
+      },
+      "detail": {
+       "default": "",
+       "title": "Detail",
+       "type": "string"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "StackServerIncident",
+     "type": "object"
+    },
+    "UnstableParameters": {
+     "additionalProperties": true,
+     "description": "One parametrized test, and what a few workers produced for it.",
+     "properties": {
+      "test": {
+       "title": "Test",
+       "type": "string"
+      },
+      "test_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test Hash"
+      },
+      "workers": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Workers",
+       "type": "array"
+      }
+     },
+     "required": [
+      "test"
+     ],
+     "title": "UnstableParameters",
+     "type": "object"
+    },
+    "WorkerDeathIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "worker_death",
+       "default": "worker_death",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "xdist_error": {
+       "default": "",
+       "title": "Xdist Error",
+       "type": "string"
+      },
+      "worker_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Worker Pid"
+      },
+      "related_deaths": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Related Deaths",
+       "type": "array"
+      },
+      "exit_status": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Status"
+      },
+      "exit_status_kind": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Status Kind"
+      },
+      "exit_status_source": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Status Source"
+      },
+      "exit_status_meaning": {
+       "default": "unknown",
+       "title": "Exit Status Meaning",
+       "type": "string"
+      },
+      "test_in_flight": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight"
+      },
+      "last_test": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test"
+      },
+      "test_in_flight_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight Hash"
+      },
+      "last_test_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "tests_started": {
+       "default": 0,
+       "title": "Tests Started",
+       "type": "integer"
+      },
+      "tests_finished": {
+       "default": 0,
+       "title": "Tests Finished",
+       "type": "integer"
+      },
+      "rss_mb_at_death": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rss Mb At Death"
+      },
+      "system_available_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "System Available Mb"
+      },
+      "cgroup": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/CgroupMemory"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "cgroup_oom_kills": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cgroup Oom Kills"
+      },
+      "cgroup_oom_kills_since_start": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cgroup Oom Kills Since Start"
+      },
+      "high_water": {
+       "anyOf": [
+        {
+         "items": {
+          "additionalProperties": true,
+          "type": "object"
+         },
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "High Water"
+      },
+      "recovered_from_run": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Recovered From Run"
+      },
+      "last_seen_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Seen At"
+      },
+      "crash_stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Crash Stack",
+       "type": "array"
+      },
+      "crash_stack_age_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Crash Stack Age Seconds"
+      },
+      "test_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test Seconds"
+      },
+      "phase_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase Seconds"
+      },
+      "matched_timeout": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Matched Timeout"
+      },
+      "timeout_source": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Timeout Source"
+      },
+      "recent_output": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Recent Output",
+       "type": "array"
+      },
+      "killer": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/SignalRecord"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "oom": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/OomKillRecord"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "signals_before_death": {
+       "items": {
+        "$ref": "#/$defs/SignalRecord"
+       },
+       "title": "Signals Before Death",
+       "type": "array"
+      },
+      "kill_sources": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/KillSources"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "WorkerDeathIncident",
+     "type": "object"
+    },
+    "WorkerStallIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "worker_stall",
+       "default": "worker_stall",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "state": {
+       "default": "SILENT",
+       "title": "State",
+       "type": "string"
+      },
+      "reason": {
+       "default": "",
+       "title": "Reason",
+       "type": "string"
+      },
+      "silent_for_seconds": {
+       "default": 0.0,
+       "title": "Silent For Seconds",
+       "type": "number"
+      },
+      "cpu_rate": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpu Rate"
+      },
+      "heartbeat_age_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Heartbeat Age Seconds"
+      },
+      "worker_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Worker Pid"
+      },
+      "test_in_flight": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight"
+      },
+      "last_test": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test"
+      },
+      "test_in_flight_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight Hash"
+      },
+      "last_test_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      },
+      "stack_probed": {
+       "default": false,
+       "title": "Stack Probed",
+       "type": "boolean"
+      },
+      "stack_unavailable_reason": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Stack Unavailable Reason"
+      },
+      "stack_age_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Stack Age Seconds"
+      },
+      "stack_source": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Stack Source"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "WorkerStallIncident",
+     "type": "object"
+    }
+   },
+   "discriminator": {
+    "mapping": {
+     "collection_mismatch": "#/$defs/CollectionMismatchIncident",
+     "cpu_burst": "#/$defs/CpuBurstIncident",
+     "cpu_hotspot": "#/$defs/CpuHotspotIncident",
+     "internal_error": "#/$defs/InternalErrorIncident",
+     "memory_profile": "#/$defs/MemoryProfileIncident",
+     "run_summary": "#/$defs/RunSummaryIncident",
+     "stack_server_unavailable": "#/$defs/StackServerIncident",
+     "worker_death": "#/$defs/WorkerDeathIncident",
+     "worker_stall": "#/$defs/WorkerStallIncident"
+    },
+    "propertyName": "kind"
+   },
+   "oneOf": [
+    {
+     "$ref": "#/$defs/WorkerDeathIncident"
+    },
+    {
+     "$ref": "#/$defs/WorkerStallIncident"
+    },
+    {
+     "$ref": "#/$defs/CollectionMismatchIncident"
+    },
+    {
+     "$ref": "#/$defs/InternalErrorIncident"
+    },
+    {
+     "$ref": "#/$defs/RunSummaryIncident"
+    },
+    {
+     "$ref": "#/$defs/StackServerIncident"
+    },
+    {
+     "$ref": "#/$defs/CpuHotspotIncident"
+    },
+    {
+     "$ref": "#/$defs/CpuBurstIncident"
+    },
+    {
+     "$ref": "#/$defs/MemoryProfileIncident"
+    }
+   ]
+  },
+  "incidents_serialized": {
+   "$defs": {
+    "Capabilities": {
+     "additionalProperties": true,
+     "description": "What the machine could measure, so a reader can tell \"nothing went\nwrong\" from \"unmeasurable here\".",
+     "properties": {
+      "platform": {
+       "default": "",
+       "title": "Platform",
+       "type": "string"
+      },
+      "system": {
+       "default": "",
+       "title": "System",
+       "type": "string"
+      },
+      "python": {
+       "default": "",
+       "title": "Python",
+       "type": "string"
+      },
+      "resident_memory": {
+       "default": "unavailable",
+       "title": "Resident Memory",
+       "type": "string"
+      },
+      "system_memory": {
+       "default": "unavailable",
+       "title": "System Memory",
+       "type": "string"
+      },
+      "cgroup_oom_counter": {
+       "default": false,
+       "title": "Cgroup Oom Counter",
+       "type": "boolean"
+      },
+      "exit_status": {
+       "default": "unavailable",
+       "title": "Exit Status",
+       "type": "string"
+      },
+      "live_stack": {
+       "default": false,
+       "title": "Live Stack",
+       "type": "boolean"
+      },
+      "external_stack": {
+       "default": "unavailable",
+       "title": "External Stack",
+       "type": "string"
+      },
+      "psutil": {
+       "default": false,
+       "title": "Psutil",
+       "type": "boolean"
+      }
+     },
+     "title": "Capabilities",
+     "type": "object"
+    },
+    "CgroupMemory": {
+     "additionalProperties": true,
+     "properties": {
+      "current_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Current Mb"
+      },
+      "peak_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Peak Mb"
+      },
+      "max_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Max Mb"
+      }
+     },
+     "title": "CgroupMemory",
+     "type": "object"
+    },
+    "CollectionMismatchIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "collection_mismatch",
+       "default": "collection_mismatch",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "variant_count": {
+       "default": 0,
+       "title": "Variant Count",
+       "type": "integer"
+      },
+      "worker_count": {
+       "default": 0,
+       "title": "Worker Count",
+       "type": "integer"
+      },
+      "complete": {
+       "default": true,
+       "title": "Complete",
+       "type": "boolean"
+      },
+      "baseline_digest": {
+       "default": "",
+       "title": "Baseline Digest",
+       "type": "string"
+      },
+      "variants": {
+       "items": {
+        "$ref": "#/$defs/CollectionVariant"
+       },
+       "title": "Variants",
+       "type": "array"
+      },
+      "variant_files": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Variant Files",
+       "type": "object"
+      },
+      "parameters_unstable": {
+       "default": false,
+       "title": "Parameters Unstable",
+       "type": "boolean"
+      },
+      "unstable_tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Unstable Tests",
+       "type": "array"
+      },
+      "unstable_test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Unstable Test Hashes",
+       "type": "array"
+      },
+      "parameter_samples": {
+       "items": {
+        "$ref": "#/$defs/UnstableParameters"
+       },
+       "title": "Parameter Samples",
+       "type": "array"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "CollectionMismatchIncident",
+     "type": "object"
+    },
+    "CollectionVariant": {
+     "additionalProperties": true,
+     "description": "One distinct collection, and how it differs from the majority.",
+     "properties": {
+      "digest": {
+       "title": "Digest",
+       "type": "string"
+      },
+      "workers": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Workers",
+       "type": "array"
+      },
+      "worker_count": {
+       "default": 0,
+       "title": "Worker Count",
+       "type": "integer"
+      },
+      "test_count": {
+       "default": 0,
+       "title": "Test Count",
+       "type": "integer"
+      },
+      "replacements": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Replacements",
+       "type": "array"
+      },
+      "role": {
+       "default": "differs",
+       "title": "Role",
+       "type": "string"
+      },
+      "kind": {
+       "default": "membership",
+       "title": "Kind",
+       "type": "string"
+      },
+      "compared": {
+       "default": true,
+       "title": "Compared",
+       "type": "boolean"
+      },
+      "missing_count": {
+       "default": 0,
+       "title": "Missing Count",
+       "type": "integer"
+      },
+      "extra_count": {
+       "default": 0,
+       "title": "Extra Count",
+       "type": "integer"
+      },
+      "missing": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Missing",
+       "type": "array"
+      },
+      "extra": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Extra",
+       "type": "array"
+      },
+      "missing_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Missing Hashes",
+       "type": "array"
+      },
+      "extra_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Extra Hashes",
+       "type": "array"
+      },
+      "modules": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Modules",
+       "type": "array"
+      },
+      "module_count": {
+       "default": 0,
+       "title": "Module Count",
+       "type": "integer"
+      },
+      "first_divergence_index": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "First Divergence Index"
+      },
+      "first_divergence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "First Divergence",
+       "type": "array"
+      },
+      "first_divergence_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "First Divergence Hashes",
+       "type": "array"
+      }
+     },
+     "required": [
+      "digest"
+     ],
+     "title": "CollectionVariant",
+     "type": "object"
+    },
+    "CpuBurstIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "cpu_burst",
+       "default": "cpu_burst",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "thread": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Thread"
+      },
+      "burst_seconds": {
+       "default": 0.0,
+       "title": "Burst Seconds",
+       "type": "number"
+      },
+      "cores": {
+       "default": 0.0,
+       "title": "Cores",
+       "type": "number"
+      },
+      "cpu_seconds": {
+       "default": 0.0,
+       "title": "Cpu Seconds",
+       "type": "number"
+      },
+      "started_s": {
+       "default": 0.0,
+       "title": "Started S",
+       "type": "number"
+      },
+      "machine_busy_percent": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Machine Busy Percent"
+      },
+      "cpus": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpus"
+      },
+      "workers": {
+       "default": 0,
+       "title": "Workers",
+       "type": "integer"
+      },
+      "test_count": {
+       "default": 0,
+       "title": "Test Count",
+       "type": "integer"
+      },
+      "tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Tests",
+       "type": "array"
+      },
+      "test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Test Hashes",
+       "type": "array"
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "CpuBurstIncident",
+     "type": "object"
+    },
+    "CpuHotspotIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "cpu_hotspot",
+       "default": "cpu_hotspot",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "cpu_seconds": {
+       "default": 0.0,
+       "title": "Cpu Seconds",
+       "type": "number"
+      },
+      "share_percent": {
+       "default": 0.0,
+       "title": "Share Percent",
+       "type": "number"
+      },
+      "self_share_percent": {
+       "default": 0.0,
+       "title": "Self Share Percent",
+       "type": "number"
+      },
+      "background_share_percent": {
+       "default": 0.0,
+       "title": "Background Share Percent",
+       "type": "number"
+      },
+      "thread": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Thread"
+      },
+      "test_count": {
+       "default": 0,
+       "title": "Test Count",
+       "type": "integer"
+      },
+      "tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Tests",
+       "type": "array"
+      },
+      "test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Test Hashes",
+       "type": "array"
+      },
+      "hottest_lines": {
+       "items": {
+        "$ref": "#/$defs/HotLine"
+       },
+       "title": "Hottest Lines",
+       "type": "array"
+      },
+      "below": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "CpuHotspotIncident",
+     "type": "object"
+    },
+    "Frame": {
+     "additionalProperties": true,
+     "description": "One line of a stack, with the answer to \"whose code is this\".",
+     "properties": {
+      "file": {
+       "title": "File",
+       "type": "string"
+      },
+      "line": {
+       "title": "Line",
+       "type": "integer"
+      },
+      "function": {
+       "title": "Function",
+       "type": "string"
+      },
+      "module": {
+       "title": "Module",
+       "type": "string"
+      },
+      "owner": {
+       "title": "Owner",
+       "type": "string"
+      }
+     },
+     "required": [
+      "file",
+      "line",
+      "function",
+      "module",
+      "owner"
+     ],
+     "title": "Frame",
+     "type": "object"
+    },
+    "HotLine": {
+     "additionalProperties": true,
+     "properties": {
+      "line": {
+       "title": "Line",
+       "type": "integer"
+      },
+      "percent": {
+       "title": "Percent",
+       "type": "number"
+      }
+     },
+     "required": [
+      "line",
+      "percent"
+     ],
+     "title": "HotLine",
+     "type": "object"
+    },
+    "InternalErrorIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "internal_error",
+       "default": "internal_error",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "exception": {
+       "default": "",
+       "title": "Exception",
+       "type": "string"
+      },
+      "detail": {
+       "default": "",
+       "title": "Detail",
+       "type": "string"
+      },
+      "test_in_flight": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight"
+      },
+      "test_in_flight_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight Hash"
+      },
+      "first_hand": {
+       "default": true,
+       "title": "First Hand",
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "InternalErrorIncident",
+     "type": "object"
+    },
+    "KillSources": {
+     "additionalProperties": true,
+     "description": "What each source said about itself, so an absence is never silent.",
+     "properties": {
+      "kernel_log": {
+       "default": "not consulted",
+       "title": "Kernel Log",
+       "type": "string"
+      },
+      "signal_trace": {
+       "default": "off",
+       "title": "Signal Trace",
+       "type": "string"
+      },
+      "controller_witness": {
+       "default": "off",
+       "title": "Controller Witness",
+       "type": "string"
+      }
+     },
+     "title": "KillSources",
+     "type": "object"
+    },
+    "MemoryGrowth": {
+     "additionalProperties": true,
+     "properties": {
+      "tests": {
+       "title": "Tests",
+       "type": "integer"
+      },
+      "per_test_mb": {
+       "title": "Per Test Mb",
+       "type": "number"
+      },
+      "objects_per_test": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Objects Per Test"
+      },
+      "recurring_mb": {
+       "default": 0,
+       "title": "Recurring Mb",
+       "type": "integer"
+      }
+     },
+     "required": [
+      "tests",
+      "per_test_mb"
+     ],
+     "title": "MemoryGrowth",
+     "type": "object"
+    },
+    "MemoryProfileIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "memory_profile",
+       "default": "memory_profile",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "before_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Before Mb"
+      },
+      "after_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "After Mb"
+      },
+      "peak_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Peak Mb"
+      },
+      "delta_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Delta Mb"
+      },
+      "growth": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/MemoryGrowth"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "worker_rss": {
+       "additionalProperties": {
+        "type": "integer"
+       },
+       "title": "Worker Rss",
+       "type": "object"
+      },
+      "workers": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Workers"
+      },
+      "median_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Median Mb"
+      },
+      "tests": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Tests",
+       "type": "array"
+      },
+      "test_hashes": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Test Hashes",
+       "type": "array"
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      },
+      "climb_mb": {
+       "default": 0,
+       "title": "Climb Mb",
+       "type": "integer"
+      },
+      "climb_total_mb": {
+       "default": 0,
+       "title": "Climb Total Mb",
+       "type": "integer"
+      },
+      "ceiling_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Ceiling Mb"
+      },
+      "arenas": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Arenas"
+      },
+      "threads": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Threads"
+      },
+      "cpus": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpus"
+      },
+      "allocator_free_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Allocator Free Mb"
+      },
+      "trim_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Trim Mb"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "MemoryProfileIncident",
+     "type": "object"
+    },
+    "OomKillRecord": {
+     "additionalProperties": true,
+     "description": "What the kernel printed when it chose this process, and the fleet\naround it at that instant.",
+     "properties": {
+      "victim_pid": {
+       "title": "Victim Pid",
+       "type": "integer"
+      },
+      "victim_comm": {
+       "default": "",
+       "title": "Victim Comm",
+       "type": "string"
+      },
+      "at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "At"
+      },
+      "matched_by": {
+       "default": "pid",
+       "title": "Matched By",
+       "type": "string"
+      },
+      "constraint": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Constraint"
+      },
+      "memcg": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Memcg"
+      },
+      "task_memcg": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Task Memcg"
+      },
+      "anon_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Anon Rss Mb"
+      },
+      "file_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "File Rss Mb"
+      },
+      "shmem_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Shmem Rss Mb"
+      },
+      "total_vm_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Total Vm Mb"
+      },
+      "uid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Uid"
+      },
+      "oom_score_adj": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Oom Score Adj"
+      },
+      "source": {
+       "default": "",
+       "title": "Source",
+       "type": "string"
+      },
+      "triggered_by_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Triggered By Pid"
+      },
+      "triggered_by_comm": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Triggered By Comm"
+      },
+      "triggered_by_role": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Triggered By Role"
+      },
+      "tasks_considered": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tasks Considered"
+      },
+      "tasks_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tasks Rss Mb"
+      },
+      "run_tasks": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Tasks"
+      },
+      "run_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Rss Mb"
+      },
+      "run_median_rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Median Rss Mb"
+      },
+      "victim_rank": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Victim Rank"
+      },
+      "largest": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Largest",
+       "type": "array"
+      },
+      "pressure": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pressure"
+      }
+     },
+     "required": [
+      "victim_pid"
+     ],
+     "title": "OomKillRecord",
+     "type": "object"
+    },
+    "RunSummaryIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "run_summary",
+       "default": "run_summary",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "exitstatus": {
+       "default": 0,
+       "title": "Exitstatus",
+       "type": "integer"
+      },
+      "incidents": {
+       "additionalProperties": {
+        "type": "integer"
+       },
+       "title": "Incidents",
+       "type": "object"
+      },
+      "raised": {
+       "default": 0,
+       "title": "Raised",
+       "type": "integer"
+      },
+      "duplicates_suppressed": {
+       "default": 0,
+       "title": "Duplicates Suppressed",
+       "type": "integer"
+      },
+      "distributed": {
+       "default": false,
+       "title": "Distributed",
+       "type": "boolean"
+      },
+      "run_ending_incidents": {
+       "default": 0,
+       "title": "Run Ending Incidents",
+       "type": "integer"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "RunSummaryIncident",
+     "type": "object"
+    },
+    "SignalRecord": {
+     "additionalProperties": true,
+     "description": "One signal somebody sent to a process of this run, and who.",
+     "properties": {
+      "signal": {
+       "title": "Signal",
+       "type": "integer"
+      },
+      "name": {
+       "default": "",
+       "title": "Name",
+       "type": "string"
+      },
+      "exit_code": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Code"
+      },
+      "api_status": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Api Status"
+      },
+      "at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "At"
+      },
+      "seconds_before_death": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Seconds Before Death"
+      },
+      "si_code": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Si Code"
+      },
+      "origin": {
+       "default": "unknown",
+       "title": "Origin",
+       "type": "string"
+      },
+      "sender_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Pid"
+      },
+      "sender_uid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Uid"
+      },
+      "sender_comm": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Comm"
+      },
+      "sender_cmdline": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Cmdline"
+      },
+      "sender_exe": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Exe"
+      },
+      "sender_role": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Sender Role"
+      },
+      "target": {
+       "default": "",
+       "title": "Target",
+       "type": "string"
+      },
+      "source": {
+       "default": "",
+       "title": "Source",
+       "type": "string"
+      }
+     },
+     "required": [
+      "signal"
+     ],
+     "title": "SignalRecord",
+     "type": "object"
+    },
+    "StackServerIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "stack_server_unavailable",
+       "default": "stack_server_unavailable",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "requested_port": {
+       "default": 0,
+       "title": "Requested Port",
+       "type": "integer"
+      },
+      "host": {
+       "default": "",
+       "title": "Host",
+       "type": "string"
+      },
+      "drawn": {
+       "default": true,
+       "title": "Drawn",
+       "type": "boolean"
+      },
+      "detail": {
+       "default": "",
+       "title": "Detail",
+       "type": "string"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "StackServerIncident",
+     "type": "object"
+    },
+    "UnstableParameters": {
+     "additionalProperties": true,
+     "description": "One parametrized test, and what a few workers produced for it.",
+     "properties": {
+      "test": {
+       "title": "Test",
+       "type": "string"
+      },
+      "test_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test Hash"
+      },
+      "workers": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Workers",
+       "type": "array"
+      }
+     },
+     "required": [
+      "test"
+     ],
+     "title": "UnstableParameters",
+     "type": "object"
+    },
+    "WorkerDeathIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "worker_death",
+       "default": "worker_death",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "xdist_error": {
+       "default": "",
+       "title": "Xdist Error",
+       "type": "string"
+      },
+      "worker_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Worker Pid"
+      },
+      "related_deaths": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Related Deaths",
+       "type": "array"
+      },
+      "exit_status": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Status"
+      },
+      "exit_status_kind": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Status Kind"
+      },
+      "exit_status_source": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Exit Status Source"
+      },
+      "exit_status_meaning": {
+       "default": "unknown",
+       "title": "Exit Status Meaning",
+       "type": "string"
+      },
+      "test_in_flight": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight"
+      },
+      "last_test": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test"
+      },
+      "test_in_flight_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight Hash"
+      },
+      "last_test_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "tests_started": {
+       "default": 0,
+       "title": "Tests Started",
+       "type": "integer"
+      },
+      "tests_finished": {
+       "default": 0,
+       "title": "Tests Finished",
+       "type": "integer"
+      },
+      "rss_mb_at_death": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rss Mb At Death"
+      },
+      "system_available_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "System Available Mb"
+      },
+      "cgroup": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/CgroupMemory"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "cgroup_oom_kills": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cgroup Oom Kills"
+      },
+      "cgroup_oom_kills_since_start": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cgroup Oom Kills Since Start"
+      },
+      "high_water": {
+       "anyOf": [
+        {
+         "items": {
+          "additionalProperties": true,
+          "type": "object"
+         },
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "High Water"
+      },
+      "recovered_from_run": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Recovered From Run"
+      },
+      "last_seen_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Seen At"
+      },
+      "crash_stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Crash Stack",
+       "type": "array"
+      },
+      "crash_stack_age_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Crash Stack Age Seconds"
+      },
+      "test_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test Seconds"
+      },
+      "phase_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase Seconds"
+      },
+      "matched_timeout": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Matched Timeout"
+      },
+      "timeout_source": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Timeout Source"
+      },
+      "recent_output": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Recent Output",
+       "type": "array"
+      },
+      "killer": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/SignalRecord"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "oom": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/OomKillRecord"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "signals_before_death": {
+       "items": {
+        "$ref": "#/$defs/SignalRecord"
+       },
+       "title": "Signals Before Death",
+       "type": "array"
+      },
+      "kill_sources": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/KillSources"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "WorkerDeathIncident",
+     "type": "object"
+    },
+    "WorkerStallIncident": {
+     "additionalProperties": true,
+     "properties": {
+      "kind": {
+       "const": "worker_stall",
+       "default": "worker_stall",
+       "title": "Kind",
+       "type": "string"
+      },
+      "worker": {
+       "title": "Worker",
+       "type": "string"
+      },
+      "verdict": {
+       "default": "UNKNOWN",
+       "title": "Verdict",
+       "type": "string"
+      },
+      "confidence": {
+       "default": "low",
+       "title": "Confidence",
+       "type": "string"
+      },
+      "evidence": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Evidence",
+       "type": "array"
+      },
+      "severity": {
+       "default": "needs-triage",
+       "title": "Severity",
+       "type": "string"
+      },
+      "owner": {
+       "default": "unknown",
+       "title": "Owner",
+       "type": "string"
+      },
+      "run_ending": {
+       "default": false,
+       "title": "Run Ending",
+       "type": "boolean"
+      },
+      "fingerprint": {
+       "default": "",
+       "title": "Fingerprint",
+       "type": "string"
+      },
+      "run_id": {
+       "default": "unknown",
+       "title": "Run Id",
+       "type": "string"
+      },
+      "raised_at": {
+       "default": 0.0,
+       "title": "Raised At",
+       "type": "number"
+      },
+      "product_version": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Product Version"
+      },
+      "capabilities": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Capabilities"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "top_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "blamed_frame": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/Frame"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "suspect_owner": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Owner"
+      },
+      "suspect_basis": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Suspect Basis"
+      },
+      "state": {
+       "default": "SILENT",
+       "title": "State",
+       "type": "string"
+      },
+      "reason": {
+       "default": "",
+       "title": "Reason",
+       "type": "string"
+      },
+      "silent_for_seconds": {
+       "default": 0.0,
+       "title": "Silent For Seconds",
+       "type": "number"
+      },
+      "cpu_rate": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpu Rate"
+      },
+      "heartbeat_age_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Heartbeat Age Seconds"
+      },
+      "worker_pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Worker Pid"
+      },
+      "test_in_flight": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight"
+      },
+      "last_test": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test"
+      },
+      "test_in_flight_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Test In Flight Hash"
+      },
+      "last_test_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Test Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "stack": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Stack",
+       "type": "array"
+      },
+      "stack_probed": {
+       "default": false,
+       "title": "Stack Probed",
+       "type": "boolean"
+      },
+      "stack_unavailable_reason": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Stack Unavailable Reason"
+      },
+      "stack_age_seconds": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Stack Age Seconds"
+      },
+      "stack_source": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Stack Source"
+      }
+     },
+     "required": [
+      "worker"
+     ],
+     "title": "WorkerStallIncident",
+     "type": "object"
+    }
+   },
+   "discriminator": {
+    "mapping": {
+     "collection_mismatch": "#/$defs/CollectionMismatchIncident",
+     "cpu_burst": "#/$defs/CpuBurstIncident",
+     "cpu_hotspot": "#/$defs/CpuHotspotIncident",
+     "internal_error": "#/$defs/InternalErrorIncident",
+     "memory_profile": "#/$defs/MemoryProfileIncident",
+     "run_summary": "#/$defs/RunSummaryIncident",
+     "stack_server_unavailable": "#/$defs/StackServerIncident",
+     "worker_death": "#/$defs/WorkerDeathIncident",
+     "worker_stall": "#/$defs/WorkerStallIncident"
+    },
+    "propertyName": "kind"
+   },
+   "oneOf": [
+    {
+     "$ref": "#/$defs/WorkerDeathIncident"
+    },
+    {
+     "$ref": "#/$defs/WorkerStallIncident"
+    },
+    {
+     "$ref": "#/$defs/CollectionMismatchIncident"
+    },
+    {
+     "$ref": "#/$defs/InternalErrorIncident"
+    },
+    {
+     "$ref": "#/$defs/RunSummaryIncident"
+    },
+    {
+     "$ref": "#/$defs/StackServerIncident"
+    },
+    {
+     "$ref": "#/$defs/CpuHotspotIncident"
+    },
+    {
+     "$ref": "#/$defs/CpuBurstIncident"
+    },
+    {
+     "$ref": "#/$defs/MemoryProfileIncident"
+    }
+   ]
+  },
+  "sample": {
+   "$defs": {
+    "SampledWorker": {
+     "additionalProperties": false,
+     "description": "One worker at one instant, as the run's own files describe it.",
+     "properties": {
+      "worker": {
+       "default": "",
+       "title": "Worker",
+       "type": "string"
+      },
+      "pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pid"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "status": {
+       "default": "",
+       "title": "Status",
+       "type": "string"
+      },
+      "why": {
+       "default": "",
+       "title": "Why",
+       "type": "string"
+      },
+      "rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rss Mb"
+      },
+      "cpu_rate": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpu Rate"
+      },
+      "heartbeat_age_s": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Heartbeat Age S"
+      },
+      "attempt": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Attempt"
+      },
+      "rerunning": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rerunning"
+      },
+      "tests_assigned": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Assigned"
+      },
+      "tests_finished": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Finished"
+      },
+      "tests_running": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Running"
+      },
+      "tests_queued": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Queued"
+      }
+     },
+     "title": "SampledWorker",
+     "type": "object"
+    }
+   },
+   "additionalProperties": false,
+   "description": "One pass over this run's workers.",
+   "properties": {
+    "session_id": {
+     "default": "",
+     "title": "Session Id",
+     "type": "string"
+    },
+    "run_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Run Id"
+    },
+    "observed_at": {
+     "default": 0.0,
+     "title": "Observed At",
+     "type": "number"
+    },
+    "workers": {
+     "items": {
+      "$ref": "#/$defs/SampledWorker"
+     },
+     "title": "Workers",
+     "type": "array"
+    },
+    "collected": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Collected"
+    },
+    "unassigned": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Unassigned"
+    },
+    "settled": {
+     "anyOf": [
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Settled"
+    },
+    "rerunning": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Rerunning"
+    },
+    "dist": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Dist"
+    }
+   },
+   "title": "WorkerSample",
+   "type": "object"
+  },
+  "sample_serialized": {
+   "$defs": {
+    "SampledWorker": {
+     "additionalProperties": false,
+     "description": "One worker at one instant, as the run's own files describe it.",
+     "properties": {
+      "worker": {
+       "default": "",
+       "title": "Worker",
+       "type": "string"
+      },
+      "pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pid"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "status": {
+       "default": "",
+       "title": "Status",
+       "type": "string"
+      },
+      "why": {
+       "default": "",
+       "title": "Why",
+       "type": "string"
+      },
+      "rss_mb": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rss Mb"
+      },
+      "cpu_rate": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpu Rate"
+      },
+      "heartbeat_age_s": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Heartbeat Age S"
+      },
+      "attempt": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Attempt"
+      },
+      "rerunning": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rerunning"
+      },
+      "tests_assigned": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Assigned"
+      },
+      "tests_finished": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Finished"
+      },
+      "tests_running": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Running"
+      },
+      "tests_queued": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Queued"
+      }
+     },
+     "title": "SampledWorker",
+     "type": "object"
+    }
+   },
+   "additionalProperties": false,
+   "description": "One pass over this run's workers.",
+   "properties": {
+    "session_id": {
+     "default": "",
+     "title": "Session Id",
+     "type": "string"
+    },
+    "run_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Run Id"
+    },
+    "observed_at": {
+     "default": 0.0,
+     "title": "Observed At",
+     "type": "number"
+    },
+    "workers": {
+     "items": {
+      "$ref": "#/$defs/SampledWorker"
+     },
+     "title": "Workers",
+     "type": "array"
+    },
+    "collected": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Collected"
+    },
+    "unassigned": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Unassigned"
+    },
+    "settled": {
+     "anyOf": [
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Settled"
+    },
+    "rerunning": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Rerunning"
+    },
+    "dist": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Dist"
+    }
+   },
+   "title": "WorkerSample",
+   "type": "object"
+  },
+  "client_workers": {
+   "$defs": {
+    "Controller": {
+     "properties": {
+      "pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pid"
+      },
+      "alive": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Alive"
+      }
+     },
+     "title": "Controller",
+     "type": "object"
+    },
+    "Identity": {
+     "description": "Who is serving this port, from ``/identity``.",
+     "properties": {
+      "service": {
+       "default": "",
+       "title": "Service",
+       "type": "string"
+      },
+      "version": {
+       "default": "",
+       "title": "Version",
+       "type": "string"
+      },
+      "pid": {
+       "default": 0,
+       "title": "Pid",
+       "type": "integer"
+      }
+     },
+     "title": "Identity",
+     "type": "object"
+    },
+    "Run": {
+     "properties": {
+      "session": {
+       "default": "",
+       "title": "Session",
+       "type": "string"
+      },
+      "run_id": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Id"
+      },
+      "directory": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Directory"
+      },
+      "controller": {
+       "$ref": "#/$defs/Controller",
+       "default": {
+        "pid": null,
+        "alive": null
+       }
+      },
+      "started_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Started At"
+      },
+      "schedule": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/ScheduleSummary"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "workers": {
+       "default": [],
+       "items": {
+        "$ref": "#/$defs/Worker"
+       },
+       "title": "Workers",
+       "type": "array"
+      }
+     },
+     "title": "Run",
+     "type": "object"
+    },
+    "ScheduleSummary": {
+     "description": "How big the run is, and whether that answer can still move.",
+     "properties": {
+      "dist": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Dist"
+      },
+      "collected": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Collected"
+      },
+      "unassigned": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Unassigned"
+      },
+      "settled": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Settled"
+      },
+      "rerunning": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rerunning"
+      },
+      "updated_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Updated At"
+      }
+     },
+     "title": "ScheduleSummary",
+     "type": "object"
+    },
+    "Worker": {
+     "description": "One worker at one instant, as the run's own files describe it.",
+     "properties": {
+      "worker": {
+       "default": "",
+       "title": "Worker",
+       "type": "string"
+      },
+      "pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pid"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_elided": {
+       "default": false,
+       "title": "Nodeid Elided",
+       "type": "boolean"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "attempt": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Attempt"
+      },
+      "rerunning": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rerunning"
+      },
+      "tests_started": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Started"
+      },
+      "tests_finished": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Finished"
+      },
+      "tests_assigned": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Assigned"
+      },
+      "tests_running": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Running"
+      },
+      "tests_queued": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Queued"
+      },
+      "state_age_s": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "State Age S"
+      },
+      "rss_mb": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rss Mb"
+      },
+      "status": {
+       "default": "",
+       "title": "Status",
+       "type": "string"
+      },
+      "why": {
+       "default": "",
+       "title": "Why",
+       "type": "string"
+      },
+      "process_exists": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Process Exists"
+      },
+      "heartbeat_age_s": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Heartbeat Age S"
+      },
+      "cpu_rate": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpu Rate"
+      }
+     },
+     "title": "Worker",
+     "type": "object"
+    },
+    "WorkerFilter": {
+     "description": "Which names were asked for, and which of them matched nothing.",
+     "properties": {
+      "workers": {
+       "default": [],
+       "items": {
+        "type": "string"
+       },
+       "title": "Workers",
+       "type": "array"
+      },
+      "unmatched": {
+       "default": [],
+       "items": {
+        "type": "string"
+       },
+       "title": "Unmatched",
+       "type": "array"
+      }
+     },
+     "title": "WorkerFilter",
+     "type": "object"
+    }
+   },
+   "description": "Every run on one machine, from ``/workers``.",
+   "properties": {
+    "served_by": {
+     "$ref": "#/$defs/Identity",
+     "default": {
+      "service": "",
+      "version": "",
+      "pid": 0
+     }
+    },
+    "observed_at": {
+     "default": 0.0,
+     "title": "Observed At",
+     "type": "number"
+    },
+    "runs": {
+     "default": [],
+     "items": {
+      "$ref": "#/$defs/Run"
+     },
+     "title": "Runs",
+     "type": "array"
+    },
+    "filter": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/WorkerFilter"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null
+    }
+   },
+   "title": "WorkersSnapshot",
+   "type": "object"
+  },
+  "client_workers_serialized": {
+   "$defs": {
+    "Controller": {
+     "properties": {
+      "pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pid"
+      },
+      "alive": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Alive"
+      }
+     },
+     "title": "Controller",
+     "type": "object"
+    },
+    "Identity": {
+     "description": "Who is serving this port, from ``/identity``.",
+     "properties": {
+      "service": {
+       "default": "",
+       "title": "Service",
+       "type": "string"
+      },
+      "version": {
+       "default": "",
+       "title": "Version",
+       "type": "string"
+      },
+      "pid": {
+       "default": 0,
+       "title": "Pid",
+       "type": "integer"
+      }
+     },
+     "title": "Identity",
+     "type": "object"
+    },
+    "Run": {
+     "properties": {
+      "session": {
+       "default": "",
+       "title": "Session",
+       "type": "string"
+      },
+      "run_id": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Run Id"
+      },
+      "directory": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Directory"
+      },
+      "controller": {
+       "$ref": "#/$defs/Controller",
+       "default": {
+        "pid": null,
+        "alive": null
+       }
+      },
+      "started_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Started At"
+      },
+      "schedule": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/ScheduleSummary"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null
+      },
+      "workers": {
+       "default": [],
+       "items": {
+        "$ref": "#/$defs/Worker"
+       },
+       "title": "Workers",
+       "type": "array"
+      }
+     },
+     "title": "Run",
+     "type": "object"
+    },
+    "ScheduleSummary": {
+     "description": "How big the run is, and whether that answer can still move.",
+     "properties": {
+      "dist": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Dist"
+      },
+      "collected": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Collected"
+      },
+      "unassigned": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Unassigned"
+      },
+      "settled": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Settled"
+      },
+      "rerunning": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rerunning"
+      },
+      "updated_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Updated At"
+      }
+     },
+     "title": "ScheduleSummary",
+     "type": "object"
+    },
+    "Worker": {
+     "description": "One worker at one instant, as the run's own files describe it.",
+     "properties": {
+      "worker": {
+       "default": "",
+       "title": "Worker",
+       "type": "string"
+      },
+      "pid": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Pid"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_elided": {
+       "default": false,
+       "title": "Nodeid Elided",
+       "type": "boolean"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "attempt": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Attempt"
+      },
+      "rerunning": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rerunning"
+      },
+      "tests_started": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Started"
+      },
+      "tests_finished": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Finished"
+      },
+      "tests_assigned": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Assigned"
+      },
+      "tests_running": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Running"
+      },
+      "tests_queued": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Tests Queued"
+      },
+      "state_age_s": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "State Age S"
+      },
+      "rss_mb": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Rss Mb"
+      },
+      "status": {
+       "default": "",
+       "title": "Status",
+       "type": "string"
+      },
+      "why": {
+       "default": "",
+       "title": "Why",
+       "type": "string"
+      },
+      "process_exists": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Process Exists"
+      },
+      "heartbeat_age_s": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Heartbeat Age S"
+      },
+      "cpu_rate": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Cpu Rate"
+      }
+     },
+     "title": "Worker",
+     "type": "object"
+    },
+    "WorkerFilter": {
+     "description": "Which names were asked for, and which of them matched nothing.",
+     "properties": {
+      "workers": {
+       "default": [],
+       "items": {
+        "type": "string"
+       },
+       "title": "Workers",
+       "type": "array"
+      },
+      "unmatched": {
+       "default": [],
+       "items": {
+        "type": "string"
+       },
+       "title": "Unmatched",
+       "type": "array"
+      }
+     },
+     "title": "WorkerFilter",
+     "type": "object"
+    }
+   },
+   "description": "Every run on one machine, from ``/workers``.",
+   "properties": {
+    "served_by": {
+     "$ref": "#/$defs/Identity",
+     "default": {
+      "service": "",
+      "version": "",
+      "pid": 0
+     }
+    },
+    "observed_at": {
+     "default": 0.0,
+     "title": "Observed At",
+     "type": "number"
+    },
+    "runs": {
+     "default": [],
+     "items": {
+      "$ref": "#/$defs/Run"
+     },
+     "title": "Runs",
+     "type": "array"
+    },
+    "filter": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/WorkerFilter"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null
+    }
+   },
+   "title": "WorkersSnapshot",
+   "type": "object"
+  },
+  "client_resources": {
+   "$defs": {
+    "ResourceBatch": {
+     "properties": {
+      "sequence": {
+       "title": "Sequence",
+       "type": "integer"
+      },
+      "observed_at": {
+       "title": "Observed At",
+       "type": "number"
+      },
+      "elapsed_s": {
+       "title": "Elapsed S",
+       "type": "number"
+      },
+      "host": {
+       "$ref": "#/$defs/ResourceMeasurements"
+      },
+      "cgroup": {
+       "$ref": "#/$defs/ResourceMeasurements"
+      },
+      "processes": {
+       "items": {
+        "$ref": "#/$defs/ResourceProcess"
+       },
+       "title": "Processes",
+       "type": "array"
+      },
+      "disks": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Disks",
+       "type": "array"
+      },
+      "consumers": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Consumers",
+       "type": "array"
+      },
+      "files": {
+       "additionalProperties": true,
+       "title": "Files",
+       "type": "object"
+      },
+      "events": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Events",
+       "type": "array"
+      },
+      "collector": {
+       "additionalProperties": true,
+       "title": "Collector",
+       "type": "object"
+      },
+      "disk_unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Disk Unavailable",
+       "type": "object"
+      },
+      "inventory_unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Inventory Unavailable",
+       "type": "object"
+      },
+      "inventory_age_s": {
+       "default": 0,
+       "title": "Inventory Age S",
+       "type": "number"
+      }
+     },
+     "required": [
+      "sequence",
+      "observed_at",
+      "elapsed_s",
+      "host",
+      "cgroup"
+     ],
+     "title": "ResourceBatch",
+     "type": "object"
+    },
+    "ResourceMeasurements": {
+     "properties": {
+      "metrics": {
+       "additionalProperties": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "title": "Metrics",
+       "type": "object"
+      },
+      "unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Unavailable",
+       "type": "object"
+      }
+     },
+     "title": "ResourceMeasurements",
+     "type": "object"
+    },
+    "ResourceProcess": {
+     "description": "A stable process identity and the times it was discovered and sampled.",
+     "properties": {
+      "metrics": {
+       "additionalProperties": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "title": "Metrics",
+       "type": "object"
+      },
+      "unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Unavailable",
+       "type": "object"
+      },
+      "first_observed_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "First Observed At"
+      },
+      "pid": {
+       "title": "Pid",
+       "type": "integer"
+      },
+      "created_at": {
+       "title": "Created At",
+       "type": "number"
+      },
+      "name": {
+       "default": "",
+       "title": "Name",
+       "type": "string"
+      },
+      "parent_pid": {
+       "default": 0,
+       "title": "Parent Pid",
+       "type": "integer"
+      },
+      "worker": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Worker"
+      },
+      "role": {
+       "default": "",
+       "title": "Role",
+       "type": "string"
+      },
+      "worker_exited": {
+       "default": false,
+       "title": "Worker Exited",
+       "type": "boolean"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "observed_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Observed At"
+      }
+     },
+     "required": [
+      "pid",
+      "created_at"
+     ],
+     "title": "ResourceProcess",
+     "type": "object"
+    }
+   },
+   "properties": {
+    "collection_status": {
+     "default": "running",
+     "title": "Collection Status",
+     "type": "string"
+    },
+    "collection_error": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Collection Error"
+    },
+    "schema_version": {
+     "default": 1,
+     "title": "Schema Version",
+     "type": "integer"
+    },
+    "session": {
+     "title": "Session",
+     "type": "string"
+    },
+    "controller_pid": {
+     "title": "Controller Pid",
+     "type": "integer"
+    },
+    "controller_created_at": {
+     "title": "Controller Created At",
+     "type": "number"
+    },
+    "started_at": {
+     "title": "Started At",
+     "type": "number"
+    },
+    "system": {
+     "default": "",
+     "title": "System",
+     "type": "string"
+    },
+    "python": {
+     "default": "",
+     "title": "Python",
+     "type": "string"
+    },
+    "scope": {
+     "default": "",
+     "title": "Scope",
+     "type": "string"
+    },
+    "pid_scope": {
+     "default": "local",
+     "title": "Pid Scope",
+     "type": "string"
+    },
+    "pytest_pid": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Pytest Pid"
+    },
+    "product_version": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Product Version"
+    },
+    "worker_count": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Worker Count"
+    },
+    "cgroups": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "title": "Cgroups",
+     "type": "object"
+    },
+    "limits": {
+     "additionalProperties": {
+      "type": "integer"
+     },
+     "title": "Limits",
+     "type": "object"
+    },
+    "sample_seconds": {
+     "title": "Sample Seconds",
+     "type": "number"
+    },
+    "max_bytes": {
+     "title": "Max Bytes",
+     "type": "integer"
+    },
+    "history_bytes": {
+     "default": 0,
+     "title": "History Bytes",
+     "type": "integer"
+    },
+    "earliest_sequence": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Earliest Sequence"
+    },
+    "latest_sequence": {
+     "default": 0,
+     "title": "Latest Sequence",
+     "type": "integer"
+    },
+    "next_after": {
+     "default": 0,
+     "title": "Next After",
+     "type": "integer"
+    },
+    "has_more": {
+     "default": false,
+     "title": "Has More",
+     "type": "boolean"
+    },
+    "cursor_expired": {
+     "default": false,
+     "title": "Cursor Expired",
+     "type": "boolean"
+    },
+    "history_truncated": {
+     "default": false,
+     "title": "History Truncated",
+     "type": "boolean"
+    },
+    "batches": {
+     "items": {
+      "$ref": "#/$defs/ResourceBatch"
+     },
+     "title": "Batches",
+     "type": "array"
+    }
+   },
+   "required": [
+    "session",
+    "controller_pid",
+    "controller_created_at",
+    "started_at",
+    "sample_seconds",
+    "max_bytes"
+   ],
+   "title": "ResourceHistory",
+   "type": "object"
+  },
+  "client_resources_serialized": {
+   "$defs": {
+    "ResourceBatch": {
+     "properties": {
+      "sequence": {
+       "title": "Sequence",
+       "type": "integer"
+      },
+      "observed_at": {
+       "title": "Observed At",
+       "type": "number"
+      },
+      "elapsed_s": {
+       "title": "Elapsed S",
+       "type": "number"
+      },
+      "host": {
+       "$ref": "#/$defs/ResourceMeasurements"
+      },
+      "cgroup": {
+       "$ref": "#/$defs/ResourceMeasurements"
+      },
+      "processes": {
+       "items": {
+        "$ref": "#/$defs/ResourceProcess"
+       },
+       "title": "Processes",
+       "type": "array"
+      },
+      "disks": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Disks",
+       "type": "array"
+      },
+      "consumers": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Consumers",
+       "type": "array"
+      },
+      "files": {
+       "additionalProperties": true,
+       "title": "Files",
+       "type": "object"
+      },
+      "events": {
+       "items": {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       "title": "Events",
+       "type": "array"
+      },
+      "collector": {
+       "additionalProperties": true,
+       "title": "Collector",
+       "type": "object"
+      },
+      "disk_unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Disk Unavailable",
+       "type": "object"
+      },
+      "inventory_unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Inventory Unavailable",
+       "type": "object"
+      },
+      "inventory_age_s": {
+       "default": 0,
+       "title": "Inventory Age S",
+       "type": "number"
+      }
+     },
+     "required": [
+      "sequence",
+      "observed_at",
+      "elapsed_s",
+      "host",
+      "cgroup"
+     ],
+     "title": "ResourceBatch",
+     "type": "object"
+    },
+    "ResourceMeasurements": {
+     "properties": {
+      "metrics": {
+       "additionalProperties": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "title": "Metrics",
+       "type": "object"
+      },
+      "unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Unavailable",
+       "type": "object"
+      }
+     },
+     "title": "ResourceMeasurements",
+     "type": "object"
+    },
+    "ResourceProcess": {
+     "description": "A stable process identity and the times it was discovered and sampled.",
+     "properties": {
+      "metrics": {
+       "additionalProperties": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "title": "Metrics",
+       "type": "object"
+      },
+      "unavailable": {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "title": "Unavailable",
+       "type": "object"
+      },
+      "first_observed_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "First Observed At"
+      },
+      "pid": {
+       "title": "Pid",
+       "type": "integer"
+      },
+      "created_at": {
+       "title": "Created At",
+       "type": "number"
+      },
+      "name": {
+       "default": "",
+       "title": "Name",
+       "type": "string"
+      },
+      "parent_pid": {
+       "default": 0,
+       "title": "Parent Pid",
+       "type": "integer"
+      },
+      "worker": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Worker"
+      },
+      "role": {
+       "default": "",
+       "title": "Role",
+       "type": "string"
+      },
+      "worker_exited": {
+       "default": false,
+       "title": "Worker Exited",
+       "type": "boolean"
+      },
+      "nodeid": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid"
+      },
+      "nodeid_hash": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Nodeid Hash"
+      },
+      "phase": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Phase"
+      },
+      "observed_at": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Observed At"
+      }
+     },
+     "required": [
+      "pid",
+      "created_at"
+     ],
+     "title": "ResourceProcess",
+     "type": "object"
+    }
+   },
+   "properties": {
+    "collection_status": {
+     "default": "running",
+     "title": "Collection Status",
+     "type": "string"
+    },
+    "collection_error": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Collection Error"
+    },
+    "schema_version": {
+     "default": 1,
+     "title": "Schema Version",
+     "type": "integer"
+    },
+    "session": {
+     "title": "Session",
+     "type": "string"
+    },
+    "controller_pid": {
+     "title": "Controller Pid",
+     "type": "integer"
+    },
+    "controller_created_at": {
+     "title": "Controller Created At",
+     "type": "number"
+    },
+    "started_at": {
+     "title": "Started At",
+     "type": "number"
+    },
+    "system": {
+     "default": "",
+     "title": "System",
+     "type": "string"
+    },
+    "python": {
+     "default": "",
+     "title": "Python",
+     "type": "string"
+    },
+    "scope": {
+     "default": "",
+     "title": "Scope",
+     "type": "string"
+    },
+    "pid_scope": {
+     "default": "local",
+     "title": "Pid Scope",
+     "type": "string"
+    },
+    "pytest_pid": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Pytest Pid"
+    },
+    "product_version": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Product Version"
+    },
+    "worker_count": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Worker Count"
+    },
+    "cgroups": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "title": "Cgroups",
+     "type": "object"
+    },
+    "limits": {
+     "additionalProperties": {
+      "type": "integer"
+     },
+     "title": "Limits",
+     "type": "object"
+    },
+    "sample_seconds": {
+     "title": "Sample Seconds",
+     "type": "number"
+    },
+    "max_bytes": {
+     "title": "Max Bytes",
+     "type": "integer"
+    },
+    "history_bytes": {
+     "default": 0,
+     "title": "History Bytes",
+     "type": "integer"
+    },
+    "earliest_sequence": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Earliest Sequence"
+    },
+    "latest_sequence": {
+     "default": 0,
+     "title": "Latest Sequence",
+     "type": "integer"
+    },
+    "next_after": {
+     "default": 0,
+     "title": "Next After",
+     "type": "integer"
+    },
+    "has_more": {
+     "default": false,
+     "title": "Has More",
+     "type": "boolean"
+    },
+    "cursor_expired": {
+     "default": false,
+     "title": "Cursor Expired",
+     "type": "boolean"
+    },
+    "history_truncated": {
+     "default": false,
+     "title": "History Truncated",
+     "type": "boolean"
+    },
+    "batches": {
+     "items": {
+      "$ref": "#/$defs/ResourceBatch"
+     },
+     "title": "Batches",
+     "type": "array"
+    }
+   },
+   "required": [
+    "session",
+    "controller_pid",
+    "controller_created_at",
+    "started_at",
+    "sample_seconds",
+    "max_bytes"
+   ],
+   "title": "ResourceHistory",
+   "type": "object"
+  }
+ },
+ "pydantic": "2.13.5",
+ "client_dumps": {
+  "resources": {
+   "sequence": 1,
+   "observed_at": 1.0,
+   "elapsed_s": 0.5,
+   "host": {
+    "metrics": {
+     "cpu_cores": 1.0
+    },
+    "unavailable": {}
+   },
+   "cgroup": {
+    "metrics": {},
+    "unavailable": {}
+   },
+   "processes": [
+    {
+     "metrics": {
+      "rss_mb": 10.0
+     },
+     "unavailable": {},
+     "first_observed_at": null,
+     "pid": 12,
+     "created_at": 1.0,
+     "name": "python",
+     "parent_pid": 1,
+     "worker": "gw0",
+     "role": "worker",
+     "worker_exited": false,
+     "nodeid": "t.py::test_a",
+     "nodeid_hash": "h",
+     "phase": "call",
+     "observed_at": 1.0
+    }
+   ],
+   "disks": [],
+   "consumers": [],
+   "files": {},
+   "events": [],
+   "collector": {},
+   "disk_unavailable": {},
+   "inventory_unavailable": {},
+   "inventory_age_s": 0.0
+  }
  }
 }

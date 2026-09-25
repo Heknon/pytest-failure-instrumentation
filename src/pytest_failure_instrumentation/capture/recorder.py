@@ -31,26 +31,46 @@ from .events import EventLog
 from .heartbeat import Heartbeat
 from .state import WorkerState
 
+#: How many readings of a lane's own CPU its record keeps: a rate needs two,
+#: and a stall verdict measures over the beats of its silence.
+LANE_CPU_READINGS = 6
 
-class _LaneSlot:
-    """One lane's share of a recorder: its own state slot and its own count.
 
-    A lane of pytest-threadlanes is a worker that shares its process with its
-    siblings, and everything per test in :class:`WorkerRecorder` was written
-    for a process with one test in flight. So each lane gets the per-test half
-    of the recorder to itself - the three attributes :meth:`WorkerRecorder._phase`
-    reads, spelt the same, so that one code path serves both - and the
-    per-process half (heartbeat, event log, dumps) stays shared.
+class _Slot:
+    """The per-test half of a recorder: a state slot, and the test it counts.
 
-    Only ever touched from the lane's own thread, which is what makes it safe
-    without a lock: a lane is one thread for the whole session.
+    A worker has one, for the process. A process running pytest-threadlanes
+    has one per lane as well: a lane is a worker that shares its process with
+    its siblings, and everything per test here was written for one test in
+    flight. The per-process half (heartbeat, event log, dumps) stays shared.
+
+    A lane's is only ever touched from the lane's own thread for its counts;
+    its state slot takes a lock, because the heartbeat writes the lane's CPU
+    there too - see WorkerState.record_cpu.
     """
 
-    def __init__(self, name: str, state: WorkerState, native_id: int, ident: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        state: WorkerState,
+        native_id: Optional[int] = None,
+        ident: Optional[int] = None,
+    ) -> None:
         self.name = name
         self.state = state
-        self._counted: Optional[str] = None
-        self._attempt = 0
+        #: The test whose protocol is open and has already been counted as
+        #: started, or None between tests. What makes a rerun not count twice
+        #: - see WorkerRecorder.pytest_runtest_protocol.
+        self.counted: Optional[str] = None
+        #: Which attempt of `counted` is running, kept here rather than read
+        #: back from the state slot: the slot clears the attempt at the end of
+        #: every teardown, exactly as it clears the node id, so a counter
+        #: living there would start again from the cleared value and every
+        #: attempt after the second would report itself as the second. Reset
+        #: at the protocol boundary, where the test changes.
+        self.attempt = 0
+        #: A lane's thread, by native id and by the ident faulthandler prints;
+        #: None for the process's own slot.
         self.native_id = native_id
         self.ident = ident
 
@@ -94,7 +114,7 @@ class WorkerRecorder:
         #: This process's lanes, by name, each created on its first test.
         #: Inserted into under the lock, from the lanes' own threads; read
         #: without it by each lane for its own entry.
-        self._lanes: dict[str, _LaneSlot] = {}
+        self._lanes: dict[str, _Slot] = {}
         #: Lanes whose slot could not be opened, so that it is tried - and the
         #: failure recorded - once, rather than on every phase of every test.
         self._lanes_failed: set[str] = set()
@@ -117,17 +137,6 @@ class WorkerRecorder:
         self.monitor: memory_capture.MemoryMonitor | None = None
         self.profiler: Any = None
         self._allocation_tracer: memory_capture.TracemallocSession | None = None
-        #: The test whose protocol is open and has already been counted as
-        #: started, or None between tests. What makes a rerun not count twice
-        #: - see pytest_runtest_protocol.
-        self._counted: str | None = None
-        #: Which attempt of `_counted` is running, kept here rather than read
-        #: back from the state slot: the slot clears the attempt at the end of
-        #: every teardown, exactly as it clears the node id, so a counter
-        #: living there would start again from the cleared value and every
-        #: attempt after the second would report itself as the second. Reset
-        #: at the protocol boundary below, where the test changes.
-        self._attempt = 0
         # Filled as each resource is opened, so close() works on a recorder
         # that never finished being built.
         self._open_resources: list[Any] = []
@@ -146,6 +155,9 @@ class WorkerRecorder:
         self.state = self._track(
             WorkerState(directory / f"{worker_id}.state", os.getpid(), settings.run_id)
         )
+        #: This process's own slot, which every test of a process without
+        #: lanes is counted in.
+        self._own = _Slot(worker_id, self.state)
         self.events = self._track(
             EventLog(directory / f"{worker_id}.events", settings.run_id)
         )
@@ -285,8 +297,9 @@ class WorkerRecorder:
                 reason="lanes run their phases at once, so handing fd 2 back at "
                 "one lane's phase end would take it from the others; pytest does "
                 "not swap fd 2 per test under lanes either. What reaches it is "
-                "passed on to stderr as it arrives, and is not trimmed until "
-                "the session ends",
+                "passed on to stderr as it arrives, and the disk under what was "
+                "passed on is given back as it goes - holes punched in the file "
+                "on Linux, the file rotated to .prev elsewhere",
             )
         if self.slow_test.enabled:
             self.events.record(
@@ -300,7 +313,7 @@ class WorkerRecorder:
             self.events.record(
                 "lanes_adjusted",
                 mechanism="heartbeat",
-                action="no test on the process's beat; per-lane CPU in threads",
+                action="no test on the process's beat; each lane's CPU on its own record",
                 reason="the process is running one test per lane, and its beat "
                 "cannot name one of them. Memory is per process and is not "
                 "attributed to any test",
@@ -415,7 +428,7 @@ class WorkerRecorder:
             # and the other is pushing one out, and both are wrong if they
             # only happen every fifth second.
             tickers=tickers,
-            threads=self._lane_threads if self.lanes else None,
+            lane_cpu=self._record_lane_cpu if self._lane_cpu_readable() else None,
         )
         self.heartbeat.start()
 
@@ -484,12 +497,12 @@ class WorkerRecorder:
         """
         slot = self._slot(item)
         if slot is not None:
-            slot._counted = None
-            slot._attempt = 0
+            slot.counted = None
+            slot.attempt = 0
         yield
         if slot is not None:
-            slot._counted = None
-            slot._attempt = 0
+            slot.counted = None
+            slot.attempt = 0
         self._profile("end_test", item.nodeid)
 
     @pytest.hookimpl(hookwrapper=True, trylast=True)
@@ -601,21 +614,21 @@ class WorkerRecorder:
             finally:
                 self._tee_hand_back()
             return
-        own = slot is self
+        own = slot is self._own
         now = time.time()
         if phase == "setup":
-            if slot._counted != nodeid:
+            if slot.counted != nodeid:
                 # The first setup of the protocol is the test starting.
-                slot._counted = nodeid
+                slot.counted = nodeid
                 slot.state.tests_started += 1
-                slot._attempt = 1
+                slot.attempt = 1
             else:
                 # A second one is a rerun of the same test, which is not a
                 # test starting - see pytest_runtest_protocol. The attempt is
                 # counted whatever the counters are doing, because it is the
                 # only field that says a rerun is happening at all; everything
                 # else here is about tests, of which this is still the one.
-                slot._attempt += 1
+                slot.attempt += 1
                 if slot.state.tests_finished > 0:
                     # And the finish counted at the end of the last attempt
                     # was not a finish either. It is taken back rather than
@@ -630,7 +643,7 @@ class WorkerRecorder:
             # death is matched against a timeout by how long the *test* ran.
             # Set on every attempt, rerun or not: an enforcer gives each
             # attempt its own deadline, measured from that attempt's setup.
-            slot.state.attempt = slot._attempt
+            slot.state.attempt = slot.attempt
             slot.state.test_started = now
             from .timeouts import effective
 
@@ -702,18 +715,17 @@ class WorkerRecorder:
 
     # -- lanes -----------------------------------------------------------
 
-    def _slot(self, item: Any) -> Any:
-        """Where this test's bookkeeping goes: this recorder, or its lane's slot.
+    def _slot(self, item: Any) -> Optional[_Slot]:
+        """Where this test's bookkeeping goes: this process's slot, or its lane's.
 
-        This recorder itself everywhere but a lane - it carries the same three
-        attributes a slot does - so a run without lanes takes exactly the path
-        it always took. None only for a lane whose slot could not be opened.
+        The process's own everywhere but a lane. None only for a lane whose
+        slot could not be opened.
         """
         if not self.lanes or item is None:
-            return self
+            return self._own
         lane = self._lane_of(item)
         if lane is None:
-            return self
+            return self._own
         slot = self._lanes.get(lane)
         if slot is None and lane not in self._lanes_failed:
             slot = self._open_lane(lane)
@@ -737,7 +749,7 @@ class WorkerRecorder:
             return None
         return str(lane)
 
-    def _open_lane(self, lane: str) -> Optional[_LaneSlot]:
+    def _open_lane(self, lane: str) -> Optional[_Slot]:
         """A lane's slot, made on its first test, on its own thread.
 
         On its own thread because the slot records which thread that is - by
@@ -750,6 +762,7 @@ class WorkerRecorder:
         lists the lanes rather than a process that is running all of them.
         """
         current = threading.current_thread()
+        native, ident = threading.get_native_id(), threading.get_ident()
         with self._lanes_lock:
             existing = self._lanes.get(lane)
             if existing is not None:
@@ -762,8 +775,8 @@ class WorkerRecorder:
                     lane={
                         "process": self.worker_id,
                         "thread_name": current.name,
-                        "thread_id": threading.get_native_id(),
-                        "thread_ident": threading.get_ident(),
+                        "thread_id": native,
+                        "thread_ident": ident,
                         "lane": True,
                     },
                 )
@@ -772,7 +785,7 @@ class WorkerRecorder:
                 self.events.record("lane_state_failed", lane=lane, detail=repr(failure))
                 return None
             self._track(state)
-            slot = _LaneSlot(lane, state, threading.get_native_id(), threading.get_ident())
+            slot = _Slot(lane, state, native, ident)
             first = not self._lanes
             self._lanes[lane] = slot
             state.update()
@@ -780,12 +793,44 @@ class WorkerRecorder:
                 self.state.update(lanes=True)
         return slot
 
-    def _lane_threads(self) -> dict[str, int]:
-        """Each lane's native thread id, for the heartbeat's per-lane CPU."""
-        with self._lanes_lock:
-            return {name: slot.native_id for name, slot in self._lanes.items()}
+    def _lane_cpu_readable(self) -> bool:
+        """Whether each lane's own CPU can be read here, said once if not.
 
-    def _current_lane(self) -> Optional[_LaneSlot]:
+        It is matched on the native thread id, which is what psutil numbers a
+        thread by on Linux and Windows. On macOS psutil numbers them 1, 2,
+        3... in the order the kernel lists them, which is no id at all, so a
+        lane there reads its process's CPU - the reading every row had before
+        per-lane figures existed - and the evidence says why.
+        """
+        if not self.lanes:
+            return False
+        if sys.platform == "darwin":
+            self.events.record(
+                "lanes_adjusted",
+                mechanism="per_lane_cpu",
+                action="unavailable: each lane reads its process's CPU",
+                reason="psutil numbers a thread on macOS by its position, not by "
+                "the native id a lane records, so no lane's thread can be found",
+            )
+            return False
+        return True
+
+    def _record_lane_cpu(self) -> None:
+        """Each lane's thread CPU onto its own record, after every beat."""
+        with self._lanes_lock:
+            slots = list(self._lanes.values())
+        if not slots:
+            return
+        from ..probes.process import thread_cpu_seconds
+
+        used = thread_cpu_seconds()
+        stamp = time.time()
+        for slot in slots:
+            seconds = used.get(slot.native_id) if slot.native_id is not None else None
+            if seconds is not None:
+                slot.state.record_cpu(stamp, seconds, LANE_CPU_READINGS)
+
+    def _current_lane(self) -> Optional[_Slot]:
         """The lane whose thread this is, if it is one."""
         ident = threading.get_ident()
         with self._lanes_lock:
@@ -796,17 +841,56 @@ class WorkerRecorder:
     def pytest_internalerror(self, excrepr: object) -> None:
         # xdist relays this to the controller as a flat string and re-raises it
         # there, so the INTERNALERROR block shows xdist's frame rather than
-        # this failure. Record the real one, attributed to this worker - or,
-        # under lanes, to the lane whose thread raised it, since the process's
-        # own slot names no test there.
-        lane = self._current_lane() if self.lanes else None
-        state = lane.state if lane is not None else self.state
+        # this failure. Record the real one, attributed to this worker.
+        if self.lanes:
+            self._lanes_internal_error(excrepr)
+            return
         self.events.record(
             "internal_error",
             detail=str(excrepr),
-            nodeid=state.nodeid,
-            nodeid_hash=state.nodeid_hash,
-            **({"lane": lane.name} if lane is not None else {}),
+            nodeid=self.state.nodeid,
+            nodeid_hash=self.state.nodeid_hash,
+        )
+
+    def _lanes_internal_error(self, excrepr: object) -> None:
+        """The same record, for a process of lanes, whose own slot names no test.
+
+        pytest-threadlanes hands an error out of a lane to the main thread and
+        raises it there, so this is rarely called on the lane that failed. The
+        test is then found the way a death finds it: a lane still naming a
+        test is one the error interrupted - it never reached the teardown
+        that clears it. One such lane is named, as a worker's test always was;
+        several are all listed, and none is named, since nothing says which of
+        them raised it.
+        """
+        current = self._current_lane()
+        with self._lanes_lock:
+            slots = list(self._lanes.values())
+        flying = [current] if current is not None else [
+            slot for slot in slots if slot.state.nodeid
+        ]
+        named = flying[0] if len(flying) == 1 else None
+        self.events.record(
+            "internal_error",
+            detail=str(excrepr),
+            nodeid=named.state.nodeid if named is not None else None,
+            nodeid_hash=named.state.nodeid_hash if named is not None else None,
+            **({"lane": named.name} if named is not None else {}),
+            **(
+                {
+                    "lanes_in_flight": [
+                        {
+                            "lane": slot.name,
+                            "nodeid": slot.state.nodeid,
+                            "nodeid_hash": slot.state.nodeid_hash,
+                            "phase": slot.state.phase,
+                        }
+                        for slot in flying
+                    ]
+                }
+                if len(flying) > 1
+                else {}
+            ),
         )
 
     def close(self) -> None:

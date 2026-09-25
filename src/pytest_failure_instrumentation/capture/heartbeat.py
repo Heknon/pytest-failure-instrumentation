@@ -39,17 +39,17 @@ class Heartbeat:
         interval: float = DEFAULT_INTERVAL,
         observers: list[Any] | None = None,
         tickers: list[Any] | None = None,
-        threads: Callable[[], dict[str, int]] | None = None,
+        lane_cpu: Callable[[], None] | None = None,
     ) -> None:
         self.record = record
-        #: The lanes this process is running, by name, with the native id of
-        #: each one's thread - or None in a process without lanes, which is
-        #: every process that is not running pytest-threadlanes. What it adds
-        #: to a beat is each lane's own CPU, because the process's is the sum
-        #: of all of them: one busy lane made every sibling read as working,
-        #: and a hung lane in a busy process was never blocked. See
-        #: :mod:`..lanes`.
-        self.threads = threads
+        #: Called after every beat in a process running pytest-threadlanes, to
+        #: write down each lane's own CPU; None in every other process. The
+        #: process's CPU is every lane's summed, so one busy lane made every
+        #: sibling read as working, and a hung lane in a busy process was never
+        #: blocked. The figures go on each lane's own record rather than on
+        #: this beat, whose line then stays the size it always was however
+        #: many lanes there are - see WorkerState.record_cpu.
+        self.lane_cpu = lane_cpu
         self.interval = max(1.0, interval)
         #: Called on every beat, with what the beat measured.
         self.observers = observers or []
@@ -116,7 +116,6 @@ class Heartbeat:
         # Read once: event-log I/O and observers can yield to the recorder.
         # Every consumer of this measurement must use this same identity.
         nodeid, nodeid_hash = self._identity
-        per_lane = self._per_lane()
         self.record(
             "heartbeat",
             cpu_seconds=round(time.process_time(), 3),
@@ -124,40 +123,16 @@ class Heartbeat:
             nodeid=nodeid,
             nodeid_hash=nodeid_hash,
             phase=self.phase,
-            # Only where there are lanes to measure, so a beat without them
-            # is the line it always was.
-            **({"threads": per_lane} if per_lane else {}),
         )
+        if self.lane_cpu is not None:
+            try:
+                self.lane_cpu()
+            except Exception:  # noqa: BLE001 - a missing figure beats a missing beat
+                pass
         if notify_observers:
             for observer in self.observers:
                 observer.observe(resident, nodeid, nodeid_hash)
         return resident
-
-    def _per_lane(self) -> dict[str, float]:
-        """CPU seconds each lane's thread has used, by lane, where it can be read.
-
-        Read from the operating system's per-thread counters, matched on the
-        native thread id each lane recorded when it started. A lane whose
-        thread cannot be found - it has ended, or this platform numbers its
-        threads differently - is left out rather than guessed, and a reader
-        falls back to the process's figure for it.
-        """
-        if self.threads is None:
-            return {}
-        try:
-            lanes = self.threads()
-            if not lanes:
-                return {}
-            from ..probes.process import thread_cpu_seconds
-
-            used = thread_cpu_seconds()
-        except Exception:  # noqa: BLE001 - a missing figure beats a missing beat
-            return {}
-        return {
-            lane: round(used[native], 3)
-            for lane, native in lanes.items()
-            if native in used
-        }
 
     def _run(self) -> None:
         poll = min(self.interval, TICK_SECONDS)

@@ -248,6 +248,9 @@ class IncidentEngine:
         #: workers is in this process, ``main``. A lane is watched as a worker
         #: of its own - see _touch_lane - and goes down with its process.
         self.lane_process: dict[str, str] = {}
+        #: Whether this run asked pytest-threadlanes for lanes. Only then are
+        #: lanes looked for on disk - see _follow_lanes.
+        self.lanes = thread_lanes.requested(config)
         #: The live node behind each worker id, so a pid read out of a file can
         #: be checked against the process the gateway is actually running
         #: before anybody signals it. See _live_pid.
@@ -666,6 +669,11 @@ class IncidentEngine:
         """
         limit = self.settings.stall_seconds
         while not self.stop.wait(min(limit / 4, 15.0)):
+            if self.lanes:
+                try:
+                    self._follow_lanes()
+                except Exception:  # noqa: BLE001 - a missed reading is one poll late
+                    pass
             now = time.monotonic()
             with self.lock:
                 candidates = [
@@ -685,6 +693,59 @@ class IncidentEngine:
                         stall.WorkerStallIncident.degraded(worker, failure)
                     )
 
+    def _follow_lanes(self) -> None:
+        """Time each lane's test from the lane's own record, not only its reports.
+
+        A lane's reports reach this process late, or not at all while it is
+        silent for a reason of its own. In a run with ``-n`` a lane is known
+        here only from its first report, so a hang in the setup of its first
+        test - a provisioning step, the commonest hang there is - was never
+        timed at all, even with every lane of the process wedged. And
+        pytest-threadlanes holds an exclusive test's reports until the test
+        ends, so a long setup followed by a long call read as one silence the
+        length of both.
+
+        Its own record has no such lag: the lane writes it on its own thread
+        as each phase starts, ``phase_started`` on the wall clock. So each
+        lane with a test in flight is watched from the start of its current
+        phase, or its last report if that is later - which is when a worker's
+        report would have arrived. A lane with no test in flight is left
+        alone; it is idle, and :func:`.stall.build` says nothing about it.
+        """
+        from ..capture.state import read_state
+
+        try:
+            states = sorted(self.directory.glob("*.state"))
+        except OSError:
+            return
+        run_id = self.run_id
+        for path in states:
+            record = read_state(path, run_id)
+            if not thread_lanes.is_lane(record) or not record.get("nodeid"):
+                continue
+            started = record.get("phase_started")
+            if not isinstance(started, (int, float)):
+                continue
+            lane, process = path.stem, str(record[thread_lanes.PROCESS_KEY])
+            since = time.monotonic() - max(0.0, time.time() - float(started))
+            with self.lock:
+                if lane in self.workers_down or process in self.workers_down:
+                    continue
+                self.lane_process.setdefault(lane, process)
+                # A second of slack: the two clocks are read a moment apart,
+                # and a phase start that merely jitters is not news.
+                if since > self.activity.get(lane, float("-inf")) + 1.0:
+                    self.activity[lane] = since
+                    self.stalled.discard(lane)
+
+    def _is_lane(self, worker: str) -> bool:
+        """Whether a name being watched is a lane of pytest-threadlanes."""
+        if worker in self.lane_process:
+            return True
+        # In a run with no workers every node xdist's hooks named is a lane:
+        # pytest-threadlanes fires them for each lane it starts.
+        return self.lanes and self.records_here and worker != SOLE_WORKER
+
     def _assess_stall(self, worker: str, silent_for: float) -> None:
         from . import stall
 
@@ -697,6 +758,7 @@ class IncidentEngine:
             run_id=self.run_id,
             live_pid=self._live_pid(worker),
             cancel=self.stop,
+            known_lane=self._is_lane(worker),
         )
         if incident is None:
             # Slow, not stuck - or the run ended under us. Re-arm rather than
@@ -1265,11 +1327,16 @@ class IncidentEngine:
         # Once per *attempt*, strictly: a rerun plugin tears the same test
         # down again, and the node id is what lets the tracker tell that from
         # the next test - see ScheduleTracker.saw_a_test_finish.
+        #
+        # Keyed by the lane where there is one: in a run with -n and lanes the
+        # scheduler hands work to lanes, so its rows are the lanes', and a
+        # finish or a rerun counted under their process matched none of them.
+        scheduled = str(lane) if lane else worker
         when = getattr(report, "when", None)
         if when == "teardown":
-            self.schedule.saw_a_test_finish(worker, getattr(report, "nodeid", None))
+            self.schedule.saw_a_test_finish(scheduled, getattr(report, "nodeid", None))
         elif when == "setup" and self.schedule.saw_a_test_start(
-            getattr(report, "nodeid", None), worker
+            getattr(report, "nodeid", None), scheduled
         ):
             # A worker starting the test it just finished is that test being
             # rerun, and it was never finished: the teardown counted above was
@@ -1410,7 +1477,8 @@ class IncidentEngine:
             # this worker abandoned is still to come, and it names this node.
             self.workers_down.add(worker)
             # Its lanes with it: they are threads of the process that is gone.
-            for lane in [lane for lane, owner in self.lane_process.items() if owner == worker]:
+            gone = [lane for lane, owner in self.lane_process.items() if owner == worker]
+            for lane in gone:
                 self.activity.pop(lane, None)
                 self.workers_down.add(lane)
             if error:
@@ -1426,6 +1494,8 @@ class IncidentEngine:
         # final record of a finished run says a dead worker is repeating a
         # test.
         self.schedule.saw_a_worker_go(worker)
+        for lane in gone:
+            self.schedule.saw_a_worker_go(lane)
         # The last reading anybody gets of this worker, and it is an accurate
         # one: xdist fires this hook *before* it takes the node out of the
         # scheduler, so the queue is still there to be read. Forced, and
@@ -1459,7 +1529,10 @@ class IncidentEngine:
                 excrepr,
                 self.directory,
                 run_id=self.run_id,
-                distributed=self.distributed,
+                # A run of lanes in this one process wrote its lanes' record of
+                # the error as a worker does, and it names the test; without
+                # lanes this process is the one raising it, first-hand.
+                distributed=self.distributed or (self.lanes and self.records_here),
             )
         except Exception as failure:  # noqa: BLE001
             incident = internal_error.InternalErrorIncident.degraded(

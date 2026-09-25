@@ -27,8 +27,15 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
+from .lanes import without_unset
 from .live_view import LiveStackServer
 from .stack_server import AUTH_HEADER, AUTH_SCHEME
 
@@ -289,6 +296,17 @@ class ResourceProcess(ResourceMeasurements):
     nodeid_hash: Optional[str] = None
     phase: Optional[str] = None
     observed_at: Optional[float] = None
+    #: Set only on the worker process of a run of pytest-threadlanes whose
+    #: lanes have started: how many of them had a test in flight when this
+    #: sample was taken, zero included. Such a process names no test of its
+    #: own - ``nodeid`` is None - because it runs one per lane. Absent from
+    #: the payload for every other process, and from this model's dump too,
+    #: so a consumer re-serving it serves what it did before lanes existed.
+    lanes_running: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        return without_unset(handler(self), self, ("lanes_running",))
 
 
 class ResourceBatch(_Wire):

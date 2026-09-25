@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional
 
-from pydantic import ConfigDict, Field, model_serializer
+from pydantic import ConfigDict, Field, SerializerFunctionWrapHandler, model_serializer
 
 from .. import lanes as thread_lanes
 from .. import probes
@@ -211,11 +211,8 @@ class WorkerDeathIncident(Incident):
     lanes_in_flight: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
-    def _without_absent_lanes(self, handler: Any) -> Any:
-        dumped = handler(self)
-        if not self.lanes_in_flight and isinstance(dumped, dict):
-            dumped.pop("lanes_in_flight", None)
-        return dumped
+    def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        return thread_lanes.without_unset(handler(self), self, ("lanes_in_flight",))
 
     def raw_stack(self) -> list[str]:
         return self.crash_stack
@@ -241,7 +238,7 @@ class WorkerDeathIncident(Incident):
             # test that happened to be running is not a lead; naming it would
             # put an owner on a cancellation.
             return None
-        if len(self.lanes_in_flight) > 1:
+        if len(self.lanes_in_flight) > 1 and not self.test_in_flight:
             # Several lanes were running a test each, and nothing on disk says
             # which of them took the process down. Naming one would be a guess
             # with an owner and a severity attached.
@@ -330,11 +327,8 @@ class WorkerDeathIncident(Incident):
             phase = f" ({self.phase})" if self.phase else ""
             # Which lane, where it was one: the process's other lanes were
             # idle, and the reader looking for its thread needs the name.
-            lane = (
-                f" on lane {self.lanes_in_flight[0].get('lane')}"
-                if len(self.lanes_in_flight) == 1
-                else ""
-            )
+            culprit = _culprit(self)
+            lane = f" on lane {culprit.get('lane')}" if culprit is not None else ""
             return f"while running {self.test_in_flight}{phase}{lane}"
         if len(self.lanes_in_flight) > 1:
             names = ", ".join(str(lane.get("lane")) for lane in self.lanes_in_flight)
@@ -365,12 +359,16 @@ def build(
     # not delete, which on Windows is any file somebody still had open - from
     # being read as this worker's last moments.
     state = read_state(directory / f"{worker}.state", run_id)
-    state, lanes = _through_lanes(directory, worker, state, run_id)
     pid = state.get("pid") or event_log.worker_pid(events)
     popen = getattr(getattr(node.gateway, "_io", None), "popen", None)
     # Read before the dump, because it decides whether a dump is still coming.
     status, status_kind, source = probes.exit_status(pid, popen)
     dump = _crash_dump(crash_file, status)
+    # After the dump: a fatal one names the thread it was written on, which
+    # for a process of lanes is which lane's test took it down.
+    state, lanes = _through_lanes(
+        directory, worker, state, run_id, crash_stack.current_thread(crash_file)
+    )
     oom_kills = probes.cgroup_oom_kills()
     beats = event_log.heartbeats(events)
     cgroup = probes.cgroup_memory()
@@ -416,22 +414,33 @@ def build(
 
 
 def _through_lanes(
-    directory: Path, worker: str, state: dict[str, Any], run_id: Optional[str]
+    directory: Path,
+    worker: str,
+    state: dict[str, Any],
+    run_id: Optional[str],
+    dumped_on: Optional[int] = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """The dead process's record as a worker's, and its lanes that were busy.
 
     A process running pytest-threadlanes keeps no test in its own slot: each
     lane has one, naming the process - see :mod:`..lanes`. Read as it stands,
     its record says the process died with nothing running, which is the one
-    thing it is sure not to have done while its lanes were mid-test. So:
+    thing it is sure not to have done while its lanes were mid-test.
 
-    * one lane in flight - that lane's record *is* the worker's, with its
-      test, phase, clocks, timeouts and counts, as a process's always was;
-    * several - no test is named, since nothing here says which of them took
-      the process down; the counts are the process's, summed over its lanes,
-      and every lane in flight is listed;
-    * none - it died between tests, and the counts and the last test are its
-      lanes', the last being whichever lane wrote most recently.
+    The counts are always the process's: every lane's, summed, since the
+    worker that died is the process. Which test it was running is the
+    question lanes make hard, and it is answered only where the evidence
+    answers it:
+
+    * one lane in flight - that lane's test, phase, clocks and timeouts are
+      the worker's, as a process's always were;
+    * several, and a fatal dump written on one of their threads -
+      ``dumped_on``, the thread faulthandler calls current - that lane's; the
+      others went down with the process and are listed beside it;
+    * several otherwise - no test is named, since nothing says which of them
+      took the process down, and every one is listed;
+    * none - it died between tests, and the last test is whichever lane
+      wrote most recently.
 
     A record that is not a container of lanes is returned untouched, so a
     process without them is read exactly as it always was.
@@ -440,11 +449,24 @@ def _through_lanes(
         return state, []
     lanes = thread_lanes.lane_records(directory, worker, run_id)
     flying = thread_lanes.in_flight(lanes)
-    if len(flying) == 1:
-        record = next(record for lane, record in lanes if lane == flying[0]["lane"])
-        return {**record, "pid": state.get("pid") or record.get("pid")}, flying
+    counts = {
+        "tests_started": sum(int(record.get("tests_started") or 0) for _, record in lanes),
+        "tests_finished": sum(int(record.get("tests_finished") or 0) for _, record in lanes),
+    }
+    busy = {entry["lane"] for entry in flying}
+    culprits = [
+        record for lane, record in lanes
+        if lane in busy and (
+            len(flying) == 1
+            or (dumped_on is not None and record.get("thread_ident") == dumped_on)
+        )
+    ]
+    if len(culprits) == 1:
+        record = culprits[0]
+        return {**record, **counts, "pid": state.get("pid") or record.get("pid")}, flying
     merged = {
         **state,
+        **counts,
         "nodeid": None,
         "nodeid_hash": None,
         "phase": None,
@@ -452,8 +474,6 @@ def _through_lanes(
         "phase_started": None,
         "test_started": None,
         "timeout_settings": [],
-        "tests_started": sum(int(record.get("tests_started") or 0) for _, record in lanes),
-        "tests_finished": sum(int(record.get("tests_finished") or 0) for _, record in lanes),
     }
     latest = max(
         (record for _, record in lanes if record.get("last_nodeid")),
@@ -487,14 +507,33 @@ def _say_which_lanes(incident: WorkerDeathIncident) -> None:
     )
     line = (
         f"{len(incident.lanes_in_flight)} lanes of this process had a test in "
-        f"flight, and the death took all of them: {running}. Nothing on disk "
-        "says which of them caused it, so none is blamed."
+        f"flight, and the death took all of them: {running}. "
     )
+    culprit = _culprit(incident)
+    if culprit is not None:
+        line += (
+            f"The fatal dump was written on lane {culprit.get('lane')}'s thread, "
+            "so its test is the one blamed; the others went down with the process."
+        )
+    else:
+        line += "Nothing on disk says which of them caused it, so none is blamed."
     evidence = incident.evidence
     if evidence and evidence[-1].startswith("Measured:"):
         evidence.insert(len(evidence) - 1, line)
     else:
         evidence.append(line)
+
+
+def _culprit(incident: WorkerDeathIncident) -> Optional[dict[str, Any]]:
+    """The entry of ``lanes_in_flight`` whose test the death is blamed on."""
+    if not incident.test_in_flight:
+        return None
+    return next(
+        (lane for lane in incident.lanes_in_flight
+         if lane.get("nodeid_hash") == incident.test_in_flight_hash
+         and lane.get("nodeid") == incident.test_in_flight),
+        None,
+    )
 
 
 def _attach_witnesses(
@@ -629,9 +668,12 @@ def recover(
         return None  # it reached its own session finish; this is not a death
 
     state = read_state(directory / f"{worker}.state", run_id)
-    state, lanes = _through_lanes(directory, worker, state, run_id)
     beats = event_log.heartbeats(events)
     dump = crash_stack.read(directory / f"{worker}.crash", limit=40)
+    state, lanes = _through_lanes(
+        directory, worker, state, run_id,
+        crash_stack.current_thread(directory / f"{worker}.crash"),
+    )
 
     incident = WorkerDeathIncident(
         worker=worker,

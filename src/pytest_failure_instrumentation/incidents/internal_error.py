@@ -96,6 +96,16 @@ def build(
 
     if chosen:
         evidence = ["Captured on the worker itself, as it was raised."]
+        flying = chosen.get("lanes_in_flight") or []
+        if flying:
+            # A process of pytest-threadlanes' lanes, several of them mid-test
+            # when it was raised, and nothing saying which one raised it.
+            evidence.append(
+                f"{len(flying)} lanes of {chosen['worker']} had a test in flight, and "
+                "nothing says which of them raised it: "
+                + "; ".join(f"{lane.get('lane')}: {lane.get('nodeid')}" for lane in flying)
+                + "."
+            )
     elif "worker_internal_error" in text:
         # xdist relays a worker's internal error by re-raising it inside
         # worker_internal_error; that frame is the tell.
@@ -109,7 +119,9 @@ def build(
     evidence.append("Look at: the full traceback, kept in the incident's detail field.")
 
     return InternalErrorIncident(
-        worker=(chosen or {}).get("worker") or worker or "controller",
+        # The lane that was running the test, where the worker ran lanes: the
+        # name its test is under everywhere else.
+        worker=(chosen or {}).get("lane") or (chosen or {}).get("worker") or worker or "controller",
         verdict="INTERNAL_ERROR",
         confidence="high" if chosen else "low",
         exception=_exception_line(detail),
@@ -166,6 +178,9 @@ def _captured(directory: Path, run_id: str | None) -> list[dict[str, Any]]:
                     "detail": event.get("detail", ""),
                     "test_in_flight": event.get("nodeid"),
                     "test_in_flight_hash": event.get("nodeid_hash"),
+                    # Only in the record of a process running lanes.
+                    "lane": event.get("lane"),
+                    "lanes_in_flight": event.get("lanes_in_flight"),
                 }
             )
     return results

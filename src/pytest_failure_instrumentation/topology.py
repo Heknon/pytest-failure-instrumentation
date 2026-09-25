@@ -119,7 +119,7 @@ def snapshot(
     except OSError:
         candidates = []
     for path in candidates:
-        described = run(path, moment, only=wanted)
+        described = _run(path, moment, wanted, seen)
         if described is None:
             continue
         seen.update(entry["worker"] for entry in described["workers"])
@@ -164,7 +164,18 @@ def run(
     natural thing to point at an artifacts directory, and describing a
     stranger's build output as a pytest run would be a confident lie.
     """
-    moment = time.time() if now is None else now
+    return _run(directory, time.time() if now is None else now, _wanted(only), set())
+
+
+def _run(
+    directory: Path,
+    moment: float,
+    wanted: Optional[set[str]],
+    matched: set[str],
+) -> Optional[dict[str, Any]]:
+    """:func:`run`, adding to ``matched`` each name asked for that was found
+    as a process of lanes: it has no row of its own, and its lanes answer for
+    it."""
     owner = _owner(directory)
     if owner is None:
         return None
@@ -174,28 +185,45 @@ def run(
     # assembled from that is a directory traversal waiting to be found; the
     # saving is the same either way, because what costs is reading the file
     # rather than listing it.
-    wanted = _wanted(only)
     # One read for the whole run, not one per worker: it is a single file the
     # controller assembles from a single object, and reading it per worker
     # would report a run whose rows came from different instants.
     schedule = read_schedule(directory)
     rows = worker_rows(schedule)
+    # A process's event tail, read once for all of its lanes: a thousand
+    # lanes asking for the same file are one read, not a thousand.
+    tails: dict[Path, list[dict[str, Any]]] = {}
+    states = sorted(directory.glob("*.state"))
     workers = []
-    for state in sorted(directory.glob("*.state")):
+    containers: set[str] = set()
+    for state in states:
         if wanted is not None and state.stem not in wanted:
             continue
-        row, record = _row(state, moment, rows.get(state.stem))
+        row, record = _row(state, moment, rows.get(state.stem), tails)
         # A process running pytest-threadlanes is the container of its lanes
         # once one has started, and its lanes are the rows: each a worker with
         # its own test. Listing the process too would add a row that is
         # running all of their tests and names none of them.
         if thread_lanes.is_container(record):
+            containers.add(state.stem)
             continue
         workers.append(row)
+    if wanted is not None and containers:
+        # Asking for a process of lanes by name - ``?worker=gw0`` - is asking
+        # for what it is running, which is its lanes' rows.
+        matched.update(containers)
+        listed = {row["worker"] for row in workers}
+        for state in states:
+            if state.stem in listed or state.stem in containers:
+                continue
+            hint = read_state(state)
+            if thread_lanes.is_lane(hint) and hint.get(thread_lanes.PROCESS_KEY) in containers:
+                workers.append(_row(state, moment, rows.get(state.stem), tails)[0])
+        workers.sort(key=lambda row: row["worker"])
     controller_pid = owner.get("pid")
     return {
         "session": directory.name,
-        "run_id": _run_id(directory),
+        "run_id": _run_id(directory, tails),
         "directory": str(directory),
         "controller": {
             "pid": controller_pid,
@@ -267,22 +295,33 @@ def worker(
     its siblings - see :mod:`.lanes`. Its record names that process, and what
     is per process is read from the process's files: the heartbeat, and with
     it the resident memory, the liveness and the finish. Its CPU is its own
-    thread's, where the beats carry a figure per lane, because the process's
-    is every lane's summed and one busy sibling would make a hung lane read as
-    working. It is not in the controller's schedule, which counts per xdist
-    worker, so what it was assigned is left unsaid rather than guessed.
+    thread's, read from the readings the heartbeat writes onto its record,
+    because the process's is every lane's summed and one busy sibling would
+    make a hung lane read as working. Its progress is its own too, and means
+    what a worker's does: where xdist's scheduler hands work to lanes - a run
+    with ``-n`` - the controller's schedule has a row per lane, counted per
+    lane, and ``schedule`` is that row. A run of lanes in one process has no
+    xdist controller to write one, and the counts it cannot say are None, as
+    they are for any run with no workers.
     """
     return _row(state_path, now, schedule)[0]
 
 
 def _row(
-    state_path: Path, now: float, schedule: Optional[dict[str, Any]] = None
+    state_path: Path,
+    now: float,
+    schedule: Optional[dict[str, Any]] = None,
+    tails: Optional[dict[Path, list[dict[str, Any]]]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """:func:`worker`'s row, and the record it was read from."""
+    """:func:`worker`'s row, and the record it was read from.
+
+    ``tails`` holds the event tails already read for this request, by path.
+    """
     events_path = state_path.with_name(f"{state_path.stem}.events")
     lane: Optional[str] = None
     process: Any = None
-    events = tail_events(events_path)
+    hint: Optional[dict[str, Any]] = None
+    events = _tail(events_path, tails)
     if not events:
         # A lane keeps no event log: its beats are its process's. Asked only
         # where there is nothing to read, so a worker that is a process - with
@@ -293,11 +332,12 @@ def _row(
             shared = thread_lanes.sibling(state_path, process, ".events")
             if shared is not None:
                 lane, events_path = state_path.stem, shared
-                schedule = None
-                events = tail_events(events_path)
+                events = _tail(events_path, tails)
     run_id = _worker_run_id(events)
     events = this_run(events, run_id)
-    record = read_state(state_path, run_id)
+    # The record already in hand, where there is one, held to the same run as
+    # a fresh read would be - see read_state.
+    record = read_state(state_path, run_id) if hint is None else _of_run(hint, run_id)
     beats = [event for event in events if event.get("event") == "heartbeat"]
     finished = _finish(events)
 
@@ -305,7 +345,7 @@ def _row(
     pid = record.get("pid")
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
-    measured = stall_analysis.lane_beats(beats, lane) if lane is not None else beats
+    measured = stall_analysis.lane_beats(beats, record.get("cpu")) if lane is not None else beats
     rate = (
         stall_analysis.cpu_rate(measured[-RATE_WINDOW:]) if len(measured) >= 2 else None
     )
@@ -376,6 +416,25 @@ def _row(
         row["thread_name"] = record.get("thread_name")
         row["thread_id"] = record.get("thread_id")
     return row, record
+
+
+def _tail(
+    path: Path, tails: Optional[dict[Path, list[dict[str, Any]]]]
+) -> list[dict[str, Any]]:
+    """The event tail of ``path``, read once per request where ``tails`` is kept."""
+    if tails is None:
+        return tail_events(path)
+    if path not in tails:
+        tails[path] = tail_events(path)
+    return tails[path]
+
+
+def _of_run(record: dict[str, Any], run_id: Optional[str]) -> dict[str, Any]:
+    """``record`` if it could be ``run_id``'s, as :func:`read_state` judges it."""
+    written_by = record.get("run_id")
+    if run_id and written_by and written_by != run_id:
+        return {}
+    return record
 
 
 def _progress(
@@ -579,7 +638,9 @@ def _interval(events: list[dict[str, Any]], events_path: Optional[Path] = None) 
     return DEFAULT_INTERVAL
 
 
-def _run_id(directory: Path) -> Optional[str]:
+def _run_id(
+    directory: Path, tails: Optional[dict[Path, list[dict[str, Any]]]] = None
+) -> Optional[str]:
     """The id this run reports, which is not the directory's name.
 
     The directory is named by something the controller fixes for itself before
@@ -588,7 +649,7 @@ def _run_id(directory: Path) -> Optional[str]:
     place the two are tied together - see ``IncidentEngine.directory``.
     """
     for path in sorted(directory.glob("*.events")):
-        for event in tail_events(path):
+        for event in _tail(path, tails):
             if event.get("run_id"):
                 return str(event["run_id"])
     return None
