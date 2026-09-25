@@ -2998,17 +2998,25 @@ cost more than the failure it came to explain.
 
 ## Releasing
 
-Tag the commit and the rest runs itself:
+Bump `version` in `pyproject.toml` (and `__version__` in
+`src/pytest_failure_instrumentation/__init__.py`) in a pull request, and merge
+it. The merge releases itself: `.github/workflows/release.yml` runs on every
+push to `master`, and when that version has no `vX.Y.Z` tag yet it builds the
+sdist and wheel, installs the **built wheel** on Linux, macOS and Windows and
+runs the whole suite against it, publishes to PyPI, then tags the merge commit
+`vX.Y.Z` and creates the GitHub release with the artifacts attached. A merge
+that does not change the version finds its tag already there and stops at the
+first job, so nothing is published twice. Merging a version bump is releasing
+it: run the pre-merge gate in [AGENTS.md](AGENTS.md) first.
+
+Tagging by hand still works, for a commit that is not a merge:
 
 ```console
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-The tag is the only input. `.github/workflows/release.yml` builds the sdist and
-wheel, refuses to continue if the tag disagrees with the version in
-`pyproject.toml`, installs the **built wheel** on Linux, macOS and Windows and
-runs the whole suite against it, publishes to PyPI, and then creates the GitHub
-release with the artifacts attached.
+The run then refuses to continue if the tag disagrees with the version in
+`pyproject.toml`.
 
 The wheel is tested rather than the checkout because this plugin is one entry
 point. If packaging drops it the import still succeeds, the suite still passes,
@@ -3047,8 +3055,10 @@ publish, and waits. Nothing is uploaded until someone approves, and waiting does
 not consume the job's timeout.
 
 Worth setting at the same time, under *Deployment branches and tags*: restrict
-the environment to the tag pattern `v*`, so the only thing that can ever reach
-PyPI is a tagged commit.
+the environment to the branch `master` and the tag pattern `v*`, so the only
+things that can ever reach PyPI are a merged commit and a tagged one. The
+branch has to be in the list: a merge publishes from `master`, and an
+environment limited to `v*` alone refuses it.
 
 **TestPyPI** is a separate site with a separate account, so rehearsing needs its
 own pending publisher at test.pypi.org with the environment named `testpypi`.
