@@ -1397,3 +1397,51 @@ def test_a_drain_passes_on_only_whole_lines_so_two_files_never_splice_one(tmp_pa
     lines = finished.stderr.splitlines()
     assert "w1-00420" in lines
     assert "child" in lines
+
+
+REORDER_SCRIPT = r"""
+import os, sys
+from pathlib import Path
+from pytest_failure_instrumentation.capture import output
+
+output._punch_hole = lambda descriptor, length: False
+tee = output.StderrTee(Path(sys.argv[1]), limit=4096, append=True)
+tee.start()
+tee.take()
+late = os.dup(2)                 # a write already under way when fd 2 is switched
+os.write(2, b"x" * 4096 * 3 + b"\n")
+tee.drain()                      # rotates: the old file is followed from now on
+follow = tee._follow_retired
+
+def a_writer_finishes_meanwhile():
+    follow()
+    # Between reading the old file and the new one, the stalled write lands
+    # in the old file and the same writer's next line in the new one.
+    os.write(late, b"k-00001\n")
+    os.write(2, b"k-00002\n")
+
+tee._follow_retired = a_writer_finishes_meanwhile
+tee.drain()
+tee._follow_retired = follow
+tee.drain()
+os.close(late)
+tee.hand_back()
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the tee is POSIX only")
+def test_a_writers_lines_keep_their_order_across_a_rotation(tmp_path):
+    """One writer's lines reach the terminal in the order it wrote them, even
+    when one landed late in the rotated file and the next in the fresh one
+    while a drain was between the two: stress runs showed the later line
+    first. A drain notes how far the fresh file goes before it reads the old
+    one, and passes the fresh one on no further than that."""
+    import subprocess
+
+    finished = subprocess.run(
+        [sys.executable, "-c", REORDER_SCRIPT, str(tmp_path / "main.output")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    ours = [line for line in finished.stderr.splitlines() if line.startswith("k-")]
+    assert ours == ["k-00001", "k-00002"]

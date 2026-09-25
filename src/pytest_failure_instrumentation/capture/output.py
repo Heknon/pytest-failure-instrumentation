@@ -188,8 +188,15 @@ class StderrTee:
         if not self.active or self._file is None or self._passthrough is None:
             return
         try:
+            # How far the current file goes is noted before the old one is
+            # read, and the current one passed on no further: a writer's line
+            # that lands late in the old file comes before its next line, and
+            # that next line would otherwise be passed on first - see _copy.
+            end = os.fstat(self._file).st_size
             self._follow_retired()
-            self._phase_offset = self._copy(self._file, self._phase_offset, whole_lines=True)
+            self._phase_offset = self._copy(
+                self._file, self._phase_offset, whole_lines=True, upto=end
+            )
             if self._phase_offset - self._released >= RELEASE_FACTOR * self.limit:
                 self._release()
         except OSError:
@@ -220,8 +227,15 @@ class StderrTee:
             return
         self._rotate()
 
-    def _copy(self, source: int, offset: int, whole_lines: bool = False) -> int:
-        """Pass ``source`` on from ``offset`` to its end; the new offset.
+    def _copy(
+        self,
+        source: int,
+        offset: int,
+        whole_lines: bool = False,
+        upto: Optional[int] = None,
+    ) -> int:
+        """Pass ``source`` on from ``offset`` to its end, or to ``upto``;
+        the new offset.
 
         With ``whole_lines``, for a file still being written, stop at its last
         newline. A read can catch a write the kernel is still copying in - its
@@ -230,10 +244,16 @@ class StderrTee:
         its halves. The rest follows with its newline, or when fd 2 is handed
         back, which passes on everything. A line longer than a whole read is
         passed on as it stands, so the copy always moves.
+
+        ``upto`` bounds the copy where a file must not be passed on past what
+        was in it at a given moment - see :meth:`drain`.
         """
         assert self._passthrough is not None
         while True:
-            chunk = os.pread(source, COPY_BYTES, offset)
+            want = COPY_BYTES if upto is None else min(COPY_BYTES, upto - offset)
+            if want <= 0:
+                return offset
+            chunk = os.pread(source, want, offset)
             if whole_lines:
                 end = chunk.rfind(b"\n") + 1
                 if end:
@@ -276,8 +296,11 @@ class StderrTee:
             raise
         old, offset = self._file, self._phase_offset
         self._file, self._phase_offset, self._released = fresh, 0, 0
-        offset = self._copy(old, offset, whole_lines=True)
+        # The file retired before this one goes first, for the same reason
+        # drain notes where the current file ends before reading it.
+        end = os.fstat(old).st_size
         self._drain_retired()
+        offset = self._copy(old, offset, whole_lines=True, upto=end)
         self._retired = (old, offset)
         tail = os.pread(old, self.limit, max(0, offset - self.limit))
         previous = self.path.with_name(self.path.name + PREVIOUS_SUFFIX)
