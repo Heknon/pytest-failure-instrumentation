@@ -2519,6 +2519,94 @@ was repaired. The live-heap reading that tells freed-but-mapped memory
 from kept memory is glibc only; elsewhere what a test kept is its resident
 step alone.
 
+## Running under pytest-threadlanes
+
+[pytest-threadlanes](https://github.com/Heknon/pytest-threadlanes) runs
+pytest-xdist's own schedulers on threads it calls lanes: `--lanes 3` is one
+process running three tests at once, and `-n 2 --lanes 3` is two xdist workers
+running three each. Everything above assumes one process is one worker with at
+most one test in flight, and a process of lanes breaks that — read as a
+process, `/workers` named whichever lane had written last, a hung lane was
+hidden by its busy siblings, and a stall or a death was blamed on the wrong
+test.
+
+So a lane is recorded as the worker it is. Nothing needs configuring and
+nothing needs pytest-threadlanes installed: the plugin never imports it, and a
+run without lanes writes exactly what it wrote before — the same files, keys
+and values, which the suite checks against 0.13.1's.
+
+**Each lane is a row.** A lane gets a state slot of its own, named after it —
+`ln3.state` in a run with no `-n`, `gw0.ln3.state` in one with — so `/workers`,
+`?worker=` and `/stack?worker=` see it as a worker, with its own test, phase and
+counts. What is per process stays on the process's files — the heartbeat, and
+with it the resident memory, liveness and finish — and a lane's row reports its
+process's. Three fields say which process and which of its threads a lane is:
+
+```json
+{"worker": "gw0.ln1", "pid": 21615, "nodeid": "test_env.py::test_s[envB-3]",
+ "phase": "call", "status": "blocked", "cpu_rate": 0.0, "rss_mb": 212,
+ "process": "gw0", "thread_name": "lane-gw0.ln1", "thread_id": 21631,
+ "tests_assigned": null}
+```
+
+`thread_id` is the operating system's number for the thread, which a stack of
+the pid reports as that thread's `os_thread_id` — the thread to open, since the
+process's main thread is pytest-threadlanes' scheduler. The three fields are
+only on a lane's row, and are on `client.Worker` and on a pushed sample's row
+the same way. Once a process's first lane has started a test, its own row
+leaves the list — its lanes are the rows — and `?worker=gw0` still resolves for
+a stack of the whole process. `tests_assigned` is left out for a lane: the
+schedule is counted per xdist worker.
+
+**Each lane's CPU is its own.** A process's CPU is every lane's summed, so one
+busy lane would make every sibling read as `working`. Under lanes the
+heartbeat also records each lane's thread (`"threads": {"gw0.ln1": 4.12}`), and
+a lane's row and its stall verdict are read from its own figure — falling back
+to the process's where the platform cannot number threads, and for a lane's
+first beat.
+
+**A stall is a lane's.** Each lane is timed on its own reports
+(`report.lane_id`), so a lane that hangs while its siblings keep reporting is
+named, with its own test and a stack of its own thread, and the incident says
+which thread of which process that is. A lane with no test in flight — out of
+work at the end of an uneven run, or waiting to be given some — is idle, and
+never reported. The process holding the lanes is judged only once none of them
+has a test in flight, as any worker with no test running is.
+
+**A death names every lane it took.** A process that dies takes each of its
+lanes' tests with it. With one lane in flight, that lane's test is
+`test_in_flight`, as a worker's always was. With several, none is blamed —
+nothing on disk says which caused it — and all of them are listed in
+`lanes_in_flight`, `{lane, nodeid, nodeid_hash, phase}` each. The field is
+absent from the payload of a death without lanes.
+
+**What is one per process is adjusted, and says so.** Each of these was built
+for one test at a time, and each adjustment is written to the process's event
+log as `lanes_adjusted`:
+
+| Mechanism | Under lanes |
+|---|---|
+| Profiler (`failure_profile`) | Off. It charges every sample to the one test in flight, and a process of lanes has one per lane |
+| Stderr tee (`failure_capture_output`) | fd 2 is taken once for the session rather than per phase — lanes' phases overlap, and pytest-threadlanes does not swap fd 2 per test either. What arrives is passed on to stderr within a second, and the file is not trimmed until the session ends |
+| Slow-test watchdog | One clock per lane. The dump is of every thread, so it holds whichever lane is overdue |
+| Heartbeat | No test on the process's beat; its memory is not attributed to a test |
+
+The files of a run with lanes, then:
+
+```
+.pytest-failures/
+  run-70a514cc7a93/
+    gw0.state          <- "lanes": true once a lane has started
+    gw0.events         <- the heartbeat, with each lane's CPU under "threads"
+    gw0.ln0.state      <- "process": "gw0", "thread_name", "thread_id"
+    gw0.ln1.state
+    gw0.ln2.state
+```
+
+Python 3.12 or later is pytest-threadlanes' own requirement; before 3.14 it
+runs with `-p no:warnings`. The design, and what was measured before and after
+it, is in [docs/pytest-lanes-support.md](docs/pytest-lanes-support.md).
+
 ## One directory per run
 
 ```
@@ -2854,6 +2942,14 @@ much as the operating system, so each gets its own job:
 - **against the declared minimums**, `pytest==7.0.1` on Python 3.9. Every other
   job installs whatever is newest, so a hook signature or an ini type that
   arrived later would pass all of them and fail on a user's pinned pytest.
+
+- **with `pytest-threadlanes`**, where it is installed: `tests/test_lanes.py`
+  runs lanes for real in all three of its modes — a live `/workers`, a hung
+  lane, idle lanes beside a busy one, a hybrid worker's death — and skips that
+  half where it is not, since it needs Python 3.12. The other half needs
+  nothing: the readers are fed evidence laid out as lanes write it, and a run
+  without lanes is compared, file by file, with what 0.13.1 wrote for the same
+  suite (`tests/evidence_without_lanes.json`).
 
 - **the profiler's budget**, `benchmarks/profile_gate.py`, which is a job of
   its own because it is the one claim in this README a reader cannot check by
