@@ -2530,10 +2530,12 @@ process, `/workers` named whichever lane had written last, a hung lane was
 hidden by its busy siblings, and a stall or a death was blamed on the wrong
 test.
 
-So a lane is recorded as the worker it is. Nothing needs configuring and
-nothing needs pytest-threadlanes installed: the plugin never imports it, and a
-run without lanes writes exactly what it wrote before — the same files, keys
-and values, which the suite checks against 0.13.1's.
+So a lane is recorded as the worker it is: a worker that is a thread of a named
+process. Nothing needs configuring and nothing needs pytest-threadlanes
+installed: the plugin never imports it, and it treats a run as one of lanes
+only when that plugin is registered *and* `--lanes` asks for lanes. A run
+without lanes writes what it wrote before — the suite checks its files, slot
+bytes, captured stderr, rows, samples and payload schemas against 0.13.1's.
 
 **Each lane is a row.** A lane gets a state slot of its own, named after it —
 `ln3.state` in a run with no `-n`, `gw0.ln3.state` in one with — so `/workers`,
@@ -2545,8 +2547,8 @@ process's. Three fields say which process and which of its threads a lane is:
 ```json
 {"worker": "gw0.ln1", "pid": 21615, "nodeid": "test_env.py::test_s[envB-3]",
  "phase": "call", "status": "blocked", "cpu_rate": 0.0, "rss_mb": 212,
- "process": "gw0", "thread_name": "lane-gw0.ln1", "thread_id": 21631,
- "tests_assigned": null}
+ "tests_finished": 3, "tests_running": 1, "tests_queued": 4, "tests_assigned": 8,
+ "process": "gw0", "thread_name": "lane-gw0.ln1", "thread_id": 21631}
 ```
 
 `thread_id` is the operating system's number for the thread, which a stack of
@@ -2554,31 +2556,55 @@ the pid reports as that thread's `os_thread_id` — the thread to open, since th
 process's main thread is pytest-threadlanes' scheduler. The three fields are
 only on a lane's row, and are on `client.Worker` and on a pushed sample's row
 the same way. Once a process's first lane has started a test, its own row
-leaves the list — its lanes are the rows — and `?worker=gw0` still resolves for
-a stack of the whole process. `tests_assigned` is left out for a lane: the
-schedule is counted per xdist worker.
+leaves the list — its lanes are the rows. `?worker=gw0` asks for what that
+process is running, and lists its lanes; `/stack?worker=gw0` still reads the
+whole process.
+
+**Each lane's progress is its own**, in the fields every row has and with the
+meaning they always had, for that lane. Under `-n` xdist's scheduler hands work
+to lanes, so the controller's schedule has a row per lane — assigned, finished,
+running, queued, and whether a rerun is under way — and a lane's row reads its
+own. A run of lanes in one process has no xdist controller writing a schedule,
+so there, as in any run with no workers, `tests_assigned`, `tests_running` and
+`tests_queued` are null.
 
 **Each lane's CPU is its own.** A process's CPU is every lane's summed, so one
-busy lane would make every sibling read as `working`. Under lanes the
-heartbeat also records each lane's thread (`"threads": {"gw0.ln1": 4.12}`), and
-a lane's row and its stall verdict are read from its own figure — falling back
-to the process's where the platform cannot number threads, and for a lane's
-first beat.
+busy lane would make every sibling read as `working`. With each beat the
+heartbeat also writes each lane's thread CPU onto the lane's own record, and a
+lane's row and its stall verdict are read from it — falling back to the
+process's figure for a lane's first reading, and where the platform cannot
+number threads: on macOS psutil numbers them by position rather than by native
+id, so there every lane reads its process's CPU, and the event log says so
+(`lanes_adjusted`, `per_lane_cpu`). The beat itself stays the line it always
+was, however many lanes there are.
 
-**A stall is a lane's.** Each lane is timed on its own reports
-(`report.lane_id`), so a lane that hangs while its siblings keep reporting is
-named, with its own test and a stack of its own thread, and the incident says
-which thread of which process that is. A lane with no test in flight — out of
-work at the end of an uneven run, or waiting to be given some — is idle, and
-never reported. The process holding the lanes is judged only once none of them
-has a test in flight, as any worker with no test running is.
+**A stall is a lane's.** Each lane is timed on its own — from its reports
+(`report.lane_id`), and from its own record, where it writes the start of each
+phase as it happens. The second is what catches a hang in a lane's very first
+setup, before it has reported anything, and what keeps an exclusive test —
+whose reports pytest-threadlanes holds until it ends — from reading as one
+silence the length of all its phases. A lane that hangs while its siblings keep
+going is named, with its own test and a stack of its own thread, and the
+incident says which thread of which process that is. A lane with no test in
+flight — never given one, out of work at the end of an uneven run, or waiting —
+is idle and never reported. The process holding the lanes is judged only once
+none of them has a test in flight, as any worker with no test running is.
 
 **A death names every lane it took.** A process that dies takes each of its
-lanes' tests with it. With one lane in flight, that lane's test is
-`test_in_flight`, as a worker's always was. With several, none is blamed —
-nothing on disk says which caused it — and all of them are listed in
-`lanes_in_flight`, `{lane, nodeid, nodeid_hash, phase}` each. The field is
-absent from the payload of a death without lanes.
+lanes' tests with it, and its counts are all of theirs. With one lane in
+flight, that lane's test is `test_in_flight`, as a worker's always was. With
+several, a fatal dump written on one of their threads — a native fault is
+delivered to the thread that faulted — blames that lane's test; otherwise none
+is blamed, since nothing on disk says which caused it. Either way every lane in
+flight is listed in `lanes_in_flight`, `{lane, nodeid, nodeid_hash, phase}`
+each, which is absent from the payload of a death without lanes. An internal
+error is named the same way: after the lane whose test it interrupted, and
+listing them all where several were mid-test.
+
+**Resources say how many lanes are running.** The worker process of a run of
+lanes carries `lanes_running` in `/resources` — how many of its lanes had a test
+in flight when the sample was taken — since it names no test of its own. It is
+absent for every other process.
 
 **What is one per process is adjusted, and says so.** Each of these was built
 for one test at a time, and each adjustment is written to the process's event
@@ -2587,9 +2613,9 @@ log as `lanes_adjusted`:
 | Mechanism | Under lanes |
 |---|---|
 | Profiler (`failure_profile`) | Off. It charges every sample to the one test in flight, and a process of lanes has one per lane |
-| Stderr tee (`failure_capture_output`) | fd 2 is taken once for the session rather than per phase — lanes' phases overlap, and pytest-threadlanes does not swap fd 2 per test either. What arrives is passed on to stderr within a second, and the file is not trimmed until the session ends |
+| Stderr tee (`failure_capture_output`) | fd 2 is taken once for the session rather than per phase — lanes' phases overlap, and pytest-threadlanes does not swap fd 2 per test either. What arrives is passed on to stderr within a second. The disk under what was passed on is given back as it goes: on Linux by punching holes in the file, which keeps the one file every writer of fd 2 shares — a test's child processes included — so no byte is lost; elsewhere by rotating it, keeping the last tail as `<name>.output.prev`, where a child that outlives a rotation loses what it writes afterwards |
 | Slow-test watchdog | One clock per lane. The dump is of every thread, so it holds whichever lane is overdue |
-| Heartbeat | No test on the process's beat; its memory is not attributed to a test |
+| Heartbeat | No test on the process's beat; its memory is not attributed to a test. Each lane's CPU is on its own record |
 
 The files of a run with lanes, then:
 
@@ -2597,9 +2623,9 @@ The files of a run with lanes, then:
 .pytest-failures/
   run-70a514cc7a93/
     gw0.state          <- "lanes": true once a lane has started
-    gw0.events         <- the heartbeat, with each lane's CPU under "threads"
-    gw0.ln0.state      <- "process": "gw0", "thread_name", "thread_id"
-    gw0.ln1.state
+    gw0.events         <- the heartbeat, as it always was
+    gw0.ln0.state      <- "process": "gw0", "thread_name", "thread_id", and
+    gw0.ln1.state         "cpu": the lane's own CPU readings
     gw0.ln2.state
 ```
 
@@ -2949,7 +2975,8 @@ much as the operating system, so each gets its own job:
   half where it is not, since it needs Python 3.12. The other half needs
   nothing: the readers are fed evidence laid out as lanes write it, and a run
   without lanes is compared, file by file, with what 0.13.1 wrote for the same
-  suite (`tests/evidence_without_lanes.json`).
+  suite (`tests/evidence_without_lanes.json`, recorded from 0.13.1 itself by
+  `tests/without_lanes.py`).
 
 - **the profiler's budget**, `benchmarks/profile_gate.py`, which is a job of
   its own because it is the one claim in this README a reader cannot check by
