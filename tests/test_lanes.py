@@ -43,6 +43,14 @@ from . import without_lanes
 LIVE = os.getpid()
 RUN_ID = "the-run"
 
+#: A worker's live stack is read only where the platform can ask for one at
+#: all - the same gate a worker without lanes goes through. Windows cannot,
+#: and a stall there is reported without a stack.
+reads_worker_stacks = pytest.mark.skipif(
+    not stall.probes.can_request_stack(),
+    reason="this platform does not read a worker's live stack",
+)
+
 
 # --- evidence laid out as a process of lanes writes it ---------------------
 
@@ -643,6 +651,7 @@ def test_a_single_process_lanes_stack_is_read_from_its_own_frames(lanes):
     assert "The run cannot finish while this lane's test is still running." in incident.evidence
 
 
+@reads_worker_stacks
 def test_a_workers_lanes_share_one_read_of_their_process_per_poll(lanes, monkeypatch):
     """Forty stalled lanes of a worker were forty reads of it in one poll."""
     lanes.process("gw0", pid=424242)
@@ -696,6 +705,7 @@ def test_a_frozen_process_of_lanes_is_one_incident_blaming_no_innocent_lane(lane
     assert not any("go on running" in line for line in incident.evidence)
 
 
+@reads_worker_stacks
 def test_a_frozen_process_blames_the_lane_py_spy_finds_holding_the_gil(lanes, monkeypatch):
     """Native code holding the GIL: py-spy reads the stopped interpreter and
     names the thread that owns it - that lane's test, and only that one."""
