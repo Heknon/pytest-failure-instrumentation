@@ -2555,7 +2555,10 @@ process's. Three fields say which process and which of its threads a lane is:
 the pid reports as that thread's `os_thread_id` — the thread to open, since the
 process's main thread is pytest-threadlanes' scheduler. The three fields are
 only on a lane's row, and are on `client.Worker` and on a pushed sample's row
-the same way. Once a process's first lane has started a test, its own row
+the same way — absent, not null, from a model dump of a row without them, so a
+run without lanes dumps what it dumped before. A lane's `state_age_s` is the
+age of its current phase: its record is written as each phase starts and at
+nothing else, so a lane hung in `call` for a minute reads a minute. Once a process's first lane has started a test, its own row
 leaves the list — its lanes are the rows. `?worker=gw0` asks for what that
 process is running, and lists its lanes; `/stack?worker=gw0` still reads the
 whole process.
@@ -2569,14 +2572,19 @@ so there, as in any run with no workers, `tests_assigned`, `tests_running` and
 `tests_queued` are null.
 
 **Each lane's CPU is its own.** A process's CPU is every lane's summed, so one
-busy lane would make every sibling read as `working`. With each beat the
-heartbeat also writes each lane's thread CPU onto the lane's own record, and a
-lane's row and its stall verdict are read from it — falling back to the
-process's figure for a lane's first reading, and where the platform cannot
-number threads: on macOS psutil numbers them by position rather than by native
-id, so there every lane reads its process's CPU, and the event log says so
-(`lanes_adjusted`, `per_lane_cpu`). The beat itself stays the line it always
-was, however many lanes there are.
+busy lane would make every sibling read as `working`. After each beat the
+heartbeat reads every lane's thread CPU at one instant and writes them all into
+one file of the process, `<process>.lanecpu` (the newest six readings, replaced
+whole), and a lane's row and its stall verdict are read from it. On Linux each
+thread's CPU clock is read in one system call that keeps the GIL, since
+reading `/proc` per thread lets go of it once per file and made the heartbeat
+seconds late beside busy lanes. A lane with fewer than two readings — its first
+beat, or a thread that has finished — has a `cpu_rate` of null, never its
+process's: an idle lane beside a busy one does not read as `working`. On macOS
+psutil numbers threads by position rather than by native id, so no lane's CPU
+is written there: rows read null, a stall is judged on its process's CPU and
+says so, and the event log says why (`lanes_adjusted`, `per_lane_cpu`). The
+beat itself stays the line it always was, however many lanes there are.
 
 **A stall is a lane's.** Each lane is timed on its own — from its reports
 (`report.lane_id`), and from its own record, where it writes the start of each
@@ -2585,17 +2593,35 @@ setup, before it has reported anything, and what keeps an exclusive test —
 whose reports pytest-threadlanes holds until it ends — from reading as one
 silence the length of all its phases. A lane that hangs while its siblings keep
 going is named, with its own test and a stack of its own thread, and the
-incident says which thread of which process that is. A lane with no test in
-flight — never given one, out of work at the end of an uneven run, or waiting —
-is idle and never reported. The process holding the lanes is judged only once
-none of them has a test in flight, as any worker with no test running is.
+incident says which thread of which process that is. That stack is the lane's
+thread or nothing — never a sibling's, which carries the same runtest protocol
+and would blame a test that was not stuck: in one process it is read from the
+lane's own frames (`stack_source: "frames"`), in an xdist worker by py-spy from
+outside, once per process per poll however many of its lanes are silent, with
+the header naming the lane's thread. A faulthandler dump is not used for it: it
+stops at a hundred threads. A lane with no test in flight — never given one,
+out of work at the end of an uneven run, or waiting — is idle and never
+reported. The process holding the lanes is judged only once none of them has a
+test in flight, as any worker with no test running is.
+
+**A frozen process is one incident.** When the process's own heartbeat stops —
+native code holding the GIL, or the process stopped — every lane goes silent
+with it, and that is the process's finding, not each lane's: one
+`STALLED_FROZEN` incident for the process, listing every lane with a test in
+flight in `lanes_in_flight`. A lane is blamed only on evidence — py-spy finding
+its thread holding the GIL — and never when the process is stopped by a signal.
+`lanes_in_flight` is absent from a stall incident without lanes.
 
 **A death names every lane it took.** A process that dies takes each of its
 lanes' tests with it, and its counts are all of theirs. With one lane in
-flight, that lane's test is `test_in_flight`, as a worker's always was. With
-several, a fatal dump written on one of their threads — a native fault is
-delivered to the thread that faulted — blames that lane's test; otherwise none
-is blamed, since nothing on disk says which caused it. Either way every lane in
+flight, that lane's test is `test_in_flight`, as a worker's always was — unless
+the fatal dump was written on a thread that is not that lane's, one a test left
+running, say, and then no lane is blamed. With several, a fatal dump written on
+one of their threads — a native fault is delivered to the thread that faulted —
+blames that lane's test; otherwise none is blamed, since nothing on disk says
+which caused it. A free-threaded interpreter's dump names no thread and prints
+only the stack that faulted: the incident shows that Python stack, and blames
+the lane whose test function is on it where exactly one is. Either way every lane in
 flight is listed in `lanes_in_flight`, `{lane, nodeid, nodeid_hash, phase}`
 each, which is absent from the payload of a death without lanes. An internal
 error is named the same way: after the lane whose test it interrupted, and
@@ -2603,8 +2629,9 @@ listing them all where several were mid-test.
 
 **Resources say how many lanes are running.** The worker process of a run of
 lanes carries `lanes_running` in `/resources` — how many of its lanes had a test
-in flight when the sample was taken — since it names no test of its own. It is
-absent for every other process.
+in flight when the sample was taken — and its `nodeid` is null, since it names
+no test of its own. `lanes_running` is absent for every other process, and
+every other process's `nodeid` is what it always was.
 
 **What is one per process is adjusted, and says so.** Each of these was built
 for one test at a time, and each adjustment is written to the process's event
@@ -2613,9 +2640,10 @@ log as `lanes_adjusted`:
 | Mechanism | Under lanes |
 |---|---|
 | Profiler (`failure_profile`) | Off. It charges every sample to the one test in flight, and a process of lanes has one per lane |
-| Stderr tee (`failure_capture_output`) | fd 2 is taken once for the session rather than per phase — lanes' phases overlap, and pytest-threadlanes does not swap fd 2 per test either. What arrives is passed on to stderr within a second. The disk under what was passed on is given back as it goes: on Linux by punching holes in the file, which keeps the one file every writer of fd 2 shares — a test's child processes included — so no byte is lost; on a Linux filesystem that cannot punch holes, by rotating it, keeping the last tail as `<name>.output.prev`, where a child that outlives a rotation loses what it writes afterwards. On macOS and other platforms the file keeps the whole session's stderr: rotating means swapping fd 2 under the lanes writing it, and only Linux does that in one step (on macOS a lane's write to stderr can fail with EBADF mid-swap) |
-| Slow-test watchdog | One clock per lane. The dump is of every thread, so it holds whichever lane is overdue |
-| Heartbeat | No test on the process's beat; its memory is not attributed to a test. Each lane's CPU is on its own record |
+| Stderr tee (`failure_capture_output`) | fd 2 is taken once for the session rather than per phase — lanes' phases overlap, and pytest-threadlanes does not swap fd 2 per test either. What arrives is passed on to stderr within a second. The disk under what was passed on is given back as it goes: on Linux by punching holes in the file, which keeps the one file every writer of fd 2 shares — a test's child processes included — so no byte is lost; on a Linux filesystem that cannot punch holes, by rotating it, keeping the last tail as `<name>.output.prev`, where a child that outlives a rotation loses what it writes afterwards. On macOS and other platforms the file keeps the whole session's stderr: rotating means swapping fd 2 under the lanes writing it, and only Linux does that in one step (on macOS a lane's write to stderr can fail with EBADF mid-swap). At session end, once fd 2 is handed back, the file is compacted to its last tail, so it is not left sparse at the size of the whole session's stderr |
+| Slow-test watchdog | One clock per lane, and at most one dump per process per timeout, however many lanes are overdue. The dump is of every thread, so it holds every lane that is |
+| Frozen-interpreter fallback | Off. faulthandler's C timer dumps without the GIL, which is safe only once no Python thread is executing — three missed beats meant that with one test in flight, and do not with many lanes contending for the GIL, or a stopped process resuming every lane at once: the dump then killed the worker with SIGSEGV. A frozen process's stack is read by py-spy instead |
+| Heartbeat | No test on the process's beat; its memory is not attributed to a test. Every lane's CPU is in the process's `.lanecpu` file |
 
 The files of a run with lanes, then:
 
@@ -2624,8 +2652,9 @@ The files of a run with lanes, then:
   run-70a514cc7a93/
     gw0.state          <- "lanes": true once a lane has started
     gw0.events         <- the heartbeat, as it always was
-    gw0.ln0.state      <- "process": "gw0", "thread_name", "thread_id", and
-    gw0.ln1.state         "cpu": the lane's own CPU readings
+    gw0.lanecpu        <- every lane's thread CPU, the newest six readings
+    gw0.ln0.state      <- "process": "gw0", "thread_name", "thread_id"
+    gw0.ln1.state
     gw0.ln2.state
 ```
 
