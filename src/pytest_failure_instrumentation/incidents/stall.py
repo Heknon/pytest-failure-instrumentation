@@ -30,6 +30,7 @@ from ..capture import events as event_log
 from ..capture.state import read_state
 from ..config import SOLE_WORKER
 from ..lanes import ThreadKey
+from ..probes import process as process_probe
 from .base import Incident
 
 #: How long to wait for a signalled worker to write its stack.
@@ -382,25 +383,46 @@ def _build_lane(
     first = assessment.assess(beats, time.time(), silent_for, interval)
     if first.needs_confirmation:
         previous = assessment.last_beat_time(beats)
+        pid = lane.get("pid") or event_log.worker_pid(events)
+        before = process_probe.process_thread_cpu(pid) if isinstance(pid, int) else {}
         if _wait(cancel, interval * 1.2):
             return None  # the run is ending; nobody is left to tell
         beats = event_log.heartbeats(event_log.this_run(event_log.read_events(path), run_id))
         second = assessment.confirm(beats, previous, time.time(), silent_for)
+        if second.state == "FROZEN" and _lanes_taking_turns(
+            before, pid, _lane_records(directory, process, run_id, shared)
+        ):
+            # Not frozen: starved. Fifty lanes running Python keep the
+            # heartbeat from the GIL for seconds at a time, and its beat is
+            # then as late as a frozen process's - but the GIL is changing
+            # hands, and the lanes' threads are burning CPU in turn. A process
+            # that is frozen - native code holding the GIL, or stopped - runs
+            # one thread or none. Each lane is judged on its own at the next
+            # poll, once the beat has caught up.
+            return None
         if second.state == "FROZEN":
             return _frozen_process(
                 process, directory, silent_for, second, events,
-                run_id=run_id, live_pid=live_pid, shared=shared,
+                run_id=run_id, live_pid=live_pid, shared=shared, stack_probe=stack_probe,
             )
-    measured = thread_lanes.lane_cpu(directory, process, run_id)
-    mine = assessment.lane_beats(beats, measured.get(worker), interval)
-    if measured and not mine and beats:
+    records = _lane_records(directory, process, run_id, shared)
+    busy = [name for name, record in records if record.get("nodeid")]
+    measured = _read_lane_cpu(directory, process, run_id, shared)
+    current = assessment.lane_cpu_current(measured.newest, beats, interval)
+    readings = measured.get(worker) or []
+    mine = assessment.lane_beats(beats, readings, interval) if current else []
+    if current and not mine and len(readings) < 2 and _just_started(lane, interval):
         # Its process measures its lanes, and this one not twice yet: it began
         # its test a beat or two ago. The next poll has its rate; a verdict
-        # without one now would call a lane burning a core stuck.
+        # without one now would call a lane burning a core stuck. Only while
+        # the file is being written, and only just after the test began: a
+        # file whose writes stopped would otherwise defer this lane forever.
         return None
-    whose = bool(measured and mine)
+    whose = bool(mine)
     verdict = (
-        assessment.assess_lane(beats, mine, time.time(), silent_for, interval)
+        assessment.assess_lane(
+            beats, mine, time.time(), silent_for, interval, max(1, len(busy))
+        )
         if whose
         else assessment.assess(beats, time.time(), silent_for, interval)
     )
@@ -416,10 +438,9 @@ def _build_lane(
     stack, probed, why, written, source = _lane_stack(
         directory, process, pid, state, stack_probe, live_pid, cancel, shared
     )
-    siblings = [
-        name for name, record in thread_lanes.lane_records(directory, process, run_id)
-        if name != worker and record.get("nodeid")
-    ]
+    if read_state(directory / f"{worker}.state", run_id).get("nodeid") != in_flight:
+        return None  # it moved on while its stack was read: that stack is not this test's
+    siblings = [name for name in busy if name != worker]
     evidence = [verdict.reason]
     confidence = verdict.confidence or CONFIDENCE.get(verdict.state, "low")
     named = thread[1] or "named for it"
@@ -429,12 +450,20 @@ def _build_lane(
         if siblings
         else ""
     )
-    figure = (
-        "The CPU figure is that thread's own"
-        if whose
-        else "No CPU can be read per thread on this platform, so the figure is the "
-        "whole process's, every lane's together"
-    )
+    if whose:
+        figure = "The CPU figure is that thread's own"
+    elif measured:
+        figure = (
+            "Its process stopped writing its lanes' own CPU readings "
+            f"{max(0.0, assessment.last_beat_time(beats) - (measured.newest or 0)):.0f} s "
+            "before its last beat, so the figure is the whole process's, every lane's "
+            "together"
+        )
+    else:
+        figure = (
+            "No CPU is read per thread for this process, so the figure is the whole "
+            "process's, every lane's together"
+        )
     evidence.append(
         f"Lane {worker} is the thread {named} in worker process {process}{others}. "
         f"{figure}, and the stack is that thread's."
@@ -490,6 +519,7 @@ def _frozen_process(
     run_id: Optional[str],
     live_pid: Optional[int],
     shared: Optional[dict[Any, Any]],
+    stack_probe: bool = True,
 ) -> WorkerStallIncident:
     """One incident for a process of lanes that has stopped running.
 
@@ -500,7 +530,7 @@ def _frozen_process(
     stopped is an accident - and no lane is blamed there.
     """
     record = read_state(directory / f"{process}.state", run_id)
-    lanes = thread_lanes.lane_records(directory, process, run_id)
+    lanes = _lane_records(directory, process, run_id, shared)
     flying = thread_lanes.in_flight(lanes)
     pid = record.get("pid") or event_log.worker_pid(events)
     evidence = [verdict.reason]
@@ -514,7 +544,7 @@ def _frozen_process(
             f"Process {pid} is stopped - SIGSTOP, or a debugger - not running native "
             "code: none of its lanes is to blame for it."
         )
-    elif isinstance(pid, int) and _cannot_probe(pid, True, live_pid) is None:
+    elif isinstance(pid, int) and _cannot_probe(pid, stack_probe, live_pid) is None:
         reading, error = _read_process(pid, shared)
         holders = [thread for thread in reading or [] if thread.get("owns_gil")]
         for name, lane_record in lanes:
@@ -525,7 +555,10 @@ def _frozen_process(
         if culprit is None:
             why = error or "no lane's thread was found holding the GIL"
     else:
-        why = "the worker's process could not be read from outside it"
+        why = (
+            _cannot_probe(pid if isinstance(pid, int) else None, stack_probe, live_pid)
+            or "the worker's process could not be read from outside it"
+        )
     if culprit is not None and reading is not None:
         held = [entry for entry in reading if _is_lanes_thread(entry, culprit)]
         stack = crash_stack.from_threads(held, limit=STACK_LINES)
@@ -573,13 +606,99 @@ def _frozen_process(
 
 
 def _stopped(pid: int) -> bool:
-    """Whether ``pid`` is stopped by a signal rather than running."""
+    """Whether ``pid`` is stopped by a signal rather than running.
+
+    Stopped, not traced: a process py-spy is reading - this engine's own read,
+    or the live view's - is in tracing-stop for as long as the read takes, and
+    is not a process somebody stopped.
+    """
     try:
         import psutil
 
-        return psutil.Process(pid).status() in (psutil.STATUS_STOPPED, "tracing-stop")
+        return bool(psutil.Process(pid).status() == psutil.STATUS_STOPPED)
     except Exception:  # noqa: BLE001 - a process that cannot be asked is not known stopped
         return False
+
+
+#: The share of its lanes' CPU one lane thread must hold, over the wait that
+#: confirms a freeze, for the process to count as frozen by that thread
+#: rather than as its lanes taking turns at the GIL.
+FROZEN_BY_ONE = 0.8
+
+#: Lane CPU, in seconds over that wait, below which nothing is taking turns.
+TAKING_TURNS_CPU = 0.05
+
+
+def _lanes_taking_turns(
+    before: dict[int, float], pid: Any, records: list[tuple[str, dict[str, Any]]]
+) -> bool:
+    """Whether its lanes shared the CPU since ``before``: a process whose GIL
+    is changing hands, rather than one frozen by a thread holding it.
+
+    A frozen process runs one thread - the one holding the GIL, in native
+    code - or none, if it is stopped; its lanes waiting on that thread wake
+    every few milliseconds to ask for the GIL, which the kernel can charge a
+    clock tick for. So it is the spread that decides, not whether a second
+    thread moved at all: fifty lanes taking turns each burn a fiftieth of it.
+
+    Only the lanes' own threads count - not the heartbeat's, whose silence is
+    the question, and not a native library's own threads, which run without
+    the GIL whether the process is frozen or not. Read from outside the
+    process, by native id; where that cannot be done (macOS numbers threads by
+    position) nothing is said, and the freeze stands.
+    """
+    if not before or not isinstance(pid, int):
+        return False
+    after = process_probe.process_thread_cpu(pid)
+    lanes = {
+        record.get("thread_id") for _, record in records
+        if isinstance(record.get("thread_id"), int)
+    }
+    burned = [
+        max(0.0, after[native] - before[native])
+        for native in lanes if native in before and native in after
+    ]
+    total = sum(burned)
+    if total < TAKING_TURNS_CPU:
+        return False  # nothing ran: stopped, or held by a thread that is no lane
+    return max(burned) < FROZEN_BY_ONE * total
+
+
+def _just_started(lane: dict[str, Any], interval: float) -> bool:
+    """Whether a lane's current phase began too recently to have been measured
+    twice: a beat or two, and a beat's slack."""
+    started = lane.get("phase_started")
+    if not isinstance(started, (int, float)):
+        return False
+    return time.time() - float(started) < 3 * interval + assessment.CURRENT_READING_SLACK
+
+
+def _lane_records(
+    directory: Path, process: str, run_id: Optional[str], shared: Optional[dict[Any, Any]]
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every lane record of ``process``, read once per poll of the engine
+    however many of its lanes are assessed: a thousand lanes each listing a
+    thousand records was a million reads a poll."""
+    if shared is None:
+        return thread_lanes.lane_records(directory, process, run_id)
+    key = ("lanes", process)
+    if key not in shared:
+        shared[key] = thread_lanes.lane_records(directory, process, run_id)
+    found: list[tuple[str, dict[str, Any]]] = shared[key]
+    return found
+
+
+def _read_lane_cpu(
+    directory: Path, process: str, run_id: Optional[str], shared: Optional[dict[Any, Any]]
+) -> thread_lanes.LaneCpuRead:
+    """``process``'s lanes' CPU, read once per poll of the engine."""
+    if shared is None:
+        return thread_lanes.read_lane_cpu(directory, process, run_id)
+    key = ("lanecpu", process)
+    if key not in shared:
+        shared[key] = thread_lanes.read_lane_cpu(directory, process, run_id)
+    found: thread_lanes.LaneCpuRead = shared[key]
+    return found
 
 
 def _read_process(
@@ -640,7 +759,9 @@ def _lane_stack(
             return [], True, "the lane's thread is no longer running", None, None
         stack = crash_stack.from_frame(frame, ident, name or "lane", limit=STACK_LINES)
         return stack, True, None, time.time(), "frames"
-    if isinstance(pid, int) and _cannot_probe(pid, True, live_pid) is None:
+    if isinstance(pid, int) and _cannot_probe(pid, stack_probe, live_pid) is None:
+        # Not a signal, but py-spy pauses the worker while it reads it, and
+        # failure_stack_probe = false is a promise to leave workers alone.
         reading, error = _read_process(pid, shared)
         if reading is not None:
             mine = [entry for entry in reading if _is_lanes_thread(entry, lane)]
@@ -662,6 +783,9 @@ def _lane_stack(
     passive, written, source = _passive_stack(directory, process, thread)
     if passive:
         return passive, False, None, written, source
+    refused = _cannot_probe(pid if isinstance(pid, int) else None, stack_probe, live_pid)
+    if refused is not None:
+        return [], False, refused, None, None
     return [], bool(lines), (
         "no dump of the process holds this lane's thread - faulthandler writes at "
         "most a hundred threads - and py-spy could not read it"

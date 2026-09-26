@@ -243,6 +243,12 @@ class IncidentEngine:
         #: them (see ``confirm``, which asks whether the beat *advanced*).
         self.activity: dict[str, float] = {}
         self.stalled: set[str] = set()
+        #: Lanes, and their process, accounted for by one incident about the
+        #: whole process stopping - see _assess_stall - with the process and
+        #: the time of its last beat then. Not ``stalled``: a lane hung on its
+        #: own through a freeze is still hung after it, and is reported once
+        #: the process runs again - see _release_silenced.
+        self.silenced: dict[str, tuple[str, float]] = {}
         #: The worker process each lane of pytest-threadlanes runs in, from its
         #: reports: ``gw0.ln3`` is in ``gw0``, and a lane of a run with no
         #: workers is in this process, ``main``. A lane is watched as a worker
@@ -637,6 +643,7 @@ class IncidentEngine:
             # in the set, a worker reported once could never be reported again
             # however badly it went on to hang.
             self.stalled.discard(worker)
+            self.silenced.pop(worker, None)
 
     def _touch_lane(self, lane: str, process: str | None) -> None:
         """A lane reported, so it is alive - and so is the process it runs in.
@@ -672,6 +679,7 @@ class IncidentEngine:
             if self.lanes:
                 try:
                     self._follow_lanes()
+                    self._release_silenced()
                 except Exception:  # noqa: BLE001 - a missed reading is one poll late
                     pass
             now = time.monotonic()
@@ -679,7 +687,9 @@ class IncidentEngine:
                 candidates = [
                     (worker, now - seen)
                     for worker, seen in self.activity.items()
-                    if now - seen > limit and worker not in self.stalled
+                    if now - seen > limit
+                    and worker not in self.stalled
+                    and worker not in self.silenced
                 ]
             # What this poll has read of each process, shared by its lanes:
             # forty stalled lanes of one process are one read of it, not
@@ -687,7 +697,7 @@ class IncidentEngine:
             shared: dict[Any, Any] = {}
             for worker, silent_for in candidates:
                 with self.lock:
-                    if worker in self.stalled:
+                    if worker in self.stalled or worker in self.silenced:
                         continue  # its process was reported this poll
                 try:
                     self._assess_stall(worker, silent_for, shared)
@@ -775,18 +785,56 @@ class IncidentEngine:
             # asking again immediately.
             self._touch(worker)
             return
+        if incident.worker != worker:
+            # A lane's silence that was its whole process stopping, which is
+            # reported once, for the process: every lane of it is accounted for
+            # by that one incident - until the process runs again.
+            process = incident.worker
+            last = self._last_beat(process)
+            with self.lock:
+                for name in [process, worker, *(
+                    lane for lane, owner in self.lane_process.items() if owner == process
+                )]:
+                    self.silenced[name] = (process, last)
+            self.raise_incident(incident)
+            return
         with self.lock:
             self.stalled.add(worker)
-            if incident.worker != worker:
-                # A lane's silence that was its whole process stopping, which
-                # is reported once, for the process: every lane of it is
-                # accounted for by that one incident.
-                self.stalled.add(incident.worker)
-                self.stalled.update(
-                    lane for lane, owner in self.lane_process.items()
-                    if owner == incident.worker
-                )
         self.raise_incident(incident)
+
+    def _last_beat(self, process: str) -> float:
+        """When ``process`` last beat, on the wall clock; 0 where it never has."""
+        from ..analysis.stall import last_beat_time
+        from ..capture import events as event_log
+
+        path = thread_lanes.sibling(self.directory / "x", process, ".events")
+        if path is None:
+            return 0.0
+        beats = event_log.heartbeats(
+            event_log.this_run(event_log.read_events(path), self.run_id)
+        )
+        return last_beat_time(beats)
+
+    def _release_silenced(self) -> None:
+        """Hand back to the watch the lanes of a process that runs again.
+
+        A freeze is one incident, and while it lasts every lane of the process
+        is silent because of it. Once the process beats again, a lane that is
+        still silent is silent for a reason of its own - one hung on a socket
+        before the freeze and after it, say - and is timed afresh from now,
+        as a lane that had just been touched: the freeze was not its silence.
+        """
+        with self.lock:
+            processes = {process: last for process, last in self.silenced.values()}
+        for process, last in processes.items():
+            if self._last_beat(process) <= last:
+                continue
+            now = time.monotonic()
+            with self.lock:
+                for name, (owner, _) in list(self.silenced.items()):
+                    if owner == process:
+                        del self.silenced[name]
+                        self.activity[name] = now
 
     def _live_pid(self, worker: str) -> int | None:
         """The pid this worker's gateway is running, if it still is.

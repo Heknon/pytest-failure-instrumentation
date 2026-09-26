@@ -90,6 +90,21 @@ def thread_cpu_seconds(native_ids: Iterable[int]) -> dict[int, float]:
         return {}
 
 
+def process_thread_cpu(pid: int) -> dict[int, float]:
+    """CPU seconds used by each thread of process ``pid``, by native id, read
+    from outside it. Empty where they cannot be read, and on macOS, where
+    psutil numbers threads by position rather than by native id."""
+    if sys.platform == "darwin":
+        return {}
+    try:
+        return {
+            int(thread.id): float(thread.user_time) + float(thread.system_time)
+            for thread in psutil.Process(pid).threads()
+        }
+    except (psutil.Error, OSError, AttributeError, ValueError):
+        return {}
+
+
 def _thread_cpu_clock(native_id: int) -> int:
     """Linux's clock id for one thread's CPU time: ``MAKE_THREAD_CPUCLOCK(tid,
     CPUCLOCK_SCHED)`` of ``include/linux/posix-timers.h``, part of the kernel's

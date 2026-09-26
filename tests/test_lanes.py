@@ -1848,6 +1848,54 @@ def test_a_line_cut_off_when_a_rotated_file_is_closed_is_not_joined_to_the_next(
 # --- review round 3 --------------------------------------------------------
 
 
+def _stale_lanecpu(lanes: Lanes, process: str, behind: float) -> None:
+    """Move every reading of ``process``'s ``.lanecpu`` ``behind`` seconds into
+    the past: its writes stopped, and the beats went on."""
+    path = lanes.run / f"{process}.lanecpu"
+    loaded = json.loads(path.read_text())
+    loaded["times"] = [stamp - behind for stamp in loaded["times"]]
+    path.write_text(json.dumps(loaded))
+
+
+def test_a_hung_lane_is_reported_when_its_process_stops_writing_its_cpu(lanes):
+    """A process whose .lanecpu writes fail - a full descriptor table, a file
+    held open on Windows - leaves readings that stop where the writes did. The
+    lane was deferred "until it is measured twice", which never came."""
+    lanes.process("main")
+    lanes.lane("ln0", "main", "t.py::test_hung", "call", phase_started=time.time() - 30)
+    lanes.lane("ln1", "main")
+    lanes.beats("main", {"ln0": 0.0}, process_step=0.0)
+    _stale_lanecpu(lanes, "main", 20.0)
+    incident = stall.build("ln0", lanes.run, 30.0, 1.0, False, run_id=RUN_ID)
+
+    assert incident is not None
+    assert incident.state == "BLOCKED"
+    assert incident.test_in_flight == "t.py::test_hung"
+    assert any("stopped writing its lanes' own CPU readings" in line
+               for line in incident.evidence)
+    assert "in the whole process" in incident.evidence[-1]
+    # And its row reads its process's figure, said as such.
+    (row,) = [row for row in topology.run(lanes.run)["workers"] if row["worker"] == "ln0"]
+    assert row["cpu_rate"] == 0.0
+    assert "stopped writing its lanes' own" in row["why"]
+
+
+def test_a_lane_just_started_waits_for_its_second_reading_and_no_longer(lanes):
+    lanes.process("main")
+    lanes.lane("ln0", "main", "t.py::test_new", "call", phase_started=time.time() - 0.5)
+    lanes.beats("main", {"other": 0.0}, process_step=0.0)
+    assert stall.build("ln0", lanes.run, 10.0, 1.0, False, run_id=RUN_ID) is None
+
+    # The same file, the same missing readings, but the test began long ago:
+    # its thread is not being measured, and waiting would be for ever. Its
+    # process's figure stands in, as where no file is written at all.
+    lanes.lane("ln0", "main", "t.py::test_new", "call", phase_started=time.time() - 30)
+    incident = stall.build("ln0", lanes.run, 10.0, 1.0, False, run_id=RUN_ID)
+    assert incident is not None
+    assert incident.test_in_flight == "t.py::test_new"
+    assert "in the whole process" in incident.evidence[-1]
+
+
 def test_busy_lanes_of_a_saturated_process_are_judged_by_their_share():
     """Fifty lanes running Python share one GIL: each gets about a fiftieth
     of a core, under the fixed floor, and each read as waiting. A lane waiting
@@ -1918,6 +1966,73 @@ def test_a_lane_with_no_test_in_flight_reads_no_cpu_and_says_why(lanes):
         assert rows[name]["why"].startswith("no test in flight on this lane")
 
 
+def test_stack_probe_off_leaves_a_worker_of_lanes_unread(lanes, monkeypatch):
+    """failure_stack_probe = false is a promise to leave workers alone, and
+    py-spy pauses the process it reads."""
+    lanes.process("gw0", pid=424242)
+    lanes.lane("gw0.ln0", "gw0", "t.py::test_hung", "call", pid=424242)
+    lanes.beats("gw0", {"gw0.ln0": 0.0}, process_step=0.0)
+
+    def refuse(pid):
+        raise AssertionError("py-spy read a worker with stack probing off")
+
+    monkeypatch.setattr(stall.probes, "live_stack", refuse)
+    incident = stall.build("gw0.ln0", lanes.run, 10.0, 1.0, False, run_id=RUN_ID,
+                           live_pid=424242, shared={})
+    assert incident.stack == []
+    assert incident.stack_unavailable_reason.startswith("failure_stack_probe is off")
+
+
+def test_a_polls_lanes_read_their_process_records_once(lanes, monkeypatch):
+    """A thousand lanes each listing every record of their process was a
+    million reads a poll."""
+    lanes.process("main")
+    for index in range(20):
+        lanes.lane(f"ln{index}", "main", f"t.py::test[{index}]", "call")
+    lanes.beats("main", {f"ln{index}": 0.0 for index in range(20)}, process_step=0.0)
+    calls = []
+    real = thread_lanes.lane_records
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(stall.thread_lanes, "lane_records", counted)
+    shared = {}
+    for index in range(20):
+        stall.build(f"ln{index}", lanes.run, 10.0, 1.0, False, run_id=RUN_ID, shared=shared)
+    assert len(calls) == 1
+
+
+def test_a_process_being_read_by_py_spy_is_not_stopped(monkeypatch):
+    import psutil
+
+    class Traced:
+        def __init__(self, pid):
+            pass
+
+        def status(self):
+            return "tracing-stop"
+
+    monkeypatch.setattr(psutil, "Process", Traced)
+    assert stall._stopped(1234) is False
+    monkeypatch.setattr(Traced, "status", lambda self: psutil.STATUS_STOPPED)
+    assert stall._stopped(1234) is True
+
+
+def test_a_stack_read_after_its_test_ended_is_not_filed_under_it(lanes, monkeypatch):
+    lanes.process("main")
+    lanes.lane("ln0", "main", "t.py::test_short", "call")
+    lanes.beats("main", {"ln0": 0.0}, process_step=0.0)
+
+    def moved_on(*args, **kwargs):
+        lanes.lane("ln0", "main", "t.py::test_next", "setup")
+        return [], False, None, None, None
+
+    monkeypatch.setattr(stall, "_lane_stack", moved_on)
+    assert stall.build("ln0", lanes.run, 10.0, 1.0, False, run_id=RUN_ID) is None
+
+
 def test_a_lanes_cpu_is_not_read_once_its_thread_has_ended(tmp_path, monkeypatch):
     """Its native id may be a new thread's by then."""
     from pytest_failure_instrumentation.capture import recorder as recorder_module
@@ -1939,6 +2054,50 @@ def test_a_lanes_cpu_is_not_read_once_its_thread_has_ended(tmp_path, monkeypatch
         recorder.close()
 
 
+def test_a_lane_hung_through_a_freeze_is_reported_once_the_process_runs_again(
+    pytester, lanes, monkeypatch
+):
+    """The freeze is one incident, the process's, and silences its lanes -
+    until the process beats again: a lane hung on its own before and after it
+    was then never reported."""
+    from pytest_failure_instrumentation.config import Settings
+    from pytest_failure_instrumentation.incidents.engine import IncidentEngine
+
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "t.py::test_gil", "call")
+    lanes.lane("gw0.ln1", "gw0", "t.py::test_socket", "call")
+    lanes.beats("gw0", {}, process_step=0.0)
+    monkeypatch.setattr(IncidentEngine, "directory", property(lambda self: lanes.run))
+    monkeypatch.setattr(IncidentEngine, "run_id", property(lambda self: RUN_ID))
+    engine = IncidentEngine(pytester.parseconfig(), Settings(directory=lanes.base))
+    raised = []
+    monkeypatch.setattr(engine, "raise_incident", raised.append)
+    monkeypatch.setattr(
+        stall, "build",
+        lambda worker, *args, **kwargs: stall.WorkerStallIncident(
+            worker="gw0", verdict="STALLED_FROZEN", state="FROZEN"
+        ),
+    )
+    engine.lane_process.update({"gw0.ln0": "gw0", "gw0.ln1": "gw0"})
+    engine._assess_stall("gw0.ln1", 20.0, {})
+
+    assert [incident.worker for incident in raised] == ["gw0"]
+    assert set(engine.silenced) == {"gw0", "gw0.ln0", "gw0.ln1"}
+    assert not engine.stalled
+    engine._release_silenced()
+    assert set(engine.silenced) == {"gw0", "gw0.ln0", "gw0.ln1"}  # still frozen
+
+    with (lanes.run / "gw0.events").open("a") as events:
+        events.write(json.dumps({"event": "heartbeat", "time": time.time() + 5,
+                                 "cpu_seconds": 1.0, "run_id": RUN_ID}) + "\n")
+    before = clock_now = time.monotonic()
+    engine._release_silenced()
+    assert engine.silenced == {}
+    # Timed afresh from now: the freeze was not its silence.
+    assert engine.activity["gw0.ln1"] >= before
+    assert clock_now <= engine.activity["gw0.ln0"]
+
+
 def test_a_lanes_cpu_file_is_current_until_it_misses_a_whole_beat():
     """Each beat's readings are written after the beat, and under fifty busy
     lanes a beat came three seconds after the one before at a one-second
@@ -1950,3 +2109,38 @@ def test_a_lanes_cpu_file_is_current_until_it_misses_a_whole_beat():
     assert stall_analysis.lane_cpu_current(now - 2.99, beats, 1.0)
     assert not stall_analysis.lane_cpu_current(now - 4.0, beats, 1.0)
     assert not stall_analysis.lane_cpu_current(None, beats, 1.0)
+
+
+def test_a_process_whose_lanes_take_turns_at_the_gil_is_starved_not_frozen(lanes, monkeypatch):
+    """Fifty lanes running Python kept the heartbeat from the GIL past the
+    confirmation, and the process was reported frozen, blaming whichever busy
+    lane py-spy found holding the GIL. A frozen process runs one thread or
+    none; a starved one runs its lanes in turn."""
+    lanes.process("gw0", pid=424242)
+    for name in ("gw0.ln0", "gw0.ln1", "gw0.ln2"):
+        lanes.lane(name, "gw0", f"t.py::test_{name[-1]}", "call", pid=424242)
+    lanes.beats("gw0", {"gw0.ln0": 0.0}, process_step=1.0)
+    events = lanes.run / "gw0.events"
+    lines = [json.loads(line) for line in events.read_text().splitlines()]
+    for line in lines:
+        if line.get("event") == "heartbeat":
+            line["time"] -= 30
+    events.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    readings = iter([
+        {_native("gw0.ln0"): 1.0, _native("gw0.ln1"): 1.0, _native("gw0.ln2"): 1.0},
+        {_native("gw0.ln0"): 1.2, _native("gw0.ln1"): 1.2, _native("gw0.ln2"): 1.0},
+    ])
+    monkeypatch.setattr(stall.process_probe, "process_thread_cpu", lambda pid: next(readings))
+    monkeypatch.setattr(stall, "_wait", lambda cancel, seconds: False)
+    assert stall.build("gw0.ln0", lanes.run, 30.0, 1.0, False, run_id=RUN_ID,
+                       live_pid=424242, shared={}) is None
+
+    # One thread burning, the rest waiting on it - and charged a tick for
+    # asking for the GIL: frozen.
+    readings = iter([
+        {_native("gw0.ln0"): 1.0, _native("gw0.ln1"): 1.0, _native("gw0.ln2"): 1.0},
+        {_native("gw0.ln0"): 2.2, _native("gw0.ln1"): 1.01, _native("gw0.ln2"): 1.01},
+    ])
+    incident = stall.build("gw0.ln0", lanes.run, 30.0, 1.0, False, run_id=RUN_ID,
+                           live_pid=424242, shared={})
+    assert incident is not None and incident.state == "FROZEN" and incident.worker == "gw0"
