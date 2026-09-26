@@ -857,6 +857,12 @@ class IncidentEngine:
         # alongside this object at configure time and nothing can add one
         # later, so one read settles it for the run.
         self.records_here = self.recorder is not None
+        if self.lanes:
+            # Imported now rather than when first needed, as they otherwise
+            # are: a session of hundreds of lanes can reach its limit of open
+            # files, and an import needs one - the run summary was then lost
+            # to an import failing in session finish.
+            from . import death, stall, summary  # noqa: F401
         self._prepare_directory()
         self._start_kill_witnesses()
         if self.settings.resources_seconds > 0:

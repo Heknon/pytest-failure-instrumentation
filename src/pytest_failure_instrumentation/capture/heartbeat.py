@@ -48,7 +48,7 @@ class Heartbeat:
         #: sibling read as working, and a hung lane in a busy process was never
         #: blocked. The figures go on each lane's own record rather than on
         #: this beat, whose line then stays the size it always was however
-        #: many lanes there are - see WorkerState.record_cpu.
+        #: many lanes there are - see lanes.LaneCpu.
         self.lane_cpu = lane_cpu
         self.interval = max(1.0, interval)
         #: Called on every beat, with what the beat measured.

@@ -64,47 +64,65 @@ def cpu_rate(beats: list[dict[str, Any]]) -> Optional[float]:
     return used / elapsed
 
 
-def lane_beats(beats: list[dict[str, Any]], readings: Any) -> list[dict[str, Any]]:
-    """The beats as one lane's, where it was measured: its own thread's CPU.
+def lane_beats(
+    beats: list[dict[str, Any]], readings: Any, interval: float
+) -> list[dict[str, Any]]:
+    """A lane's own CPU readings as beats every rule here reads, or none.
 
     A lane of pytest-threadlanes shares its process, and a process's CPU is
     every lane's summed - so one busy sibling makes a lane that is waiting on
     a socket read as working, and the verdict this module exists for, "burning
     CPU: slow, not stuck", hides exactly the lane that is stuck. The heartbeat
-    of a process with lanes writes each lane's thread CPU onto the lane's own
-    record, as ``[time, seconds]`` readings taken with each beat, and this
-    turns them into beats every rule here reads.
+    of a process with lanes reads each lane's thread CPU at every beat - see
+    :class:`..lanes.LaneCpu` - and this turns one lane's readings into beats.
 
-    Only while they are current: readings that stopped while the process's
-    beats went on - the thread has ended, or this platform cannot number it -
-    leave the process's beats in force. So does a lane measured only once so
-    far, which has no rate of its own yet: the process's is the reading it had
-    before per-thread figures existed, and "could not tell" instead raised a
-    stall, at low confidence, on a lane that had started burning a core a
-    second earlier. Timing is the heartbeat's either way, since the readings
-    are taken by the same thread: a frozen process is exactly as frozen.
+    Empty, and never the process's beats, where the lane has no rate of its
+    own: fewer than two readings, or readings that stopped while the
+    process's beats went on - its thread has ended, or this platform cannot
+    number threads. A caller reads that as "could not tell", which is what it
+    is; the process's figure there made an idle lane beside a busy one read
+    as working. ``interval`` is the beat's: a reading a beat behind the
+    latest beat is one a reader caught between the two writes.
     """
-    if not beats or not isinstance(readings, list):
-        return beats
     measured = []
-    for reading in readings:
+    for reading in readings if isinstance(readings, list) else []:
         if (
             isinstance(reading, list)
             and len(reading) == 2
             and all(isinstance(value, (int, float)) for value in reading)
         ):
             measured.append({"time": float(reading[0]), "cpu_seconds": float(reading[1])})
-    if len(measured) < 2:
-        return beats
-    if measured[-1]["time"] < last_beat_time(beats) - CURRENT_READING_SLACK:
-        return beats
+    if len(measured) < 2 or not beats:
+        return []
+    if measured[-1]["time"] < last_beat_time(beats) - interval - CURRENT_READING_SLACK:
+        return []
     return measured
 
 
-#: How far a lane's newest reading may trail the process's newest beat and
-#: still be current. The two are written by one thread, a moment apart, so a
-#: reader can land between them; a reading a whole beat behind has stopped.
+#: Slack on top of one beat's interval for a lane's newest reading to trail
+#: the process's newest beat by and still be current.
 CURRENT_READING_SLACK = 0.5
+
+
+def assess_lane(
+    beats: list[dict[str, Any]],
+    lane: list[dict[str, Any]],
+    now: float,
+    silent_for: float,
+    interval: float,
+) -> Assessment:
+    """:func:`assess` for a lane: whether its process is running at all, from
+    the process's beats, and whether its own thread is, from ``lane`` - its
+    readings as :func:`lane_beats` gives them."""
+    first = assess(beats, now, silent_for, interval)
+    if first.state == "SILENT" or first.needs_confirmation:
+        return first
+    return _from_cpu(lane, now, silent_for, first.heartbeat_age or 0.0, LANE_THREAD)
+
+
+#: Whose CPU a verdict speaks of: a worker's process, or a lane's own thread.
+PROCESS = "the process"
+LANE_THREAD = "the lane's thread"
 
 
 def assess(
@@ -148,7 +166,11 @@ def confirm(
 
 
 def _from_cpu(
-    beats: list[dict[str, Any]], now: float, silent_for: float, age: float
+    beats: list[dict[str, Any]],
+    now: float,
+    silent_for: float,
+    age: float,
+    whose: str = PROCESS,
 ) -> Assessment:
     window = [
         beat for beat in beats if now - float(beat.get("time") or 0) <= silent_for + 5
@@ -179,7 +201,7 @@ def _from_cpu(
         )
     return Assessment(
         state="BLOCKED",
-        reason=f"The heartbeat thread is running and the process used {rate:.2f} cores "
+        reason=f"The heartbeat thread is running and {whose} used {rate:.2f} cores "
         "over the window: the test thread is waiting on something.",
         cpu_rate=rate,
         heartbeat_age=age,

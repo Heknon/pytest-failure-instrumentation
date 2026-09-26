@@ -190,9 +190,9 @@ def _run(
     # would report a run whose rows came from different instants.
     schedule = read_schedule(directory)
     rows = worker_rows(schedule)
-    # A process's event tail, read once for all of its lanes: a thousand
-    # lanes asking for the same file are one read, not a thousand.
-    tails: dict[Path, list[dict[str, Any]]] = {}
+    # A process's files, read once for all of its lanes: a thousand lanes
+    # asking for the same file are one read, not a thousand.
+    tails = _Reads()
     states = sorted(directory.glob("*.state"))
     workers = []
     containers: set[str] = set()
@@ -295,9 +295,13 @@ def worker(
     its siblings - see :mod:`.lanes`. Its record names that process, and what
     is per process is read from the process's files: the heartbeat, and with
     it the resident memory, the liveness and the finish. Its CPU is its own
-    thread's, read from the readings the heartbeat writes onto its record,
-    because the process's is every lane's summed and one busy sibling would
-    make a hung lane read as working. Its progress is its own too, and means
+    thread's, read from the ``.lanecpu`` file its process's heartbeat writes
+    for all its lanes at once - see :class:`.lanes.LaneCpu` - because the
+    process's is every lane's summed and one busy sibling would make a hung
+    lane read as working. Where its thread has no readings - a lane that has
+    not been measured twice yet, or has finished - its rate is None, never
+    its process's. Its ``state_age_s`` is the age of its current phase: its
+    record is written at phase transitions and at nothing else. Its progress is its own too, and means
     what a worker's does: where xdist's scheduler hands work to lanes - a run
     with ``-n`` - the controller's schedule has a row per lane, counted per
     lane, and ``schedule`` is that row. A run of lanes in one process has no
@@ -311,11 +315,11 @@ def _row(
     state_path: Path,
     now: float,
     schedule: Optional[dict[str, Any]] = None,
-    tails: Optional[dict[Path, list[dict[str, Any]]]] = None,
+    tails: Optional[_Reads] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """:func:`worker`'s row, and the record it was read from.
 
-    ``tails`` holds the event tails already read for this request, by path.
+    ``tails`` holds what this request has already read.
     """
     events_path = state_path.with_name(f"{state_path.stem}.events")
     lane: Optional[str] = None
@@ -345,14 +349,31 @@ def _row(
     pid = record.get("pid")
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
-    measured = stall_analysis.lane_beats(beats, record.get("cpu")) if lane is not None else beats
+    interval = _interval(events, events_path, tails)
+    measured = (
+        stall_analysis.lane_beats(
+            beats,
+            _lane_cpu(state_path.parent, process, run_id, tails).get(state_path.stem),
+            interval,
+        )
+        if lane is not None
+        else beats
+    )
     rate = (
         stall_analysis.cpu_rate(measured[-RATE_WINDOW:]) if len(measured) >= 2 else None
     )
     status, why = _status(
-        exists, beats, beat_age, rate, _interval(events, events_path), record,
+        exists, beats, beat_age, rate, interval, record,
         finished=finished, now=now,
     )
+    if lane is not None and status == "blocked" and rate is None and not record.get("nodeid"):
+        # Not a silence to explain: a lane between tests, or done with its
+        # share of the run, has no test to be blocked in and no CPU figure of
+        # its own - its process's would be its siblings' work.
+        why = (
+            "no test in flight on this lane, and no CPU figure of its own: its "
+            "thread is between tests or has finished its share of the run"
+        )
 
     nodeid = record.get("nodeid")
     row = {
@@ -418,15 +439,38 @@ def _row(
     return row, record
 
 
-def _tail(
-    path: Path, tails: Optional[dict[Path, list[dict[str, Any]]]]
-) -> list[dict[str, Any]]:
+class _Reads:
+    """What one request has read of each process's files, so that its lanes
+    share one read of each: the event tail, the heartbeat cadence - which,
+    once the run has outgrown the tail, takes a read of the head too - and
+    the lanes' CPU."""
+
+    def __init__(self) -> None:
+        self.tails: dict[Path, list[dict[str, Any]]] = {}
+        self.intervals: dict[Path, float] = {}
+        self.lane_cpu: dict[Any, dict[str, list[list[float]]]] = {}
+
+
+def _tail(path: Path, tails: Optional[_Reads]) -> list[dict[str, Any]]:
     """The event tail of ``path``, read once per request where ``tails`` is kept."""
     if tails is None:
         return tail_events(path)
-    if path not in tails:
-        tails[path] = tail_events(path)
-    return tails[path]
+    if path not in tails.tails:
+        tails.tails[path] = tail_events(path)
+    return tails.tails[path]
+
+
+def _lane_cpu(
+    directory: Path, process: Any, run_id: Optional[str], tails: Optional[_Reads]
+) -> dict[str, list[list[float]]]:
+    """A process's lanes' CPU readings, read once per request - see
+    :class:`.lanes.LaneCpu`."""
+    if tails is None:
+        return thread_lanes.lane_cpu(directory, process, run_id)
+    key = (directory, process)
+    if key not in tails.lane_cpu:
+        tails.lane_cpu[key] = thread_lanes.lane_cpu(directory, process, run_id)
+    return tails.lane_cpu[key]
 
 
 def _of_run(record: dict[str, Any], run_id: Optional[str]) -> dict[str, Any]:
@@ -607,7 +651,11 @@ def _finish(events: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     return None
 
 
-def _interval(events: list[dict[str, Any]], events_path: Optional[Path] = None) -> float:
+def _interval(
+    events: list[dict[str, Any]],
+    events_path: Optional[Path] = None,
+    tails: Optional[_Reads] = None,
+) -> float:
     """The heartbeat cadence this worker was actually started with.
 
     Read rather than assumed: it is what "stale" is measured in, and a run
@@ -631,15 +679,22 @@ def _interval(events: list[dict[str, Any]], events_path: Optional[Path] = None) 
         if event.get("event") == "watchdog_started" and event.get("interval"):
             return float(event["interval"])
     if events_path is not None:
+        if tails is not None and events_path in tails.intervals:
+            return tails.intervals[events_path]
+        found = DEFAULT_INTERVAL
         head = head_events(events_path)
         for event in head:
             if event.get("event") == "watchdog_started" and event.get("interval"):
-                return float(event["interval"])
+                found = float(event["interval"])
+                break
+        if tails is not None:
+            tails.intervals[events_path] = found
+        return found
     return DEFAULT_INTERVAL
 
 
 def _run_id(
-    directory: Path, tails: Optional[dict[Path, list[dict[str, Any]]]] = None
+    directory: Path, tails: Optional[_Reads] = None
 ) -> Optional[str]:
     """The id this run reports, which is not the directory's name.
 

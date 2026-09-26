@@ -83,12 +83,12 @@ class Lanes:
                 "phase": phase,
                 "tests_started": 2,
                 "tests_finished": 1 if nodeid else 2,
-                **fields,
                 "process": process,
                 "thread_name": f"lane-{name}",
                 "thread_id": _native(name),
                 "thread_ident": _ident(name),
                 "lane": True,
+                **fields,
             },
         )
 
@@ -129,14 +129,15 @@ class Lanes:
         (self.run / f"{process}.events").write_text(
             "".join(json.dumps(line) + "\n" for line in lines)
         )
-        for lane, step in lanes.items():
-            path = self.run / f"{lane}.state"
-            record = json.loads(path.read_text())
-            record["cpu"] = [
-                [now - (count - 1 - index) * interval + 0.001, index * step]
-                for index in range(count)
-            ]
-            path.write_text(json.dumps(record) + "\n")
+        if lanes:
+            (self.run / f"{process}.lanecpu").write_text(json.dumps({
+                "run_id": RUN_ID,
+                "times": [now - (count - 1 - index) * interval + 0.001 for index in range(count)],
+                "lanes": {
+                    lane: [index * step for index in range(count)]
+                    for lane, step in lanes.items()
+                },
+            }))
 
 
 @pytest.fixture
@@ -242,8 +243,8 @@ def test_a_lane_carries_its_own_progress_where_the_schedule_counts_lanes(lanes):
 
 
 def test_a_thousand_lanes_read_their_process_once(lanes, monkeypatch):
-    """Each lane's beats are its process's: one read of them per request, and
-    each lane's CPU from its own slot, whatever the lane count."""
+    """Each lane's beats are its process's, and so is the file of its CPU:
+    one read of each per request, whatever the lane count."""
     lanes.process("main")
     names = {f"ln{index}": 0.0 for index in range(1000)}
     for name in names:
@@ -260,6 +261,14 @@ def test_a_thousand_lanes_read_their_process_once(lanes, monkeypatch):
     assert len(reads) <= 2 + 1000  # its own, and one empty look per lane
     assert sum(1 for path in reads if path.name == "main.events") == 1
     assert time.perf_counter() - started < 20
+    # Once the run has outgrown the tail, the cadence is read from the head
+    # of the file: once, not once per lane.
+    heads = []
+    monkeypatch.setattr(topology, "head_events", lambda path: heads.append(path) or [])
+    monkeypatch.setattr(topology, "tail_events", lambda path: [
+        event for event in real(path) if event.get("event") != "watchdog_started"])
+    topology.run(lanes.run)
+    assert len(heads) == 1
 
 
 def test_a_lane_and_its_process_are_both_addressable_for_a_stack(lanes):
@@ -324,24 +333,53 @@ def test_the_state_record_gains_keys_only_under_lanes(tmp_path):
 # --- per-lane CPU -----------------------------------------------------------
 
 
-def test_lane_beats_fall_back_to_the_process_where_a_lane_is_not_measured():
+def test_a_lane_has_its_own_rate_or_none_never_its_processes():
+    """The process's CPU is every lane's: an idle lane beside a busy one read
+    it, and read as working."""
     beats = [{"time": 1.0, "cpu_seconds": 1.0}, {"time": 2.0, "cpu_seconds": 2.0},
-             {"time": 3.0, "cpu_seconds": 3.0}]
+             {"time": 3.0, "cpu_seconds": 3.0}, {"time": 4.0, "cpu_seconds": 4.0}]
     # Current readings: the lane's own.
-    measured = stall_analysis.lane_beats(beats, [[2.001, 0.5], [3.001, 0.5]])
+    measured = stall_analysis.lane_beats(beats, [[3.001, 0.5], [4.001, 0.5]], 1.0)
     assert stall_analysis.cpu_rate(measured) == 0.0
-    # Readings that stopped while the beats went on: the process's stand.
-    assert stall_analysis.lane_beats(beats, [[1.001, 0.5], [2.001, 0.5]]) is beats
-    # Measured once: no rate of its own yet, so the process's reading stands.
-    assert stall_analysis.lane_beats(beats, [[3.001, 0.5]]) is beats
-    # Nothing, or nonsense: the process's.
-    assert stall_analysis.lane_beats(beats, None) is beats
-    assert stall_analysis.lane_beats(beats, [["x", 1], [3.0]]) is beats
+    # A reader caught between the beat and the lanes' readings: still current.
+    assert stall_analysis.lane_beats(beats, [[2.001, 0.5], [3.001, 0.5]], 1.0)
+    # Readings that stopped while the beats went on - the thread has ended.
+    assert stall_analysis.lane_beats(beats, [[1.001, 0.5], [2.001, 0.5]], 1.0) == []
+    # Measured once, not at all, or nonsense: no rate.
+    assert stall_analysis.lane_beats(beats, [[4.001, 0.5]], 1.0) == []
+    assert stall_analysis.lane_beats(beats, None, 1.0) == []
+    assert stall_analysis.lane_beats(beats, [["x", 1], [3.0]], 1.0) == []
 
 
-def test_a_lanes_cpu_is_on_its_own_record_and_the_beat_is_unchanged(tmp_path):
+def test_an_idle_lane_beside_a_busy_one_reads_no_rate_not_working(lanes):
+    lanes.process("main")
+    lanes.lane("ln0", "main", "t.py::test_busy", "call")
+    lanes.lane("ln1", "main")
+    lanes.beats("main", {"ln0": 1.0}, process_step=1.0)
+    rows = {row["worker"]: row for row in topology.run(lanes.run)["workers"]}
+    assert rows["ln0"]["status"] == "working"
+    assert rows["ln1"]["cpu_rate"] is None
+    assert rows["ln1"]["status"] != "working"
+    assert rows["ln1"]["why"].startswith("no test in flight on this lane")
+
+
+def test_a_lanes_state_age_is_its_phases_and_grows(lanes):
+    """The heartbeat writes nothing on a lane's record, so its age is the
+    phase's: a lane hung for a minute reads a minute, not the last beat."""
+    lanes.process("main")
+    lanes.lane("ln0", "main", "t.py::test_hung", "call")
+    record = json.loads((lanes.run / "ln0.state").read_text())
+    record["time"] = time.time() - 60
+    (lanes.run / "ln0.state").write_text(json.dumps(record))
+    lanes.beats("main", {"ln0": 0.0}, process_step=0.0)
+    (row,) = topology.run(lanes.run)["workers"]
+    assert row["state_age_s"] >= 59
+
+
+def test_the_lanes_cpu_is_one_file_and_the_beat_is_unchanged(tmp_path):
     """The beat of a process of lanes is the line it always was, however many
-    lanes it has; each lane's figures go on its own slot, newest kept."""
+    lanes it has; every lane's figures are one file of the process, read at
+    one instant, the newest six kept."""
     written = []
     calls = []
     Heartbeat(lambda event, **fields: written.append(fields),
@@ -351,13 +389,14 @@ def test_a_lanes_cpu_is_on_its_own_record_and_the_beat_is_unchanged(tmp_path):
     assert list(written[0]) == list(written[1]) == [
         "cpu_seconds", "rss_mb", "nodeid", "nodeid_hash", "phase"]
 
-    lane = WorkerState(tmp_path / "ln0.state", LIVE, RUN_ID,
-                       lane={"process": "main", "lane": True})
+    record = thread_lanes.LaneCpu(tmp_path / "main.lanecpu", RUN_ID)
     for index in range(8):
-        lane.record_cpu(100.0 + index, index * 0.5, keep=6)
-    readings = read_state(tmp_path / "ln0.state")["cpu"]
-    assert readings == [[100.0 + index, index * 0.5] for index in range(2, 8)]
-    assert list(read_state(tmp_path / "ln0.state"))[-1] == "cpu"
+        record.record(100.0 + index, {"ln0": index * 0.5, **({"ln1": 1.0} if index < 3 else {})})
+    readings = thread_lanes.lane_cpu(tmp_path, "main", RUN_ID)
+    assert readings["ln0"] == [[100.0 + index, index * 0.5] for index in range(2, 8)]
+    # A lane measured no more drops out once its readings are all gaps.
+    assert readings["ln1"] == [[102.0, 1.0]]
+    assert thread_lanes.lane_cpu(tmp_path, "main", "another-run") == {}
 
 
 @pytest.mark.skipif(
@@ -384,16 +423,56 @@ def test_every_lanes_cpu_is_recorded_after_a_beat(tmp_path):
         while not opened:
             time.sleep(0.01)
         recorder._record_lane_cpu()
-        recorder._record_lane_cpu()
+        # A lane opening its slot holds the lanes' lock across file I/O; the
+        # beat does not queue behind it.
+        with recorder._lanes_lock:
+            recorder._record_lane_cpu()
         done.set()
         thread.join()
         record = read_state(tmp_path / "ln0.state")
         assert record["thread_name"] == "lane-ln0"
         assert record["thread_id"] == thread.native_id
-        assert len(record["cpu"]) == 2
+        assert "cpu" not in record
+        assert len(thread_lanes.lane_cpu(tmp_path, "main")["ln0"]) == 2
         assert read_state(tmp_path / "main.state")["lanes"] is True
     finally:
         recorder.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux's per-thread clocks")
+def test_a_threads_cpu_is_read_by_its_native_id_without_procfs(monkeypatch):
+    """Reading /proc per thread lets go of the GIL once per file, and each
+    time the heartbeat has to win it back from every running lane: one
+    reading took 17.7 s beside twenty busy lanes. The thread's own CPU clock
+    is read in one call, and a thread that has gone is left out."""
+    from pytest_failure_instrumentation.probes import process
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("procfs was read")
+
+    monkeypatch.setattr(process.psutil, "Process", refuse)
+    ready, done = threading.Event(), threading.Event()
+
+    def spin() -> None:
+        end = time.monotonic() + 0.3
+        while time.monotonic() < end:
+            pass
+        ready.set()
+        done.wait(5)
+
+    thread = threading.Thread(target=spin)
+    thread.start()
+    ready.wait(5)
+    gone = threading.Thread(target=lambda: None)
+    gone.start()
+    gone.join()
+    try:
+        used = process.thread_cpu_seconds([thread.native_id, gone.native_id])
+    finally:
+        done.set()
+        thread.join()
+    assert set(used) == {thread.native_id}
+    assert 0.2 <= used[thread.native_id] < 5
 
 
 def test_macos_reads_no_lanes_cpu_and_says_so(tmp_path, monkeypatch):

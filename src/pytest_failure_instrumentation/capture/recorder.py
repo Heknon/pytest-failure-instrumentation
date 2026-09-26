@@ -22,18 +22,16 @@ from typing import Any, Optional
 import pytest
 
 from ..config import Settings
+from ..lanes import LANE_CPU_SUFFIX, LaneCpu
 from ..probes import tracing
 from ..probes.platform_flags import platform_description
+from ..probes.process import thread_cpu_seconds
 from . import crash_stack
 from . import memory as memory_capture
 from . import output as output_capture
 from .events import EventLog
 from .heartbeat import Heartbeat
 from .state import WorkerState
-
-#: How many readings of a lane's own CPU its record keeps: a rate needs two,
-#: and a stall verdict measures over the beats of its silence.
-LANE_CPU_READINGS = 6
 
 
 class _Slot:
@@ -44,9 +42,9 @@ class _Slot:
     its siblings, and everything per test here was written for one test in
     flight. The per-process half (heartbeat, event log, dumps) stays shared.
 
-    A lane's is only ever touched from the lane's own thread for its counts;
-    its state slot takes a lock, because the heartbeat writes the lane's CPU
-    there too - see WorkerState.record_cpu.
+    A lane's is only ever touched from the lane's own thread while it runs,
+    so it takes no lock; its CPU is written elsewhere, by the heartbeat - see
+    :class:`..lanes.LaneCpu`.
     """
 
     def __init__(
@@ -119,6 +117,9 @@ class WorkerRecorder:
         #: failure recorded - once, rather than on every phase of every test.
         self._lanes_failed: set[str] = set()
         self._lanes_lock = threading.Lock()
+        #: The lanes' CPU file, made on the first beat that has a lane to
+        #: measure. Only the heartbeat's thread touches it.
+        self._lane_cpu: Any = None
         #: Serializes the session-long tee's copies, which lanes' phase ends
         #: and the heartbeat's ticks make concurrently. Untouched without lanes.
         self._tee_lock = threading.Lock()
@@ -798,11 +799,12 @@ class WorkerRecorder:
     def _lane_cpu_readable(self) -> bool:
         """Whether each lane's own CPU can be read here, said once if not.
 
-        It is matched on the native thread id, which is what psutil numbers a
-        thread by on Linux and Windows. On macOS psutil numbers them 1, 2,
-        3... in the order the kernel lists them, which is no id at all, so a
-        lane there reads its process's CPU - the reading every row had before
-        per-lane figures existed - and the evidence says why.
+        It is matched on the native thread id: Linux reads each thread's CPU
+        clock by it, and psutil numbers a thread by it on Windows. On macOS
+        psutil numbers them 1, 2, 3... in the order the kernel lists them,
+        which is no id at all, so no ``.lanecpu`` file is written there: a
+        lane's row reads no CPU rate of its own, its stall is judged on its
+        process's CPU and says so, and the evidence says why.
         """
         if not self.lanes:
             return False
@@ -818,19 +820,33 @@ class WorkerRecorder:
         return True
 
     def _record_lane_cpu(self) -> None:
-        """Each lane's thread CPU onto its own record, after every beat."""
-        with self._lanes_lock:
-            slots = list(self._lanes.values())
+        """Every lane's thread CPU, read at one instant, into one file for the
+        process - see :class:`..lanes.LaneCpu` - after every beat.
+
+        The slots are copied without the lock. A lane opening its slot holds
+        it across the slot's file I/O, and every one of those calls lets go of
+        the GIL and has to win it back from the running lanes: with twenty
+        lanes starting at once the heartbeat waited 6.7 s behind them. A slot
+        is only ever added, and copying a dict's values is one step for the
+        interpreter, so the copy is whole whether or not a lane is being
+        added; one added meanwhile is read at the next beat.
+        """
+        slots = list(self._lanes.values())
         if not slots:
             return
-        from ..probes.process import thread_cpu_seconds
-
-        used = thread_cpu_seconds()
         stamp = time.time()
-        for slot in slots:
-            seconds = used.get(slot.native_id) if slot.native_id is not None else None
-            if seconds is not None:
-                slot.state.record_cpu(stamp, seconds, LANE_CPU_READINGS)
+        used = thread_cpu_seconds(
+            slot.native_id for slot in slots if slot.native_id is not None
+        )
+        if self._lane_cpu is None:
+            self._lane_cpu = LaneCpu(
+                self.directory / f"{self.worker_id}{LANE_CPU_SUFFIX}", self.state.run_id
+            )
+        self._lane_cpu.record(stamp, {
+            slot.name: used[slot.native_id]
+            for slot in slots
+            if slot.native_id is not None and slot.native_id in used
+        })
 
     def _current_lane(self) -> Optional[_Slot]:
         """The lane whose thread this is, if it is one."""

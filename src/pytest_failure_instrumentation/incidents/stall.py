@@ -235,7 +235,7 @@ def build(
     # not be cleared, which on Windows is any file somebody still had open -
     # are old by definition, and old beats are exactly what FROZEN is read off.
     events = event_log.this_run(event_log.read_events(path), run_id)
-    beats = _measured(event_log.heartbeats(events), lane)
+    beats = _measured(event_log.heartbeats(events), lane, worker, directory, run_id, interval)
     verdict = assessment.assess(beats, time.time(), silent_for, interval)
 
     if verdict.needs_confirmation:
@@ -246,7 +246,7 @@ def build(
             lane = read_state(directory / f"{worker}.state", run_id) or lane
         beats = _measured(
             event_log.heartbeats(event_log.this_run(event_log.read_events(path), run_id)),
-            lane,
+            lane, worker, directory, run_id, interval,
         )
         verdict = assessment.confirm(beats, previous, time.time(), silent_for)
 
@@ -344,10 +344,19 @@ def _lane(
 
 
 def _measured(
-    beats: list[dict[str, Any]], lane: Optional[dict[str, Any]]
+    beats: list[dict[str, Any]],
+    lane: Optional[dict[str, Any]],
+    worker: str,
+    directory: Path,
+    run_id: Optional[str],
+    interval: float,
 ) -> list[dict[str, Any]]:
     """The beats as a lane's own CPU, for a lane; as they are otherwise."""
-    return assessment.lane_beats(beats, lane.get("cpu")) if lane is not None else beats
+    if lane is None:
+        return beats
+    process = str(lane[thread_lanes.PROCESS_KEY])
+    readings = thread_lanes.lane_cpu(directory, process, run_id).get(worker)
+    return assessment.lane_beats(beats, readings, interval) or beats
 
 
 def _wait(cancel: Optional[threading.Event], seconds: float) -> bool:

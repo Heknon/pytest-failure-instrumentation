@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -119,14 +118,6 @@ class WorkerState:
         #: its workers. Absent from the record until then, and forever in a
         #: run without lanes.
         self.lanes: bool | None = None
-        #: A lane's own CPU, as ``[time, seconds]`` pairs, newest last - see
-        #: :meth:`record_cpu`. Only ever set on a lane's record.
-        self.cpu: list[list[float]] | None = None
-        #: A lane's slot has two writers - its own thread at each phase, and
-        #: the heartbeat's with its CPU - and one pwrite of a record assembled
-        #: from both must not interleave with the other. A worker's slot has
-        #: one writer, and takes no lock.
-        self._lock = threading.Lock() if self.lane else None
         from ..probes.process import creation_time
 
         self.pid = pid
@@ -168,8 +159,20 @@ class WorkerState:
         # write costs one syscall and survives interpreter shutdown.
         # O_BINARY matters on Windows: without it os.write translates "\n"
         # into "\r\n" and the fixed-size slot silently overflows.
-        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0)
-        self._descriptor = os.open(str(path), flags, 0o644)
+        #
+        # Except a lane's, which is opened for each write and closed after
+        # it: a process of pytest-threadlanes runs hundreds of lanes, and a
+        # descriptor held for each of them for the whole session ended a run
+        # of 300 lanes under a limit of 300 open files - 256 is macOS's
+        # default. Its writes are once a phase, where an open is noise.
+        self._flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        self._descriptor: int | None = (
+            None if self.lane else os.open(str(path), self._flags, 0o644)
+        )
+        if self.lane:
+            # Created now, as a worker's slot is, so a reader listing the
+            # directory finds the lane from its first moment.
+            os.close(os.open(str(path), self._flags, 0o644))
         # pwrite is one syscall but Unix-only; seek+write is the portable
         # equivalent and still cheap enough for a per-phase write.
         self._pwrite = getattr(os, "pwrite", None)
@@ -183,29 +186,6 @@ class WorkerState:
         self._hashed: tuple[str | None, str | None] = (None, None)
 
     def update(self, **fields: Any) -> None:
-        if self._lock is None:
-            self._update(fields)
-            return
-        with self._lock:
-            self._update(fields)
-
-    def record_cpu(self, stamp: float, seconds: float, keep: int) -> None:
-        """Add one reading of a lane's thread CPU, keeping the newest ``keep``.
-
-        On the lane's own record rather than on the process's beat: a beat
-        carrying every lane's figure grew with the lane count - fourteen
-        kilobytes a beat at a thousand lanes, which pushed all but a handful
-        of beats out of the tail a reader takes, and with them the window a
-        rate is measured over. Here each lane's figures cost its own slot a
-        few dozen bytes, and a reader of one lane reads one slot.
-        """
-        with self._lock or _NO_LOCK:
-            readings = list(self.cpu or [])
-            readings.append([round(stamp, 3), round(seconds, 3)])
-            self.cpu = readings[-keep:]
-            self._update({})
-
-    def _update(self, fields: dict[str, Any]) -> None:
         for name, value in fields.items():
             setattr(self, name, value)
         if self.nodeid:
@@ -218,11 +198,18 @@ class WorkerState:
         self.sequence += 1
         payload_bytes = self._encode().ljust(SLOT_SIZE)
         try:
-            if self._pwrite is not None:
-                self._pwrite(self._descriptor, payload_bytes, 0)
-            else:
-                os.lseek(self._descriptor, 0, os.SEEK_SET)
-                os.write(self._descriptor, payload_bytes)
+            descriptor = self._descriptor
+            if descriptor is None:
+                descriptor = os.open(str(self.path), self._flags, 0o644)
+            try:
+                if self._pwrite is not None:
+                    self._pwrite(descriptor, payload_bytes, 0)
+                else:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    os.write(descriptor, payload_bytes)
+            finally:
+                if descriptor != self._descriptor:
+                    os.close(descriptor)
         except OSError:
             pass  # never let bookkeeping break a test run
 
@@ -298,27 +285,17 @@ class WorkerState:
                 # without them is the record this file always wrote.
                 **({"lanes": True} if self.lanes else {}),
                 **(self.lane or {}),
-                **({"cpu": self.cpu} if self.cpu else {}),
             }
         )
         return payload.encode("utf-8") + b"\n"
 
     def close(self) -> None:
+        if self._descriptor is None:
+            return
         try:
             os.close(self._descriptor)
         except OSError:
             pass
-
-
-class _NoLock:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, *failure: Any) -> None:
-        return None
-
-
-_NO_LOCK = _NoLock()
 
 
 def read_state(path: Path, run_id: str | None = None) -> dict[str, Any]:
