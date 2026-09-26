@@ -594,6 +594,142 @@ def test_a_stack_is_the_lanes_thread_out_of_a_dump_of_all_of_them(tmp_path):
     assert "test_busy" in crash_stack.from_threads(live)[1]
 
 
+def test_a_lanes_stack_is_its_thread_or_nothing_never_a_siblings(tmp_path):
+    """faulthandler stops at a hundred threads: a lane's thread missing from a
+    dump must not be stood in for by a sibling's, whose test was not stuck.
+    The one found is named, as faulthandler does not name it."""
+    lane, sibling = 0x7F00000000A1, 0x7F00000000B2
+    dump = tmp_path / "gw0.crash"
+    dump.write_text(
+        f"Thread 0x{sibling:016x} (most recent call first):\n"
+        '  File "t.py", line 9 in test_busy\n'
+        '  File "_pytest/runner.py", line 1 in pytest_runtest_call\n'
+    )
+    assert crash_stack.read(dump, thread=(lane, "lane-gw0.ln1")) == []
+    named = crash_stack.read(dump, thread=(sibling, "lane-gw0.ln0"))
+    assert named[0] == f"Thread 0x{sibling:016x} (lane-gw0.ln0, most recent call first):"
+
+
+def test_a_single_process_lanes_stack_is_read_from_its_own_frames(lanes):
+    """In a run with no -n the process assessing the stall is the one running
+    the lane: its thread's frames are read directly, whatever the thread
+    count and whatever py-spy can read."""
+    started, release = threading.Event(), threading.Event()
+
+    def stuck_in_provisioning():
+        started.set()
+        release.wait(10)
+
+    thread = threading.Thread(target=stuck_in_provisioning, name="lane-ln0")
+    thread.start()
+    started.wait(5)
+    try:
+        lanes.process("main")
+        lanes.lane("ln0", "main", "t.py::test_hung", "call",
+                   thread_ident=thread.ident, thread_name="lane-ln0")
+        lanes.beats("main", {"ln0": 0.0}, process_step=1.0)
+        incident = _stall(lanes, "ln0")
+    finally:
+        release.set()
+        thread.join()
+    assert incident.stack_source == "frames"
+    assert incident.stack[0].startswith(f"Thread 0x{thread.ident:016x} (lane-ln0,")
+    assert any("stuck_in_provisioning" in line for line in incident.stack)
+    # The lane's own CPU, said as such.
+    assert "the lane's thread used 0.00 cores" in incident.reason
+    # Its siblings are idle, and it says the run waits on this lane - not on
+    # xdist, which is not running this one.
+    assert not any("go on running" in line for line in incident.evidence)
+    assert "The run cannot finish while this lane's test is still running." in incident.evidence
+
+
+def test_a_workers_lanes_share_one_read_of_their_process_per_poll(lanes, monkeypatch):
+    """Forty stalled lanes of a worker were forty reads of it in one poll."""
+    lanes.process("gw0", pid=424242)
+    for name in ("gw0.ln0", "gw0.ln1"):
+        lanes.lane(name, "gw0", f"t.py::test_{name[-1]}", "call", pid=424242)
+    lanes.beats("gw0", {"gw0.ln0": 0.0, "gw0.ln1": 0.0}, process_step=0.0)
+    reads = []
+
+    def live_stack(pid):
+        reads.append(pid)
+        return [{"thread_id": _ident(name), "os_thread_id": _native(name),
+                 "thread_name": f"lane-{name}",
+                 "frames": [{"file": "t.py", "line": 3, "function": "wait_here"}]}
+                for name in ("gw0.ln0", "gw0.ln1")], None
+
+    monkeypatch.setattr(stall.probes, "live_stack", live_stack)
+    shared = {}
+    found = [
+        stall.build(name, lanes.run, 10.0, 1.0, True, run_id=RUN_ID, live_pid=424242,
+                    shared=shared)
+        for name in ("gw0.ln0", "gw0.ln1")
+    ]
+    assert reads == [424242]
+    for incident, name in zip(found, ("gw0.ln0", "gw0.ln1")):
+        assert incident.stack_source == "py-spy"
+        assert f"lane-{name}" in incident.stack[0]
+
+
+def test_a_frozen_process_of_lanes_is_one_incident_blaming_no_innocent_lane(lanes):
+    """Its heartbeat stopped: every lane went silent with it. That is one
+    finding, the process's, and no lane is blamed without evidence."""
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "t.py::test_a", "call")
+    lanes.lane("gw0.ln1", "gw0", "t.py::test_b", "call")
+    lanes.lane("gw0.ln2", "gw0")
+    lanes.beats("gw0", {"gw0.ln0": 0.0, "gw0.ln1": 0.0}, process_step=0.0)
+    events = lanes.run / "gw0.events"
+    lines = [json.loads(line) for line in events.read_text().splitlines()]
+    for line in lines:
+        if line.get("event") == "heartbeat":
+            line["time"] -= 30  # nothing has beaten for half a minute
+    events.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    incident = stall.build("gw0.ln1", lanes.run, 30.0, 1.0, False, run_id=RUN_ID)
+
+    assert incident.worker == "gw0"
+    assert incident.state == "FROZEN"
+    assert incident.test_in_flight is None
+    assert incident.suspect_nodeid() is None
+    assert [lane["lane"] for lane in incident.lanes_in_flight] == ["gw0.ln0", "gw0.ln1"]
+    assert "while running 2 tests on its lanes" in incident.summary()
+    assert not any("go on running" in line for line in incident.evidence)
+
+
+def test_a_frozen_process_blames_the_lane_py_spy_finds_holding_the_gil(lanes, monkeypatch):
+    """Native code holding the GIL: py-spy reads the stopped interpreter and
+    names the thread that owns it - that lane's test, and only that one."""
+    lanes.process("gw0", pid=424242)
+    for name in ("gw0.ln0", "gw0.ln1"):
+        lanes.lane(name, "gw0", f"t.py::test_{name[-1]}", "call", pid=424242)
+    lanes.beats("gw0", {"gw0.ln0": 0.0, "gw0.ln1": 0.0}, process_step=0.0)
+    events = lanes.run / "gw0.events"
+    lines = [json.loads(line) for line in events.read_text().splitlines()]
+    for line in lines:
+        if line.get("event") == "heartbeat":
+            line["time"] -= 30
+    events.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    def live_stack(pid):
+        return [{"thread_id": _ident(name), "os_thread_id": _native(name),
+                 "thread_name": f"lane-{name}", "owns_gil": name == "gw0.ln1",
+                 "frames": [{"file": "t.py", "line": 3, "function": f"in_{name[-3:]}"}]}
+                for name in ("gw0.ln0", "gw0.ln1")], None
+
+    monkeypatch.setattr(stall.probes, "live_stack", live_stack)
+    monkeypatch.setattr(stall, "_stopped", lambda pid: False)
+    incident = stall.build("gw0.ln0", lanes.run, 30.0, 1.0, True, run_id=RUN_ID,
+                           live_pid=424242, shared={})
+
+    assert incident.worker == "gw0"
+    assert incident.state == "FROZEN"
+    assert incident.test_in_flight == "t.py::test_1"
+    assert any("lane gw0.ln1's thread holding the GIL" in line for line in incident.evidence)
+    assert incident.stack_source == "py-spy"
+    assert "lane-gw0.ln1" in incident.stack[0]
+    assert all("in_ln0" not in line for line in incident.stack)
+
+
 def test_the_watchdog_keeps_a_clock_per_lane(tmp_path):
     watchdog = crash_stack.SlowTestWatchdog(tmp_path / "main.slow", 0.05)
     watchdog.start_lane("ln0")
@@ -693,6 +829,78 @@ def test_a_dump_that_is_not_fatal_blames_no_lane(lanes):
     assert _died(lanes).test_in_flight is None
 
 
+def test_a_fault_on_no_lanes_thread_blames_no_lane(lanes):
+    """A thread a passed test left behind faulted: the one lane running a test
+    is not what died, and the dump says so."""
+    lanes.process("gw0")
+    lanes.lane("gw0.ln1", "gw0", "t.py::test_b", "call")
+    lanes.beats("gw0", {}, process_step=0.0)
+    (lanes.run / "gw0.crash").write_text(
+        "Fatal Python error: Segmentation fault\n\n"
+        "Current thread 0x00007f00000000ff (most recent call first):\n"
+        '  File "/src/t.py", line 6 in <lambda>\n'
+    )
+    incident = _died(lanes)
+    assert incident.test_in_flight is None
+    assert incident.suspect_nodeid() is None
+    assert [lane["lane"] for lane in incident.lanes_in_flight] == ["gw0.ln1"]
+    assert "does not blame" in incident.summary()
+    assert any("none of these lanes'" in line for line in incident.evidence)
+
+
+def test_a_free_threaded_dump_blames_the_lane_whose_test_is_on_it(lanes):
+    """With the GIL disabled faulthandler prints one stack and no thread id."""
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "tests/test_a.py::test_one[x]", "call")
+    lanes.lane("gw0.ln1", "gw0", "tests/test_b.py::test_two[y]", "call")
+    lanes.beats("gw0", {}, process_step=0.0)
+    (lanes.run / "gw0.crash").write_text(FREE_THREADED_DUMP.format(function="test_two"))
+    incident = _died(lanes)
+    assert incident.test_in_flight == "tests/test_b.py::test_two[y]"
+    assert len(incident.lanes_in_flight) == 2
+    # Its Python stack, not the C stack trace Python 3.14 prints after it -
+    # whose header, "Current thread's C stack trace", reads as a thread's.
+    assert incident.crash_stack[1] == "Stack (most recent call first):"
+    assert any("in test_two" in line for line in incident.crash_stack)
+    assert not any("Binary file" in line for line in incident.crash_stack)
+
+
+def test_a_free_threaded_dump_of_a_function_several_lanes_run_blames_none(lanes):
+    """Two lanes in the same test function: the stack cannot tell them apart,
+    and the dump names no thread - and that is what it says, not that the
+    fault was on a thread that is none of theirs."""
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0", "tests/test_b.py::test_two[x]", "call")
+    lanes.lane("gw0.ln1", "gw0", "tests/test_b.py::test_two[y]", "call")
+    lanes.beats("gw0", {}, process_step=0.0)
+    (lanes.run / "gw0.crash").write_text(FREE_THREADED_DUMP.format(function="test_two"))
+    incident = _died(lanes)
+    assert incident.test_in_flight is None
+    assert any("running on 2 of these lanes (gw0.ln0, gw0.ln1)" in line
+               for line in incident.evidence)
+    assert not any("none of these lanes'" in line for line in incident.evidence)
+
+    (lanes.run / "gw0.crash").write_text(FREE_THREADED_DUMP.format(function="helper"))
+    incident = _died(lanes)
+    assert incident.test_in_flight is None
+    assert any("no lane's test is on the stack that faulted" in line
+               for line in incident.evidence)
+
+
+#: What a free-threaded 3.14 writes as it dies of a fault.
+FREE_THREADED_DUMP = (
+    "Fatal Python error: Segmentation fault\n\n"
+    "<Cannot show all threads while the GIL is disabled>\n"
+    "Stack (most recent call first):\n"
+    '  File "/usr/lib/python3.14t/ctypes/__init__.py", line 590 in string_at\n'
+    '  File "/src/tests/test_b.py", line 9 in {function}\n'
+    "\n"
+    "Current thread's C stack trace (most recent call first):\n"
+    '  Binary file "/usr/bin/python3.14t", at _Py_DumpStack+0x30 [0x4b53b0]\n'
+    '  Binary file "/lib/x86_64-linux-gnu/libc.so.6", at +0x45330 [0x7f6108645330]\n'
+)
+
+
 def test_a_death_between_tests_counts_every_lanes_tests(lanes):
     lanes.process("gw0")
     lanes.lane("gw0.ln0", "gw0")
@@ -710,6 +918,38 @@ def test_lanes_are_not_processes_to_anything_that_counts_processes(lanes):
     _hybrid(lanes)
     assert killer.roles_in(lanes.run)[LIVE] == "gw0"
     assert [record["worker"] for record in leftovers.worker_records(lanes.run)] == ["gw0"]
+
+
+def test_a_lanes_slot_holds_no_descriptor_between_writes(tmp_path):
+    """Hundreds of lanes, each holding its slot open for the session, ended a
+    run at its open-file limit."""
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("counts descriptors through /proc")
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    slots = [WorkerState(tmp_path / f"ln{index}.state", LIVE, RUN_ID,
+                         lane={"process": "main", "lane": True}) for index in range(50)]
+    for slot in slots:
+        slot.update(nodeid="t.py::test_a", phase="call")
+    assert len(list(Path("/proc/self/fd").iterdir())) - before < 5
+    assert read_state(tmp_path / "ln7.state")["nodeid"] == "t.py::test_a"
+
+
+def test_the_watchdog_dumps_a_process_of_lanes_at_most_once_a_timeout(tmp_path, monkeypatch):
+    """Two hundred long tests begun a moment apart came due a moment apart:
+    eleven whole-process dumps in fifty seconds."""
+    clock = [1000.0]
+    monkeypatch.setattr(crash_stack.time, "monotonic", lambda: clock[0])
+    watchdog = crash_stack.SlowTestWatchdog(tmp_path / "main.slow", 10.0)
+    dumps = []
+    monkeypatch.setattr(watchdog, "_dump", lambda: dumps.append(clock[0]))
+    for index in range(200):
+        clock[0] = 1000.0 + index * 0.25
+        watchdog.start_lane(f"ln{index}")
+    for _ in range(200):
+        clock[0] += 0.25
+        watchdog.tick()
+    assert len(dumps) == 5  # 50 s of ticks, one dump every 10 s at most
+    assert all(later - earlier >= 10.0 for earlier, later in zip(dumps, dumps[1:]))
 
 
 # --- the tee, the resources, an internal error ------------------------------

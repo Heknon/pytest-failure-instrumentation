@@ -681,9 +681,16 @@ class IncidentEngine:
                     for worker, seen in self.activity.items()
                     if now - seen > limit and worker not in self.stalled
                 ]
+            # What this poll has read of each process, shared by its lanes:
+            # forty stalled lanes of one process are one read of it, not
+            # forty - see stall._build_lane.
+            shared: dict[Any, Any] = {}
             for worker, silent_for in candidates:
+                with self.lock:
+                    if worker in self.stalled:
+                        continue  # its process was reported this poll
                 try:
-                    self._assess_stall(worker, silent_for)
+                    self._assess_stall(worker, silent_for, shared)
                 except Exception as failure:  # noqa: BLE001
                     from . import stall
 
@@ -746,7 +753,9 @@ class IncidentEngine:
         # pytest-threadlanes fires them for each lane it starts.
         return self.lanes and self.records_here and worker != SOLE_WORKER
 
-    def _assess_stall(self, worker: str, silent_for: float) -> None:
+    def _assess_stall(
+        self, worker: str, silent_for: float, shared: dict[Any, Any] | None = None
+    ) -> None:
         from . import stall
 
         incident = stall.build(
@@ -759,6 +768,7 @@ class IncidentEngine:
             live_pid=self._live_pid(worker),
             cancel=self.stop,
             known_lane=self._is_lane(worker),
+            shared=shared,
         )
         if incident is None:
             # Slow, not stuck - or the run ended under us. Re-arm rather than
@@ -767,6 +777,15 @@ class IncidentEngine:
             return
         with self.lock:
             self.stalled.add(worker)
+            if incident.worker != worker:
+                # A lane's silence that was its whole process stopping, which
+                # is reported once, for the process: every lane of it is
+                # accounted for by that one incident.
+                self.stalled.add(incident.worker)
+                self.stalled.update(
+                    lane for lane, owner in self.lane_process.items()
+                    if owner == incident.worker
+                )
         self.raise_incident(incident)
 
     def _live_pid(self, worker: str) -> int | None:
