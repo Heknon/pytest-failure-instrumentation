@@ -333,6 +333,13 @@ class WorkerDeathIncident(Incident):
         if len(self.lanes_in_flight) > 1:
             names = ", ".join(str(lane.get("lane")) for lane in self.lanes_in_flight)
             return f"while running {len(self.lanes_in_flight)} tests at once, on lanes {names}"
+        if self.lanes_in_flight:
+            # One lane was running a test, and the dump says it was not what
+            # died: the fault was on a thread of no lane's.
+            return (
+                f"while lane {self.lanes_in_flight[0].get('lane')} was running a test "
+                "that the fatal dump does not blame"
+            )
         if self.tests_finished:
             # Not "in" - the last test had already finished, and saying
             # otherwise puts a passing test's name on a death it had no part in.
@@ -364,11 +371,11 @@ def build(
     # Read before the dump, because it decides whether a dump is still coming.
     status, status_kind, source = probes.exit_status(pid, popen)
     dump = _crash_dump(crash_file, status)
+    if thread_lanes.is_container(state):
+        dump = crash_stack.free_threaded(crash_file, limit=40) or dump
     # After the dump: a fatal one names the thread it was written on, which
     # for a process of lanes is which lane's test took it down.
-    state, lanes = _through_lanes(
-        directory, worker, state, run_id, crash_stack.current_thread(crash_file)
-    )
+    state, lanes = _through_lanes(directory, worker, state, run_id, crash_file)
     oom_kills = probes.cgroup_oom_kills()
     beats = event_log.heartbeats(events)
     cgroup = probes.cgroup_memory()
@@ -418,7 +425,7 @@ def _through_lanes(
     worker: str,
     state: dict[str, Any],
     run_id: Optional[str],
-    dumped_on: Optional[int] = None,
+    crash_file: Optional[Path] = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """The dead process's record as a worker's, and its lanes that were busy.
 
@@ -432,11 +439,16 @@ def _through_lanes(
     question lanes make hard, and it is answered only where the evidence
     answers it:
 
-    * one lane in flight - that lane's test, phase, clocks and timeouts are
-      the worker's, as a process's always were;
-    * several, and a fatal dump written on one of their threads -
-      ``dumped_on``, the thread faulthandler calls current - that lane's; the
-      others went down with the process and are listed beside it;
+    * a fatal dump that names the thread it was written on - faulthandler's
+      "Current thread", which a native fault is delivered to - blames the
+      lane whose thread that is, and no lane when it is none of theirs (a
+      thread a test left running, say); the others went down with the
+      process and are listed beside it;
+    * otherwise one lane in flight - that lane's test, phase, clocks and
+      timeouts are the worker's, as a process's always were;
+    * several, and a free-threaded interpreter's fatal dump, which names no
+      thread and prints only the one that faulted - the lane whose test's
+      function is on that stack, where exactly one is;
     * several otherwise - no test is named, since nothing says which of them
       took the process down, and every one is listed;
     * none - it died between tests, and the last test is whichever lane
@@ -447,6 +459,7 @@ def _through_lanes(
     """
     if not thread_lanes.is_container(state):
         return state, []
+    dumped_on = crash_stack.current_thread(crash_file) if crash_file is not None else None
     lanes = thread_lanes.lane_records(directory, worker, run_id)
     flying = thread_lanes.in_flight(lanes)
     counts = {
@@ -454,13 +467,23 @@ def _through_lanes(
         "tests_finished": sum(int(record.get("tests_finished") or 0) for _, record in lanes),
     }
     busy = {entry["lane"] for entry in flying}
-    culprits = [
-        record for lane, record in lanes
-        if lane in busy and (
-            len(flying) == 1
-            or (dumped_on is not None and record.get("thread_ident") == dumped_on)
-        )
-    ]
+    if dumped_on is not None:
+        # The dump names the thread that faulted: that lane, or - where it is
+        # none of theirs, a thread some test left behind, say - no lane at all.
+        culprits = [
+            record for lane, record in lanes
+            if lane in busy and record.get("thread_ident") == dumped_on
+        ]
+    elif len(flying) == 1:
+        culprits = [record for lane, record in lanes if lane in busy]
+    else:
+        # A free-threaded interpreter's dump has no thread ids, only the
+        # stack of the thread that faulted: the lane whose test is on it.
+        frames = crash_stack.current_stack(crash_file) if crash_file is not None else []
+        culprits = [
+            record for lane, record in lanes
+            if lane in busy and frames and _on_stack(record.get("nodeid"), frames)
+        ]
     if len(culprits) == 1:
         record = culprits[0]
         return {**record, **counts, "pid": state.get("pid") or record.get("pid")}, flying
@@ -490,6 +513,21 @@ def _through_lanes(
     return merged, flying
 
 
+def _on_stack(nodeid: Any, frames: list[str]) -> bool:
+    """Whether a test's own function is among a dump's frames, by the file
+    and the function its node id names."""
+    if not isinstance(nodeid, str) or "::" not in nodeid:
+        return False
+    path, _, rest = nodeid.partition("::")
+    function = rest.split("::")[-1].split("[", 1)[0]
+    filename = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return any(
+        (f'/{filename}"' in frame.replace("\\", "/") or f'"{filename}"' in frame)
+        and frame.rstrip().endswith(f" in {function}")
+        for frame in frames
+    )
+
+
 def _say_which_lanes(incident: WorkerDeathIncident) -> None:
     """Name every lane that was running a test, when more than one was.
 
@@ -498,16 +536,19 @@ def _say_which_lanes(incident: WorkerDeathIncident) -> None:
     change - a process that died of a signal died of it whichever lanes were
     busy.
     """
-    if len(incident.lanes_in_flight) < 2:
+    if not incident.lanes_in_flight or (
+        len(incident.lanes_in_flight) == 1 and incident.test_in_flight
+    ):
         return
     running = "; ".join(
         f"{lane.get('lane')}: {lane.get('nodeid')}"
         + (f" ({lane.get('phase')})" if lane.get("phase") else "")
         for lane in incident.lanes_in_flight
     )
+    count = len(incident.lanes_in_flight)
     line = (
-        f"{len(incident.lanes_in_flight)} lanes of this process had a test in "
-        f"flight, and the death took all of them: {running}. "
+        f"{count} lane{'s' if count != 1 else ''} of this process had a test in "
+        f"flight, and the death took {'all of them' if count != 1 else 'it'}: {running}. "
     )
     culprit = _culprit(incident)
     if culprit is not None:
@@ -515,6 +556,34 @@ def _say_which_lanes(incident: WorkerDeathIncident) -> None:
             f"The fatal dump was written on lane {culprit.get('lane')}'s thread, "
             "so its test is the one blamed; the others went down with the process."
         )
+    elif crash_stack.is_fatal(incident.crash_stack) and any(
+        crash_stack.CURRENT_THREAD.match(line) for line in incident.crash_stack
+    ):
+        line += (
+            "The fatal dump was written on a thread that is none of these lanes' - "
+            "one a test left running, say - so no lane's test is blamed."
+        )
+    elif crash_stack.is_fatal(incident.crash_stack) and crash_stack.one_stack(
+        incident.crash_stack
+    ):
+        # A free-threaded interpreter's dump: no thread named, only the stack
+        # of the one that faulted, and several lanes' tests may share it.
+        frames = crash_stack.one_stack(incident.crash_stack)
+        on = [lane.get("lane") for lane in incident.lanes_in_flight
+              if _on_stack(lane.get("nodeid"), frames)]
+        if on:
+            line += (
+                "The fatal dump names no thread - a free-threaded interpreter cannot "
+                "show them - and the test function on the stack that faulted was "
+                f"running on {len(on)} of these lanes ({', '.join(map(str, on))}), "
+                "so no lane's test is blamed."
+            )
+        else:
+            line += (
+                "The fatal dump names no thread - a free-threaded interpreter cannot "
+                "show them - and no lane's test is on the stack that faulted: one a "
+                "test left running, say. No lane's test is blamed."
+            )
     else:
         line += "Nothing on disk says which of them caused it, so none is blamed."
     evidence = incident.evidence
@@ -670,10 +739,9 @@ def recover(
     state = read_state(directory / f"{worker}.state", run_id)
     beats = event_log.heartbeats(events)
     dump = crash_stack.read(directory / f"{worker}.crash", limit=40)
-    state, lanes = _through_lanes(
-        directory, worker, state, run_id,
-        crash_stack.current_thread(directory / f"{worker}.crash"),
-    )
+    if thread_lanes.is_container(state):
+        dump = crash_stack.free_threaded(directory / f"{worker}.crash", limit=40) or dump
+    state, lanes = _through_lanes(directory, worker, state, run_id, directory / f"{worker}.crash")
 
     incident = WorkerDeathIncident(
         worker=worker,

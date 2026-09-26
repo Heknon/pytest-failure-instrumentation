@@ -234,6 +234,12 @@ class Worker(_Wire):
     thread_name: Optional[str] = None
     thread_id: Optional[int] = None
 
+    @model_serializer(mode="wrap")
+    def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        # Left out while unset, as the server leaves them out: a consumer
+        # re-serving a row without lanes serves what it did before lanes.
+        return without_unset(handler(self), self, ("process", "thread_name", "thread_id"))
+
 
 class Run(_Wire):
     session: str = ""

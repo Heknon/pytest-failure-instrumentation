@@ -10695,47 +10695,139 @@
  "pydantic": "2.13.5",
  "client_dumps": {
   "resources": {
-   "sequence": 1,
-   "observed_at": 1.0,
+   "cgroup": {
+    "metrics": {},
+    "unavailable": {}
+   },
+   "collector": {},
+   "consumers": [],
+   "disk_unavailable": {},
+   "disks": [],
    "elapsed_s": 0.5,
+   "events": [],
+   "files": {},
    "host": {
     "metrics": {
      "cpu_cores": 1.0
     },
     "unavailable": {}
    },
-   "cgroup": {
-    "metrics": {},
-    "unavailable": {}
-   },
+   "inventory_age_s": 0.0,
+   "inventory_unavailable": {},
+   "observed_at": 1.0,
    "processes": [
     {
+     "created_at": 1.0,
+     "first_observed_at": null,
      "metrics": {
       "rss_mb": 10.0
      },
-     "unavailable": {},
-     "first_observed_at": null,
-     "pid": 12,
-     "created_at": 1.0,
      "name": "python",
-     "parent_pid": 1,
-     "worker": "gw0",
-     "role": "worker",
-     "worker_exited": false,
      "nodeid": "t.py::test_a",
      "nodeid_hash": "h",
+     "observed_at": 1.0,
+     "parent_pid": 1,
      "phase": "call",
-     "observed_at": 1.0
+     "pid": 12,
+     "role": "worker",
+     "unavailable": {},
+     "worker": "gw0",
+     "worker_exited": false
     }
    ],
-   "disks": [],
-   "consumers": [],
-   "files": {},
-   "events": [],
-   "collector": {},
-   "disk_unavailable": {},
-   "inventory_unavailable": {},
-   "inventory_age_s": 0.0
+   "sequence": 1
+  },
+  "workers": {
+   "filter": null,
+   "observed_at": 1.0,
+   "runs": [
+    {
+     "controller": {
+      "alive": true,
+      "pid": 1
+     },
+     "directory": null,
+     "run_id": "r",
+     "schedule": null,
+     "session": "run-1",
+     "started_at": null,
+     "workers": [
+      {
+       "attempt": null,
+       "cpu_rate": 0.0,
+       "heartbeat_age_s": null,
+       "nodeid": "t.py::test_a",
+       "nodeid_elided": false,
+       "nodeid_hash": "h",
+       "phase": "call",
+       "pid": 12,
+       "process_exists": null,
+       "rerunning": null,
+       "rss_mb": null,
+       "state_age_s": null,
+       "status": "blocked",
+       "tests_assigned": null,
+       "tests_finished": 0,
+       "tests_queued": null,
+       "tests_running": null,
+       "tests_started": 1,
+       "why": "w",
+       "worker": "gw0"
+      }
+     ]
+    }
+   ],
+   "served_by": {
+    "pid": 1,
+    "service": "s",
+    "version": ""
+   }
+  },
+  "workers_python": {
+   "filter": null,
+   "observed_at": 1.0,
+   "runs": [
+    {
+     "controller": {
+      "alive": true,
+      "pid": 1
+     },
+     "directory": null,
+     "run_id": "r",
+     "schedule": null,
+     "session": "run-1",
+     "started_at": null,
+     "workers": [
+      {
+       "attempt": null,
+       "cpu_rate": 0.0,
+       "heartbeat_age_s": null,
+       "nodeid": "t.py::test_a",
+       "nodeid_elided": false,
+       "nodeid_hash": "h",
+       "phase": "call",
+       "pid": 12,
+       "process_exists": null,
+       "rerunning": null,
+       "rss_mb": null,
+       "state_age_s": null,
+       "status": "blocked",
+       "tests_assigned": null,
+       "tests_finished": 0,
+       "tests_queued": null,
+       "tests_running": null,
+       "tests_started": 1,
+       "why": "w",
+       "worker": "gw0"
+      }
+     ]
+    }
+   ],
+   "served_by": {
+    "pid": 1,
+    "service": "s",
+    "version": ""
+   }
   }
  }
 }

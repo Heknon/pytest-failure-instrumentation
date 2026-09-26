@@ -40,6 +40,6 @@ from .config import Settings
 from .nodeid import hash_of
 from .registration import install, installed_settings
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 
 __all__ = ["Settings", "__version__", "hash_of", "install", "installed_settings"]

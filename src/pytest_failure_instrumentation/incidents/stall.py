@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, SerializerFunctionWrapHandler, model_serializer
 
 from .. import lanes as thread_lanes
 from .. import probes
@@ -28,7 +28,9 @@ from ..analysis import stall as assessment
 from ..capture import crash_stack
 from ..capture import events as event_log
 from ..capture.state import read_state
+from ..config import SOLE_WORKER
 from ..lanes import ThreadKey
+from ..probes import process as process_probe
 from .base import Incident
 
 #: How long to wait for a signalled worker to write its stack.
@@ -50,6 +52,7 @@ SOURCE_WORDING = {
     "crash": "the worker, into its crash file",
     "py-spy": "py-spy, reading the process from outside it",
     "probe": "the worker, in answer to the stall probe",
+    "frames": "this process, reading the lane's own thread",
 }
 
 
@@ -108,6 +111,15 @@ class WorkerStallIncident(Incident):
     #: having stopped responding, which is a finding in itself - and the
     #: frames look identical.
     stack_source: Optional[str] = None
+    #: For a process of pytest-threadlanes' lanes that stopped running as a
+    #: whole: every lane that had a test in flight, ``{lane, nodeid,
+    #: nodeid_hash, phase}`` each - they all stopped with it. Absent from the
+    #: payload, rather than empty, for every other stall.
+    lanes_in_flight: list[dict[str, Any]] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        return thread_lanes.without_unset(handler(self), self, ("lanes_in_flight",))
 
     def raw_stack(self) -> list[str]:
         return self.stack
@@ -136,6 +148,9 @@ class WorkerStallIncident(Incident):
         if self.test_in_flight:
             phase = f" ({self.phase})" if self.phase else ""
             line += f" while running {self.test_in_flight}{phase}"
+        elif self.lanes_in_flight:
+            count = len(self.lanes_in_flight)
+            line += f" while running {count} test{'s' if count != 1 else ''} on its lanes"
         elif self.last_test:
             line += f" with no test running (the last was {self.last_test})"
         else:
@@ -180,6 +195,7 @@ def build(
     live_pid: Optional[int] = None,
     cancel: Optional[threading.Event] = None,
     known_lane: bool = False,
+    shared: Optional[dict[Any, Any]] = None,
 ) -> Optional[WorkerStallIncident]:
     """Assess a silent worker. Returns None when it is merely slow.
 
@@ -214,39 +230,37 @@ def build(
 
     ``known_lane`` is the engine saying this name is a lane. A lane that has
     never started a test has no record yet - more lanes than there is work
-    for, say - and is idle like any other.
+    for, say - and is idle like any other. ``shared`` is what one poll of the
+    engine has already read of each process - see :func:`_build_lane`.
     """
     record = read_state(directory / f"{worker}.state", run_id)
-    files, thread, lane = worker, None, _lane(directory, worker, record)
-    lanes: Optional[list[tuple[str, dict[str, Any]]]] = None
+    lane = _lane(directory, worker, record)
     if lane is None and known_lane:
         return None  # a lane with no record has never had a test: idle
     if lane is not None:
-        if not lane.get("nodeid"):
-            return None  # idle; the engine re-arms it, and nothing is said
-        files = lane[thread_lanes.PROCESS_KEY]
-        thread = (lane.get("thread_ident"), lane.get("thread_name"))
-    elif thread_lanes.is_container(record):
+        return _build_lane(
+            worker, lane, directory, silent_for, interval, stack_probe,
+            run_id=run_id, live_pid=live_pid, cancel=cancel, shared=shared,
+        )
+    lanes: Optional[list[tuple[str, dict[str, Any]]]] = None
+    if thread_lanes.is_container(record):
         lanes = thread_lanes.lane_records(directory, worker, run_id)
         if thread_lanes.in_flight(lanes):
             return None  # its lanes are watched, and judged, one by one
-    path = directory / f"{files}.events"
+    path = directory / f"{worker}.events"
     # Only this run's. An earlier run's beats - left where the directory could
     # not be cleared, which on Windows is any file somebody still had open -
     # are old by definition, and old beats are exactly what FROZEN is read off.
     events = event_log.this_run(event_log.read_events(path), run_id)
-    beats = _measured(event_log.heartbeats(events), lane)
+    beats = event_log.heartbeats(events)
     verdict = assessment.assess(beats, time.time(), silent_for, interval)
 
     if verdict.needs_confirmation:
         previous = assessment.last_beat_time(beats)
         if _wait(cancel, interval * 1.2):
             return None  # the run is ending; nobody is left to tell
-        if lane is not None:
-            lane = read_state(directory / f"{worker}.state", run_id) or lane
-        beats = _measured(
-            event_log.heartbeats(event_log.this_run(event_log.read_events(path), run_id)),
-            lane,
+        beats = event_log.heartbeats(
+            event_log.this_run(event_log.read_events(path), run_id)
         )
         verdict = assessment.confirm(beats, previous, time.time(), silent_for)
 
@@ -256,10 +270,8 @@ def build(
     state = read_state(directory / f"{worker}.state", run_id)
     pid = state.get("pid") or event_log.worker_pid(events)
     in_flight = state.get("nodeid")
-    if lane is not None and not in_flight:
-        return None  # the lane's test ended while it was being assessed
     stack, probed, why, written, source = _stack(
-        directory, files, pid, stack_probe, live_pid, cancel, thread
+        directory, worker, pid, stack_probe, live_pid, cancel
     )
 
     evidence = [verdict.reason]
@@ -279,20 +291,9 @@ def build(
                 f"None of this process's {len(lanes)} lanes had a test in flight."
             )
         confidence = "low"
-    if lane is not None:
-        evidence.append(
-            f"Lane {worker} is the thread {lane.get('thread_name') or 'named for it'} "
-            f"in worker process {files}, whose other lanes go on running. The CPU "
-            "figure is that thread's own where it was measured, and the stack is "
-            "that thread's."
-        )
-        evidence.append(
-            "The run cannot finish while xdist waits for the test this lane was handed."
-        )
-    else:
-        evidence.append(
-            "The run cannot finish while xdist waits for work this worker was handed."
-        )
+    evidence.append(
+        "The run cannot finish while xdist waits for work this worker was handed."
+    )
     age = round(max(0.0, time.time() - written), 1) if written is not None else None
     if in_flight:
         evidence.append(f"Look at: {in_flight}.")
@@ -343,11 +344,483 @@ def _lane(
     return record
 
 
-def _measured(
-    beats: list[dict[str, Any]], lane: Optional[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """The beats as a lane's own CPU, for a lane; as they are otherwise."""
-    return assessment.lane_beats(beats, lane.get("cpu")) if lane is not None else beats
+def _build_lane(
+    worker: str,
+    lane: dict[str, Any],
+    directory: Path,
+    silent_for: float,
+    interval: float,
+    stack_probe: bool,
+    *,
+    run_id: Optional[str],
+    live_pid: Optional[int],
+    cancel: Optional[threading.Event],
+    shared: Optional[dict[Any, Any]],
+) -> Optional[WorkerStallIncident]:
+    """:func:`build` for a lane of pytest-threadlanes.
+
+    Whether its process is running at all is read from the process's beats,
+    and whether the lane's own thread is doing anything from the CPU the
+    heartbeat reads for it - see :class:`..lanes.LaneCpu`. A lane with no
+    test in flight is idle and says nothing.
+
+    A process that has stopped running altogether - its heartbeat frozen by
+    native code holding the GIL, or the process stopped - is not a lane's
+    finding: every lane of it went silent at once, and each blaming its own
+    test would be as many incidents about as many innocent tests, with the
+    real one liable to be dropped as their duplicate. It is one incident, for
+    the process, listing its lanes in flight - see :func:`_frozen_process`.
+    """
+    if not lane.get("nodeid"):
+        return None  # idle; the engine re-arms it, and nothing is said
+    process = str(lane[thread_lanes.PROCESS_KEY])
+    path = directory / f"{process}.events"
+    events = event_log.this_run(event_log.read_events(path), run_id)
+    beats = event_log.heartbeats(events)
+    # Whether the process is running at all comes first, and from its beats
+    # alone: a process frozen as a whole is its own finding, whatever its
+    # lanes had or had not been measured doing before it froze.
+    first = assessment.assess(beats, time.time(), silent_for, interval)
+    if first.needs_confirmation:
+        previous = assessment.last_beat_time(beats)
+        pid = lane.get("pid") or event_log.worker_pid(events)
+        before = process_probe.process_thread_cpu(pid) if isinstance(pid, int) else {}
+        if _wait(cancel, interval * 1.2):
+            return None  # the run is ending; nobody is left to tell
+        beats = event_log.heartbeats(event_log.this_run(event_log.read_events(path), run_id))
+        second = assessment.confirm(beats, previous, time.time(), silent_for)
+        if second.state == "FROZEN" and _lanes_taking_turns(
+            before, pid, _lane_records(directory, process, run_id, shared)
+        ):
+            # Not frozen: starved. Fifty lanes running Python keep the
+            # heartbeat from the GIL for seconds at a time, and its beat is
+            # then as late as a frozen process's - but the GIL is changing
+            # hands, and the lanes' threads are burning CPU in turn. A process
+            # that is frozen - native code holding the GIL, or stopped - runs
+            # one thread or none. Each lane is judged on its own at the next
+            # poll, once the beat has caught up.
+            return None
+        if second.state == "FROZEN":
+            return _frozen_process(
+                process, directory, silent_for, second, events,
+                run_id=run_id, live_pid=live_pid, shared=shared, stack_probe=stack_probe,
+            )
+    records = _lane_records(directory, process, run_id, shared)
+    busy = [name for name, record in records if record.get("nodeid")]
+    measured = _read_lane_cpu(directory, process, run_id, shared)
+    current = assessment.lane_cpu_current(measured.newest, beats, interval)
+    readings = measured.get(worker) or []
+    mine = assessment.lane_beats(beats, readings, interval) if current else []
+    if current and not mine and len(readings) < 2 and _just_started(lane, interval):
+        # Its process measures its lanes, and this one not twice yet: it began
+        # its test a beat or two ago. The next poll has its rate; a verdict
+        # without one now would call a lane burning a core stuck. Only while
+        # the file is being written, and only just after the test began: a
+        # file whose writes stopped would otherwise defer this lane forever.
+        return None
+    whose = bool(mine)
+    verdict = (
+        assessment.assess_lane(
+            beats, mine, time.time(), silent_for, interval, max(1, len(busy))
+        )
+        if whose
+        else assessment.assess(beats, time.time(), silent_for, interval)
+    )
+    if verdict.state is None:
+        return None  # burning CPU: slow, not stuck - or a beat late again
+
+    state = read_state(directory / f"{worker}.state", run_id)
+    in_flight = state.get("nodeid")
+    if not in_flight:
+        return None  # the lane's test ended while it was being assessed
+    pid = state.get("pid") or event_log.worker_pid(events)
+    thread = (state.get("thread_ident"), state.get("thread_name"))
+    stack, probed, why, written, source = _lane_stack(
+        directory, process, pid, state, stack_probe, live_pid, cancel, shared
+    )
+    if read_state(directory / f"{worker}.state", run_id).get("nodeid") != in_flight:
+        return None  # it moved on while its stack was read: that stack is not this test's
+    siblings = [name for name in busy if name != worker]
+    evidence = [verdict.reason]
+    confidence = verdict.confidence or CONFIDENCE.get(verdict.state, "low")
+    named = thread[1] or "named for it"
+    others = (
+        f", whose other {len(siblings)} lane{'s' if len(siblings) != 1 else ''} with a "
+        "test in flight go on running"
+        if siblings
+        else ""
+    )
+    if whose:
+        figure = "The CPU figure is that thread's own"
+    elif measured:
+        figure = (
+            "Its process stopped writing its lanes' own CPU readings "
+            f"{max(0.0, assessment.last_beat_time(beats) - (measured.newest or 0)):.0f} s "
+            "before its last beat, so the figure is the whole process's, every lane's "
+            "together"
+        )
+    else:
+        figure = (
+            "No CPU is read per thread for this process, so the figure is the whole "
+            "process's, every lane's together"
+        )
+    evidence.append(
+        f"Lane {worker} is the thread {named} in worker process {process}{others}. "
+        f"{figure}, and the stack is that thread's."
+    )
+    if process == SOLE_WORKER:
+        evidence.append("The run cannot finish while this lane's test is still running.")
+    else:
+        evidence.append(
+            "The run cannot finish while xdist waits for the test this lane was handed."
+        )
+    evidence.append(f"Look at: {in_flight}.")
+    facts = [f"silent for {silent_for:.0f} s"]
+    if verdict.heartbeat_age is not None:
+        facts.append(f"last heartbeat {verdict.heartbeat_age:.0f} s ago")
+    if verdict.cpu_rate is not None:
+        on = "on the lane's thread" if whose else "in the whole process"
+        facts.append(f"{verdict.cpu_rate:.2f} cores of CPU {on} over the window")
+    evidence.append("Measured: " + ", ".join(facts) + ".")
+    age = round(max(0.0, time.time() - written), 1) if written is not None else None
+    return WorkerStallIncident(
+        worker=worker,
+        verdict=f"STALLED_{verdict.state}",
+        confidence=confidence,
+        state=verdict.state,
+        reason=verdict.reason,
+        silent_for_seconds=round(silent_for, 1),
+        cpu_rate=round(verdict.cpu_rate, 3) if verdict.cpu_rate is not None else None,
+        heartbeat_age_seconds=(
+            round(verdict.heartbeat_age, 1) if verdict.heartbeat_age is not None else None
+        ),
+        worker_pid=pid,
+        test_in_flight=in_flight,
+        last_test=state.get("last_nodeid"),
+        test_in_flight_hash=state.get("nodeid_hash"),
+        last_test_hash=state.get("last_nodeid_hash"),
+        phase=state.get("phase"),
+        stack=stack,
+        stack_probed=probed,
+        stack_unavailable_reason=why,
+        stack_age_seconds=age,
+        stack_source=source,
+        evidence=evidence,
+    )
+
+
+def _frozen_process(
+    process: str,
+    directory: Path,
+    silent_for: float,
+    verdict: assessment.Assessment,
+    events: list[dict[str, Any]],
+    *,
+    run_id: Optional[str],
+    live_pid: Optional[int],
+    shared: Optional[dict[Any, Any]],
+    stack_probe: bool = True,
+) -> WorkerStallIncident:
+    """One incident for a process of lanes that has stopped running.
+
+    Its lanes in flight are all listed, and one is blamed only on evidence
+    that it is the one holding the others up: py-spy, reading the stopped
+    interpreter, finds that lane's thread holding the GIL. A process stopped
+    by a signal holds nobody up - whichever thread had the GIL when it
+    stopped is an accident - and no lane is blamed there.
+    """
+    record = read_state(directory / f"{process}.state", run_id)
+    lanes = _lane_records(directory, process, run_id, shared)
+    flying = thread_lanes.in_flight(lanes)
+    pid = record.get("pid") or event_log.worker_pid(events)
+    evidence = [verdict.reason]
+    culprit: Optional[dict[str, Any]] = None
+    stack: list[str] = []
+    why: Optional[str] = None
+    reading: Optional[list[dict[str, Any]]] = None
+    if isinstance(pid, int) and _stopped(pid):
+        why = f"process {pid} is stopped by a signal, so no lane is holding it up"
+        evidence.append(
+            f"Process {pid} is stopped - SIGSTOP, or a debugger - not running native "
+            "code: none of its lanes is to blame for it."
+        )
+    elif isinstance(pid, int) and _cannot_probe(pid, stack_probe, live_pid) is None:
+        reading, error = _read_process(pid, shared)
+        holders = [thread for thread in reading or [] if thread.get("owns_gil")]
+        for name, lane_record in lanes:
+            if name not in {entry["lane"] for entry in flying}:
+                continue
+            if any(_is_lanes_thread(thread, lane_record) for thread in holders):
+                culprit = {**lane_record, "lane": name}
+        if culprit is None:
+            why = error or "no lane's thread was found holding the GIL"
+    else:
+        why = (
+            _cannot_probe(pid if isinstance(pid, int) else None, stack_probe, live_pid)
+            or "the worker's process could not be read from outside it"
+        )
+    if culprit is not None and reading is not None:
+        held = [entry for entry in reading if _is_lanes_thread(entry, culprit)]
+        stack = crash_stack.from_threads(held, limit=STACK_LINES)
+        evidence.append(
+            f"py-spy found lane {culprit['lane']}'s thread holding the GIL: its test is "
+            "the one blamed, and the others are held up behind it."
+        )
+    if flying:
+        running = "; ".join(f"{entry['lane']}: {entry['nodeid']}" for entry in flying)
+        evidence.append(
+            f"Every lane of this process stopped with it. Lanes with a test in flight: "
+            f"{running}."
+        )
+    evidence.append(
+        "The run cannot finish while xdist waits for work this worker was handed."
+        if process != SOLE_WORKER
+        else "The run cannot finish while this process is stopped."
+    )
+    measured = [f"silent for {silent_for:.0f} s"]
+    if verdict.heartbeat_age is not None:
+        measured.append(f"last heartbeat {verdict.heartbeat_age:.0f} s ago")
+    evidence.append("Measured: " + ", ".join(measured) + ".")
+    return WorkerStallIncident(
+        worker=process,
+        verdict="STALLED_FROZEN",
+        confidence=CONFIDENCE["FROZEN"],
+        state="FROZEN",
+        reason=verdict.reason,
+        silent_for_seconds=round(silent_for, 1),
+        heartbeat_age_seconds=(
+            round(verdict.heartbeat_age, 1) if verdict.heartbeat_age is not None else None
+        ),
+        worker_pid=pid if isinstance(pid, int) else None,
+        test_in_flight=culprit.get("nodeid") if culprit else None,
+        test_in_flight_hash=culprit.get("nodeid_hash") if culprit else None,
+        phase=culprit.get("phase") if culprit else None,
+        stack=stack,
+        stack_probed=reading is not None,
+        stack_unavailable_reason=None if stack else why,
+        stack_age_seconds=None,
+        stack_source="py-spy" if stack else None,
+        lanes_in_flight=flying,
+        evidence=evidence,
+    )
+
+
+def _stopped(pid: int) -> bool:
+    """Whether ``pid`` is stopped by a signal rather than running.
+
+    Stopped, not traced: a process py-spy is reading - this engine's own read,
+    or the live view's - is in tracing-stop for as long as the read takes, and
+    is not a process somebody stopped.
+    """
+    try:
+        import psutil
+
+        return bool(psutil.Process(pid).status() == psutil.STATUS_STOPPED)
+    except Exception:  # noqa: BLE001 - a process that cannot be asked is not known stopped
+        return False
+
+
+#: The share of its lanes' CPU one lane thread must hold, over the wait that
+#: confirms a freeze, for the process to count as frozen by that thread
+#: rather than as its lanes taking turns at the GIL.
+FROZEN_BY_ONE = 0.8
+
+#: Lane CPU, in seconds over that wait, below which nothing is taking turns.
+TAKING_TURNS_CPU = 0.05
+
+
+def _lanes_taking_turns(
+    before: dict[int, float], pid: Any, records: list[tuple[str, dict[str, Any]]]
+) -> bool:
+    """Whether its lanes shared the CPU since ``before``: a process whose GIL
+    is changing hands, rather than one frozen by a thread holding it.
+
+    A frozen process runs one thread - the one holding the GIL, in native
+    code - or none, if it is stopped; its lanes waiting on that thread wake
+    every few milliseconds to ask for the GIL, which the kernel can charge a
+    clock tick for. So it is the spread that decides, not whether a second
+    thread moved at all: fifty lanes taking turns each burn a fiftieth of it.
+
+    Only the lanes' own threads count - not the heartbeat's, whose silence is
+    the question, and not a native library's own threads, which run without
+    the GIL whether the process is frozen or not. Read from outside the
+    process, by native id; where that cannot be done (macOS numbers threads by
+    position) nothing is said, and the freeze stands.
+    """
+    if not before or not isinstance(pid, int):
+        return False
+    after = process_probe.process_thread_cpu(pid)
+    lanes = {
+        record.get("thread_id") for _, record in records
+        if isinstance(record.get("thread_id"), int)
+    }
+    burned = [
+        max(0.0, after[native] - before[native])
+        for native in lanes if native in before and native in after
+    ]
+    total = sum(burned)
+    if total < TAKING_TURNS_CPU:
+        return False  # nothing ran: stopped, or held by a thread that is no lane
+    return max(burned) < FROZEN_BY_ONE * total
+
+
+def _just_started(lane: dict[str, Any], interval: float) -> bool:
+    """Whether a lane's current phase began too recently to have been measured
+    twice: a beat or two, and a beat's slack."""
+    started = lane.get("phase_started")
+    if not isinstance(started, (int, float)):
+        return False
+    return time.time() - float(started) < 3 * interval + assessment.CURRENT_READING_SLACK
+
+
+def _lane_records(
+    directory: Path, process: str, run_id: Optional[str], shared: Optional[dict[Any, Any]]
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every lane record of ``process``, read once per poll of the engine
+    however many of its lanes are assessed: a thousand lanes each listing a
+    thousand records was a million reads a poll."""
+    if shared is None:
+        return thread_lanes.lane_records(directory, process, run_id)
+    key = ("lanes", process)
+    if key not in shared:
+        shared[key] = thread_lanes.lane_records(directory, process, run_id)
+    found: list[tuple[str, dict[str, Any]]] = shared[key]
+    return found
+
+
+def _read_lane_cpu(
+    directory: Path, process: str, run_id: Optional[str], shared: Optional[dict[Any, Any]]
+) -> thread_lanes.LaneCpuRead:
+    """``process``'s lanes' CPU, read once per poll of the engine."""
+    if shared is None:
+        return thread_lanes.read_lane_cpu(directory, process, run_id)
+    key = ("lanecpu", process)
+    if key not in shared:
+        shared[key] = thread_lanes.read_lane_cpu(directory, process, run_id)
+    found: thread_lanes.LaneCpuRead = shared[key]
+    return found
+
+
+def _read_process(
+    pid: int, shared: Optional[dict[Any, Any]]
+) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """py-spy's reading of ``pid``, once per poll of the engine however many
+    of its lanes ask: every stalled lane reading the whole process for itself
+    was forty reads of one process, each pausing it, in one poll."""
+    if shared is None:
+        return probes.live_stack(pid)
+    key = ("py-spy", pid)
+    if key not in shared:
+        shared[key] = probes.live_stack(pid)
+    found: tuple[Optional[list[dict[str, Any]]], Optional[str]] = shared[key]
+    return found
+
+
+def _is_lanes_thread(thread: dict[str, Any], lane: dict[str, Any]) -> bool:
+    """Whether a live reading's thread is ``lane``'s: by native id, which
+    py-spy reports as ``os_thread_id``, or by its ident."""
+    native, ident = lane.get("thread_id"), lane.get("thread_ident")
+    if native is not None and thread.get("os_thread_id") == native:
+        return True
+    return ident is not None and thread.get("thread_id") == ident
+
+
+def _lane_stack(
+    directory: Path,
+    process: str,
+    pid: Any,
+    lane: dict[str, Any],
+    stack_probe: bool,
+    live_pid: Optional[int],
+    cancel: Optional[threading.Event],
+    shared: Optional[dict[Any, Any]],
+) -> tuple[list[str], bool, Optional[str], Optional[float], Optional[str]]:
+    """The lane's own thread's stack - never a sibling's in its place.
+
+    A faulthandler dump stops at a hundred threads, so in a process of more
+    lanes the thread asked for may not be in it, and the thread a dump would
+    otherwise fall back to is another lane's, whose test was not stuck. So
+    the lane's thread is read where it lives. In a run with no ``-n`` that is
+    this process, whose own frames are right here. In a worker, py-spy reads
+    it, once per poll of the process whichever lanes ask; where it cannot, a
+    dump is asked for - once per process per poll too - and used only if the
+    lane's thread is in it. Otherwise there is no stack, and the incident
+    says why.
+    """
+    ident, name = lane.get("thread_ident"), lane.get("thread_name")
+    thread = (ident, name)
+    if pid == os.getpid():
+        import sys
+
+        if not isinstance(ident, int):
+            return [], False, "the lane's record does not say which thread it is", None, None
+        frame = sys._current_frames().get(ident)
+        if frame is None:
+            return [], True, "the lane's thread is no longer running", None, None
+        stack = crash_stack.from_frame(frame, ident, name or "lane", limit=STACK_LINES)
+        return stack, True, None, time.time(), "frames"
+    if isinstance(pid, int) and _cannot_probe(pid, stack_probe, live_pid) is None:
+        # Not a signal, but py-spy pauses the worker while it reads it, and
+        # failure_stack_probe = false is a promise to leave workers alone.
+        reading, error = _read_process(pid, shared)
+        if reading is not None:
+            mine = [entry for entry in reading if _is_lanes_thread(entry, lane)]
+            if mine:
+                return (
+                    crash_stack.from_threads(mine, limit=STACK_LINES),
+                    True, None, time.time(), "py-spy",
+                )
+            return [], True, "py-spy's reading of the process has no thread of this lane", None, None
+    if shared is not None and ("probe", pid) in shared:
+        lines, written = shared[("probe", pid)]
+    else:
+        lines, written = _probed(directory, process, pid, stack_probe, live_pid, cancel)
+        if shared is not None:
+            shared[("probe", pid)] = (lines, written)
+    stack = crash_stack.pick(lines, STACK_LINES, thread) if lines else []
+    if stack:
+        return stack, True, None, written, "probe"
+    passive, written, source = _passive_stack(directory, process, thread)
+    if passive:
+        return passive, False, None, written, source
+    refused = _cannot_probe(pid if isinstance(pid, int) else None, stack_probe, live_pid)
+    if refused is not None:
+        return [], False, refused, None, None
+    return [], bool(lines), (
+        "no dump of the process holds this lane's thread - faulthandler writes at "
+        "most a hundred threads - and py-spy could not read it"
+    ), None, None
+
+
+def _probed(
+    directory: Path,
+    process: str,
+    pid: Any,
+    allowed: bool,
+    live_pid: Optional[int],
+    cancel: Optional[threading.Event],
+) -> tuple[list[str], Optional[float]]:
+    """What one on-demand dump of a lane's process added to its crash file."""
+    if not isinstance(pid, int) or _cannot_probe(pid, allowed, live_pid) is not None:
+        return [], None
+    crash_file = directory / f"{process}.crash"
+    before = crash_stack.size(crash_file)
+    if not probes.request_stack(pid):
+        return [], None
+    deadline = time.time() + STACK_WAIT_SECONDS
+    while time.time() < deadline:
+        if _wait(cancel, STACK_POLL_SECONDS):
+            break
+        if crash_stack.size(crash_file) > before:
+            _wait(cancel, STACK_POLL_SECONDS)  # the rest of a large dump
+            break
+    try:
+        with crash_file.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(before)
+            lines = [line.rstrip() for line in handle if line.strip()]
+    except OSError:
+        return [], None
+    return lines, time.time()
 
 
 def _wait(cancel: Optional[threading.Event], seconds: float) -> bool:

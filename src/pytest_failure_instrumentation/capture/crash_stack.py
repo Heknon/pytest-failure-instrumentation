@@ -221,7 +221,15 @@ class SlowTestWatchdog:
 
     def _tick_lanes(self) -> None:
         """One dump whenever any lane's test is due one, on each lane's own
-        cadence - measured within that lane's test, as the single clock's is."""
+        cadence - measured within that lane's test, as the single clock's is -
+        and never more than one per ``timeout`` for the process.
+
+        The dump is of every thread, so one holds every lane that is due, and
+        each of them counts as dumped by it. Without the process's own bound,
+        two hundred long tests started a moment apart came due a moment apart:
+        eleven dumps of a third of a megabyte each in fifty seconds, each one
+        pausing the process to walk every thread.
+        """
         now = time.monotonic()
         with self._lanes_lock:
             due = [
@@ -235,7 +243,11 @@ class SlowTestWatchdog:
             ]
             if not due:
                 return
-            for lane in due:
+            if self._dumped_at is not None and now - self._dumped_at < self.timeout:
+                return  # the process's last dump is recent; the next holds these
+            self._dumped_at = now
+            for lane in [lane for lane, started in self._lanes.items()
+                         if now - started >= self.timeout]:
                 self._lanes_dumped[lane] = now
             self._dump()
 
@@ -467,9 +479,14 @@ def read(
     ``thread`` names the thread wanted, as ``(ident, name)``, when the caller
     knows which it is: a lane of pytest-threadlanes, which shares its process
     and therefore its dump with every sibling lane - each of them carrying
-    the runtest protocol - and with a main thread that is the scheduler.
+    the runtest protocol - and with a main thread that is the scheduler. That
+    thread or nothing: see :func:`_most_relevant`.
     """
-    lines = _lines(path, offset)
+    return pick(_lines(path, offset), limit, thread)
+
+
+def pick(lines: list[str], limit: int = 12, thread: Optional[ThreadKey] = None) -> list[str]:
+    """:func:`read`, for a dump already in hand."""
     if not lines:
         return []
 
@@ -477,10 +494,32 @@ def read(
     banner = lines[0] if lines[0].startswith(BANNERS) else None
     sections = _thread_sections(lines)
     if not sections:
-        return _capped(lines, limit)
+        return [] if thread is not None else _capped(lines, limit)
 
-    section = _capped(_most_relevant(sections, thread), limit)
+    chosen = _most_relevant(sections, thread)
+    if not chosen:
+        return []
+    section = _capped(chosen, limit)
     return ([banner] + section) if banner else section
+
+
+def from_frame(frame: Any, ident: int, name: str, limit: int = 12) -> list[str]:
+    """One live thread's stack, read in this process, as a dump would print it.
+
+    For a lane of pytest-threadlanes whose stall is assessed by the process
+    running it: its own frames are right here, in ``sys._current_frames()``,
+    whatever the thread count - a faulthandler dump stops at a hundred
+    threads - and whichever interpreter this is (py-spy cannot read a
+    free-threaded one).
+    """
+    import traceback
+
+    lines = [f"Thread 0x{ident:016x} ({name}, most recent call first):"]
+    lines.extend(
+        f'  File "{summary.filename}", line {summary.lineno} in {summary.name}'
+        for summary in reversed(traceback.extract_stack(frame))
+    )
+    return _capped(lines, limit)
 
 
 def current_thread(path: Path) -> Optional[int]:
@@ -503,6 +542,57 @@ def current_thread(path: Path) -> Optional[int]:
             found = _THREAD_HEADER.match(line)
             return int(found.group(1), 16) if found else None
     return None
+
+
+#: What a free-threaded interpreter prints instead of every thread, and the
+#: header of the one stack it prints in their place: the thread that faulted.
+NO_THREADS = "<Cannot show all threads while the GIL is disabled>"
+ONE_STACK = "Stack (most recent call first):"
+
+
+def current_stack(path: Path) -> list[str]:
+    """The frames of a free-threaded interpreter's fatal dump, or nothing.
+
+    With the GIL disabled faulthandler cannot walk other threads, so it says
+    so and prints the one it is on - the one the fault was delivered to - with
+    no thread id at all. :func:`current_thread` finds nothing to match there,
+    and this is what is left to match a lane by: the frames of its test.
+    """
+    return _frames_of_one_stack(_latest_dump(_lines(path)))
+
+
+def free_threaded(path: Path, limit: int = 12) -> list[str]:
+    """A free-threaded interpreter's fatal dump as a death reports it: the
+    banner and the Python stack of the thread that faulted. Nothing where the
+    latest dump is not one.
+
+    :func:`read` finds no Python thread there to pick - the one stack is
+    headed "Stack", not "Current thread 0x..." - and returns the C stack
+    trace Python 3.14 prints after it, whose header does begin "Current
+    thread". Used for a process of lanes, whose death is matched to a lane by
+    exactly these frames.
+    """
+    lines = _latest_dump(_lines(path))
+    frames = _frames_of_one_stack(lines)
+    if not frames:
+        return []
+    return [lines[0], ONE_STACK] + _capped(frames, limit)
+
+
+def one_stack(lines: list[str]) -> list[str]:
+    """The frames under a dump's ``Stack (most recent call first):`` header,
+    in a dump already read - :func:`free_threaded`'s, say."""
+    try:
+        start = next(index for index, line in enumerate(lines) if line.strip() == ONE_STACK)
+    except StopIteration:
+        return []
+    return [line for line in lines[start + 1:] if line.lstrip().startswith("File ")]
+
+
+def _frames_of_one_stack(lines: list[str]) -> list[str]:
+    if not is_fatal(lines) or not any(line.strip() == NO_THREADS for line in lines):
+        return []
+    return one_stack(lines)
 
 
 def from_threads(
@@ -536,7 +626,8 @@ def from_threads(
             for frame in reading.get("frames") or []
         )
     sections = _thread_sections(lines)
-    return _capped(_most_relevant(sections, thread), limit) if sections else []
+    chosen = _most_relevant(sections, thread) if sections else []
+    return _capped(chosen, limit) if chosen else []
 
 
 def _capped(lines: list[str], limit: int) -> list[str]:
@@ -599,6 +690,10 @@ def _thread_sections(lines: list[str]) -> list[list[str]]:
 #: The thread id in a section's first line, as faulthandler prints it.
 _THREAD_HEADER = re.compile(r"(?:Current thread|Thread) 0x([0-9a-fA-F]+)")
 
+#: The header of the thread a fatal dump was written on, id and all - and not
+#: the "Current thread's C stack trace" Python 3.14 prints after the stacks.
+CURRENT_THREAD = re.compile(r"Current thread 0x[0-9a-fA-F]+")
+
 
 def _is_thread(
     header: str, thread: ThreadKey
@@ -623,9 +718,12 @@ def _most_relevant(
     """The thread worth reporting, in descending order of certainty.
 
     A caller that knows which thread it is asking about - a lane of
-    pytest-threadlanes - is answered with that one, whenever the dump holds
-    it. Nothing below can pick it out: its siblings carry the same runtest
-    protocol, and the thread a signal lands on is the scheduler's.
+    pytest-threadlanes - is answered with that one, or with nothing where the
+    dump does not hold it: faulthandler stops at a hundred threads, and a
+    process of lanes has more. Nothing below may stand in for it: its
+    siblings carry the same runtest protocol, and a sibling's stack reported
+    as the lane's blames a test that was not stuck. Its header names it, as a
+    live read's does and faulthandler's does not.
 
     A fatal signal and an on-demand SIGUSR1 both label the thread they reached
     as "Current thread", and that is the answer.
@@ -639,7 +737,8 @@ def _most_relevant(
     if thread is not None:
         for section in sections:
             if _is_thread(section[0], thread):
-                return section
+                return _named(section, thread[1])
+        return []
     for section in sections:
         if section[0].startswith("Current thread") and not _mentions_us(section):
             return section
@@ -650,6 +749,14 @@ def _most_relevant(
         if not _mentions_us(section):
             return section
     return sections[0]
+
+
+def _named(section: list[str], name: Optional[str]) -> list[str]:
+    """``section`` with its header naming the thread, where it does not."""
+    header = section[0]
+    if not name or f"({name}," in header or not header.endswith("(most recent call first):"):
+        return section
+    return [header.replace("(most recent call first):", f"({name}, most recent call first):")] + section[1:]
 
 
 def _mentions_us(section: list[str]) -> bool:

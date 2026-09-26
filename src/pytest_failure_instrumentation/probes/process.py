@@ -18,7 +18,9 @@ towards saying it is not ours.
 from __future__ import annotations
 
 import os
+import sys
 import time
+from collections.abc import Iterable
 from typing import Any, Optional
 
 import psutil
@@ -47,25 +49,68 @@ def same_process(pid: int, created: Any = None) -> bool:
                 and abs(observed - created) > 0.001)
 
 
-def thread_cpu_seconds() -> dict[int, float]:
-    """CPU seconds, user and system, used by each thread of this process.
+def thread_cpu_seconds(native_ids: Iterable[int]) -> dict[int, float]:
+    """CPU seconds, user and system, used by each of these threads of this
+    process, keyed by native thread id - ``threading.get_native_id()``.
 
-    Keyed by psutil's id for each thread. On Linux and Windows that is the
-    native thread id - the number ``threading.get_native_id()`` returns - and
-    a lane finds its own thread by it. On macOS it is not: psutil numbers the
-    threads 1, 2, 3... in the order the kernel lists them, so no lane can be
-    found there, and the recorder does not ask - see
-    ``WorkerRecorder._lane_cpu_readable``. Empty where they cannot be read: a
-    lane then reads its process's figure, the reading it had before
-    per-thread ones.
+    **Read without letting go of the GIL, where that can be done.** This is
+    read on the heartbeat's thread, every beat, beside every lane's test
+    thread. psutil lists a process's threads by reading a procfs file per
+    thread in Python, and every one of those reads releases the GIL and has
+    to win it back from the lanes: with twenty lanes running Python on four
+    cores one reading took 17.7 s. The heartbeat is late by that much, and a
+    late heartbeat is what a frozen process looks like. On Linux each
+    thread's CPU clock has a clock id of its own, made from its thread id the
+    way glibc's ``pthread_getcpuclockid`` makes it, and ``clock_gettime``
+    reads it in one system call without releasing the GIL. A thread that has
+    exited reads EINVAL and is left out.
+
+    Elsewhere psutil, keyed by its id for each thread: the native thread id on
+    Windows. On macOS psutil numbers the threads 1, 2, 3... in the order the
+    kernel lists them, so no lane can be found there, and the recorder does
+    not ask - see ``WorkerRecorder._lane_cpu_readable``. Empty where they
+    cannot be read: a lane then has no figure of its own.
     """
+    wanted = set(native_ids)
+    if sys.platform.startswith("linux"):
+        used: dict[int, float] = {}
+        for native_id in wanted:
+            try:
+                used[native_id] = time.clock_gettime(_thread_cpu_clock(native_id))
+            except (OSError, OverflowError, ValueError):
+                continue  # exited since it was listed
+        return used
     try:
         return {
             int(thread.id): float(thread.user_time) + float(thread.system_time)
             for thread in psutil.Process().threads()
+            if int(thread.id) in wanted
         }
     except (psutil.Error, OSError, AttributeError, ValueError):
         return {}
+
+
+def process_thread_cpu(pid: int) -> dict[int, float]:
+    """CPU seconds used by each thread of process ``pid``, by native id, read
+    from outside it. Empty where they cannot be read, and on macOS, where
+    psutil numbers threads by position rather than by native id."""
+    if sys.platform == "darwin":
+        return {}
+    try:
+        return {
+            int(thread.id): float(thread.user_time) + float(thread.system_time)
+            for thread in psutil.Process(pid).threads()
+        }
+    except (psutil.Error, OSError, AttributeError, ValueError):
+        return {}
+
+
+def _thread_cpu_clock(native_id: int) -> int:
+    """Linux's clock id for one thread's CPU time: ``MAKE_THREAD_CPUCLOCK(tid,
+    CPUCLOCK_SCHED)`` of ``include/linux/posix-timers.h``, part of the kernel's
+    ABI - it is what ``pthread_getcpuclockid`` hands back."""
+    per_thread, sched = 4, 2
+    return ((~native_id) << 3) | per_thread | sched
 
 
 def is_running(pid: int) -> bool:
