@@ -263,8 +263,9 @@ build id group a whole run's incidents.
 
 **Turning the entry point off.** `-p no:failure_instrumentation` skips the
 entry point entirely; `install` puts back the hookspecs so
-`pytest_failure_incident`, `pytest_failure_worker_sample` and
-`pytest_failure_server_ready` all still reach their implementers. Note that it also skips `pytest_addoption`, so
+`pytest_failure_incident`, `pytest_failure_worker_sample`,
+`pytest_failure_server_ready` and `pytest_failure_test_attributes` all still
+reach their implementers. Note that it also skips `pytest_addoption`, so
 `failure_*` ini keys become unknown config options — which is the point if your
 framework owns the settings, and a reason to leave the entry point enabled and
 just call `install` if it does not. Either way `install` is itself the switch:
@@ -384,6 +385,10 @@ without a WMI query for a marketing release name during each worker's startup.
 **`suspect_owner`** is kept apart from `owner` on purpose. When no stack names
 anybody, the test that was in flight is a lead worth recording — but a guess
 must never sit in the column a reader takes for a finding.
+
+**`test_attributes`**, on a `worker_death` and a `worker_stall`, is what you
+tagged the test in flight with — its team, its component, its suite — and is
+absent where you tagged nothing. See [Tagging tests](#tagging-tests).
 
 ### How an incident reads
 
@@ -2077,6 +2082,148 @@ The default off path does not import or start the resource collector. A
 single-process pytest run can still stop its sampling thread by holding the
 GIL; this feature does not change the existing native-GIL limitation.
 
+## Tagging tests
+
+`owner` says whose *code* failed. What a dashboard is usually cut by is
+something this plugin cannot know: which team owns the test, which component
+it exercises, which suite it belongs to. Tell it, and every reader of the test
+in flight carries the answer — a death's and a stall's `test_attributes`, a
+sample row, `/workers`, and the OpenTelemetry metrics below.
+
+Name markers whose first argument is the value:
+
+```ini
+[pytest]
+failure_test_attributes = team component
+```
+
+```python
+@pytest.mark.team("payments")
+def test_refund(): ...
+```
+
+Or compute them, in any conftest or plugin:
+
+```python
+def pytest_failure_test_attributes(item):
+    return {"suite": item.nodeid.split("/")[1]}   # tests/<suite>/...
+```
+
+Every implementation is heard, the conftest nearest the test last, and a
+marker named in `failure_test_attributes` has the last word over all of them:
+a directory's conftest sets a default, and a test's own marker overrides it. A
+marker with no arguments reads `"true"`.
+
+**Why not the test report.** The report is how anything else would carry these
+to the controller, and it misses exactly the failures this plugin exists for:
+a worker killed in setup never sends one for its test, and a run killed
+outright takes whatever its controller had been sent with it. So the tags are
+read where the test runs, once per test as its setup begins, and written into
+the worker's fixed-size state slot beside the node id — which is what the
+controller, the stall watcher and the next run over the directory already
+read. A setup death, a stall and a recovered run all carry them.
+
+They are dimensions, not data, and bounded as such: at most 16 keys, each a
+name of up to 64 characters, each value a string, number or bool of up to 128
+characters once written as text, 1 KiB in all. Anything else is dropped rather
+than cut, since a cut value is a different value, and warned about once. Keep
+them to values that repeat — a team, not a ticket number.
+
+A run that names no marker and implements no hook reads nothing and writes
+exactly the record it always did.
+
+## OpenTelemetry metrics
+
+An incident is a record. What a record cannot give you is a rate across a
+fleet: how many workers were killed this week and whose tests they were in,
+whether a runner pool's stalls are rising. If your product already has a
+metrics pipeline, point this run at it:
+
+```console
+pip install "pytest-failure-instrumentation[otel]"
+```
+
+```ini
+[pytest]
+failure_otel = true
+```
+
+```python
+# conftest.py at the rootdir, or a plugin - not a conftest below it
+from opentelemetry import metrics
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+
+def pytest_configure(config):
+    if hasattr(config, "workerinput"):   # the metrics are the controller's
+        return
+    metrics.set_meter_provider(
+        MeterProvider(metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())])
+    )
+
+def pytest_unconfigure(config):
+    provider = metrics.get_meter_provider()
+    if hasattr(provider, "shutdown"):
+        provider.shutdown()
+```
+
+The `otel` extra is the OpenTelemetry API alone. The SDK, the exporter and
+the provider are yours: this plugin never sets a provider and never shuts one
+down. A framework that keeps its own instead of the global one passes it as
+`install(config, otel_meter_provider=provider)`, which also switches this on.
+
+| Metric | Instrument | Attributes |
+|---|---|---|
+| `pytest.failure.incidents` | counter, `{incident}` | `pytest.failure.kind`, `.verdict`, `.owner`, `.severity`, `.run_ending`, and the test's tags |
+| `pytest.failure.runs` | counter, `{run}` | `pytest.failure.exit_status`, `.distributed` |
+| `pytest.failure.workers` | up-down counter, `{worker}` | `pytest.failure.worker.status` |
+| `pytest.failure.worker.tests` | up-down counter, `{test}` | `pytest.failure.worker`, `pytest.failure.test.state` — `finished`, `running`, `queued` |
+| `pytest.failure.run.tests.unassigned` | up-down counter, `{test}` | — |
+| `pytest.failure.worker.memory.rss` | gauge, `By` | `pytest.failure.worker`, and the tags of its test in flight |
+| `pytest.failure.worker.cpu.rate` | gauge, `{cpu}` | the same |
+| `pytest.failure.worker.heartbeat.age` | gauge, `s` | the same |
+
+A tag is `test.tag.<key>`, apart from the plugin's own attributes, so a tag
+called `owner` cannot overwrite the finding of the same name. A duplicate
+incident — the same fingerprint again — is suppressed before it is counted,
+exactly as it is before it reaches your hook, and the run summary is counted
+as a run rather than as an incident. The worker figures come from the files
+the run was writing anyway, read once per collection, and a worker that is
+gone is left out of the gauges rather than held at its last beat.
+
+No node id, fingerprint, run id or pid is ever an attribute: each is a new
+series per test or per run, which is a table and not a metric. They are in the
+incident; a build id belongs in `OTEL_RESOURCE_ATTRIBUTES`.
+
+**When the provider is set does not matter.** Every instrument is observable,
+the two counters included: a hook adds to a tally and the reader collects the
+tally whenever it collects. A synchronous counter's `add` made before a
+provider exists is dropped without a word, and one of these is made early —
+the incidents of a killed run are recovered as the session starts, before a
+conftest below the rootdir has been loaded to set anything up. The
+instruments themselves are made at configure time through the OpenTelemetry
+API, which stands in for a provider not yet set and hands everything to it
+once it is.
+
+**Where it is set does.** Under xdist the controller reports and only the
+workers collect, so a conftest below the rootdir is never loaded where the
+metrics are. The run says so at its end rather than leaving an empty dashboard
+to be read as a quiet week. The `workerinput` check above keeps every worker
+from starting an SDK of its own; `opentelemetry-instrument pytest` does not,
+since its `sitecustomize` reaches every xdist worker too.
+
+**Short runs are flushed.** A periodic reader's first export is a minute away
+and most runs are over sooner, so the provider is flushed as the session
+finishes — after the run summary, bounded at five seconds.
+
+**A killed controller is the limit.** Metrics wait in memory until they are
+exported, so a controller killed outright takes the unexported ones with it —
+the one failure this plugin exists for. Its incidents still reach the next
+run over the same directory, which counts them as it recovers them, or the
+sidecar's `failure_on_run_death` reporter. The metrics are a dashboard; the
+incidents are the record.
+
 ## Profiling
 
 Everything above waits for something to go wrong. `--failure-profile` waits for
@@ -2824,6 +2971,16 @@ overwhelming majority of what runs.
 - Off by default: `tracemalloc` (needed to attribute an OOM kill to a source
   line) and the live-object census — walking the heap on a worker near its
   ceiling is exactly the instrumentation that makes things worse.
+- Off by default: test attributes. Per test that has any, one marker lookup
+  per named marker, a call to `pytest_failure_test_attributes` where it is
+  implemented, and a few hundred bytes more in a slot write that happens
+  anyway. A run that tags nothing asks once, at its first test, whether
+  anything implements the hook; after that a test costs it one call that
+  returns at once.
+- Off by default: OpenTelemetry metrics, on the controller only. A hook adds
+  to a tally; each collection by the product's reader walks the run's
+  directory once, the same read a worker sample is, and nothing is asked of a
+  worker.
 - The live stack server, when switched on: one thread per session, which
   either serves or retries the claim every five seconds. Nothing is sampled
   and nothing is written unless something asks.
@@ -2867,6 +3024,8 @@ accepted and inert.
 | `failure_resources_scan_seconds` | `60` | Delay after each directory scan, minimum 10 seconds |
 | `failure_resources_max_files` | `50000` | Entry budget per directory scan, clamped to 100–100000 |
 | `failure_sample_seconds` | `0` | Push a worker sample this often while the run is going. 0 is off |
+| `failure_test_attributes` | — | Marker names whose first argument each test carries as an attribute. See [Tagging tests](#tagging-tests) |
+| `failure_otel` | `false` | Report incidents, runs and worker figures as OpenTelemetry metrics through the provider this process sets. Needs the `otel` extra. See [OpenTelemetry metrics](#opentelemetry-metrics) |
 | `failure_stack_server` | `false` | Serve live stacks over HTTP |
 | `failure_stack_server_port` | `0` | 0 draws a free port and writes it down; any other is claimed and shared (`--callstack-port`) |
 | `failure_stack_server_host` | `127.0.0.1` | What it binds; `0.0.0.0` for a container (`--callstack-host`) |

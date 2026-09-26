@@ -69,6 +69,9 @@ WORKER_NAME = "failure-instrumentation-worker"
 #: process that is plainly a session is the kind of small lie that costs
 #: somebody an afternoon.
 RECORDER_NAME = "failure-instrumentation-recorder"
+#: The OpenTelemetry adapter, where ``failure_otel`` asked for one - see
+#: :mod:`.otel`. On the process that raises incidents, whichever that is.
+METRICS_NAME = "failure-instrumentation-metrics"
 
 
 def installed_settings(config: pytest.Config) -> Optional[Settings]:
@@ -236,6 +239,10 @@ def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
     if running is None:
         return []
     plugins: list[tuple[str, Any]] = [(CONTROLLER_NAME, running)]
+    if settings.otel:
+        metrics = _metrics(running, settings)
+        if metrics is not None:
+            plugins.append((METRICS_NAME, metrics))
     if running.distributed:
         return plugins  # the workers record; this process only reports
 
@@ -270,6 +277,27 @@ def _build(config: pytest.Config, settings: Settings) -> list[tuple[str, Any]]:
     if recording is not None:
         plugins.append((RECORDER_NAME, recording))
     return plugins
+
+
+def _metrics(engine: Any, settings: Settings) -> Any:
+    """The OpenTelemetry adapter, or None and a warning.
+
+    Apart from :func:`_built`, whose warning says the instrumentation is off:
+    here it is only the metrics that are, and the likeliest reason is an
+    extra that was not installed, which is worth naming.
+    """
+    try:
+        from .otel import MetricsAdapter
+
+        return MetricsAdapter(engine, settings)
+    except ImportError as failure:
+        _warn(
+            f"failure_otel is on, but OpenTelemetry could not be imported ({failure}); "
+            "install pytest-failure-instrumentation[otel]. The run is otherwise unaffected"
+        )
+    except Exception as failure:  # noqa: BLE001 - see the module docstring
+        _warn(f"OpenTelemetry metrics are off for this run: {failure!r}")
+    return None
 
 
 def _ensure_hookspecs(config: pytest.Config) -> None:

@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import pytest
 
+from ..attributes import Collector
 from ..config import Settings
 from ..lanes import LANE_CPU_SUFFIX, LaneCpu
 from ..probes import tracing
@@ -69,6 +70,10 @@ class _Slot:
         #: attempt after the second would report itself as the second. Reset
         #: at the protocol boundary, where the test changes.
         self.attempt = 0
+        #: What the product tagged `counted` with, read at its first setup and
+        #: kept here for the same reason as the attempt: the slot clears its
+        #: copy at the end of every teardown, and a rerun's setup restores it.
+        self.test_attributes: dict[str, str] = {}
         #: A lane's thread, by native id and by the ident faulthandler prints;
         #: None for the process's own slot.
         self.native_id = native_id
@@ -152,6 +157,10 @@ class WorkerRecorder:
         self.monitor: memory_capture.MemoryMonitor | None = None
         self.profiler: Any = None
         self._allocation_tracer: memory_capture.TracemallocSession | None = None
+        #: Reads what the product tagged each test with, once per test, as its
+        #: first setup begins - see :mod:`..attributes`. Returns at once when
+        #: no marker is named and nothing implements the hook.
+        self.attributes = Collector(settings.test_attributes)
         # Filled as each resource is opened, so close() works on a recorder
         # that never finished being built.
         self._open_resources: list[Any] = []
@@ -662,6 +671,9 @@ class WorkerRecorder:
                 slot.counted = nodeid
                 slot.state.tests_started += 1
                 slot.attempt = 1
+                # Once per test rather than per attempt: a rerun is the same
+                # test, with the same markers and the same answer.
+                slot.test_attributes = self.attributes(item) if item is not None else {}
             else:
                 # A second one is a rerun of the same test, which is not a
                 # test starting - see pytest_runtest_protocol. The attempt is
@@ -685,6 +697,9 @@ class WorkerRecorder:
             # attempt its own deadline, measured from that attempt's setup.
             slot.state.attempt = slot.attempt
             slot.state.test_started = now
+            # Every attempt, because the end of each teardown clears it with
+            # the node id, and a rerun's setup is where both come back.
+            slot.state.test_attributes = slot.test_attributes or None
             from .timeouts import effective
 
             slot.state.timeout_settings = effective(item) if item is not None else []
@@ -751,7 +766,9 @@ class WorkerRecorder:
         # against a test that had already passed.
         if own and self.heartbeat is not None:
             self.heartbeat.nodeid = None
-        slot.state.update(phase=None, nodeid=None, phase_started=None, test_started=None)
+        slot.state.update(
+            phase=None, nodeid=None, phase_started=None, test_started=None, test_attributes=None
+        )
 
     # -- lanes -----------------------------------------------------------
 
@@ -971,7 +988,7 @@ class WorkerRecorder:
         # reaches here without the teardown that would have cleared either,
         # and an attempt beside a null node id names a test the same record
         # says is not running.
-        self.state.update(phase=None, nodeid=None, attempt=None)
+        self.state.update(phase=None, nodeid=None, attempt=None, test_attributes=None)
         if self.lanes:
             # Every lane, for the same reason: a session torn down inside a
             # test leaves its lane's slot naming it. The lanes' threads have
@@ -979,7 +996,7 @@ class WorkerRecorder:
             with self._lanes_lock:
                 slots = list(self._lanes.values())
             for slot in slots:
-                slot.state.update(phase=None, nodeid=None, attempt=None)
+                slot.state.update(phase=None, nodeid=None, attempt=None, test_attributes=None)
             # And fd 2 back where it was, with what is left of the session's
             # stderr passed on - see _tee_session.
             if self.stderr_tee is not None:

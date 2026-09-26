@@ -1,13 +1,18 @@
 """The hooks your product implements.
 
-Three, and they answer different questions. ``pytest_failure_incident`` says
-something went wrong, once per incident, and is the reason this package exists.
-``pytest_failure_worker_sample`` says what every worker is doing right now,
-on a cadence, and is off unless asked for. ``pytest_failure_server_ready`` says
-the live-stack server is up and where - nothing went wrong, and a product that
-never switches the server on never sees it.
+Three deliver, and they answer different questions. ``pytest_failure_incident``
+says something went wrong, once per incident, and is the reason this package
+exists. ``pytest_failure_worker_sample`` says what every worker is doing right
+now, on a cadence, and is off unless asked for. ``pytest_failure_server_ready``
+says the live-stack server is up and where - nothing went wrong, and a product
+that never switches the server on never sees it.
 
-All three are named for what they deliver - most of what arrives at the first
+A fourth asks rather than delivers: ``pytest_failure_test_attributes`` is how a
+product tags its tests - a team, a component, a suite - so that an incident, a
+sample row and a metric can be grouped by what the product cares about. See
+:mod:`.attributes`.
+
+All four are named for what they carry - most of what arrives at the first
 is not a crash - and namespaced to this distribution, the way ``pytest_xdist_*``
 hooks are, so none of them can collide with anyone else's.
 
@@ -95,7 +100,8 @@ rather than passing for a whole one.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Optional
 
 import pytest
 
@@ -156,4 +162,32 @@ def pytest_failure_worker_sample(sample: WorkerSample) -> None:
 
     Called from the sampler's own thread, and wrapped like the others - an
     exception here is never allowed to become an INTERNALERROR in the run.
+    """
+
+
+@pytest.hookspec()
+def pytest_failure_test_attributes(item: pytest.Item) -> Optional[Mapping[str, object]]:
+    """Return the attributes to record for ``item`` - ``{"team": "payments"}``.
+
+    Called once per test, as its setup begins, in the process that runs it -
+    an xdist worker, or the session itself without one - and only in a run
+    with the plugin switched on. Called through ``item.ihook``, so a conftest
+    answers only for the tests beneath it. Every implementation is heard, the
+    one nearest the test last, and a marker named in
+    ``failure_test_attributes`` has the last word over all of them.
+
+    What is returned is written into the worker's state slot beside the node
+    id, so it reaches every reader of the test in flight: a death or a stall
+    incident's ``test_attributes``, a sample row, ``/workers``, and the
+    metrics adapter's ``test.tag.*`` attributes - including a death in setup
+    and a run killed outright, which no test report survives.
+
+    Keys are names of up to 64 characters; values are strings, numbers or
+    bools of up to 128 characters once written as text; at most 16 of them
+    and 1 KiB in all. Anything else is dropped and warned about once. They
+    are dimensions for grouping, so keep them to values that repeat - a team,
+    not a ticket number.
+
+    Return None to add nothing. Never raises into the run: an exception here
+    is warned about once, and the test is recorded without this answer.
     """

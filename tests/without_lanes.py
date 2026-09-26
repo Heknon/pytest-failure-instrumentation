@@ -86,6 +86,16 @@ LANE_PROPERTIES = {
     "ResourceProcess": {"lanes_running"},
 }
 
+#: The fields declared for tagged tests - see ``attributes.py`` - which, like
+#: the lanes', only a run that tags its tests ever fills: the other
+#: differences the schemas may have from 0.13.1's.
+TAG_PROPERTIES = {
+    "WorkerDeathIncident": {"test_attributes"},
+    "WorkerStallIncident": {"test_attributes"},
+    "SampledWorker": {"test_attributes"},
+    "Worker": {"test_attributes"},
+}
+
 VOLATILE = "<volatile>"
 
 #: Fields whose values differ between any two runs of the same suite, or
@@ -252,7 +262,8 @@ def client_dumps() -> dict[str, Any]:
 
 def schemas() -> dict[str, Any]:
     """The JSON schemas of the payloads, in both modes, with the properties
-    0.14.0 declares for lanes taken out - so what is left must be 0.13.1's.
+    0.14.0 declares for lanes and those declared for tagged tests taken out -
+    so what is left must be 0.13.1's.
 
     The client's models only where httpx is installed; the key is absent
     otherwise, and the comparison skips it.
@@ -283,7 +294,7 @@ def _without_lane_properties(schema: Any) -> Any:
     if not isinstance(schema, dict):
         return schema
     cleaned = {key: _without_lane_properties(value) for key, value in schema.items()}
-    for model, names in LANE_PROPERTIES.items():
+    for model, names in [*LANE_PROPERTIES.items(), *TAG_PROPERTIES.items()]:
         definition = cleaned.get("$defs", {}).get(model)
         if definition is None and cleaned.get("title") == model:
             definition = cleaned

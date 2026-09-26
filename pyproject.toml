@@ -41,7 +41,9 @@ classifiers = [
 dependencies = ["pytest>=7.0", "pydantic>=2.0", "psutil>=5.9", "py-spy>=0.3"]
 
 [project.optional-dependencies]
-test = ["pytest-xdist>=3.0", "pytest-timeout>=2.3"]
+# The SDK, for the in-memory reader the metrics tests collect through. The
+# package itself only ever needs the API - see the otel extra below.
+test = ["pytest-xdist>=3.0", "pytest-timeout>=2.3", "opentelemetry-sdk>=1.20"]
 # Kept so that an existing pin on [psutil] keeps resolving. It is a required
 # dependency now, so this extra adds nothing.
 psutil = ["psutil>=5.9"]
@@ -52,6 +54,12 @@ stacks = ["py-spy>=0.3"]
 # run. The plugin never imports it, so a run that serves a live view without
 # consuming one pays nothing for this.
 client = ["httpx>=0.24"]
+# OpenTelemetry metrics, with failure_otel on. The API alone: the SDK and its
+# exporters are the product's choice, set up where the product sets up its
+# provider, and the plugin never sets one. Imported on the controller only,
+# and only when switched on. 1.41 is the last release that installs on 3.9,
+# and pip picks it there by itself.
+otel = ["opentelemetry-api>=1.20"]
 
 [project.urls]
 Homepage = "https://github.com/Heknon/pytest-failure-instrumentation"

@@ -65,6 +65,7 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Optional
 
+from . import attributes as test_attributes
 from . import lanes as thread_lanes
 from .analysis import stall as stall_analysis
 from .capture.events import head_events, tail_events, this_run
@@ -450,6 +451,12 @@ def _row(
         # produces exactly the second one.
         "cpu_rate": None if rate is None else round(rate, 3),
     }
+    tags = test_attributes.in_flight(record)
+    if tags:
+        # What the product tagged the test above with - see :mod:`.attributes`.
+        # Only while a tagged test is in flight: a row without them is the row
+        # this always returned.
+        row["test_attributes"] = tags
     if lane is not None:
         # Which process the lane runs in and which of its threads it is, so a
         # reader holding the process's stack can open the lane's thread in it

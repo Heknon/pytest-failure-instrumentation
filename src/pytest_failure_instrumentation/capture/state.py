@@ -155,6 +155,13 @@ class WorkerState:
         self.phase_started: float | None = None
         self.test_started: float | None = None
         self.timeout_settings: list[dict[str, Any]] = []
+        #: What the product tagged the test in flight with - see
+        #: :mod:`..attributes`. Set with the test and cleared with it, like
+        #: ``nodeid``: a worker between tests is running nobody's test, and
+        #: its tags would put a team's name on a death that was not theirs.
+        #: Bounded where it is read, so it costs the node ids a known share
+        #: of the slot rather than an open-ended one.
+        self.test_attributes: dict[str, str] | None = None
         # Opened once; the descriptor lives for the process lifetime so a
         # write costs one syscall and survives interpreter shutdown.
         # O_BINARY matters on Windows: without it os.write translates "\n"
@@ -281,6 +288,9 @@ class WorkerState:
                 "timeout_settings": self.timeout_settings,
                 "tests_started": self.tests_started,
                 "tests_finished": self.tests_finished,
+                # Only while a tagged test is in flight, so a run that tags
+                # nothing writes the record it always did.
+                **({"test_attributes": self.test_attributes} if self.test_attributes else {}),
                 # Only ever present under lanes, and last, so a record written
                 # without them is the record this file always wrote.
                 **({"lanes": True} if self.lanes else {}),

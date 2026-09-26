@@ -22,6 +22,7 @@ from typing import Any, ClassVar, Literal, Optional
 
 from pydantic import ConfigDict, Field, SerializerFunctionWrapHandler, model_serializer
 
+from .. import attributes as test_attributes
 from .. import lanes as thread_lanes
 from .. import probes
 from ..analysis import stall as assessment
@@ -91,6 +92,12 @@ class WorkerStallIncident(Incident):
     #: :mod:`..nodeid`. Null where the id itself is.
     test_in_flight_hash: Optional[str] = None
     last_test_hash: Optional[str] = None
+    #: What the product tagged the test in flight with - see
+    #: :mod:`..attributes`. Read from the worker's own slot, which is
+    #: written as the test begins, so a test that never got past setup
+    #: carries them too. Absent from the payload, rather than empty, where
+    #: nothing was tagged - the payload a run without tags always had.
+    test_attributes: dict[str, str] = Field(default_factory=dict)
     phase: Optional[str] = None
 
     stack: list[str] = Field(default_factory=list)
@@ -119,7 +126,9 @@ class WorkerStallIncident(Incident):
 
     @model_serializer(mode="wrap")
     def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
-        return thread_lanes.without_unset(handler(self), self, ("lanes_in_flight",))
+        return thread_lanes.without_unset(
+            handler(self), self, ("lanes_in_flight", "test_attributes")
+        )
 
     def raw_stack(self) -> list[str]:
         return self.stack
@@ -322,6 +331,7 @@ def build(
         last_test=state.get("last_nodeid"),
         test_in_flight_hash=state.get("nodeid_hash"),
         last_test_hash=state.get("last_nodeid_hash"),
+        test_attributes=test_attributes.in_flight(state),
         phase=state.get("phase"),
         stack=stack,
         stack_probed=probed,
@@ -499,6 +509,7 @@ def _build_lane(
         last_test=state.get("last_nodeid"),
         test_in_flight_hash=state.get("nodeid_hash"),
         last_test_hash=state.get("last_nodeid_hash"),
+        test_attributes=test_attributes.in_flight(state),
         phase=state.get("phase"),
         stack=stack,
         stack_probed=probed,
@@ -594,6 +605,7 @@ def _frozen_process(
         worker_pid=pid if isinstance(pid, int) else None,
         test_in_flight=culprit.get("nodeid") if culprit else None,
         test_in_flight_hash=culprit.get("nodeid_hash") if culprit else None,
+        test_attributes=test_attributes.in_flight(culprit),
         phase=culprit.get("phase") if culprit else None,
         stack=stack,
         stack_probed=reading is not None,

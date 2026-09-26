@@ -59,6 +59,8 @@ DEFAULTS = {
     "failure_resources_max_files": "50000",
     "failure_resources_roots": [],
     "failure_sample_seconds": "0",
+    "failure_test_attributes": [],
+    "failure_otel": "false",
     "failure_stack_server": "false",
     "failure_stack_server_port": "0",
     "failure_stack_server_host": "127.0.0.1",

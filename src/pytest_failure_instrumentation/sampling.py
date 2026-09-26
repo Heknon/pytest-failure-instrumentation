@@ -107,9 +107,16 @@ class SampledWorker(BaseModel):
     thread_name: Optional[str] = None
     thread_id: Optional[int] = None
 
+    #: What the product tagged the test in flight with - see
+    #: :mod:`.attributes`. Absent from a dump, like the lane fields, wherever
+    #: nothing was tagged.
+    test_attributes: dict[str, str] = Field(default_factory=dict)
+
     @model_serializer(mode="wrap")
     def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
-        return without_unset(handler(self), self, ("process", "thread_name", "thread_id"))
+        return without_unset(
+            handler(self), self, ("process", "thread_name", "thread_id", "test_attributes")
+        )
 
 
 class WorkerSample(BaseModel):
@@ -192,6 +199,7 @@ class WorkerSampler:
                     process=record.get("process"),
                     thread_name=record.get("thread_name"),
                     thread_id=record.get("thread_id"),
+                    test_attributes=record.get("test_attributes") or {},
                 )
                 for record in described.get("workers", [])
             ],

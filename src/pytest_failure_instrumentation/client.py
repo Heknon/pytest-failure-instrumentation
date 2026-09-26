@@ -233,12 +233,18 @@ class Worker(_Wire):
     #: is the lanes' scheduler. None where the row is not a lane.
     thread_name: Optional[str] = None
     thread_id: Optional[int] = None
+    #: What the product tagged the test in flight with, through
+    #: ``pytest_failure_test_attributes`` or ``failure_test_attributes``.
+    #: Empty where nothing was, and from a server too old to say.
+    test_attributes: dict[str, str] = {}
 
     @model_serializer(mode="wrap")
     def _without_absent_lanes(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         # Left out while unset, as the server leaves them out: a consumer
         # re-serving a row without lanes serves what it did before lanes.
-        return without_unset(handler(self), self, ("process", "thread_name", "thread_id"))
+        return without_unset(
+            handler(self), self, ("process", "thread_name", "thread_id", "test_attributes")
+        )
 
 
 class Run(_Wire):

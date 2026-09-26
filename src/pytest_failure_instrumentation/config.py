@@ -348,6 +348,24 @@ class Settings:
     #: are raised only when the same code bursts across many tests.
     profile_burst_seconds: float = 2.0
 
+    #: Marker names whose first argument each test carries as an attribute -
+    #: ``team`` for ``@pytest.mark.team("payments")``. Read where the test
+    #: runs and written into its state slot, so it reaches every reader of the
+    #: test in flight - see :mod:`.attributes`, which is also where the hook
+    #: that computes them instead is described. Empty, the default, reads no
+    #: marker, and a run whose product implements no hook pays nothing.
+    test_attributes: tuple[str, ...] = ()
+    #: Report what this run finds as OpenTelemetry metrics - see :mod:`.otel`.
+    #: Off by default, and on the controller only: a worker never imports
+    #: OpenTelemetry. Needs the ``otel`` extra and a MeterProvider set by the
+    #: product; the plugin never sets one.
+    otel: bool = False
+    #: The MeterProvider to report through, for a product that does not set
+    #: the global one. None, the default, uses the global provider, whenever
+    #: it is set - before this run starts or during it. Passing one implies
+    #: ``otel``. Never sent to a worker, and never shut down by this package.
+    otel_meter_provider: Any = None
+
     #: Live resource history is independent of worker-sample hooks/profiling.
     #: Zero preserves the existing default runtime cost and wire contracts.
     resources_seconds: float = 0.0
@@ -359,6 +377,17 @@ class Settings:
     def __post_init__(self) -> None:
         object.__setattr__(self, "directory", Path(self.directory))
         object.__setattr__(self, "packages", tuple(self.packages))
+        markers = self.test_attributes
+        if isinstance(markers, str):
+            markers = markers.split()
+        object.__setattr__(
+            self,
+            "test_attributes",
+            tuple(dict.fromkeys(str(name).strip() for name in markers if str(name).strip())),
+        )
+        object.__setattr__(
+            self, "otel", bool(self.otel) or self.otel_meter_provider is not None
+        )
         object.__setattr__(
             self,
             "heartbeat_interval",
@@ -635,6 +664,10 @@ class Settings:
             "profile_allocation_depth": self.profile_allocation_depth,
             "profile_burst_cores": self.profile_burst_cores,
             "profile_burst_seconds": self.profile_burst_seconds,
+            # Read where the test is, which is the worker. The otel switch
+            # and its provider stay out: the metrics are the controller's,
+            # and a provider is an object no pipe can carry anyway.
+            "test_attributes": list(self.test_attributes),
             # crash_stack is absent, and for a reason of its own: it asks
             # whether a run with no workers should take the fatal dump off its
             # terminal, and a worker has no terminal and no choice. It always
@@ -802,6 +835,24 @@ def add_options(parser: pytest.Parser) -> None:
         help="Push a worker sample to pytest_failure_worker_sample this often, "
         "while the run is going. 0 disables, and is the default.",
         default="0",
+    )
+    parser.addini(
+        "failure_test_attributes",
+        help="Marker names whose first argument each test carries as an "
+        "attribute - team for @pytest.mark.team('payments') - on the incidents, "
+        "sample rows and metrics that name the test in flight. A marker with "
+        "no arguments reads 'true'. Implement pytest_failure_test_attributes "
+        "to compute them instead.",
+        type="args",
+        default=[],
+    )
+    parser.addini(
+        "failure_otel",
+        help="Report incidents, run summaries and worker figures as "
+        "OpenTelemetry metrics, through the MeterProvider this process sets. "
+        "Needs the otel extra; the plugin never sets a provider itself. Off by "
+        "default.",
+        default="false",
     )
     parser.addini(
         "failure_tracer",
@@ -1246,6 +1297,8 @@ def resolve(config: pytest.Config) -> Settings:
         on_run_death=str(_ini(config, "failure_on_run_death", "") or "").strip() or None,
         tracer=str(_ini(config, "failure_tracer", "parent") or "parent").strip().lower(),
         sample_seconds=_number(config, "failure_sample_seconds", 0.0),
+        test_attributes=tuple(_ini(config, "failure_test_attributes", ()) or ()),
+        otel=_flag(config, "failure_otel", False),
         resources_seconds=_number(config, "failure_resources_seconds", 0.0),
         resources_max_mb=_number(config, "failure_resources_max_mb", 256),
         resources_scan_seconds=_number(config, "failure_resources_scan_seconds", 60),
