@@ -192,9 +192,12 @@ class WorkerRecorder:
         # user's faulthandler_timeout and with it the exit that was meant to
         # end a hung run. Losing a stack is a worse report; losing somebody's
         # configured timeout is a worse run.
+        #
+        # And it stands down under lanes, where it cannot keep its promise to
+        # fire only once nothing is executing - see _record_lane_adjustments.
         self._frozen_stream = None
         self.frozen = crash_stack.FrozenInterpreterFallback(None, 0.0)
-        if settings.watchdog and self.faulthandler_timeout <= 0:
+        if settings.watchdog and self.faulthandler_timeout <= 0 and not self.lanes:
             self._frozen_stream = self._track(
                 (directory / f"{worker_id}.frozen").open(
                     "w", buffering=1, encoding="utf-8"
@@ -312,11 +315,31 @@ class WorkerRecorder:
                 reason="several tests are in flight at once; the dump is of "
                 "every thread, so it holds whichever lane is overdue",
             )
+        if settings.watchdog and self.faulthandler_timeout <= 0:
+            # Its dump is taken without the GIL, and is safe only once no
+            # Python thread is executing. Three missed beats meant that in a
+            # process running one test; under lanes they do not. Twenty lanes
+            # running Python on four cores kept the heartbeat from the GIL for
+            # longer than that, and a stopped process resumes every lane at
+            # the instant the overdue timer fires: either way the dump walked
+            # frames being torn down, and the worker died of SIGSEGV in 3 runs
+            # of 4 and 5 of 5. A stack for a frozen process of lanes is read
+            # from outside it instead, by py-spy, with the process's incident.
+            self.events.record(
+                "lanes_adjusted",
+                mechanism="frozen_fallback",
+                action="off",
+                reason="its dump is taken without the GIL and is safe only once no "
+                "Python thread is executing, which missed beats cannot show when "
+                "many lanes contend for the GIL or a stopped process resumes. A "
+                "frozen process's stack is read by py-spy from outside it instead",
+            )
         if settings.watchdog:
             self.events.record(
                 "lanes_adjusted",
                 mechanism="heartbeat",
-                action="no test on the process's beat; each lane's CPU on its own record",
+                action="no test on the process's beat; each lane's CPU in the "
+                "process's .lanecpu file",
                 reason="the process is running one test per lane, and its beat "
                 "cannot name one of them. Memory is per process and is not "
                 "attributed to any test",

@@ -1487,6 +1487,10 @@ def test_what_is_one_per_process_is_adjusted_and_says_so(pytester):
     assert adjusted["slow_test_watchdog"] == "one clock per lane"
     assert "heartbeat" in adjusted
     assert not list(directory.glob("*.profile.jsonl"))
+    # faulthandler's C timer dumps without the GIL: with lanes running, missed
+    # beats do not mean nothing is executing, so it is never armed.
+    assert adjusted["frozen_fallback"] == "off"
+    assert not list(directory.glob("*.frozen"))
     # The process's beat names no test: its lanes are running several.
     assert {event["nodeid"] for event in events if event["event"] == "heartbeat"} == {None}
 
