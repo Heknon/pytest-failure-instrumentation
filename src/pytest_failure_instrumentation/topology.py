@@ -350,30 +350,52 @@ def _row(
     exists = is_running(int(pid)) if pid else None
     beat_age = (now - stall_analysis.last_beat_time(beats)) if beats else None
     interval = _interval(events, events_path, tails)
-    measured = (
-        stall_analysis.lane_beats(
-            beats,
-            _lane_cpu(state_path.parent, process, run_id, tails).get(state_path.stem),
-            interval,
-        )
-        if lane is not None
-        else beats
-    )
+    measured = beats
+    # For a lane: where its CPU figure comes from, when it is not its own.
+    borrowed: Optional[str] = None
+    busy = stall_analysis.BUSY_THRESHOLD
+    if lane is not None:
+        cpu = _lane_cpu(state_path.parent, process, run_id, tails)
+        if not record.get("nodeid"):
+            # No test in flight: nothing to measure. Its last test's CPU, or
+            # its process's, would be read as this lane working.
+            measured = []
+        elif stall_analysis.lane_cpu_current(cpu.newest, beats, interval):
+            measured = stall_analysis.lane_beats(beats, cpu.get(state_path.stem), interval)
+            share = stall_analysis.fair_share(
+                measured[-RATE_WINDOW:], beats,
+                _lanes_in_flight(state_path.parent, process, run_id, tails),
+            )
+            if share is not None:
+                busy = share.threshold
+        else:
+            # This process writes no figure per thread - macOS, or a Linux
+            # without per-thread clocks - or stopped writing it. Its own
+            # figure, said as such, reads a busy lane as busy; none at all
+            # read every lane as blocked.
+            borrowed = (
+                "the CPU figure is the process's, every lane's together: this "
+                "process stopped writing its lanes' own"
+                if cpu
+                else "the CPU figure is the process's, every lane's together: no "
+                "figure per thread is written for this process"
+            )
     rate = (
         stall_analysis.cpu_rate(measured[-RATE_WINDOW:]) if len(measured) >= 2 else None
     )
     status, why = _status(
         exists, beats, beat_age, rate, interval, record,
-        finished=finished, now=now,
+        finished=finished, now=now, busy=busy,
     )
-    if lane is not None and status == "blocked" and rate is None and not record.get("nodeid"):
+    if lane is not None and status == "blocked" and not record.get("nodeid"):
         # Not a silence to explain: a lane between tests, or done with its
-        # share of the run, has no test to be blocked in and no CPU figure of
-        # its own - its process's would be its siblings' work.
+        # share of the run, has no test to be blocked in.
         why = (
-            "no test in flight on this lane, and no CPU figure of its own: its "
-            "thread is between tests or has finished its share of the run"
+            "no test in flight on this lane: its thread is between tests or has "
+            "finished its share of the run"
         )
+    elif borrowed is not None and status in ("working", "blocked"):
+        why = f"{why}; {borrowed}"
 
     nodeid = record.get("nodeid")
     row = {
@@ -448,7 +470,8 @@ class _Reads:
     def __init__(self) -> None:
         self.tails: dict[Path, list[dict[str, Any]]] = {}
         self.intervals: dict[Path, float] = {}
-        self.lane_cpu: dict[Any, dict[str, list[list[float]]]] = {}
+        self.lane_cpu: dict[Any, thread_lanes.LaneCpuRead] = {}
+        self.in_flight: dict[Any, int] = {}
 
 
 def _tail(path: Path, tails: Optional[_Reads]) -> list[dict[str, Any]]:
@@ -462,15 +485,29 @@ def _tail(path: Path, tails: Optional[_Reads]) -> list[dict[str, Any]]:
 
 def _lane_cpu(
     directory: Path, process: Any, run_id: Optional[str], tails: Optional[_Reads]
-) -> dict[str, list[list[float]]]:
+) -> thread_lanes.LaneCpuRead:
     """A process's lanes' CPU readings, read once per request - see
     :class:`.lanes.LaneCpu`."""
     if tails is None:
-        return thread_lanes.lane_cpu(directory, process, run_id)
+        return thread_lanes.read_lane_cpu(directory, process, run_id)
     key = (directory, process)
     if key not in tails.lane_cpu:
-        tails.lane_cpu[key] = thread_lanes.lane_cpu(directory, process, run_id)
+        tails.lane_cpu[key] = thread_lanes.read_lane_cpu(directory, process, run_id)
     return tails.lane_cpu[key]
+
+
+def _lanes_in_flight(
+    directory: Path, process: Any, run_id: Optional[str], tails: Optional[_Reads]
+) -> int:
+    """How many of a process's lanes have a test in flight, counted once per
+    request."""
+    key = (directory, process)
+    if tails is not None and key in tails.in_flight:
+        return tails.in_flight[key]
+    count = len(thread_lanes.in_flight(thread_lanes.lane_records(directory, process, run_id)))
+    if tails is not None:
+        tails.in_flight[key] = count
+    return count
 
 
 def _of_run(record: dict[str, Any], run_id: Optional[str]) -> dict[str, Any]:
@@ -568,8 +605,13 @@ def _status(
     record: dict[str, Any],
     finished: Optional[dict[str, Any]] = None,
     now: Optional[float] = None,
+    busy: float = stall_analysis.BUSY_THRESHOLD,
 ) -> tuple[str, str]:
     """:mod:`.analysis.stall`'s truth table, as a status rather than a verdict.
+
+    ``busy`` is the rate above which a worker is working: for a lane of a
+    saturated process, a fraction of its share of it - see
+    :func:`.analysis.stall.fair_share`.
 
     The order matters. A worker that wrote down that its session ended
     outranks everything, because everything below it is inference from
@@ -621,7 +663,7 @@ def _status(
             "the heartbeat is running but no CPU figure could be measured, so "
             "this rests on the silence alone - a busy worker cannot be ruled out",
         )
-    if rate > stall_analysis.BUSY_THRESHOLD:
+    if rate > busy:
         return "working", f"heartbeat {beat_age:.1f}s old, burning {rate:.2f} cores"
     return (
         "blocked",

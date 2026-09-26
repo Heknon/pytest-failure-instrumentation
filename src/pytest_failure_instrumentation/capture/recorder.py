@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,6 +54,7 @@ class _Slot:
         state: WorkerState,
         native_id: Optional[int] = None,
         ident: Optional[int] = None,
+        thread: Optional[threading.Thread] = None,
     ) -> None:
         self.name = name
         self.state = state
@@ -71,6 +73,18 @@ class _Slot:
         #: None for the process's own slot.
         self.native_id = native_id
         self.ident = ident
+        #: The lane's thread itself, weakly, so its CPU is read only while it
+        #: is alive: once it has ended its native id can be given to a new
+        #: thread, whose CPU would be read as the lane's.
+        self._thread = weakref.ref(thread) if thread is not None else None
+
+    def alive(self) -> bool:
+        """Whether this slot's thread is still running - a lane's, where it
+        has one; the process's own slot always is."""
+        if self._thread is None:
+            return True
+        thread = self._thread()
+        return thread is not None and thread.is_alive()
 
 
 class _SessionTeeDrain:
@@ -811,7 +825,7 @@ class WorkerRecorder:
                 self.events.record("lane_state_failed", lane=lane, detail=repr(failure))
                 return None
             self._track(state)
-            slot = _Slot(lane, state, native, ident)
+            slot = _Slot(lane, state, native, ident, current)
             first = not self._lanes
             self._lanes[lane] = slot
             state.update()
@@ -858,6 +872,7 @@ class WorkerRecorder:
         if not slots:
             return
         stamp = time.time()
+        slots = [slot for slot in slots if slot.alive()]
         used = thread_cpu_seconds(
             slot.native_id for slot in slots if slot.native_id is not None
         )

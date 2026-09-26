@@ -1843,3 +1843,110 @@ def test_a_line_cut_off_when_a_rotated_file_is_closed_is_not_joined_to_the_next(
     lines = finished.stderr.splitlines()
     assert "w1-00500" in lines
     assert "c-01" in lines
+
+
+# --- review round 3 --------------------------------------------------------
+
+
+def test_busy_lanes_of_a_saturated_process_are_judged_by_their_share():
+    """Fifty lanes running Python share one GIL: each gets about a fiftieth
+    of a core, under the fixed floor, and each read as waiting. A lane waiting
+    on something beside them burns nothing, and still reads as waiting."""
+    now = time.time()
+    process = [{"time": now - 4 + index, "cpu_seconds": index * 1.05} for index in range(5)]
+
+    def readings(step):
+        return [{"time": now - 4 + index, "cpu_seconds": index * step} for index in range(5)]
+
+    busy = stall_analysis.assess_lane(process, readings(0.04), now, 12.0, 1.0, 50)
+    assert busy.state is None
+    waiting = stall_analysis.assess_lane(process, readings(0.0), now, 12.0, 1.0, 50)
+    assert waiting.state == "BLOCKED"
+    assert waiting.confidence is None  # the state's own, high
+    assert "saturated" in waiting.reason and "about 0.021 each" in waiting.reason
+    # A thousand lanes: a busy one's share over four seconds is four
+    # milliseconds, which cannot be told from none.
+    crowded = stall_analysis.assess_lane(process, readings(0.0), now, 12.0, 1.0, 1000)
+    assert crowded.state == "BLOCKED" and crowded.confidence == "low"
+    # A process that is not saturated: the floor, as before.
+    idle = [{"time": now - 4 + index, "cpu_seconds": index * 0.1} for index in range(5)]
+    assert stall_analysis.assess_lane(idle, readings(0.04), now, 12.0, 1.0, 50).state == "BLOCKED"
+
+
+def test_a_saturated_processs_busy_lanes_read_working(lanes):
+    lanes.process("main")
+    for index in range(50):
+        lanes.lane(f"ln{index}", "main", f"t.py::test_busy[env{index}]", "call")
+    steps = {f"ln{index}": 0.04 for index in range(49)}
+    steps["ln49"] = 0.0
+    lanes.beats("main", steps, process_step=1.05, count=5)
+    rows = {row["worker"]: row for row in topology.run(lanes.run)["workers"]}
+    assert {rows[f"ln{index}"]["status"] for index in range(49)} == {"working"}
+    assert rows["ln49"]["status"] == "blocked"
+
+
+def test_lanes_of_a_process_writing_no_cpu_file_read_its_figure(lanes):
+    """macOS, or a Linux without per-thread clocks: no .lanecpu at all. A
+    busy lane read "blocked, no CPU figure"; its process's figure, said as
+    such, reads it as it read in 0.14.0."""
+    lanes.process("main")
+    lanes.lane("ln0", "main", "t.py::test_busy", "call")
+    lanes.lane("ln1", "main")
+    lanes.beats("main", {}, process_step=1.0)
+    rows = {row["worker"]: row for row in topology.run(lanes.run)["workers"]}
+    assert rows["ln0"]["status"] == "working"
+    assert rows["ln0"]["cpu_rate"] == 1.0
+    assert "the CPU figure is the process's" in rows["ln0"]["why"]
+    # A lane with no test in flight reads no figure, whosever it would be.
+    assert rows["ln1"]["cpu_rate"] is None
+
+
+def test_a_lane_with_no_test_in_flight_reads_no_cpu_and_says_why(lanes):
+    """A finished lane kept its last test's CPU (0.97 on a lane with nothing
+    running), and one measured at 0.0 read "the test thread is waiting"."""
+    lanes.process("gw0")
+    lanes.lane("gw0.ln0", "gw0")
+    lanes.lane("gw0.ln1", "gw0")
+    lanes.beats("gw0", {"gw0.ln0": 1.0, "gw0.ln1": 0.0}, process_step=1.0, finish=True)
+    rows = {row["worker"]: row for row in topology.run(lanes.run)["workers"]}
+    assert rows["gw0.ln0"]["cpu_rate"] is None
+    assert rows["gw0.ln1"]["cpu_rate"] is None
+    lanes.beats("gw0", {"gw0.ln0": 1.0, "gw0.ln1": 0.0}, process_step=1.0)
+    rows = {row["worker"]: row for row in topology.run(lanes.run)["workers"]}
+    for name in ("gw0.ln0", "gw0.ln1"):
+        assert rows[name]["cpu_rate"] is None
+        assert rows[name]["why"].startswith("no test in flight on this lane")
+
+
+def test_a_lanes_cpu_is_not_read_once_its_thread_has_ended(tmp_path, monkeypatch):
+    """Its native id may be a new thread's by then."""
+    from pytest_failure_instrumentation.capture import recorder as recorder_module
+    from pytest_failure_instrumentation.capture.recorder import WorkerRecorder
+    from pytest_failure_instrumentation.config import Settings
+
+    recorder = WorkerRecorder(tmp_path, "main", Settings(watchdog=False), lanes=True)
+    try:
+        thread = threading.Thread(target=lambda: recorder._open_lane("ln0"), name="lane-ln0")
+        thread.start()
+        thread.join()
+        # A new thread given the ended one's native id reads as busy.
+        monkeypatch.setattr(recorder_module, "thread_cpu_seconds",
+                            lambda ids: {native: 5.0 for native in ids})
+        recorder._record_lane_cpu()
+        recorder._record_lane_cpu()
+        assert "ln0" not in thread_lanes.lane_cpu(tmp_path, "main")
+    finally:
+        recorder.close()
+
+
+def test_a_lanes_cpu_file_is_current_until_it_misses_a_whole_beat():
+    """Each beat's readings are written after the beat, and under fifty busy
+    lanes a beat came three seconds after the one before at a one-second
+    interval: a reader between the beat and its readings saw the previous
+    readings a whole gap behind, called the file stale, and read every lane
+    as its process for that moment."""
+    now = time.time()
+    beats = [{"time": now - 3.0, "cpu_seconds": 1.0}, {"time": now, "cpu_seconds": 4.0}]
+    assert stall_analysis.lane_cpu_current(now - 2.99, beats, 1.0)
+    assert not stall_analysis.lane_cpu_current(now - 4.0, beats, 1.0)
+    assert not stall_analysis.lane_cpu_current(None, beats, 1.0)

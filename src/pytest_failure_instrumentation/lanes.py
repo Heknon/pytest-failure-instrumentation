@@ -225,30 +225,52 @@ class LaneCpu:
             pass  # a reading lost is a rate one beat older, never a failed run
 
 
-def lane_cpu(
-    directory: Path, process: Any, run_id: Optional[str] = None
-) -> dict[str, list[list[float]]]:
-    """Each lane of ``process``'s ``[time, seconds]`` readings, oldest first.
+class LaneCpuRead:
+    """What a process's ``.lanecpu`` file said when it was read.
 
-    Empty where there are none - no lanes, a platform that cannot number
-    threads, or another run's file.
+    ``lanes`` is each lane's ``[time, seconds]`` readings, oldest first, and
+    ``newest`` the time of the file's latest reading - None where there is no
+    file of this run to read. The second is what says whether the file is
+    still being written: a process that stopped writing it (a full descriptor
+    table, a file another program holds open on Windows) leaves one behind
+    whose readings end where the writes did, and a lane read from it would
+    wait forever for a reading that is never coming.
     """
+
+    def __init__(
+        self, newest: Optional[float] = None, lanes: Optional[dict[str, list[list[float]]]] = None
+    ) -> None:
+        self.newest = newest
+        self.lanes = lanes or {}
+
+    def get(self, lane: str) -> Optional[list[list[float]]]:
+        return self.lanes.get(lane)
+
+    def __bool__(self) -> bool:
+        return self.newest is not None
+
+
+def read_lane_cpu(directory: Path, process: Any, run_id: Optional[str] = None) -> LaneCpuRead:
+    """``process``'s ``.lanecpu`` file, or an empty reading where there is
+    none of this run - no lanes, a platform that cannot number threads, or
+    another run's file."""
     path = sibling(directory / "x", process, LANE_CPU_SUFFIX)
     if path is None:
-        return {}
+        return LaneCpuRead()
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return LaneCpuRead()
     if not isinstance(loaded, dict):
-        return {}
+        return LaneCpuRead()
     written_by = loaded.get("run_id")
     if run_id and written_by and written_by != run_id:
-        return {}
+        return LaneCpuRead()
     times = loaded.get("times")
     lanes = loaded.get("lanes")
     if not isinstance(times, list) or not isinstance(lanes, dict):
-        return {}
+        return LaneCpuRead()
+    stamps = [float(stamp) for stamp in times if isinstance(stamp, (int, float))]
     found: dict[str, list[list[float]]] = {}
     for lane, values in lanes.items():
         if not isinstance(values, list):
@@ -258,4 +280,12 @@ def lane_cpu(
             for stamp, value in zip(times[-len(values):], values)
             if isinstance(stamp, (int, float)) and isinstance(value, (int, float))
         ]
-    return found
+    return LaneCpuRead(max(stamps) if stamps else None, found)
+
+
+def lane_cpu(
+    directory: Path, process: Any, run_id: Optional[str] = None
+) -> dict[str, list[list[float]]]:
+    """Each lane of ``process``'s ``[time, seconds]`` readings, oldest first -
+    :func:`read_lane_cpu`'s, without when the file was last written."""
+    return read_lane_cpu(directory, process, run_id).lanes
