@@ -970,5 +970,6 @@ class WorkerRecorder:
             if self.stderr_tee is not None:
                 with self._tee_lock:
                     self.stderr_tee.hand_back()
+                    self.stderr_tee.compact()
         if self._allocation_tracer is not None:
             self._allocation_tracer.close()

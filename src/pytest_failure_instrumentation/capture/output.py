@@ -352,6 +352,32 @@ class StderrTee:
         finally:
             os.close(old)
 
+    def compact(self) -> None:
+        """Leave a session's capture file as its last ring, once fd 2 is back.
+
+        A session of lanes gives back the disk under what it passed on by
+        punching holes (:meth:`_release`), so the file's blocks are the tail
+        while its length still counts every byte the session wrote: a
+        gigabyte "file" of sixteen kilobytes, which a copy, an archive or an
+        upload of the evidence directory then expands in full. Written anew
+        as its tail and moved into place, after :meth:`hand_back` has given
+        fd 2 back, so nothing of this process writes it any more.
+        """
+        if self._file is None or not self._flags & os.O_APPEND or self._passthrough is not None:
+            return
+        try:
+            size = os.fstat(self._file).st_size
+            if size <= self.limit:
+                return
+            tail = os.pread(self._file, self.limit, size - self.limit)
+            cut = tail.find(b"\n")
+            tail = tail[cut + 1:] if cut != -1 else tail
+            staging = self.path.with_name(self.path.name + ".part")
+            staging.write_bytes(tail)
+            os.replace(staging, self.path)
+        except OSError:
+            pass  # a file left long is a larger file, not a lost one
+
     def _trim(self) -> None:
         """Keep the file to its last ``limit`` bytes. Only between phases, so a
         phase's own output is never trimmed while it is still being written."""
@@ -457,7 +483,10 @@ def _punch_hole(descriptor: int, length: int) -> bool:
     try:
         import ctypes
 
-        fallocate = ctypes.CDLL(None, use_errno=True).fallocate
+        libc = ctypes.CDLL(None, use_errno=True)
+        # The 64-bit entry point where there is one: on a 32-bit build
+        # ``fallocate`` takes 32-bit offsets, which the arguments below are not.
+        fallocate = getattr(libc, "fallocate64", None) or libc.fallocate
         fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
         fallocate.restype = ctypes.c_int
         # FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE

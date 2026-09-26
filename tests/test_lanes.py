@@ -998,7 +998,12 @@ with lock:
     tee.drain()
     tee.hand_back()
 print(os.stat(path).st_blocks * 512, os.path.getsize(path))
-print(output.read_tail(path)[-1])
+last = output.read_tail(path)[-1]
+print(last)
+# Session end: fd 2 is back, and the file is left as its tail rather than as
+# a sparse file whose length is every byte the session wrote.
+tee.compact()
+print(os.path.getsize(path), output.read_tail(path)[-1] == last)
 """
 
 
@@ -1032,6 +1037,9 @@ def test_a_session_long_tee_passes_every_byte_on_once_and_stays_bounded(tmp_path
     else:
         assert len(child) == len(set(child))
     on_disk, length = (int(value) for value in finished.stdout.split()[:2])
+    compacted, tail_kept = finished.stdout.splitlines()[2].split()
+    assert int(compacted) <= 4096
+    assert tail_kept == "True"
     if how == "grow":
         assert length >= 3 * 2000 * 9 + 2000 * 8
         assert not (tmp_path / "main.output.prev").exists()
