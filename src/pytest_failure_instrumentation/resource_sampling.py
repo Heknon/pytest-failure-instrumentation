@@ -143,6 +143,10 @@ class ResourceSampler:
                     containers[visible] = path.stem
         for visible, name in containers.items():
             workers[visible]["lanes_running"] = running.get(name, 0)
+            # A process of lanes runs no test of its own: None, as the other
+            # fields of a test not running are, rather than the empty id a
+            # worker between tests has always been sent.
+            workers[visible]["nodeid"] = None
         return workers
 
     def _discover(self, workers: dict[int, dict[str, Any]], now: float) -> None:

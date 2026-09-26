@@ -1112,6 +1112,8 @@ def test_a_process_of_lanes_says_how_many_are_running_in_its_resources(tmp_path)
         sampler.close()
     assert workers[LIVE]["worker"] == "gw0"
     assert workers[LIVE]["lanes_running"] == 1
+    # A process of lanes runs no test of its own: None, not a worker's "".
+    assert workers[LIVE]["nodeid"] is None
     assert "lanes_running" not in workers[1]
 
 
