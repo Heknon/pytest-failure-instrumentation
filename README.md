@@ -2578,13 +2578,27 @@ one file of the process, `<process>.lanecpu` (the newest six readings, replaced
 whole), and a lane's row and its stall verdict are read from it. On Linux each
 thread's CPU clock is read in one system call that keeps the GIL, since
 reading `/proc` per thread lets go of it once per file and made the heartbeat
-seconds late beside busy lanes. A lane with fewer than two readings — its first
-beat, or a thread that has finished — has a `cpu_rate` of null, never its
-process's: an idle lane beside a busy one does not read as `working`. On macOS
-psutil numbers threads by position rather than by native id, so no lane's CPU
-is written there: rows read null, a stall is judged on its process's CPU and
-says so, and the event log says why (`lanes_adjusted`, `per_lane_cpu`). The
+seconds late beside busy lanes. A lane with no test in flight has a `cpu_rate`
+of null and says so in `why`; so does one with a test but fewer than two
+readings of its own (its first beat) — never its process's figure, which read
+an idle lane beside a busy one as `working`. Where the process writes no
+`.lanecpu` at all — macOS, where psutil numbers threads by position rather than
+by native id (the event log says so: `lanes_adjusted`, `per_lane_cpu`) — or its
+writes have stopped (a full descriptor table; a file another program holds open
+on Windows), a lane with a test in flight reads its process's figure, and its
+`why` and any stall say that it is the process's, every lane's together. The
 beat itself stays the line it always was, however many lanes there are.
+
+**A saturated process's lanes are judged by their share of it.** Fifty lanes
+running Python share one GIL, and each gets about a fiftieth of a core: under
+the fixed floor a busy worker is judged by, and every one of them read as
+waiting. Where the process burns at least 0.8 cores and more than one of its
+lanes has a test in flight, a lane counts as working above a quarter of its
+fair share (the process's rate over its lanes in flight), and a stall reason
+says the process is saturated; a lane waiting on something burns next to
+nothing however many siblings it has, and is still reported. Where that share
+is too small to measure over the window (a thousand lanes running Python), the
+verdict is low confidence and says why.
 
 **A stall is a lane's.** Each lane is timed on its own — from its reports
 (`report.lane_id`), and from its own record, where it writes the start of each
@@ -2609,8 +2623,15 @@ native code holding the GIL, or the process stopped — every lane goes silent
 with it, and that is the process's finding, not each lane's: one
 `STALLED_FROZEN` incident for the process, listing every lane with a test in
 flight in `lanes_in_flight`. A lane is blamed only on evidence — py-spy finding
-its thread holding the GIL — and never when the process is stopped by a signal.
-`lanes_in_flight` is absent from a stall incident without lanes.
+its thread holding the GIL — and never when the process is stopped by a signal
+(a process py-spy is reading is traced, not stopped). A process whose beat is
+late because its lanes are starving the heartbeat of the GIL is not frozen:
+its lanes' threads, read from outside, are sharing the CPU, where a frozen
+process runs one thread or none — and nothing is raised. Once a frozen process
+beats again its lanes are timed afresh, so a lane hung on its own through the
+freeze is still reported. `lanes_in_flight` is absent from a stall incident
+without lanes. With `failure_stack_probe = false` a worker of lanes is left
+alone — py-spy pauses the process it reads — as a worker without lanes is.
 
 **A death names every lane it took.** A process that dies takes each of its
 lanes' tests with it, and its counts are all of theirs. With one lane in
@@ -2621,7 +2642,10 @@ one of their threads — a native fault is delivered to the thread that faulted 
 blames that lane's test; otherwise none is blamed, since nothing on disk says
 which caused it. A free-threaded interpreter's dump names no thread and prints
 only the stack that faulted: the incident shows that Python stack, and blames
-the lane whose test function is on it where exactly one is. Either way every lane in
+the lane whose test function is on it where exactly one is. It cannot tell
+apart lanes running the same function — every parametrization of one test,
+say, which is the usual shape of a run of lanes — and then blames none of them
+and says so. Either way every lane in
 flight is listed in `lanes_in_flight`, `{lane, nodeid, nodeid_hash, phase}`
 each, which is absent from the payload of a death without lanes. An internal
 error is named the same way: after the lane whose test it interrupted, and
