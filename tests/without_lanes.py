@@ -80,6 +80,7 @@ INCIDENT_MODELS = {
 #: JSON schemas may have from 0.13.1's - see :func:`schemas`.
 LANE_PROPERTIES = {
     "WorkerDeathIncident": {"lanes_in_flight"},
+    "WorkerStallIncident": {"lanes_in_flight"},
     "SampledWorker": {"process", "thread_name", "thread_id"},
     "Worker": {"process", "thread_name", "thread_id"},
     "ResourceProcess": {"lanes_running"},
@@ -219,15 +220,34 @@ RESOURCE_BATCH = {
 }
 
 
+#: And a ``/workers`` answer without lanes.
+WORKERS_SNAPSHOT = {
+    "served_by": {"service": "s", "pid": 1}, "observed_at": 1.0,
+    "runs": [{
+        "session": "run-1", "run_id": "r", "controller": {"pid": 1, "alive": True},
+        "workers": [{
+            "worker": "gw0", "pid": 12, "nodeid": "t.py::test_a", "nodeid_elided": False,
+            "nodeid_hash": "h", "phase": "call", "status": "blocked", "why": "w",
+            "tests_started": 1, "tests_finished": 0, "cpu_rate": 0.0,
+        }],
+    }],
+}
+
+
 def client_dumps() -> dict[str, Any]:
     """The client's models, parsed from a payload without lanes and dumped:
     a consumer re-serving them must serve what it did. Empty without httpx."""
     try:
-        from pytest_failure_instrumentation.client import ResourceBatch
+        from pytest_failure_instrumentation.client import ResourceBatch, WorkersSnapshot
     except ImportError:
         return {}
     parsed = ResourceBatch.model_validate(RESOURCE_BATCH)
-    return {"resources": json.loads(parsed.model_dump_json())}
+    workers = WorkersSnapshot.model_validate(WORKERS_SNAPSHOT)
+    return {
+        "resources": json.loads(parsed.model_dump_json()),
+        "workers": json.loads(workers.model_dump_json()),
+        "workers_python": workers.model_dump(),
+    }
 
 
 def schemas() -> dict[str, Any]:

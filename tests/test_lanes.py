@@ -1191,11 +1191,19 @@ def test_the_schemas_are_0_13_1s_plus_only_the_declared_lane_fields():
     import pydantic
 
     golden = json.loads(BASELINE.read_text(encoding="utf-8"))
+    # CI's lint job pins the pydantic they were recorded with and says so: a
+    # skip there would be the comparison silently not running.
+    required = os.environ.get("FAILURE_SCHEMA_GOLDEN") == "required"
     if pydantic.VERSION != golden["pydantic"]:
-        pytest.skip(f"the schemas were recorded with pydantic {golden['pydantic']}")
+        message = f"the schemas were recorded with pydantic {golden['pydantic']}"
+        if required:
+            pytest.fail(message + f", and this is {pydantic.VERSION}")
+        pytest.skip(message)
     found = without_lanes.schemas()
     for name, schema in golden["schemas"].items():
         if name.startswith("client_") and name not in found:
+            if required:
+                pytest.fail("httpx is not installed, so the client's schemas went unchecked")
             continue  # httpx is not installed
         assert found[name] == schema, name
     # And each declared property is really there, in both modes.

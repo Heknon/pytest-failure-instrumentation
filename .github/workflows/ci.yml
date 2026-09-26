@@ -67,6 +67,17 @@ jobs:
       - name: Mypy
         run: mypy
 
+      # The payload's JSON schemas are compared with 0.13.1's, which were
+      # recorded under one pydantic: the comparison skips under any other,
+      # so this is the one job that pins it - with httpx, for the client's
+      # models - and is told a skip is a failure.
+      - name: Payload schemas against 0.13.1's
+        env:
+          FAILURE_SCHEMA_GOLDEN: required
+        run: |
+          pip install "pydantic==2.13.5"
+          pytest -q -p no:cacheprovider tests/test_lanes.py -k "schemas or clients_models or incidents_without"
+
   test:
     if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'profiling-iterate')
     # Linux is the full PR gate. Python 3.9 is exercised with the declared
