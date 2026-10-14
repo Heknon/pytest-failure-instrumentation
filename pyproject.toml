@@ -68,7 +68,7 @@ where = ["src"]
 # `incident: WorkerDeathIncident` against registry.parse() gets Any without
 # this file, which is the opposite of what a typed union is for.
 [tool.setuptools.package-data]
-pytest_failure_instrumentation = ["py.typed"]
+pytest_failure_instrumentation = ["py.typed", "sahara_docs/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

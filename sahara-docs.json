@@ -1,5 +1,5 @@
 {
   "mount": "failure-instrumentation",
-  "path": "docs/site",
+  "path": "src/pytest_failure_instrumentation/sahara_docs",
   "owner": "morphine"
 }
