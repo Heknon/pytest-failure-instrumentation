@@ -1,35 +1,45 @@
-# Add to a team repo whose docs/ folder is published on the docs site (it is
-# one of the site's sources.json entries). Merge it into the repo's own
-# .gitlab-ci.yml, e.g. with `include: local: ci/docs.gitlab-ci.yml`.
+# Add to a repo whose docs ship inside its Python package
+# (<package>/sahara_docs/, package data) and reach the docs site from the
+# package index: the site's sources.json lists it with "package", not "repo".
+# Merge it into the repo's own .gitlab-ci.yml, e.g. with
+# `include: local: ci/docs.gitlab-ci.yml`. init_repo_docs.py --package fills it in.
 #
-# On a merge request that touches docs/, the docs site is built with this
-# branch's pages in place, so a broken link or an external load fails here,
-# in the team's merge request, not on the shared site. After merge, the site
-# is rebuilt so the change goes live.
+# On a merge request that touches the docs, the whole docs site is built here
+# with this branch's pages in place (assemble_sources.py --local), so a broken
+# link or an external load fails the merge request.
+#
+# There is no publish job and nothing here triggers the site. To publish:
+# release the package, then run the docs site's pipeline (or wait for its next
+# run). Every site run pulls the newest matching version from the index.
 
 variables:
   DOCS_SITE_PROJECT: "TODO/docs-site"     # path of the docs site project
+  DOCS_SITE_BRANCH: "main"
   DOCS_SOURCE_NAME: "pytest-failure-instrumentation"                # this repo's "name" in the site's sources.json
+  DOCS_PATH: "src/pytest_failure_instrumentation/sahara_docs"           # the docs folder: src/<package>/sahara_docs
+  DOCS_NODE_IMAGE: "TODO.registry.internal/library/node:22"   # the full image: it has python3 and pip
+  NPM_CONFIG_REGISTRY: "https://TODO-npm-mirror.internal/"
+  PIP_INDEX_URL: "https://TODO-pypi-mirror.internal/simple"  # the site's other package sources come from here
+  ASTRO_TELEMETRY_DISABLED: "1"
 
 docs:check:
   stage: test
+  image: $DOCS_NODE_IMAGE
+  tags: [TODO-runner-tag]
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      changes: [docs/site/**/*, sahara-docs.json]
-  trigger:
-    project: $DOCS_SITE_PROJECT
-    branch: main
-    strategy: depend          # this job fails if the docs build fails
+      changes: [TODO/sahara_docs/**/*]
   variables:
-    SOURCE_NAME: $DOCS_SOURCE_NAME
-    SOURCE_REF: $CI_COMMIT_REF_NAME
-    UPSTREAM_MERGE_REQUEST: $CI_MERGE_REQUEST_IID
-
-docs:publish:
-  stage: deploy
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes: [docs/site/**/*, sahara-docs.json]
-  trigger:
-    project: $DOCS_SITE_PROJECT
-    branch: main
+    # The site's other repo sources are cloned with this job's token: the docs site
+    # project, and each of them, must allow this project in their job token allowlist.
+    SOURCES_GIT_BASE: "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}"
+  script:
+    - git clone --quiet --depth 1 --branch "$DOCS_SITE_BRANCH" "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${DOCS_SITE_PROJECT}.git" .docs-site
+    - cd .docs-site
+    - npm ci --no-audit --no-fund
+    - python3 scripts/assemble_sources.py sources.json --local "$DOCS_SOURCE_NAME=$CI_PROJECT_DIR/$DOCS_PATH"
+    - python3 scripts/build_views.py
+  artifacts:
+    paths: [.docs-site/public/]         # the whole site with this branch's pages
+    expose_as: "Docs preview"
+    expire_in: 1 week
