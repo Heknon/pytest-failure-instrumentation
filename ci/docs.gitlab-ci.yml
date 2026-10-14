@@ -1,0 +1,35 @@
+# Add to a team repo whose docs/ folder is published on the docs site (it is
+# one of the site's sources.json entries). Merge it into the repo's own
+# .gitlab-ci.yml, e.g. with `include: local: ci/docs.gitlab-ci.yml`.
+#
+# On a merge request that touches docs/, the docs site is built with this
+# branch's pages in place, so a broken link or an external load fails here,
+# in the team's merge request, not on the shared site. After merge, the site
+# is rebuilt so the change goes live.
+
+variables:
+  DOCS_SITE_PROJECT: "TODO/docs-site"     # path of the docs site project
+  DOCS_SOURCE_NAME: "pytest-failure-instrumentation"                # this repo's "name" in the site's sources.json
+
+docs:check:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [docs/site/**/*, sahara-docs.json]
+  trigger:
+    project: $DOCS_SITE_PROJECT
+    branch: main
+    strategy: depend          # this job fails if the docs build fails
+  variables:
+    SOURCE_NAME: $DOCS_SOURCE_NAME
+    SOURCE_REF: $CI_COMMIT_REF_NAME
+    UPSTREAM_MERGE_REQUEST: $CI_MERGE_REQUEST_IID
+
+docs:publish:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [docs/site/**/*, sahara-docs.json]
+  trigger:
+    project: $DOCS_SITE_PROJECT
+    branch: main
