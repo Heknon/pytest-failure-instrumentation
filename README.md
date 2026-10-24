@@ -2984,6 +2984,15 @@ deliberate `os._exit(3)` gives. What separates a crash from a clean exit there
 is whether a dump was written, not the exit status, which is why the crash
 stack is evidence in its own right rather than a decoration on the verdict.
 
+A fault's dump is headed `Windows fatal exception: …` there, not `Fatal Python
+error`, and faulthandler writes it before anything knows whether the exception
+will be handled — the `OSError` ctypes raises comes after it. So that dump is
+taken as the death's only when the worker then exited with an error NTSTATUS.
+Any error-severity NTSTATUS (`0xC…`) is a `NATIVE_CRASH`, decoded or not:
+`0xC0000142` — a desktop heap run dry, common under service-hosted CI agents —
+and `0xC0000017`, Windows' out-of-memory, are read as faults, not as a worker
+choosing to exit with 3221225794.
+
 `psutil` is a dependency, imported like any other. It is the only
 cross-platform way to ask whether a process is still there, and the POSIX way
 is actively dangerous on Windows: `os.kill(pid, 0)` sends a console event only

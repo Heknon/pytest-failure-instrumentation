@@ -256,7 +256,21 @@ def exit_status(pid: int | None, popen: Any, timeout: float = 5.0) -> tuple[int 
     ``WNOWAIT`` reads it without consuming it, so whoever owns the process can
     still reap normally. Windows has no such rule: any handle you can open
     answers, which makes it the easier platform here.
+
+    On Windows every reader below ends in ``GetExitCodeProcess`` - popen's
+    returncode and wait and psutil's wait included - and the source says so
+    whichever answered. The classifier keys on it: there, the code is
+    whatever a ``TerminateProcess`` caller chose, and a worker killed by
+    ``taskkill /F`` must not read as one that called ``exit(1)``. Normalised
+    here, where the platform is known, as the sign is.
     """
+    status, kind, source = _exit_status(pid, popen, timeout)
+    if IS_WINDOWS and status is not None:
+        source = "GetExitCodeProcess"
+    return status, kind, source
+
+
+def _exit_status(pid: int | None, popen: Any, timeout: float) -> tuple[int | None, str | None, str]:
     if popen is not None and getattr(popen, "returncode", None) is not None:
         return unsigned_on_windows(int(popen.returncode)), None, "popen.returncode"
 

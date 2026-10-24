@@ -46,6 +46,9 @@ def test_sigkill_does_not_claim_oom():
         (3221225477, "NATIVE_CRASH", "access violation"),
         (3221225725, "NATIVE_CRASH", "stack overflow"),
         (3221226505, "NATIVE_CRASH", "stack buffer overrun"),
+        (0xC0000374, "NATIVE_CRASH", "heap corruption"),
+        (0xC0000017, "NATIVE_CRASH", "out of memory"),
+        (0xC0000142, "NATIVE_CRASH", "desktop heap"),
         (3221225786, "INTERRUPTED", "control-C"),
     ],
 )
@@ -54,6 +57,29 @@ def test_windows_ntstatus(status, expected_verdict, fragment):
     assert verdict == expected_verdict
     assert fragment in description
     assert fragment in exit_status.describe(status)
+
+
+def test_an_unlisted_ntstatus_error_is_named_in_hex():
+    """Decimal is what made 0xC0000142 unrecognisable as 3221225794."""
+    assert exit_status.describe(0xC0000999) == "0xC0000999 NTSTATUS error"
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        (0xC0000000, True),
+        (0xC0000999, True),
+        (0xFFFFFFFF, True),
+        # Warning and informational severities are not faults.
+        (0x80000003, False),
+        (0x40000015, False),
+        (3, False),
+        (-11, False),
+        (None, False),
+    ],
+)
+def test_only_error_severity_is_an_ntstatus_error(status, expected):
+    assert exit_status.is_ntstatus_error(status) is expected
 
 
 def test_wrapper_convention_is_reported_as_a_convention():

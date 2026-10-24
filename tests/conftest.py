@@ -120,6 +120,18 @@ def native_call(pointer):
     os.abort()
 
 
+def windows_fault():
+    """A real access violation on Windows, outside ctypes' exception handling.
+
+    faulthandler's own test helper reads address 0 in C. The process dies with
+    0xC0000005, and faulthandler's dump of it is headed "Windows fatal
+    exception" rather than "Fatal Python error".
+    """
+    import faulthandler
+
+    faulthandler._read_null()
+
+
 def exit_with_ntstatus(status=ACCESS_VIOLATION):
     """Die with the exit code Windows reports for a real fault.
 

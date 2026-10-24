@@ -108,6 +108,43 @@ def test_a_windows_ntstatus_is_a_fault_wherever_it_is_decoded():
     assert "crashed with 0xC0000005 access violation" in rendered(exit_status=3221225477).splitlines()[0]
 
 
+@pytest.mark.parametrize("source", ["GetExitCodeProcess", "popen.wait"])
+def test_an_ntstatus_outside_the_table_is_still_a_fault(source):
+    """0xC0000142 - a desktop heap run dry - used to read as a worker that
+    chose to exit with 3221225794. Wherever it was read, it is a fault."""
+    verdict, confidence, evidence = verdict_of(exit_status=0xC0000999, exit_status_source=source)
+    assert (verdict, confidence) == ("NATIVE_CRASH", "medium")
+    assert any("error-severity NTSTATUS" in line for line in evidence)
+    assert not any("exit was requested from inside" in line for line in evidence)
+    headline = rendered(exit_status=0xC0000999, exit_status_source=source).splitlines()[0]
+    assert "crashed with 0xC0000999 NTSTATUS error" in headline
+
+
+#: faulthandler's dump of a Windows structured exception. It is written before
+#: anything knows whether the exception will be handled.
+WINDOWS_FAULT_DUMP = [
+    "Windows fatal exception: access violation",
+    "Current thread 0x00001234 (most recent call first):",
+    '  File "C:\\srv\\app\\victim.py", line 6 in native_call',
+]
+
+
+def test_a_windows_fault_dump_is_the_deaths_when_the_status_is_that_fault():
+    _, _, evidence = verdict_of(exit_status=0xC0000005, crash_stack=WINDOWS_FAULT_DUMP)
+    assert any("wrote a stack as it died" in line for line in evidence)
+    lines, _ = death(exit_status=0xC0000005, crash_stack=WINDOWS_FAULT_DUMP).blame_stack()
+    assert lines == WINDOWS_FAULT_DUMP
+
+
+def test_a_windows_fault_dump_a_worker_survived_is_not_the_deaths():
+    """ctypes catches an access violation after faulthandler has dumped it,
+    and the test goes on to pass. A later os._exit(3) is not that fault."""
+    verdict, _, evidence = verdict_of(exit_status=3, crash_stack=WINDOWS_FAULT_DUMP)
+    assert verdict == "SELF_EXIT"
+    assert not any("wrote a stack as it died" in line for line in evidence)
+    assert death(exit_status=3, crash_stack=WINDOWS_FAULT_DUMP).blame_stack() == ([], False)
+
+
 def test_a_control_c_on_windows_is_an_interruption_not_a_defect():
     verdict, _, _ = verdict_of(exit_status=3221225786)
     assert verdict == "INTERRUPTED"
