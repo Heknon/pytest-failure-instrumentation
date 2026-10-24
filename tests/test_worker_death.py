@@ -160,6 +160,9 @@ def test_a_stop_signal_is_not_a_defect(distributed):
     "status, verdict, meaning",
     [
         (0xC0000005, "NATIVE_CRASH", "access violation"),
+        (0xC0000142, "NATIVE_CRASH", "DLL initialization failed"),
+        # In no table: still a fault, and still named in hex.
+        (0xC0000999, "NATIVE_CRASH", "0xC0000999 NTSTATUS error"),
         (0xC000013A, "INTERRUPTED", "control-C"),
     ],
 )
@@ -184,6 +187,24 @@ def test_a_windows_ntstatus_is_decoded_as_what_it_stands_for(
     assert death.owner == "unknown"
     assert death.suspect_owner == "customer-code"
     assert "test_crash.py" in (death.suspect_basis or "")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a structured exception is Windows'")
+def test_a_windows_fault_is_blamed_on_the_frames_its_dump_names(distributed):
+    """faulthandler heads a Windows fault's dump "Windows fatal exception",
+    not "Fatal Python error". Read as a dump of a process that went on living,
+    it was kept off the incident's blame, and the crash had no owner."""
+    distributed.pytester.makepyfile(test_crash=crashing_test("victim.windows_fault()"))
+    incidents = distributed.run("-n", "2", "test_crash.py", timeout=180)
+
+    death = distributed.only(incidents, "worker_death")
+    assert death.exit_status == 0xC0000005
+    assert death.verdict == "NATIVE_CRASH"
+    assert death.crash_stack[0].startswith("Windows fatal exception: access violation")
+    assert any("wrote a stack as it died" in line for line in death.evidence)
+    assert death.blamed_frame is not None
+    assert death.blamed_frame.module == "victim"
+    assert death.owner == "product"
 
 
 def test_a_wrapped_signal_is_not_mistaken_for_a_chosen_exit_code(distributed):

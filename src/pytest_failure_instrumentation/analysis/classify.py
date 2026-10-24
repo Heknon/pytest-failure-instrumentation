@@ -320,7 +320,7 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
             "remote gateway, with no local process to ask."
         )
 
-    fatal_dump = crash_stack.is_fatal(incident.crash_stack)
+    fatal_dump = crash_stack.is_fatal(incident.crash_stack, status)
     if fatal_dump:
         evidence.append("The worker wrote a stack as it died.")
     elif incident.crash_stack:
@@ -385,6 +385,15 @@ def of(incident: WorkerDeathIncident) -> tuple[str, str, list[str]]:
     if status in status_table.WINDOWS_STATUS:
         verdict, _description = status_table.WINDOWS_STATUS[status]
         return verdict, "high", close([])
+
+    if status_table.is_ntstatus_error(status):
+        # Not one the table names, but still a fault: read as an ordinary
+        # exit it says the worker asked to leave, with the code in decimal.
+        return "NATIVE_CRASH", "medium", close(output + [
+            f"0x{status:08X} is an error-severity NTSTATUS, which a process ends "
+            "with on an unhandled exception or a failure the loader or runtime "
+            "raised, not by calling exit()."
+        ])
 
     if terminated:
         # After the NTSTATUS table on purpose: a fault ends a process through

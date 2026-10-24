@@ -33,6 +33,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional, TextIO
 
+from ..analysis import exit_status as exit_status_table
 from ..lanes import ThreadKey
 from ..probes import stacks
 
@@ -429,13 +430,20 @@ class FrozenInterpreterFallback:
 #: What faulthandler writes before the first thread when the process is dying.
 FATAL_BANNER = "Fatal Python error"
 
+#: What faulthandler writes on Windows for a structured exception - an access
+#: violation, a stack overflow - in place of :data:`FATAL_BANNER`. It is
+#: written before anything decides whether the exception is handled, so a
+#: process that survives one leaves it behind too: ctypes turns an access
+#: violation into OSError after the dump is on file. See :func:`is_fatal`.
+WINDOWS_FATAL_BANNER = "Windows fatal exception"
+
 #: What a watchdog dump is headed with - faulthandler's own wording, since
 #: it is faulthandler's own dump. The test may well go on to pass.
 TIMEOUT_BANNER = "Timeout ("
 
 #: Lines faulthandler writes before the first thread, which say what kind of
 #: dump this is.
-BANNERS = (FATAL_BANNER, TIMEOUT_BANNER)
+BANNERS = (FATAL_BANNER, WINDOWS_FATAL_BANNER, TIMEOUT_BANNER)
 
 #: Frames only ever present on the thread running a test. What makes a dump
 #: useful is finding *that* thread, not the first one printed.
@@ -766,15 +774,28 @@ def _mentions_us(section: list[str]) -> bool:
     return any(OWN_PACKAGE in line.replace("\\", "/") for line in section)
 
 
-def is_fatal(lines: list[str]) -> bool:
+def is_fatal(lines: list[str], exit_status: Optional[int] = None) -> bool:
     """Whether a dump was written by a process that was ending.
 
     A watchdog dump and a crash dump are the same shape, and only the banner
     separates them. On Windows that separation is load-bearing: ``abort()``
     exits with 3, exactly as a deliberate ``os._exit(3)`` does, so the dump is
     the only evidence that one was a crash.
+
+    A :data:`WINDOWS_FATAL_BANNER` dump is the death's only when the process
+    then ended with an error NTSTATUS, which is what an exception it did not
+    survive leaves as its exit code. Without that, it is the dump of one that
+    was caught - an access violation ctypes turned into OSError in a test that
+    went on to pass - and blaming a later death on it names the wrong test.
+    Callers with no status to give get the strict answer.
     """
-    return bool(lines) and lines[0].startswith(FATAL_BANNER)
+    if not lines:
+        return False
+    if lines[0].startswith(FATAL_BANNER):
+        return True
+    return lines[0].startswith(WINDOWS_FATAL_BANNER) and exit_status_table.is_ntstatus_error(
+        exit_status
+    )
 
 
 def size(path: Path) -> int:

@@ -131,6 +131,36 @@ def test_a_fatal_banner_is_what_marks_a_dump_as_a_death():
     assert not crash_stack.is_fatal([])
 
 
+def test_a_windows_fault_banner_is_a_death_only_beside_a_fault_status():
+    """faulthandler writes it for an exception a process goes on to survive,
+    too, so it takes the exit status to say which this was."""
+    dump = ["Windows fatal exception: access violation", "  File..."]
+    assert crash_stack.is_fatal(dump, 0xC0000005)
+    assert crash_stack.is_fatal(dump, 0xC0000374)
+    assert not crash_stack.is_fatal(dump, 3)
+    assert not crash_stack.is_fatal(dump, 0)
+    assert not crash_stack.is_fatal(dump)
+    # The status never demotes the POSIX banner.
+    assert crash_stack.is_fatal(["Fatal Python error: Aborted", "  File..."], 3)
+
+
+def test_a_windows_fault_dump_starts_a_new_dump(tmp_path):
+    """A watchdog dump earlier in the file is not part of the fault's."""
+    path = tmp_path / "gw0.crash"
+    path.write_text(
+        "Timeout (0:00:02)!\n"
+        "Thread 0x0001 (most recent call first):\n"
+        '  File "slow.py", line 1 in slow_call\n'
+        "Windows fatal exception: access violation\n"
+        "Current thread 0x0001 (most recent call first):\n"
+        '  File "victim.py", line 6 in native_call\n',
+        encoding="utf-8",
+    )
+    lines = crash_stack.read(path)
+    assert lines[0] == "Windows fatal exception: access violation"
+    assert "slow_call" not in "\n".join(lines)
+
+
 # -- which dump, when a file holds several --------------------------------
 
 TWO_DUMPS = """Timeout (0:00:02)!

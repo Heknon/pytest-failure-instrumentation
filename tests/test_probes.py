@@ -152,6 +152,21 @@ def test_a_process_that_was_never_ours_yields_no_status_rather_than_a_guess():
     assert probes.exit_status(None, None) == (None, None, "unavailable")
 
 
+@pytest.mark.parametrize("windows, source", [(True, "GetExitCodeProcess"), (False, "popen.returncode")])
+def test_every_windows_status_is_labelled_as_the_call_it_came_from(monkeypatch, windows, source):
+    """popen's returncode is GetExitCodeProcess's answer on Windows. Labelled
+    as popen's, the classifier read taskkill's exit code 1 as the worker
+    calling exit(1) - the one thing a Windows code cannot tell it."""
+    monkeypatch.setattr(process, "IS_WINDOWS", windows)
+    finished = SimpleNamespace(returncode=1, pid=None)
+    assert process.exit_status(None, finished) == (1, None, source)
+
+
+def test_no_status_is_still_unavailable_on_windows(monkeypatch):
+    monkeypatch.setattr(process, "IS_WINDOWS", True)
+    assert process.exit_status(None, None) == (None, None, "unavailable")
+
+
 @windows_only
 def test_an_ntstatus_is_normalised_to_the_unsigned_form_it_is_documented_as():
     """0xC000013A arrives signed or unsigned depending on who answered, and a

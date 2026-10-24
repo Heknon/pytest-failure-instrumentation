@@ -94,13 +94,13 @@ def _crash_dump(path: Path, status: Optional[int]) -> list[str]:
     reads once and moves on.
     """
     dump = crash_stack.read(path, limit=40)
-    if crash_stack.is_fatal(dump) or not _expects_a_dump(status):
+    if crash_stack.is_fatal(dump, status) or not _expects_a_dump(status):
         return dump
     deadline = time.monotonic() + FATAL_DUMP_WAIT_SECONDS
     while time.monotonic() < deadline:
         time.sleep(FATAL_DUMP_POLL_SECONDS)
         landed = crash_stack.read(path, limit=40)
-        if crash_stack.is_fatal(landed):
+        if crash_stack.is_fatal(landed, status):
             return landed
     # It never arrived. The probe stack is still evidence and is still
     # returned - is_fatal() is what tells a reader it is not the death stack,
@@ -228,7 +228,7 @@ class WorkerDeathIncident(Incident):
         - and if that module is the product's, an unrelated clean exit pages
         somebody at severity=critical.
         """
-        if not crash_stack.is_fatal(self.crash_stack):
+        if not crash_stack.is_fatal(self.crash_stack, self.exit_status):
             return [], False
         return self.crash_stack, False  # faulthandler prints deepest first
 
@@ -295,8 +295,8 @@ class WorkerDeathIncident(Incident):
                 name = exit_status.signal_name(received)
                 detail = exit_status.FATAL_SIGNALS.get(received)
                 return f"crashed with {name} ({detail})" if detail else f"crashed with {name}"
-            if status in exit_status.WINDOWS_STATUS:
-                return f"crashed with {exit_status.WINDOWS_STATUS[status][1]}"
+            if status in exit_status.WINDOWS_STATUS or exit_status.is_ntstatus_error(status):
+                return f"crashed with {exit_status.describe(status)}"
             code = f" (exit code {status})" if status is not None else ""
             return f"crashed, leaving a fatal stack{code}"
         if self.verdict.startswith("SIGNAL_") and status is not None and status < 0:
@@ -556,14 +556,14 @@ def _say_which_lanes(incident: WorkerDeathIncident) -> None:
             f"The fatal dump was written on lane {culprit.get('lane')}'s thread, "
             "so its test is the one blamed; the others went down with the process."
         )
-    elif crash_stack.is_fatal(incident.crash_stack) and any(
+    elif crash_stack.is_fatal(incident.crash_stack, incident.exit_status) and any(
         crash_stack.CURRENT_THREAD.match(line) for line in incident.crash_stack
     ):
         line += (
             "The fatal dump was written on a thread that is none of these lanes' - "
             "one a test left running, say - so no lane's test is blamed."
         )
-    elif crash_stack.is_fatal(incident.crash_stack) and crash_stack.one_stack(
+    elif crash_stack.is_fatal(incident.crash_stack, incident.exit_status) and crash_stack.one_stack(
         incident.crash_stack
     ):
         # A free-threaded interpreter's dump: no thread named, only the stack
